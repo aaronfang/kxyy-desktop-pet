@@ -5,7 +5,8 @@
 // 新增角色：把素材放到 assets/pets/<id>/，在本文件用 registerPet 注册，
 // 并在 shared/roster.json 里加一行 { "id": "...", "label": "..." }。
 
-const WEBMEJI_BASE = "./assets/pets";
+// index.html 位于 renderer/，素材在项目根的 assets/，故相对路径需回退一级
+const WEBMEJI_BASE = "../assets/pets";
 
 /** 各动作默认帧数（kxyy-cyber 基准）；新角色用 frames 覆盖 */
 const DEFAULT_PET_FRAMES = {

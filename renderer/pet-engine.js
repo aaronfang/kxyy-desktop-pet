@@ -121,7 +121,7 @@ class Creature {
     this.canvas = document.createElement('canvas');
     this.canvas.id = containerId;
     this.canvas.className = 'webmeji-sprite';
-    this.ctx = this.canvas.getContext('2d');
+    this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
     this._frameUrl = '';
     this.container.appendChild(this.canvas);
 

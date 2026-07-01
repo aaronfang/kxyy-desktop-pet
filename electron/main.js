@@ -82,6 +82,12 @@ function createWindow() {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.setIgnoreMouseEvents(true, { forward: true });
 
+  if (process.env.PET_DEBUG) {
+    win.webContents.on("console-message", (_e, _lvl, message) => {
+      console.log("[renderer]", message);
+    });
+  }
+
   win.loadFile(path.join(__dirname, "..", "renderer", "index.html"));
   win.once("ready-to-show", () => win.showInactive());
 }

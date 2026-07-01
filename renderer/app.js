@@ -72,6 +72,7 @@ async function boot() {
   await window.initPet(petId);
   applyPetSize(settings.sizePercent ?? 150);
   bindMouseTracking();
+  console.log(`桌宠已启动: ${petId}`);
 
   // 主进程下发的设置变更（切换角色 / 调整大小 / 显隐）
   window.petAPI?.onApplySettings?.(async (data = {}) => {
