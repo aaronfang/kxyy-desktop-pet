@@ -1,0 +1,39 @@
+/* 透明全屏舞台：整窗透明，桌宠贴在屏幕底部行走 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.webmeji-container {
+  position: fixed;
+  bottom: 0;
+  width: var(--pet-size, 100px);
+  height: var(--pet-size, 100px);
+  overflow: hidden;
+  z-index: 45;
+  cursor: grab;
+}
+
+.webmeji-container:active {
+  cursor: grabbing;
+}
+
+.webmeji-container canvas.webmeji-sprite {
+  width: 100%;
+  height: 100%;
+  user-select: none;
+  pointer-events: none;
+  display: block;
+  transform-origin: center center;
+}

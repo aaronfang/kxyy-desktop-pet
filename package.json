@@ -1,0 +1,50 @@
+{
+  "name": "kxyy-desktop-pet",
+  "version": "0.1.0",
+  "description": "元元桌宠 · 基于 webmeji 动画的 macOS / Windows 跨平台桌面宠物",
+  "author": "aaronfang",
+  "license": "MIT",
+  "private": true,
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "sync-assets": "node scripts/sync-assets.mjs",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.aaronfang.kxyydesktoppet",
+    "productName": "元元桌宠",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "renderer/**/*",
+      "shared/**/*",
+      "assets/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.entertainment",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

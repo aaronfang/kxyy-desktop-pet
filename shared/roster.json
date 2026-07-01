@@ -1,0 +1,7 @@
+{
+  "defaultPetId": "kxyy-miaojiang",
+  "pets": [
+    { "id": "kxyy-cyber", "label": "赛博元元" },
+    { "id": "kxyy-miaojiang", "label": "苗疆元元" }
+  ]
+}
