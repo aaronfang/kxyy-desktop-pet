@@ -30,7 +30,9 @@
       "assets/**/*"
     ],
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.entertainment",
+      "identity": null,
       "target": [
         "dmg",
         "zip"
