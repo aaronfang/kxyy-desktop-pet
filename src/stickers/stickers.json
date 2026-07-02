@@ -1,0 +1,1440 @@
+{
+  "version": 1,
+  "width": 120,
+  "stickers": [
+    {
+      "file": "maimeng_01.gif",
+      "url": "stickers/maimeng_01.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "戴眼镜的短发女孩双手托下巴手势，面带微笑。",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "爱心",
+        "可爱",
+        "撒娇",
+        "手势"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon.gif"
+    },
+    {
+      "file": "haixiu_01.gif",
+      "url": "stickers/haixiu_01.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "女生戴着白色毛绒手套，托着下巴低头浅笑，眼神含羞带怯。",
+      "text": "",
+      "tags": [
+        "害羞",
+        "腼腆",
+        "娇羞",
+        "捂脸笑",
+        "软萌"
+      ],
+      "width": 120,
+      "height": 143,
+      "src": "douyin_emoticon (1).gif"
+    },
+    {
+      "file": "zanting_01.gif",
+      "url": "stickers/zanting_01.gif",
+      "slug": "zanting",
+      "emotion": "暂停",
+      "desc": "女孩对着镜头比暂停手势。",
+      "text": "",
+      "tags": [
+        "暂停",
+        "可爱",
+        "兔耳",
+        "撒娇",
+        "萌"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (2).gif"
+    },
+    {
+      "file": "tiaopi_01.gif",
+      "url": "stickers/tiaopi_01.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "古风装扮女子认真的表情，打开闪光灯拍照。",
+      "text": "",
+      "tags": [
+        "调皮",
+        "拍照",
+        "闪光灯",
+        "懵",
+        "呆住",
+        "石化",
+        "尴尬"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (3).gif"
+    },
+    {
+      "file": "wuyu_01.gif",
+      "url": "stickers/wuyu_01.gif",
+      "slug": "wuyu",
+      "emotion": "无语",
+      "desc": "女生翻白眼，表情无奈又嫌弃",
+      "text": "",
+      "tags": [
+        "无语",
+        "翻白眼",
+        "无奈",
+        "嫌弃",
+        "服了"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (4).gif"
+    },
+    {
+      "file": "haixiu_02.gif",
+      "url": "stickers/haixiu_02.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "黑发女孩微微低头，嘴角轻扬，眼神含羞带笑。",
+      "text": "",
+      "tags": [
+        "害羞",
+        "脸红",
+        "腼腆",
+        "偷笑",
+        "娇羞"
+      ],
+      "width": 120,
+      "height": 108,
+      "src": "douyin_emoticon (5).gif"
+    },
+    {
+      "file": "qinwen_01.gif",
+      "url": "stickers/qinwen_01.gif",
+      "slug": "qinwen",
+      "emotion": "亲吻",
+      "desc": "戴眼镜的人闭眼嘟嘴亲吻，表情俏皮可爱。",
+      "text": "宝宝AI生成",
+      "tags": [
+        "亲吻",
+        "卖萌",
+        "俏皮",
+        "嘟嘴",
+        "搞怪"
+      ],
+      "width": 120,
+      "height": 167,
+      "src": "douyin_emoticon (6).gif"
+    },
+    {
+      "file": "kaixin_01.gif",
+      "url": "stickers/kaixin_01.gif",
+      "slug": "kaixin",
+      "emotion": "开心吃东西",
+      "desc": "戴蓝帽子的少年咬着西瓜，脸颊有蓝色彩绘。",
+      "text": "",
+      "tags": [
+        "开心",
+        "吃零食",
+        "西瓜",
+        "可爱",
+        "彩绘"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (7).gif"
+    },
+    {
+      "file": "jingya_01.gif",
+      "url": "stickers/jingya_01.gif",
+      "slug": "jingya",
+      "emotion": "惊讶",
+      "desc": "少年皱眉鼓腮，脸颊有彩绘，头顶‘傻眼’文字",
+      "text": "傻眼",
+      "tags": [
+        "惊讶",
+        "无语",
+        "嫌弃",
+        "翻白眼",
+        "懵"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (8).gif"
+    },
+    {
+      "file": "xindong_01.gif",
+      "url": "stickers/xindong_01.gif",
+      "slug": "xindong",
+      "emotion": "心动",
+      "desc": "女生微微抬头，含情脉脉，风吹动头发。",
+      "text": "",
+      "tags": [
+        "心动",
+        "害羞",
+        "腼腆",
+        "含情脉脉"
+      ],
+      "width": 120,
+      "height": 116,
+      "src": "douyin_emoticon (9).gif"
+    },
+    {
+      "file": "wuyu_02.gif",
+      "url": "stickers/wuyu_02.gif",
+      "slug": "wuyu",
+      "emotion": "无语",
+      "desc": "低头揪头发，表情无奈又疲惫",
+      "text": "",
+      "tags": [
+        "无语",
+        "头疼",
+        "崩溃",
+        "抓狂",
+        "无奈"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (10).gif"
+    },
+    {
+      "file": "shengqi_01.gif",
+      "url": "stickers/shengqi_01.gif",
+      "slug": "shengqi",
+      "emotion": "生气",
+      "desc": "黑发女孩穿红衣，肘击，表情可爱",
+      "text": "",
+      "tags": [
+        "生气",
+        "肘击",
+        "可爱",
+        "撒娇",
+        "手势"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (11).gif"
+    },
+    {
+      "file": "wink_01.gif",
+      "url": "stickers/wink_01.gif",
+      "slug": "wink",
+      "emotion": "眨眼",
+      "desc": "古风装扮的女生微微低头，嘴角带笑，眼神含羞。",
+      "text": "",
+      "tags": [
+        "眨眼",
+        "wink",
+        "娇羞",
+        "脸红",
+        "古风少女",
+        "抿嘴笑"
+      ],
+      "width": 120,
+      "height": 138,
+      "src": "douyin_emoticon (12).gif"
+    },
+    {
+      "file": "deyi_01.gif",
+      "url": "stickers/deyi_01.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "古风装扮女子侧脸微笑，发间插花，模仿得意抽烟的表情。",
+      "text": "",
+      "tags": [
+        "得意",
+        "抽烟",
+        "得瑟",
+        "古风美女",
+        "抿嘴笑"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (14).gif"
+    },
+    {
+      "file": "wink_02.gif",
+      "url": "stickers/wink_02.gif",
+      "slug": "wink",
+      "emotion": "眨眼",
+      "desc": "古风装扮的女生俏皮地眨一只眼，嘴角微扬。",
+      "text": "",
+      "tags": [
+        "眨眼",
+        "俏皮",
+        "撒娇",
+        "wink",
+        "撩人"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (15).gif"
+    },
+    {
+      "file": "kaixin_02.gif",
+      "url": "stickers/kaixin_02.gif",
+      "slug": "kaixin",
+      "emotion": "开心",
+      "desc": "女孩闭眼微笑，嘴角上扬，露出洁白牙齿，显得十分愉悦。",
+      "text": "",
+      "tags": [
+        "开心",
+        "笑",
+        "高兴",
+        "愉快",
+        "灿烂"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (16).gif"
+    },
+    {
+      "file": "tiaopi_02.gif",
+      "url": "stickers/tiaopi_02.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "古风装扮女子摇头晃脑",
+      "text": "",
+      "tags": [
+        "调皮",
+        "低头",
+        "古风",
+        "含蓄"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (17).gif"
+    },
+    {
+      "file": "maimeng_02.gif",
+      "url": "stickers/maimeng_02.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "戴毛绒发饰的女生微笑着摇头晃脑卖萌。",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "可爱",
+        "古风",
+        "卖萌",
+        "撒娇"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (18).gif"
+    },
+    {
+      "file": "tiaopi_03.gif",
+      "url": "stickers/tiaopi_03.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "女子双手模仿蛇的手势，面带微笑，穿着古风服饰。",
+      "text": "",
+      "tags": [
+        "调皮",
+        "手势",
+        "可爱",
+        "撒娇",
+        "古风"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (19).gif"
+    },
+    {
+      "file": "qinwen_02.gif",
+      "url": "stickers/qinwen_02.gif",
+      "slug": "qinwen",
+      "emotion": "亲吻",
+      "desc": "身着华丽古装、头戴凤冠的女子端庄凝视镜头，比心飞吻。",
+      "text": "",
+      "tags": [
+        "飞吻",
+        "古风",
+        "新娘",
+        "凤冠霞帔",
+        "端庄",
+        "国风"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (20).gif"
+    },
+    {
+      "file": "haixiu_03.gif",
+      "url": "stickers/haixiu_03.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "古风装扮女子微笑，手轻抚脸颊",
+      "text": "",
+      "tags": [
+        "害羞",
+        "可爱",
+        "古风",
+        "撒娇",
+        "甜妹"
+      ],
+      "width": 120,
+      "height": 214,
+      "src": "douyin_emoticon (21).gif"
+    },
+    {
+      "file": "yiwen_01.gif",
+      "url": "stickers/yiwen_01.gif",
+      "slug": "yiwen",
+      "emotion": "疑惑",
+      "desc": "女子用手指轻触嘴唇，做出疑惑的表情。",
+      "text": "",
+      "tags": [
+        "疑惑",
+        "安静",
+        "嘘",
+        "捂嘴",
+        "小声"
+      ],
+      "width": 120,
+      "height": 148,
+      "src": "douyin_emoticon (22).gif"
+    },
+    {
+      "file": "kaixin_03.gif",
+      "url": "stickers/kaixin_03.gif",
+      "slug": "kaixin",
+      "emotion": "开心",
+      "desc": "女孩眯眼微笑，开心的摇头晃脑。",
+      "text": "",
+      "tags": [
+        "开心",
+        "可爱",
+        "撒娇",
+        "心动",
+        "甜"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (23).gif"
+    },
+    {
+      "file": "maimeng_03.gif",
+      "url": "stickers/maimeng_03.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "女孩闭眼低头，嘴角微抿，摇头晃脑，神情可爱。",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "可爱",
+        "摇头晃脑"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (24).gif"
+    },
+    {
+      "file": "deyi_02.gif",
+      "url": "stickers/deyi_02.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "女孩摇头晃脑，脸颊微红，佩戴珍珠项链。",
+      "text": "",
+      "tags": [
+        "得意",
+        "摇头晃脑",
+        "娇羞",
+        "腼腆"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (25).gif"
+    },
+    {
+      "file": "deyi_03.gif",
+      "url": "stickers/deyi_03.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "女生扎双马尾，摇头晃脑",
+      "text": "",
+      "tags": [
+        "得意",
+        "可爱",
+        "摇头晃脑",
+        "萌"
+      ],
+      "width": 120,
+      "height": 134,
+      "src": "douyin_emoticon (26).gif"
+    },
+    {
+      "file": "kaixin_04.gif",
+      "url": "stickers/kaixin_04.gif",
+      "slug": "kaixin",
+      "emotion": "开心",
+      "desc": "女生大笑，眼睛眯起，露出整齐牙齿，周围环绕‘哈哈哈’文字。",
+      "text": "哈哈哈",
+      "tags": [
+        "开心",
+        "大笑",
+        "欢乐",
+        "笑疯了",
+        "乐"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (27).gif"
+    },
+    {
+      "file": "deyi_04.gif",
+      "url": "stickers/deyi_04.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "长发人物手持折扇，另一只手指向镜头, 眼神温柔做出挑眉动作。",
+      "text": "",
+      "tags": [
+        "得意",
+        "挑眉",
+        "撒娇",
+        "可爱",
+        "手势"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (28).gif"
+    },
+    {
+      "file": "deyi_05.gif",
+      "url": "stickers/deyi_05.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "女性转动眼珠并微笑抿嘴，表情温柔可爱。",
+      "text": "",
+      "tags": [
+        "得逞",
+        "得意",
+        "撒娇",
+        "转眼珠",
+        "可爱"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (29).gif"
+    },
+    {
+      "file": "shengqi_02.gif",
+      "url": "stickers/shengqi_02.gif",
+      "slug": "shengqi",
+      "emotion": "生气",
+      "desc": "戴银饰头饰和耳环的女子咬牙切齿",
+      "text": "",
+      "tags": [
+        "生气",
+        "可爱",
+        "民族风",
+        "咬牙切齿",
+        "银饰"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (30).gif"
+    },
+    {
+      "file": "qinwen_03.gif",
+      "url": "stickers/qinwen_03.gif",
+      "slug": "qinwen",
+      "emotion": "亲吻",
+      "desc": "闭眼嘟嘴亲吻，可爱表情。",
+      "text": "",
+      "tags": [
+        "亲吻",
+        "可爱",
+        "嘟嘴",
+        "撒娇",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (31).gif"
+    },
+    {
+      "file": "maimeng_04.gif",
+      "url": "stickers/maimeng_04.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "穿红白衣服的人跳钢管舞",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "跳舞",
+        "抽象",
+        "可爱",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (33).gif"
+    },
+    {
+      "file": "haixiu_04.gif",
+      "url": "stickers/haixiu_04.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "女生近距离自拍，眼神躲闪，微抿嘴唇，略带羞涩",
+      "text": "",
+      "tags": [
+        "害羞",
+        "脸红",
+        "低头",
+        "腼腆",
+        "偷看"
+      ],
+      "width": 120,
+      "height": 144,
+      "src": "douyin_emoticon (34).gif"
+    },
+    {
+      "file": "ganga_01.gif",
+      "url": "stickers/ganga_01.gif",
+      "slug": "ganga",
+      "emotion": "尴尬",
+      "desc": "银发女性佩戴闪亮饰品，往上提衣服",
+      "text": "",
+      "tags": [
+        "尴尬",
+        "爱心",
+        "撒娇",
+        "可爱",
+        "闪亮"
+      ],
+      "width": 120,
+      "height": 206,
+      "src": "douyin_emoticon (35).gif"
+    },
+    {
+      "file": "wink_03.gif",
+      "url": "stickers/wink_03.gif",
+      "slug": "wink",
+      "emotion": "眨眼",
+      "desc": "女生wink，嘴角微扬，卖萌",
+      "text": "",
+      "tags": [
+        "眨眼",
+        "wink",
+        "微笑",
+        "可爱",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 139,
+      "src": "douyin_emoticon (36).gif"
+    },
+    {
+      "file": "deyi_06.gif",
+      "url": "stickers/deyi_06.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "戴着花环、脸上有彩点的少女微笑wink，神情娇羞可爱。",
+      "text": "",
+      "tags": [
+        "得意",
+        "wink",
+        "挑眉",
+        "花环",
+        "彩点",
+        "甜美",
+        "眨眼"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (38).gif"
+    },
+    {
+      "file": "xianqi_01.gif",
+      "url": "stickers/xianqi_01.gif",
+      "slug": "xianqi",
+      "emotion": "嫌弃",
+      "desc": "女子侧眼斜视，表情略带嫌弃与无奈。",
+      "text": "",
+      "tags": [
+        "无语",
+        "翻白眼",
+        "嫌弃",
+        "无奈",
+        "装傻"
+      ],
+      "width": 120,
+      "height": 192,
+      "src": "douyin_emoticon (39).gif"
+    },
+    {
+      "file": "weiqu_01.gif",
+      "url": "stickers/weiqu_01.gif",
+      "slug": "weiqu",
+      "emotion": "委屈",
+      "desc": "长发女生微微低头，脸颊泛红，眼神躲闪，露出委屈神情。",
+      "text": "",
+      "tags": [
+        "委屈",
+        "流泪",
+        "低头",
+        "腼腆",
+        "娇羞"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (40).gif"
+    },
+    {
+      "file": "deyi_07.gif",
+      "url": "stickers/deyi_07.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "古风女子微笑，得意的神情。",
+      "text": "",
+      "tags": [
+        "得意",
+        "可爱",
+        "古风",
+        "撒娇",
+        "心动"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (42).gif"
+    },
+    {
+      "file": "dianzan_01.gif",
+      "url": "stickers/dianzan_01.gif",
+      "slug": "dianzan",
+      "emotion": "点赞",
+      "desc": "短发少年戴蓝帽穿条纹衫，竖起大拇指微笑",
+      "text": "SIA",
+      "tags": [
+        "点赞",
+        "支持",
+        "好评",
+        "赞",
+        "鼓励"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (43).gif"
+    },
+    {
+      "file": "haipa_01.gif",
+      "url": "stickers/haipa_01.gif",
+      "slug": "haipa",
+      "emotion": "害怕",
+      "desc": "短发青年被突然吓到后闭眼张嘴，身体颤抖。",
+      "text": "",
+      "tags": [
+        "害怕",
+        "惊吓",
+        "闭眼",
+        "张嘴"
+      ],
+      "width": 120,
+      "height": 136,
+      "src": "douyin_emoticon (44).gif"
+    },
+    {
+      "file": "maimeng_05.gif",
+      "url": "stickers/maimeng_05.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "古风装扮女孩用手指整理发丝，斗鸡眼，俏皮可爱。",
+      "text": "",
+      "tags": [
+        "装傻",
+        "古风",
+        "可爱",
+        "眨眼",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (45).gif"
+    },
+    {
+      "file": "haixiu_05.gif",
+      "url": "stickers/haixiu_05.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "女生低头抿嘴，眼神躲闪，脸颊微红显羞涩。",
+      "text": "",
+      "tags": [
+        "害羞",
+        "脸红",
+        "腼腆",
+        "娇羞"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (46).gif"
+    },
+    {
+      "file": "tiaopi_04.gif",
+      "url": "stickers/tiaopi_04.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "双手抓住头顶头发，眼神专注可爱",
+      "text": "",
+      "tags": [
+        "调皮",
+        "爱心",
+        "可爱",
+        "手势",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (47).gif"
+    },
+    {
+      "file": "tiaopi_05.gif",
+      "url": "stickers/tiaopi_05.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "短发女生双手托饮料，对着镜头",
+      "text": "旺仔牛奶",
+      "tags": [
+        "调皮",
+        "可爱",
+        "模仿",
+        "椰汁",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (48).gif"
+    },
+    {
+      "file": "yiwen_02.gif",
+      "url": "stickers/yiwen_02.gif",
+      "slug": "yiwen",
+      "emotion": "疑惑",
+      "desc": "女生用手指轻点脸颊，眼神疑惑略带嫌弃。",
+      "text": "摆烂歪歪制作",
+      "tags": [
+        "疑惑",
+        "嫌弃",
+        "皱眉",
+        "认真"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (49).gif"
+    },
+    {
+      "file": "maimeng_06.gif",
+      "url": "stickers/maimeng_06.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "黑发女孩双手比yeah，面带微笑看着镜头。",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "微笑",
+        "可爱",
+        "撒娇",
+        "手势"
+      ],
+      "width": 120,
+      "height": 108,
+      "src": "douyin_emoticon (50).gif"
+    },
+    {
+      "file": "tiaopi_06.gif",
+      "url": "stickers/tiaopi_06.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "女孩脸颊画着小老鼠图案，嘴唇微嘟",
+      "text": "",
+      "tags": [
+        "调皮",
+        "可爱",
+        "手绘",
+        "小老鼠",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 125,
+      "src": "douyin_emoticon (51).gif"
+    },
+    {
+      "file": "xianqi_02.gif",
+      "url": "stickers/xianqi_02.gif",
+      "slug": "xianqi",
+      "emotion": "嫌弃",
+      "desc": "戴眼镜的人皱眉撇嘴，右手抬起做抽烟手势。",
+      "text": "",
+      "tags": [
+        "嫌弃",
+        "无奈",
+        "翻白眼",
+        "服了",
+        "无语凝噎"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (52).gif"
+    },
+    {
+      "file": "haixiu_06.gif",
+      "url": "stickers/haixiu_06.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "古风装扮女子微笑眨眼，头戴华丽发饰，做出害羞姿态。",
+      "text": "礼物展柜 11/20",
+      "tags": [
+        "害羞",
+        "古风",
+        "甜美",
+        "眨眼",
+        "撒娇"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (53).gif"
+    },
+    {
+      "file": "jingya_02.gif",
+      "url": "stickers/jingya_02.gif",
+      "slug": "jingya",
+      "emotion": "惊讶",
+      "desc": "古风装扮女子瞪大眼睛，表情惊讶。",
+      "text": "",
+      "tags": [
+        "惊讶",
+        "翻白眼",
+        "嫌弃",
+        "无奈",
+        "装傻"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (54).gif"
+    },
+    {
+      "file": "maimeng_07.gif",
+      "url": "stickers/maimeng_07.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "女孩微笑，一手托脸一手比出V字手势",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "可爱",
+        "卖萌",
+        "微笑",
+        "手势"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (55).gif"
+    },
+    {
+      "file": "xindong_02.gif",
+      "url": "stickers/xindong_02.gif",
+      "slug": "xindong",
+      "emotion": "心动",
+      "desc": "黑狗低头，口水往下滴，眼神呆滞。",
+      "text": "",
+      "tags": [
+        "心动",
+        "狗狗",
+        "流口水",
+        "呆滞",
+        "兴奋"
+      ],
+      "width": 120,
+      "height": 178,
+      "src": "douyin_emoticon (56).gif"
+    },
+    {
+      "file": "wuyu_03.gif",
+      "url": "stickers/wuyu_03.gif",
+      "slug": "wuyu",
+      "emotion": "无语",
+      "desc": "短发人物直视镜头，眼神平静",
+      "text": "",
+      "tags": [
+        "无语",
+        "懵",
+        "呆住",
+        "沉默",
+        "无奈"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (57).gif"
+    },
+    {
+      "file": "yiwen_03.gif",
+      "url": "stickers/yiwen_03.gif",
+      "slug": "yiwen",
+      "emotion": "疑惑",
+      "desc": "人物皱眉抿嘴，手指轻触太阳穴，表情无奈又困惑。",
+      "text": "",
+      "tags": [
+        "疑惑",
+        "无奈",
+        "困惑",
+        "翻白眼",
+        "心累"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (58).gif"
+    },
+    {
+      "file": "yiwen_04.gif",
+      "url": "stickers/yiwen_04.gif",
+      "slug": "yiwen",
+      "emotion": "疑惑",
+      "desc": "戴眼镜的人微微张嘴，眼神略显无奈或困惑。",
+      "text": "",
+      "tags": [
+        "无语",
+        "懵",
+        "疑惑",
+        "愣住",
+        "不知道说啥"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (59).gif"
+    },
+    {
+      "file": "xindong_03.gif",
+      "url": "stickers/xindong_03.gif",
+      "slug": "xindong",
+      "emotion": "心动",
+      "desc": "红发角色捧手机，周围飞满粉色爱心，表情惊喜陶醉。",
+      "text": "",
+      "tags": [
+        "心动",
+        "喜欢",
+        "害羞",
+        "恋爱",
+        "花痴"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (60).gif"
+    },
+    {
+      "file": "maimeng_08.gif",
+      "url": "stickers/maimeng_08.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "女生低头浅笑，脸颊微红，眼神躲闪。",
+      "text": "",
+      "tags": [
+        "卖萌",
+        "脸红",
+        "低头",
+        "腼腆",
+        "娇羞"
+      ],
+      "width": 120,
+      "height": 134,
+      "src": "douyin_emoticon (61).gif"
+    },
+    {
+      "file": "wuyu_04.gif",
+      "url": "stickers/wuyu_04.gif",
+      "slug": "wuyu",
+      "emotion": "无语质问",
+      "desc": "短发人物瞪眼歪头，表情惊讶又嫌弃地质疑对方。",
+      "text": "你是来拉屎的吧",
+      "tags": [
+        "无语",
+        "嫌弃",
+        "质问",
+        "搞笑",
+        "吐槽"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (62).gif"
+    },
+    {
+      "file": "deyi_08.gif",
+      "url": "stickers/deyi_08.gif",
+      "slug": "deyi",
+      "emotion": "得意",
+      "desc": "古风装扮女子眨眼微笑，右手摸脸。",
+      "text": "",
+      "tags": [
+        "得意",
+        "可爱",
+        "古风",
+        "眨眼",
+        "撒娇"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (64).gif"
+    },
+    {
+      "file": "ku_01.gif",
+      "url": "stickers/ku_01.gif",
+      "slug": "ku",
+      "emotion": "哭",
+      "desc": "猴子穿粉色短裤，爬在棍子上，哭泣表情。",
+      "text": "",
+      "tags": [
+        "哭泣",
+        "伤心",
+        "撒娇",
+        "可爱",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (65).gif"
+    },
+    {
+      "file": "weiqu_02.gif",
+      "url": "stickers/weiqu_02.gif",
+      "slug": "weiqu",
+      "emotion": "委屈",
+      "desc": "女子用手指轻触眼角，表情委屈欲哭",
+      "text": "委屈",
+      "tags": [
+        "委屈",
+        "难过",
+        "想哭",
+        "撒娇",
+        "楚楚可怜"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (66).gif"
+    },
+    {
+      "file": "haixiu_07.gif",
+      "url": "stickers/haixiu_07.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "古风装扮女子低头浅笑，额间饰有珠花，神情娇羞。",
+      "text": "",
+      "tags": [
+        "害羞",
+        "娇羞",
+        "古风",
+        "低头笑",
+        "新娘"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (68).gif"
+    },
+    {
+      "file": "wuyu_05.gif",
+      "url": "stickers/wuyu_05.gif",
+      "slug": "wuyu",
+      "emotion": "无语",
+      "desc": "古风装扮女子翻白眼，无语表情",
+      "text": "",
+      "tags": [
+        "无语",
+        "翻白眼",
+        "古风",
+        "撒娇"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (69).gif"
+    },
+    {
+      "file": "shengqi_03.gif",
+      "url": "stickers/shengqi_03.gif",
+      "slug": "shengqi",
+      "emotion": "生气",
+      "desc": "女孩侧脸靠近海豹玩偶，眼神凶",
+      "text": "爆点歪歪制作",
+      "tags": [
+        "生气",
+        "嫌弃",
+        "瞪眼",
+        "可爱",
+        "皱眉",
+        "撒娇"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (70).gif"
+    },
+    {
+      "file": "jingya_03.gif",
+      "url": "stickers/jingya_03.gif",
+      "slug": "jingya",
+      "emotion": "惊讶",
+      "desc": "睁大眼睛、微张嘴，表情惊讶",
+      "text": "",
+      "tags": [
+        "惊讶",
+        "震惊",
+        "懵了"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (71).gif"
+    },
+    {
+      "file": "tiaopi_07.gif",
+      "url": "stickers/tiaopi_07.gif",
+      "slug": "tiaopi",
+      "emotion": "调皮",
+      "desc": "女孩微笑用手指牙齿上的黑块，做出调皮动作。",
+      "text": "",
+      "tags": [
+        "调皮",
+        "可爱",
+        "撒娇",
+        "卖萌",
+        "甜笑"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (72).gif"
+    },
+    {
+      "file": "xianqi_03.gif",
+      "url": "stickers/xianqi_03.gif",
+      "slug": "xianqi",
+      "emotion": "嫌弃",
+      "desc": "古风装扮女子用手指弹鼻屎，眼神嫌弃。",
+      "text": "",
+      "tags": [
+        "嫌弃",
+        "撒娇",
+        "古风",
+        "可爱",
+        "卖萌"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (73).gif"
+    },
+    {
+      "file": "ganga_02.gif",
+      "url": "stickers/ganga_02.gif",
+      "slug": "ganga",
+      "emotion": "尴尬",
+      "desc": "女子对着镜头微笑扭动身体，衣服滑落，氛围梦幻粉紫光效。",
+      "text": "",
+      "tags": [
+        "尴尬",
+        "撒娇",
+        "可爱",
+        "甜妹"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (74).gif"
+    },
+    {
+      "file": "yiwen_05.gif",
+      "url": "stickers/yiwen_05.gif",
+      "slug": "yiwen",
+      "emotion": "疑惑",
+      "desc": "红发女子皱眉歪头，手指轻触嘴唇，表情困惑无奈。",
+      "text": "摆烂歪歪制作",
+      "tags": [
+        "无语",
+        "无奈",
+        "懵",
+        "疑惑",
+        "翻白眼"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (75).gif"
+    },
+    {
+      "file": "dianzan_02.gif",
+      "url": "stickers/dianzan_02.gif",
+      "slug": "dianzan",
+      "emotion": "点赞",
+      "desc": "女子双手竖起大拇指，面带微笑，佩戴红色珠串与古风耳饰。",
+      "text": "",
+      "tags": [
+        "点赞",
+        "爱心",
+        "撒娇",
+        "可爱",
+        "古风"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (76).gif"
+    },
+    {
+      "file": "weiqu_03.gif",
+      "url": "stickers/weiqu_03.gif",
+      "slug": "weiqu",
+      "emotion": "委屈",
+      "desc": "古风女子低头垂眸，脸颊微红，神情羞涩委屈。",
+      "text": "",
+      "tags": [
+        "委屈",
+        "脸红",
+        "低头",
+        "娇羞",
+        "古风"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (77).gif"
+    },
+    {
+      "file": "maimeng_09.gif",
+      "url": "stickers/maimeng_09.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "红发古风装扮的女生低头双手抓取动作",
+      "text": "樱花歪歪制作",
+      "tags": [
+        "卖萌",
+        "可爱",
+        "古风",
+        "撒娇",
+        "心动"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (78).gif"
+    },
+    {
+      "file": "yiwen_06.gif",
+      "url": "stickers/yiwen_06.gif",
+      "slug": "yiwen",
+      "emotion": "疑惑",
+      "desc": "女生睁大眼睛，嘴唇微张，表情惊讶又疑惑。",
+      "text": "",
+      "tags": [
+        "疑惑",
+        "卖萌",
+        "懵了",
+        "尴尬",
+        "石化"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (79).gif"
+    },
+    {
+      "file": "haixiu_08.gif",
+      "url": "stickers/haixiu_08.gif",
+      "slug": "haixiu",
+      "emotion": "害羞",
+      "desc": "穿红色古风服饰的女生对着镜头遮挡嘴唇, 不知可否。",
+      "text": "D45",
+      "tags": [
+        "害羞",
+        "害怕",
+        "古风",
+        "撒娇",
+        "甜妹"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (80).gif"
+    },
+    {
+      "file": "shengqi_04.gif",
+      "url": "stickers/shengqi_04.gif",
+      "slug": "shengqi",
+      "emotion": "生气",
+      "desc": "人物认真脸, 一脸严肃",
+      "text": "",
+      "tags": [
+        "生气",
+        "认真",
+        "可爱",
+        "无语",
+        "萌"
+      ],
+      "width": 120,
+      "height": 213,
+      "src": "douyin_emoticon (81).gif"
+    },
+    {
+      "file": "qidai_01.gif",
+      "url": "stickers/qidai_01.gif",
+      "slug": "qidai",
+      "emotion": "期待",
+      "desc": "古风装扮女子向内招手，表示\"来来来\"面带微笑",
+      "text": "",
+      "tags": [
+        "期待",
+        "爱心",
+        "古风",
+        "撒娇",
+        "可爱"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (82).gif"
+    },
+    {
+      "file": "maimeng_10.gif",
+      "url": "stickers/maimeng_10.gif",
+      "slug": "maimeng",
+      "emotion": "卖萌",
+      "desc": "黑发女子手指轻触嘴唇，眼神含羞带笑。",
+      "text": "",
+      "tags": [
+        "害羞",
+        "卖萌",
+        "娇羞",
+        "脸红",
+        "俏皮"
+      ],
+      "width": 120,
+      "height": 212,
+      "src": "douyin_emoticon (83).gif"
+    },
+    {
+      "file": "xindong_04.gif",
+      "url": "stickers/xindong_04.gif",
+      "slug": "xindong",
+      "emotion": "心动",
+      "desc": "女生手持红色物体做出拉动红绳的动作，神情诱惑。",
+      "text": "",
+      "tags": [
+        "心动",
+        "诱惑",
+        "撒娇",
+        "可爱",
+        "手势"
+      ],
+      "width": 120,
+      "height": 160,
+      "src": "douyin_emoticon (84).gif"
+    },
+    {
+      "file": "weiqu_04.gif",
+      "url": "stickers/weiqu_04.gif",
+      "slug": "weiqu",
+      "emotion": "委屈",
+      "desc": "古风装扮女子低头抿嘴，脸颊微红，神情羞涩。",
+      "text": "",
+      "tags": [
+        "委屈",
+        "害羞",
+        "低头",
+        "古风",
+        "娇羞"
+      ],
+      "width": 120,
+      "height": 120,
+      "src": "douyin_emoticon (85).gif"
+    }
+  ]
+}

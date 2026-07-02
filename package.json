@@ -12,7 +12,8 @@
     "build": "tauri build",
     "build:win": "tauri build --bundles nsis",
     "build:mac": "tauri build --bundles dmg",
-    "sync-assets": "node scripts/sync-assets.mjs"
+    "sync-assets": "node scripts/sync-assets.mjs",
+    "sync-ai": "node scripts/sync-ai.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

@@ -17,6 +17,74 @@ function computePetSizePx(sizePercent) {
   return Math.round(PET_SIZE_BASE * Math.max(0.5, Math.min(3, scale)));
 }
 
+// ---- 聊天 → 桌宠：情绪驱动动作（映射沿用 kxyy_ai_clone/pet-bridge.js）----
+const EMOTION_ACTION = {
+  开心: "dance", 开心吃东西: "dance", 得意: "dance", 点赞: "dance", 期待: "dance",
+  心动: "pet", 亲吻: "pet", 害羞: "pet", 尴尬: "pet", 卖萌: "pet", 眨眼: "pet",
+  调皮: "spin", 惊讶: "spin",
+  生气: "trip", 害怕: "trip",
+  委屈: "sit", 哭: "sit",
+  疑惑: "forcethink", 无语: "forcethink", 无语质问: "forcethink", 嫌弃: "forcethink", 暂停: "forcethink",
+};
+const DEFAULT_REPLY_ACTION = "dance";
+
+function normEmotion(s) {
+  return (s || "").replace(/[\s，。!！?？、,.]/g, "");
+}
+
+function mapEmotionToAction(emotion) {
+  const raw = (emotion || "").trim();
+  if (!raw) return null;
+  if (EMOTION_ACTION[raw]) return EMOTION_ACTION[raw];
+  const n = normEmotion(raw);
+  const key = Object.keys(EMOTION_ACTION).find((k) => normEmotion(k) === n);
+  return key ? EMOTION_ACTION[key] : DEFAULT_REPLY_ACTION;
+}
+
+function petCreatures() {
+  return window.webmejiCreatures || [];
+}
+
+/** 处理 chat 窗口发来的 "pet-chat" 事件：思考 / 说话 / 回复(带情绪) / 用户消息 / 中断。 */
+function handlePetChat(type, emotion) {
+  if (hidden) return; // 桌宠隐藏时不驱动
+  const list = petCreatures();
+  if (!list.length) return;
+  switch (type) {
+    case "thinking":
+      list.forEach((c) => c.startThinking?.());
+      break;
+    case "speaking":
+      list.forEach((c) => c.startSpeaking?.());
+      break;
+    case "reply": {
+      const emo = (emotion || "").trim();
+      list.forEach((c) => {
+        c.stopSpeaking?.();
+        c.stopThinking?.();
+        if (!emo) {
+          c.resumeIdle?.();
+          return;
+        }
+        const action = mapEmotionToAction(emo) || DEFAULT_REPLY_ACTION;
+        const loops = action === "sit" ? 1 : 2;
+        const durationMs = action === "forcethink" ? 2800 : action === "pet" ? 2000 : 2400;
+        c.playReaction?.(action, { loops, durationMs });
+      });
+      break;
+    }
+    case "user":
+      list.forEach((c) => {
+        c.stopReactionModes?.();
+        c.playReaction?.("pet", { loops: 1, durationMs: 1400 });
+      });
+      break;
+    case "abort":
+      list.forEach((c) => c.resumeIdle?.());
+      break;
+  }
+}
+
 function applyPetSize(sizePercent) {
   const px = computePetSizePx(sizePercent);
   document.documentElement.style.setProperty("--pet-size", `${px}px`);
@@ -167,6 +235,12 @@ async function boot() {
       hidden = !!data.hidden;
       applyHidden(hidden);
     }
+  });
+
+  // 聊天窗口发来的对话状态：驱动桌宠思考 / 说话 / 按情绪做动作。
+  listen("pet-chat", ({ payload }) => {
+    const p = payload || {};
+    handlePetChat(p.type, p.emotion);
   });
 
   console.log(`桌宠已启动: ${petId}`);

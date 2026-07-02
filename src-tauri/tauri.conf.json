@@ -24,6 +24,33 @@
         "shadow": false,
         "focus": false,
         "visible": false
+      },
+      {
+        "label": "chat",
+        "url": "chat.html",
+        "width": 420,
+        "height": 340,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "skipTaskbar": true,
+        "shadow": false,
+        "focus": true,
+        "visible": false
+      },
+      {
+        "label": "settings",
+        "title": "元元桌宠 · 设置",
+        "url": "settings.html",
+        "width": 600,
+        "height": 760,
+        "resizable": true,
+        "maximizable": false,
+        "skipTaskbar": false,
+        "visible": false
       }
     ],
     "security": {

@@ -1,5 +1,8 @@
+mod api;
+
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -7,9 +10,10 @@ use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
     window::Monitor,
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Wry,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WindowEvent, Wry,
 };
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 // 角色清单在编译期嵌入，主进程托盘与前端共用同一份数据。
 const ROSTER_JSON: &str = include_str!("../../shared/roster.json");
@@ -47,6 +51,98 @@ struct Settings {
     /// 目标显示器标识（Monitor::name()）。为 None 时表示"自动"，即跟随当前所在屏幕。
     #[serde(default)]
     monitor_id: Option<String>,
+
+    // ---- AI 聊天相关（阶段 1）----
+    /// DeepSeek 文字模型 Key。
+    #[serde(default)]
+    deepseek_key: String,
+    /// 通义千问 VL（看图）Key。
+    #[serde(default)]
+    qwen_vl_key: String,
+    /// 火山引擎（豆包）声音复刻 TTS Key（阶段 2·D：朗读）。
+    #[serde(default)]
+    volc_tts_key: String,
+    /// 是否自动朗读元元的回复（阶段 2·D）。
+    #[serde(default)]
+    auto_speak: bool,
+    /// 朗读音色 voice_id（火山复刻音色，S_ 开头）；空则无法朗读。
+    #[serde(default)]
+    tts_voice: String,
+    /// 文字模型；空串表示自动（按 thinking 选 deepseek-chat / deepseek-reasoner）。
+    #[serde(default)]
+    text_model: String,
+    /// 思考模式（deepseek-reasoner）。
+    #[serde(default)]
+    thinking: bool,
+    /// 采样温度。
+    #[serde(default = "default_temperature")]
+    temperature: f64,
+    /// 观众昵称（元元如何称呼你），空则默认「元宝」。
+    #[serde(default)]
+    user_name: String,
+
+    // ---- 观众画像（每位用户自填，影响元元如何对待你）----
+    /// 你和元元的关系。
+    #[serde(default)]
+    persona_relationship: String,
+    /// 想让元元记住的事（多行，每行一条）。
+    #[serde(default)]
+    persona_facts: String,
+    /// 你俩的暗号 / 梗（多行，每行一条）。
+    #[serde(default)]
+    persona_jokes: String,
+    /// 希望元元怎么对待你。
+    #[serde(default)]
+    persona_treat_as: String,
+    /// 对话时是否加载观众画像（把上面这些注入 system prompt）。
+    #[serde(default = "default_true")]
+    load_persona: bool,
+
+    // ---- 头像与外观 ----
+    /// AI（元元）头像 data URL；空则用内置默认。
+    #[serde(default)]
+    ai_avatar: String,
+    /// 我的头像 data URL；空则用内置默认。
+    #[serde(default)]
+    user_avatar: String,
+    /// 聊天气泡字号(px)。
+    #[serde(default = "default_font_size")]
+    chat_font_size: u32,
+
+    /// 全局快捷键（toggle 聊天窗口）。
+    #[serde(default = "default_hotkey")]
+    hotkey: String,
+    /// 聊天气泡窗口逻辑宽度(px)。
+    #[serde(default = "default_chat_width")]
+    chat_width: u32,
+    /// 聊天气泡窗口逻辑高度(px)。
+    #[serde(default = "default_chat_height")]
+    chat_height: u32,
+    /// 聊天窗口距工作区底部的逻辑偏移(px)。
+    #[serde(default = "default_chat_bottom_offset")]
+    chat_bottom_offset: u32,
+}
+
+fn default_temperature() -> f64 {
+    0.8
+}
+fn default_true() -> bool {
+    true
+}
+fn default_font_size() -> u32 {
+    14
+}
+fn default_hotkey() -> String {
+    "Ctrl+Shift+Space".to_string()
+}
+fn default_chat_width() -> u32 {
+    420
+}
+fn default_chat_height() -> u32 {
+    340
+}
+fn default_chat_bottom_offset() -> u32 {
+    96
 }
 
 impl Settings {
@@ -57,12 +153,59 @@ impl Settings {
             size_percent: 150,
             hidden: false,
             monitor_id: None,
+            deepseek_key: String::new(),
+            qwen_vl_key: String::new(),
+            volc_tts_key: String::new(),
+            auto_speak: false,
+            tts_voice: String::new(),
+            text_model: String::new(),
+            thinking: false,
+            temperature: default_temperature(),
+            user_name: String::new(),
+            persona_relationship: String::new(),
+            persona_facts: String::new(),
+            persona_jokes: String::new(),
+            persona_treat_as: String::new(),
+            load_persona: true,
+            ai_avatar: String::new(),
+            user_avatar: String::new(),
+            chat_font_size: default_font_size(),
+            hotkey: default_hotkey(),
+            chat_width: default_chat_width(),
+            chat_height: default_chat_height(),
+            chat_bottom_offset: default_chat_bottom_offset(),
         }
     }
 }
 
 struct AppState {
     settings: Mutex<Settings>,
+    /// 本地 AI 代理监听端口。
+    api_port: u16,
+}
+
+/// 供本地 HTTP 代理按需读取的 AI 配置快照。
+pub(crate) struct AiConfig {
+    pub deepseek_key: String,
+    pub qwen_vl_key: String,
+    pub text_model: String,
+    pub thinking_default: bool,
+    /// 火山 TTS Key（/api/tts 用）。
+    pub volc_tts_key: String,
+    /// 默认朗读音色（前端未显式指定 voice 时的兜底）。
+    pub tts_voice: String,
+}
+
+pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
+    let s = app.state::<AppState>().settings.lock().unwrap().clone();
+    AiConfig {
+        deepseek_key: s.deepseek_key,
+        qwen_vl_key: s.qwen_vl_key,
+        text_model: s.text_model,
+        thinking_default: s.thinking,
+        volc_tts_key: s.volc_tts_key,
+        tts_voice: s.tts_voice,
+    }
 }
 
 fn settings_path(app: &AppHandle) -> Option<PathBuf> {
@@ -105,6 +248,15 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?;
+
+    let chat_item = MenuItem::with_id(
+        app,
+        "toggle_chat",
+        "聊天（Ctrl+Shift+Space）",
+        true,
+        None::<&str>,
+    )?;
+    let settings_item = MenuItem::with_id(app, "open_settings", "设置…", true, None::<&str>)?;
 
     let pet_menu = Submenu::new(app, "选择形象", true)?;
     for p in &r.pets {
@@ -187,6 +339,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 
     let menu = Menu::new(app)?;
     menu.append(&toggle)?;
+    menu.append(&chat_item)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&pet_menu)?;
     menu.append(&size_menu)?;
@@ -194,6 +347,7 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         menu.append(mm)?;
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&settings_item)?;
     menu.append(&autostart)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&quit)?;
@@ -244,6 +398,56 @@ fn apply_monitor_to_window(app: &AppHandle, monitor_id: &Option<String>) {
     }
 }
 
+/// 把聊天窗口按设置的尺寸定位到目标显示器工作区的「底部居中」。
+fn position_chat_window(app: &AppHandle) {
+    let s = app.state::<AppState>().settings.lock().unwrap().clone();
+    if let Some(win) = app.get_webview_window("chat") {
+        if let Some(monitor) = resolve_monitor(&win, &s.monitor_id) {
+            let wa = monitor.work_area();
+            let sf = monitor.scale_factor();
+            let w = (s.chat_width as f64 * sf).round() as u32;
+            let h = (s.chat_height as f64 * sf).round() as u32;
+            let offset = (s.chat_bottom_offset as f64 * sf).round() as i32;
+            let x = wa.position.x + ((wa.size.width as i32 - w as i32) / 2);
+            let y = wa.position.y + wa.size.height as i32 - h as i32 - offset;
+            let _ = win.set_size(PhysicalSize::new(w, h));
+            let _ = win.set_position(PhysicalPosition::new(x, y));
+        }
+    }
+}
+
+/// 切换聊天窗口显隐（全局快捷键与托盘共用）。
+fn toggle_chat(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("chat") {
+        if win.is_visible().unwrap_or(false) {
+            let _ = win.hide();
+        } else {
+            position_chat_window(app);
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+}
+
+/// 打开（或聚焦）设置窗口。
+fn open_settings_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("settings") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// 按当前设置里的快捷键重新注册全局热键（先全部注销再注册）。
+fn re_register_hotkey(app: &AppHandle) {
+    let hotkey = app.state::<AppState>().settings.lock().unwrap().hotkey.clone();
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+    if let Ok(sc) = Shortcut::from_str(&hotkey) {
+        let _ = gs.register(sc);
+    }
+}
+
 fn commit_settings<F: FnOnce(&mut Settings)>(app: &AppHandle, f: F) {
     let snapshot = {
         let state = app.state::<AppState>();
@@ -262,6 +466,8 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "quit" => app.exit(0),
         "toggle_hidden" => commit_settings(app, |s| s.hidden = !s.hidden),
+        "toggle_chat" => toggle_chat(app),
+        "open_settings" => open_settings_window(app),
         "autostart" => {
             let mgr = app.autolaunch();
             if mgr.is_enabled().unwrap_or(false) {
@@ -327,6 +533,98 @@ fn show_menu(app: AppHandle) {
     });
 }
 
+/// 返回本地 AI 代理的基址，前端聊天页据此发起 /api/chat 请求。
+#[tauri::command]
+fn get_api_base(state: tauri::State<AppState>) -> String {
+    format!("http://127.0.0.1:{}", state.api_port)
+}
+
+#[tauri::command]
+fn toggle_chat_window(app: AppHandle) {
+    toggle_chat(&app);
+}
+
+#[tauri::command]
+fn hide_chat(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("chat") {
+        let _ = win.hide();
+    }
+}
+
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    open_settings_window(&app);
+}
+
+/// 设置页保存的 AI / 聊天相关配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiSettingsInput {
+    deepseek_key: String,
+    qwen_vl_key: String,
+    #[serde(default)]
+    volc_tts_key: String,
+    #[serde(default)]
+    auto_speak: bool,
+    #[serde(default)]
+    tts_voice: String,
+    text_model: String,
+    thinking: bool,
+    temperature: f64,
+    user_name: String,
+    #[serde(default)]
+    persona_relationship: String,
+    #[serde(default)]
+    persona_facts: String,
+    #[serde(default)]
+    persona_jokes: String,
+    #[serde(default)]
+    persona_treat_as: String,
+    #[serde(default = "default_true")]
+    load_persona: bool,
+    #[serde(default)]
+    ai_avatar: String,
+    #[serde(default)]
+    user_avatar: String,
+    #[serde(default = "default_font_size")]
+    chat_font_size: u32,
+    hotkey: String,
+    chat_width: u32,
+    chat_height: u32,
+    chat_bottom_offset: u32,
+}
+
+/// 保存 AI / 聊天设置：持久化 + 通知聊天窗口热更新 + 重注册快捷键 + 重定位聊天窗口。
+#[tauri::command]
+fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
+    commit_settings(&app, |s| {
+        s.deepseek_key = settings.deepseek_key.trim().to_string();
+        s.qwen_vl_key = settings.qwen_vl_key.trim().to_string();
+        s.volc_tts_key = settings.volc_tts_key.trim().to_string();
+        s.auto_speak = settings.auto_speak;
+        s.tts_voice = settings.tts_voice.trim().to_string();
+        s.text_model = settings.text_model.trim().to_string();
+        s.thinking = settings.thinking;
+        s.temperature = settings.temperature;
+        s.user_name = settings.user_name.trim().to_string();
+        s.persona_relationship = settings.persona_relationship.trim().to_string();
+        s.persona_facts = settings.persona_facts.trim().to_string();
+        s.persona_jokes = settings.persona_jokes.trim().to_string();
+        s.persona_treat_as = settings.persona_treat_as.trim().to_string();
+        s.load_persona = settings.load_persona;
+        s.ai_avatar = settings.ai_avatar;
+        s.user_avatar = settings.user_avatar;
+        s.chat_font_size = settings.chat_font_size.clamp(12, 22);
+        let hk = settings.hotkey.trim();
+        s.hotkey = if hk.is_empty() { default_hotkey() } else { hk.to_string() };
+        s.chat_width = settings.chat_width.clamp(240, 900);
+        s.chat_height = settings.chat_height.clamp(200, 900);
+        s.chat_bottom_offset = settings.chat_bottom_offset.min(1200);
+    });
+    re_register_hotkey(&app);
+    position_chat_window(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebView2（Windows）额外启动参数：本应用是单页、可信的本地内容，
@@ -342,11 +640,25 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    // 仅注册了聊天热键这一个，按下即 toggle 聊天窗口。
+                    if event.state() == ShortcutState::Pressed {
+                        toggle_chat(app);
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             let handle = app.handle().clone();
             let settings = load_settings(&handle);
+
+            // 先启动本地 AI 代理，拿到端口后随设置一起纳入全局状态。
+            let api_port = api::start(handle.clone()).unwrap_or(0);
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
+                api_port,
             });
 
             if let Some(win) = app.get_webview_window("main") {
@@ -358,6 +670,21 @@ pub fn run() {
                 if settings.hidden {
                     win.hide()?;
                 }
+            }
+
+            // 注册全局快捷键（toggle 聊天窗口）。
+            re_register_hotkey(&handle);
+
+            // 设置窗口默认点「关闭」按钮会销毁窗口，导致 get_webview_window("settings")
+            // 返回 None、再次点「设置…」打不开。拦截关闭请求改为隐藏，保证可反复打开。
+            if let Some(settings_win) = app.get_webview_window("settings") {
+                let w = settings_win.clone();
+                settings_win.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
             }
 
             let menu = build_tray_menu(&handle)?;
@@ -377,7 +704,12 @@ pub fn run() {
             get_settings,
             set_ignore_cursor,
             cursor_pos,
-            show_menu
+            show_menu,
+            get_api_base,
+            toggle_chat_window,
+            hide_chat,
+            open_settings,
+            set_ai_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

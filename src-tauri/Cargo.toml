@@ -16,8 +16,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 本地 AI 代理：轻量回环 HTTP 服务 + 上游流式转发
+tiny_http = "0.12"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [profile.release]
 panic = "abort"

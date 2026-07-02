@@ -1,0 +1,319 @@
+/* 透明浮层聊天窗：整窗透明，气泡半透明浮在最上层，输入条固定底部。
+   气泡风格仿照 kxyy-ai-clone 网页版：深色半透明、带头像、毛玻璃。 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  /* 半透明深色气泡（AI）与紫色气泡（用户），仿网页版 */
+  --bubble-ai: rgba(38, 34, 56, 0.62);
+  --bubble-user: rgba(120, 92, 220, 0.62);
+  --text: #f4f2fb;
+  --accent: #b79cff;
+  --chat-font-size: 14px;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#chat {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  height: 100%;
+  padding: 8px 10px 10px;
+  gap: 8px;
+}
+
+#messages {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+  /* 顶部渐隐，避免溢出突兀 */
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 22px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 22px);
+}
+/* 最新消息始终贴着底部输入栏，消息变多时向上生长直到溢出顶部才滚动。
+   用首条 margin-top:auto 顶到底部；溢出时该 auto 收缩为 0，正常滚动。 */
+#messages > .row:first-child {
+  margin-top: auto;
+}
+/* 滚动条默认隐藏，仅在鼠标靠近右边缘 / 滚动时（.show-scrollbar）淡入 */
+#messages::-webkit-scrollbar {
+  width: 6px;
+}
+#messages::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+  transition: background 0.25s ease;
+}
+#messages.show-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(200, 190, 230, 0.55);
+}
+
+.row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: 100%;
+}
+.row.assistant,
+.row.sticker {
+  justify-content: flex-start;
+}
+.row.user {
+  justify-content: flex-start;
+  flex-direction: row-reverse;
+}
+
+/* 头像 */
+.avatar {
+  flex: 0 0 auto;
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.bubble {
+  max-width: 74%;
+  padding: 8px 12px;
+  border-radius: 16px;
+  font-size: var(--chat-font-size);
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bubble-ai);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.28);
+  word-break: break-word;
+  white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.row.assistant .bubble {
+  border-bottom-left-radius: 5px;
+}
+.row.user .bubble {
+  background: var(--bubble-user);
+  border-bottom-right-radius: 5px;
+}
+.row.error .bubble {
+  background: rgba(180, 40, 60, 0.55);
+  color: #ffe0e0;
+}
+.row.streaming .bubble::after {
+  content: "▌";
+  color: var(--accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* AI 表情贴纸气泡：无底色，直接浮出 gif */
+.bubble.sticker-bubble {
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: none;
+  border-radius: 12px;
+  overflow: hidden;
+}
+.bubble.sticker-bubble img {
+  display: block;
+  width: 108px;
+  height: auto;
+  border-radius: 12px;
+  filter: drop-shadow(0 3px 8px rgba(0, 0, 0, 0.28));
+}
+
+/* 用户消息里的图片缩略图 */
+.bubble .msg-image {
+  display: block;
+  max-width: 180px;
+  max-height: 180px;
+  border-radius: 10px;
+  margin-top: 6px;
+}
+.bubble .msg-image:first-child {
+  margin-top: 0;
+}
+
+/* 待发送图片预览 */
+#attach-preview {
+  position: relative;
+  flex: 0 0 auto;
+  align-self: flex-start;
+  margin: 0 2px;
+}
+#attach-thumb {
+  display: block;
+  max-width: 120px;
+  max-height: 120px;
+  border-radius: 10px;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.24);
+}
+#attach-remove {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(20, 20, 20, 0.82);
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#composer {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 0 0 auto;
+}
+/* 图标按钮（表情库 / 发图）：暗色半透明毛玻璃，与气泡风格统一 */
+#stickers-btn,
+#attach {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 50%;
+  background: rgba(38, 34, 56, 0.55);
+  color: var(--text);
+  cursor: pointer;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: background 0.18s ease;
+}
+#stickers-btn:hover,
+#attach:hover {
+  background: rgba(60, 52, 92, 0.7);
+}
+#stickers-btn svg,
+#attach svg {
+  pointer-events: none;
+}
+#stickers-btn.on {
+  background: #7a5edb;
+  color: #fff;
+}
+#attach.has-image {
+  background: #7a5edb;
+  color: #fff;
+  border-color: transparent;
+}
+#input {
+  flex: 1 1 auto;
+  height: 40px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  background: rgba(38, 34, 56, 0.55);
+  font-size: 14px;
+  color: var(--text);
+  outline: none;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  -webkit-user-select: text;
+  user-select: text;
+}
+#input::placeholder {
+  color: rgba(244, 242, 251, 0.55);
+}
+#send {
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 20px;
+  background: #7a5edb;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
+}
+#send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* 表情库面板：底部弹出的半透明深色网格 */
+#sticker-panel {
+  flex: 0 0 auto;
+  max-height: 190px;
+  overflow-y: auto;
+  padding: 8px;
+  border-radius: 14px;
+  background: rgba(30, 26, 46, 0.72);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.32);
+}
+#sticker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
+  gap: 6px;
+}
+#sticker-grid .sticker-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 10px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.04);
+  transition: background 0.15s ease;
+}
+#sticker-grid .sticker-cell:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+#sticker-grid .sticker-cell img {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 6px;
+}
+#sticker-panel::-webkit-scrollbar {
+  width: 6px;
+}
+#sticker-panel::-webkit-scrollbar-thumb {
+  background: rgba(200, 190, 230, 0.45);
+  border-radius: 3px;
+}

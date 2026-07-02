@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>元元桌宠 · 设置</title>
+  <link rel="stylesheet" href="./settings.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>聊天设置</h1>
+
+    <section>
+      <h2>AI 服务 Key</h2>
+      <label>
+        <span>DeepSeek API Key<small>文字聊天必填</small></span>
+        <div class="pw-field">
+          <input id="deepseekKey" type="password" placeholder="sk-..." />
+          <button type="button" class="pw-toggle" data-target="deepseekKey" aria-label="显示 / 隐藏">👁</button>
+        </div>
+      </label>
+      <label>
+        <span>通义千问 VL Key<small>看图（选填，阶段 2）</small></span>
+        <div class="pw-field">
+          <input id="qwenVlKey" type="password" placeholder="sk-..." />
+          <button type="button" class="pw-toggle" data-target="qwenVlKey" aria-label="显示 / 隐藏">👁</button>
+        </div>
+      </label>
+      <label>
+        <span>火山 TTS Key<small>朗读（选填，阶段 2）</small></span>
+        <div class="pw-field">
+          <input id="volcTtsKey" type="password" placeholder="选填" />
+          <button type="button" class="pw-toggle" data-target="volcTtsKey" aria-label="显示 / 隐藏">👁</button>
+        </div>
+      </label>
+      <label>
+        <span>朗读音色 voice_id<small>火山复刻音色，S_ 开头</small></span>
+        <input id="ttsVoice" type="text" placeholder="S_..." />
+      </label>
+      <label class="row-inline">
+        <input id="autoSpeak" type="checkbox" />
+        <span>自动朗读元元的回复（需填火山 Key 与音色）</span>
+      </label>
+      <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商，不经任何第三方。</p>
+    </section>
+
+    <section>
+      <h2>模型与人格</h2>
+      <label>
+        <span>文字模型</span>
+        <select id="textModel">
+          <option value="">自动（按思考模式）</option>
+          <option value="deepseek-chat">deepseek-chat（快）</option>
+          <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+        </select>
+      </label>
+      <label class="row-inline">
+        <input id="thinking" type="checkbox" />
+        <span>开启思考模式（deepseek-reasoner，更慢更贵）</span>
+      </label>
+      <label>
+        <span>采样温度<small>0~2，越高越发散</small></span>
+        <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
+      </label>
+      <label>
+        <span>你的昵称<small>元元如何称呼你，留空=元宝</small></span>
+        <input id="userName" type="text" placeholder="元宝" />
+      </label>
+    </section>
+
+    <section>
+      <h2>观众画像（元元如何对待你）</h2>
+      <label>
+        <span>你和元元的关系</span>
+        <input id="personaRelationship" type="text" placeholder="比如：刚关注的萌新" />
+      </label>
+      <label>
+        <span>想让元元记住的事<small>每行一条</small></span>
+        <textarea id="personaFacts" rows="3" placeholder="我在深圳上班&#10;我养了只橘猫叫团子"></textarea>
+      </label>
+      <label>
+        <span>你俩的暗号 / 梗<small>每行一条</small></span>
+        <textarea id="personaJokes" rows="2" placeholder="每次都催她唱《虫儿飞》"></textarea>
+      </label>
+      <label>
+        <span>希望元元怎么对待你</span>
+        <textarea id="personaTreatAs" rows="2" placeholder="把我当聊得来的朋友，别太客套"></textarea>
+      </label>
+      <label class="row-inline">
+        <input id="loadPersona" type="checkbox" />
+        <span>对话时加载观众画像</span>
+      </label>
+      <p class="hint">这些资料只在本机保存，会随对话注入，让元元更懂你。留空就当普通粉丝「元宝」。</p>
+    </section>
+
+    <section>
+      <h2>头像与外观</h2>
+      <div class="avatar-grid">
+        <div class="avatar-item">
+          <span class="avatar-label">AI 头像</span>
+          <img id="aiAvatarPreview" class="avatar-preview" alt="AI 头像" />
+          <div class="avatar-btns">
+            <button id="aiAvatarUpload" type="button">上传</button>
+            <button id="aiAvatarReset" type="button" class="ghost">恢复默认</button>
+          </div>
+          <input id="aiAvatarFile" type="file" accept="image/*" hidden />
+        </div>
+        <div class="avatar-item">
+          <span class="avatar-label">我的头像</span>
+          <img id="userAvatarPreview" class="avatar-preview" alt="我的头像" />
+          <div class="avatar-btns">
+            <button id="userAvatarUpload" type="button">上传</button>
+            <button id="userAvatarReset" type="button" class="ghost">恢复默认</button>
+          </div>
+          <input id="userAvatarFile" type="file" accept="image/*" hidden />
+        </div>
+      </div>
+      <label>
+        <span>聊天字号 (px)</span>
+        <input id="chatFontSize" type="number" min="12" max="22" step="1" value="14" />
+      </label>
+    </section>
+
+    <section>
+      <h2>快捷键与气泡</h2>
+      <label>
+        <span>切换聊天快捷键</span>
+        <input id="hotkey" type="text" placeholder="Ctrl+Shift+Space" />
+      </label>
+      <p class="hint">格式如 <code>Ctrl+Shift+Space</code>、<code>Alt+X</code>；修饰键 + 主键，改后立即生效。</p>
+      <div class="grid3">
+        <label>
+          <span>气泡宽度 (px)</span>
+          <input id="chatWidth" type="number" min="240" max="900" step="10" value="420" />
+        </label>
+        <label>
+          <span>气泡高度 (px)</span>
+          <input id="chatHeight" type="number" min="200" max="900" step="10" value="340" />
+        </label>
+        <label>
+          <span>距底部 (px)</span>
+          <input id="chatBottomOffset" type="number" min="0" max="1200" step="8" value="96" />
+        </label>
+      </div>
+    </section>
+
+    <div class="actions">
+      <span id="status"></span>
+      <button id="save" type="button">保存</button>
+    </div>
+  </div>
+  <script type="module" src="./settings.js"></script>
+</body>
+</html>
