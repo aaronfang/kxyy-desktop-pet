@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
+    window::Monitor,
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Wry,
 };
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
@@ -43,6 +44,9 @@ struct Settings {
     pet_id: String,
     size_percent: u32,
     hidden: bool,
+    /// 目标显示器标识（Monitor::name()）。为 None 时表示"自动"，即跟随当前所在屏幕。
+    #[serde(default)]
+    monitor_id: Option<String>,
 }
 
 impl Settings {
@@ -52,6 +56,7 @@ impl Settings {
             pet_id: r.default_pet_id,
             size_percent: 150,
             hidden: false,
+            monitor_id: None,
         }
     }
 }
@@ -127,6 +132,47 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         size_menu.append(&item)?;
     }
 
+    let mut monitors = app
+        .get_webview_window("main")
+        .and_then(|w| w.available_monitors().ok())
+        .unwrap_or_default();
+    monitors.sort_by_key(|m| m.position().x);
+
+    let monitor_menu = if monitors.len() > 1 {
+        let menu = Submenu::new(app, "所在屏幕", true)?;
+        let auto_item = CheckMenuItem::with_id(
+            app,
+            "monitor:auto",
+            "自动（当前屏幕）",
+            true,
+            s.monitor_id.is_none(),
+            None::<&str>,
+        )?;
+        menu.append(&auto_item)?;
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        for (i, m) in monitors.iter().enumerate() {
+            let name = match m.name() {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+            let size = m.size();
+            let label = format!("显示器 {} ({}×{})", i + 1, size.width, size.height);
+            let checked = s.monitor_id.as_deref() == Some(name.as_str());
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("monitor:{name}"),
+                &label,
+                true,
+                checked,
+                None::<&str>,
+            )?;
+            menu.append(&item)?;
+        }
+        Some(menu)
+    } else {
+        None
+    };
+
     let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
     let autostart = CheckMenuItem::with_id(
         app,
@@ -144,6 +190,9 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&pet_menu)?;
     menu.append(&size_menu)?;
+    if let Some(mm) = &monitor_menu {
+        menu.append(mm)?;
+    }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&autostart)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -169,6 +218,32 @@ fn apply_hidden_to_window(app: &AppHandle, hidden: bool) {
     }
 }
 
+/// 根据用户选择的显示器标识解析出目标 Monitor；未选择或选择的显示器已不存在时，回退到当前所在屏幕。
+fn resolve_monitor(win: &tauri::WebviewWindow, monitor_id: &Option<String>) -> Option<Monitor> {
+    if let Some(id) = monitor_id {
+        if let Ok(monitors) = win.available_monitors() {
+            if let Some(m) = monitors
+                .into_iter()
+                .find(|m| m.name().map(|n| n == id).unwrap_or(false))
+            {
+                return Some(m);
+            }
+        }
+    }
+    win.current_monitor().ok().flatten()
+}
+
+/// 将主窗口铺满目标显示器的工作区（排除任务栏）。
+fn apply_monitor_to_window(app: &AppHandle, monitor_id: &Option<String>) {
+    if let Some(win) = app.get_webview_window("main") {
+        if let Some(monitor) = resolve_monitor(&win, monitor_id) {
+            let wa = monitor.work_area();
+            let _ = win.set_position(PhysicalPosition::new(wa.position.x, wa.position.y));
+            let _ = win.set_size(PhysicalSize::new(wa.size.width, wa.size.height));
+        }
+    }
+}
+
 fn commit_settings<F: FnOnce(&mut Settings)>(app: &AppHandle, f: F) {
     let snapshot = {
         let state = app.state::<AppState>();
@@ -179,6 +254,7 @@ fn commit_settings<F: FnOnce(&mut Settings)>(app: &AppHandle, f: F) {
     save_settings(app, &snapshot);
     let _ = app.emit("apply-settings", &snapshot);
     apply_hidden_to_window(app, snapshot.hidden);
+    apply_monitor_to_window(app, &snapshot.monitor_id);
     rebuild_tray(app);
 }
 
@@ -203,6 +279,13 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
                 if let Ok(v) = size.parse::<u32>() {
                     commit_settings(app, move |s| s.size_percent = v);
                 }
+            } else if let Some(mon) = other.strip_prefix("monitor:") {
+                let monitor_id = if mon == "auto" {
+                    None
+                } else {
+                    Some(mon.to_string())
+                };
+                commit_settings(app, move |s| s.monitor_id = monitor_id);
             }
         }
     }
@@ -267,13 +350,9 @@ pub fn run() {
             });
 
             if let Some(win) = app.get_webview_window("main") {
-                // 先显示以获取显示器信息，再铺满工作区（排除任务栏）。
+                // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
                 win.show()?;
-                if let Ok(Some(monitor)) = win.current_monitor() {
-                    let wa = monitor.work_area();
-                    win.set_position(PhysicalPosition::new(wa.position.x, wa.position.y))?;
-                    win.set_size(PhysicalSize::new(wa.size.width, wa.size.height))?;
-                }
+                apply_monitor_to_window(&handle, &settings.monitor_id);
                 win.set_always_on_top(true)?;
                 win.set_ignore_cursor_events(true)?;
                 if settings.hidden {
