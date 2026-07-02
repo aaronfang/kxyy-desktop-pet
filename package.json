@@ -1,59 +1,20 @@
 {
   "name": "kxyy-desktop-pet",
-  "version": "0.1.0",
-  "description": "元元桌宠 · 基于 webmeji 动画的 macOS / Windows 跨平台桌面宠物",
+  "version": "0.2.0",
+  "description": "元元桌宠 · 基于 webmeji 动画的 macOS / Windows 跨平台桌面宠物（Tauri）",
   "author": "aaronfang",
   "license": "MIT",
   "private": true,
-  "main": "electron/main.js",
+  "type": "module",
   "scripts": {
-    "start": "electron .",
-    "sync-assets": "node scripts/sync-assets.mjs",
-    "make-ico": "node scripts/make-ico.mjs",
-    "dist": "electron-builder",
-    "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win"
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:win": "tauri build --bundles nsis",
+    "build:mac": "tauri build --bundles dmg",
+    "sync-assets": "node scripts/sync-assets.mjs"
   },
   "devDependencies": {
-    "electron": "^33.2.0",
-    "electron-builder": "^25.1.8",
-    "png-to-ico": "^3.0.1"
-  },
-  "build": {
-    "appId": "com.aaronfang.kxyydesktoppet",
-    "productName": "元元桌宠",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "electron/**/*",
-      "renderer/**/*",
-      "shared/**/*",
-      "assets/**/*"
-    ],
-    "mac": {
-      "icon": "build/icon.icns",
-      "category": "public.app-category.entertainment",
-      "identity": null,
-      "target": [
-        "dmg",
-        "zip"
-      ]
-    },
-    "win": {
-      "icon": "build/icon.ico",
-      "target": [
-        "nsis",
-        "portable"
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "artifactName": "kxyy-desktop-pet-${version}-setup.${ext}"
-    },
-    "portable": {
-      "artifactName": "kxyy-desktop-pet-${version}-portable.${ext}"
-    }
+    "@tauri-apps/cli": "^2"
   }
 }

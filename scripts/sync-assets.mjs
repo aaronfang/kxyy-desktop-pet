@@ -15,7 +15,7 @@ const ROOT = path.join(__dirname, "..");
 
 const DEFAULT_SRC = path.join(ROOT, "..", "kxyy_ai_clone", "web", "public", "img", "webmeji");
 const SRC = process.argv[2] || process.env.SRC || DEFAULT_SRC;
-const DEST = path.join(ROOT, "assets", "pets");
+const DEST = path.join(ROOT, "src", "assets", "pets");
 
 function die(msg) {
   console.error(`✗ ${msg}`);
@@ -57,6 +57,6 @@ const missing = characters.filter((id) => !rosterIds.has(id));
 if (missing.length) {
   console.log(
     `\n提示：新角色 [${missing.join(", ")}] 还需在 shared/roster.json 添加标签，` +
-      `并在 renderer/pet-config.js 用 registerPet() 注册帧数/节奏后才会出现在菜单里。`,
+      `并在 src/pet-config.js 用 registerPet() 注册帧数/节奏后才会出现在菜单里。`,
   );
 }

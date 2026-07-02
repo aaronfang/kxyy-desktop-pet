@@ -534,6 +534,21 @@ class Creature {
     this.container?.remove();
   }
 
+  // 暂停 / 恢复主循环（隐藏桌宠时停帧，避免空跑占用 CPU）
+  pause() {
+    if (this.animationFrameId) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+  }
+
+  resume() {
+    if (!this.animationFrameId) {
+      this.lastTime = 0;
+      this.animationFrameId = requestAnimationFrame(this.animate);
+    }
+  }
+
   isSideEdge(edge) { return edge === 'left' || edge === 'right'; }
   isNonBottomEdge(edge) { return edge !== 'bottom'; }
 
