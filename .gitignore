@@ -8,4 +8,6 @@ dist/
 # Rust / Tauri 构建产物
 /src-tauri/target/
 /src-tauri/gen/
+/src-tauri/assets/persona-assets.enc
+/src/ai/.persona-assets.js.bak
 

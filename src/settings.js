@@ -12,6 +12,7 @@ const FIELDS = [
   "textModel",
   "temperature",
   "userName",
+  "patText",
   "personaRelationship",
   "personaFacts",
   "personaJokes",
@@ -47,6 +48,7 @@ function fill(s) {
   el("thinking").checked = !!s.thinking;
   el("temperature").value = s.temperature ?? 0.8;
   el("userName").value = s.userName || "";
+  el("patText").value = s.patText || "";
   el("personaRelationship").value = s.personaRelationship || "";
   el("personaFacts").value = s.personaFacts || "";
   el("personaJokes").value = s.personaJokes || "";
@@ -81,6 +83,7 @@ function collect() {
     thinking: el("thinking").checked,
     temperature: Number(el("temperature").value) || 0.8,
     userName: el("userName").value.trim(),
+    patText: el("patText").value.trim(),
     personaRelationship: el("personaRelationship").value.trim(),
     personaFacts: el("personaFacts").value.trim(),
     personaJokes: el("personaJokes").value.trim(),

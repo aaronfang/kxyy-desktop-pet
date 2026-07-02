@@ -94,11 +94,15 @@ const PROACTIVE_HINT = {
 可以问还在不在，也可以从生活、心情、烦恼、好玩的事、妆造、人气、哥姐们、弹幕气氛、当前直播环节里挑一个轻松话题；别重复你刚才说过的话。
 可 1~2 条短消息，每条一行。`,
   followup: `# 本轮任务（勿向观众复述本段）
-你刚回答完{who}，这是**紧接着上一条、你自己再顺口补一句**——不是对方又发来了新消息，别把它当成对方在跟你说话。像真人唠嗑那样**再补 1 句**（单独一条消息）：
-- 就顺着你俩**刚才那个话题**往下半步：补个小细节、递个态度、或随口反问一句（「你呢」「是不是」「对吧」）。
+**场景（务必理解）**：观众**上一轮刚说完**，你也**刚回完**——现在是**你自己**想再多嘴补一句，不是观众没吭声、更不是 idle 沉默！对话里最后一条观众消息仍是他们刚说的那句，别当成对方走了或装死。
+
+你刚回答完{who}，像真人唠嗑那样**再补 1 句**（单独一条消息）：
+- 就顺着你俩**刚才那个话题**往下半步：补个小细节、递个态度、或随口反问一句（「你呢」「是不是」「对吧」）——反问也**只许接话题**，不许质问对方怎么不回。
 - **紧扣上一条、别开新话题、别硬转折**：这一句要跟你上一条明显是同一段话，绝对不要突然跳到不相干的事上（也别硬塞什么妆造 / 人气 / 直播环节当新话头）。
 - **别像要结束 / 别收线**：绝对不要说"行了不跟你扯了""我去忙 / 收拾一下 / 收拾造型去""晚上见 / 晚上直播间见""不聊了""该睡了 / 困了"这类离场、告别、催散场的话——除非对方自己刚明确说要走 / 要睡。
-- **别抱怨对方、别催促**：对方明明刚跟你说完话，绝对不要问"你怎么不说话""就光我一个人说""在吗""咋不理我"这类质问催促。
+- **严禁「催说话 / 嫌沉默」**（最高优先级）：观众刚说完，**绝对禁止**「你怎么不说话」「咋不说话」「不吱声」「在吗」「还在吗」「咋不理我」「就光我一个人说」「没动静」「倒是回一句」——这类是 idle 场景才偶尔用的，续说时一字不许碰。
+- 好的续说示例：「反正我觉着还行」「你那边咋样」「不过话说回来…」「对了还有个事」；坏的续说：「你怎么不说话」「在吗」「理我一下」。
+
 别重复你上一条刚说过的话；就 **1 句**短消息，一行说完。`,
   pat: `# 本轮任务（勿向观众复述本段）
 观众{who}刚刚在聊天里{pat}。像被熟人轻轻戳了一下那样，自然、俏皮地回一句，**1 句、最多 2 句**。
@@ -485,12 +489,24 @@ export function splitReply(text, { maxBubbles = MAX_REPLY_BUBBLES } = {}) {
 
 export function shouldDoFollowup(userText, assistantReply, chance = DEFAULT_FOLLOWUP_CHANCE) {
   const u = (userText || "").trim();
+  const a = (assistantReply || "").trim();
   if (!u || SKIP_FOLLOWUP_RE.test(u)) return false;
-  if (splitReply(assistantReply).length > 1) return false;
+  if (splitReply(a).length > 1) return false;
   let p = chance;
   if (/[？?]|吗|呢|啥|怎么|为什么/.test(u)) p = Math.min(0.7, p + 0.15);
-  if ((assistantReply || "").trim().length < 12) p *= 0.5;
+  if (a.length < 12) p *= 0.5;
+  // 上一条已带问句收尾时，续说更容易滑向「怎么不说话」——降低概率。
+  if (/[？?]$/.test(a)) p *= 0.35;
   return Math.random() < p;
+}
+
+/** follow-up 续说若滑向「催观众说话 / 嫌沉默」，应丢弃不展示。 */
+export function isBadFollowupReply(text) {
+  const t = (text || "").trim();
+  if (!t) return true;
+  return /(你怎么|你咋|咋).{0,6}不说话|(怎么|咋).{0,4}不吱声|不吱声|没吱声|就光我(一个|人)?说|光我一个人|咋不理|不理我|还不回|倒是回|倒是说|没动静|怎么没声|还不说话|理我一下|回我一下|在吗[？?]?$|还在吗[？?]?$|沉默/.test(
+    t,
+  );
 }
 
 export function joinReply(parts) {
@@ -590,11 +606,23 @@ export function buildMessages({
   const stickerHint = buildStickerHint(stickerEmotions, stickerFrequency);
   if (stickerHint) runtimeMsgs.push({ role: "system", content: stickerHint });
   const shot = proactiveKind ? [] : fewShot;
+  // follow-up：不把「续说」幕后触发语发给模型——最后一条保留为观众真实发言 + 你上一条回复，
+  // 避免「（还在听）」等字样让模型误以为观众沉默。
+  let apiHistory = trimmed;
+  if (proactiveKind === "followup") {
+    while (
+      apiHistory.length &&
+      apiHistory[apiHistory.length - 1].role === "user" &&
+      isHiddenUserMessage(apiHistory[apiHistory.length - 1].content)
+    ) {
+      apiHistory = apiHistory.slice(0, -1);
+    }
+  }
   return [
     { role: "system", content: systemPrompt },
     ...runtimeMsgs,
     ...shot,
-    ...trimmed.map(toApiMessage),
+    ...apiHistory.map(toApiMessage),
   ];
 }
 
@@ -604,6 +632,14 @@ export function proactiveWhoLabel(name) {
 
 export function getProactiveUserTrigger(kind) {
   return PROACTIVE_USER_TRIGGER[kind];
+}
+
+/** follow-up 用的幕后 user 触发（界面隐藏；勿用「还在听」——易被模型理解成观众沉默）。 */
+export function getFollowupUserTrigger() {
+  return (
+    HIDDEN_DIRECTIVE_PREFIX +
+    "【续说】你刚回完观众上一条，现在由你再顺口补一句；观众刚说完、正听着，没有沉默。禁止问怎么不说话/不吱声/在吗/咋不理我。"
+  );
 }
 
 // 幕后指令前缀：以此开头的 user 消息会发给模型当作指令，但不在聊天界面显示

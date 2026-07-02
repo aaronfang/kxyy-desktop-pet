@@ -117,6 +117,12 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         (Method::Post, "/api/tts") => {
             proxy_tts(app, client, request);
         }
+        (Method::Get, "/api/assets") => {
+            match crate::persona_assets::decrypted_json() {
+                Ok(body) => respond_json(request, 200, body),
+                Err(e) => error_json(request, 500, &e),
+            }
+        }
         _ => {
             error_json(request, 404, "Not Found");
         }

@@ -58,7 +58,7 @@ npm run dev        # 开发模式（tauri dev）
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。
 
-> **隐私**：所有 Key、人设、头像仅写入本机配置目录的 `settings.json`（Windows 为 `%APPDATA%\<应用ID>\`），**不进仓库、不上传**；请求由内置本地代理（Rust `api.rs`）直连各服务商，不经任何第三方。
+> **隐私**：所有 Key、观众画像、头像仅写入本机配置目录的 `settings.json`（Windows 为 `%APPDATA%\<应用ID>\`），**不进仓库、不上传**；请求由内置本地代理（Rust `api.rs`）直连各服务商，不经任何第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
 
 ### 配置
 
@@ -66,14 +66,19 @@ npm run dev        # 开发模式（tauri dev）
 
 ## 打包
 
+打包前会自动加密人设语料并临时移走明文文件，避免语料原文打进安装包：
+
 ```bash
-npm run build       # 当前平台
-npm run build:win   # Windows 安装包 (NSIS)
-npm run build:mac   # macOS dmg
+npm run encrypt-assets   # 单独执行：将 persona-assets.js 加密为 src-tauri/assets/persona-assets.enc
+npm run build            # 当前平台（含 encrypt → strip → tauri build → restore）
+npm run build:win        # Windows 安装包 (NSIS)
+npm run build:mac        # macOS dmg
 ```
 
 产物在 `src-tauri/target/release/bundle/` 目录。
 
+> **开发注意**：`npm run dev` 前也会自动执行 `encrypt-assets`；若 `sync-ai` 后更新了语料，需重新加密。`persona-assets.enc` 已加入 `.gitignore`，CI 与本地打包时现场生成。
+>
 > 图标：`src-tauri/icons/` 由 `npx tauri icon <方形png>` 生成；仓库 `build/icon-square.png` 为图标源。
 
 ## 目录结构
@@ -89,15 +94,17 @@ src/                  前端（渲染层，随前端一起打包）
   chat.html/js/css    AI 聊天气泡窗口（流式对话、图片附件、表情库面板）
   settings.html/js/css 设置窗口（Key、模型、人设、头像、快捷键、气泡尺寸）
   ai/                 复用自上游的纯逻辑/语料模块
-    persona.js        人设与提示词组装
-    persona-assets.js 人设语料
+    persona.js        人设与提示词组装（运行时从 /api/assets 拉取语料）
+    persona-assets.js 人设语料（开发用明文；打包时加密嵌入，不随安装包分发）
     stickers.js       表情系统（清单加载与情绪匹配）
     tts.js            火山 TTS 语音合成
     avatars.js        默认头像
   stickers/           表情包清单 stickers.json + GIF 素材
 src-tauri/            Rust 主进程
   src/lib.rs          透明置顶穿透窗口、托盘菜单、开机自启、设置持久化、全局快捷键、聊天/设置窗口管理、IPC 命令
-  src/api.rs          本地 AI 代理：转发聊天请求到 DeepSeek，含传输层自动重试
+  src/api.rs          本地 AI 代理：聊天 / TTS / 语料下发（/api/assets）
+  src/persona_assets.rs 人设语料 XOR 解密（编译期嵌入 persona-assets.enc）
+  assets/             persona-assets.enc（encrypt-assets 生成，gitignore）
   src/main.rs         入口
   tauri.conf.json     窗口 / 打包 / 图标配置
   capabilities/       前端权限
@@ -107,6 +114,8 @@ shared/
 scripts/
   sync-assets.mjs     从 web 工程同步角色素材到 src/assets/pets
   sync-ai.mjs         从 web 工程同步 AI 逻辑模块、人设语料与表情素材
+  encrypt-assets.mjs  将 persona-assets.js 加密为 src-tauri/assets/persona-assets.enc
+  bundle-assets.mjs   打包前 strip / 打包后 restore 明文语料文件
 ```
 
 ## 扩展 / 同步新角色
@@ -135,9 +144,22 @@ npm run sync-ai
 node scripts/sync-ai.mjs /path/to/kxyy_ai_clone
 ```
 
-会把上游的 `persona.js` / `tts.js` / `persona-assets.js` / `stickers.js` 同步到 `src/ai/`，并把表情清单与 GIF 拷到 `src/stickers/`（自动改写为包内相对路径）。
+会把上游的 `persona.js` / `tts.js` / `persona-assets.js` / `stickers.js` 同步到 `src/ai/`，并把表情清单与 GIF 拷到 `src/stickers/`（自动改写为包内相对路径）。同步语料后请执行：
+
+```bash
+npm run encrypt-assets
+```
 
 > 若上游改动了 `/api/chat` 的请求 / 响应契约，需手动同步更新 `src-tauri/src/api.rs` 与 `src/chat.js`。
+
+## 发布
+
+推送形如 `v0.2.1` 的 tag 会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，自动构建并上传到 GitHub Release：
+
+- **Windows**：NSIS 安装包（`.exe`）
+- **macOS**：Apple Silicon（`aarch64`）与 Intel（`x64`）各一份 `.dmg`
+
+也可在 GitHub Actions 页面手动 **workflow_dispatch** 重跑。
 
 ## 致谢
 

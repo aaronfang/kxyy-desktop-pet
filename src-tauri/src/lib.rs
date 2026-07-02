@@ -1,4 +1,5 @@
 mod api;
+mod persona_assets;
 
 use std::fs;
 use std::path::PathBuf;
@@ -80,6 +81,9 @@ struct Settings {
     /// 观众昵称（元元如何称呼你），空则默认「元宝」。
     #[serde(default)]
     user_name: String,
+    /// 拍一拍提示文案；可用 {name}、{ai} 占位，空则用默认「{name}拍了拍{ai}」。
+    #[serde(default)]
+    pat_text: String,
 
     // ---- 观众画像（每位用户自填，影响元元如何对待你）----
     /// 你和元元的关系。
@@ -162,6 +166,7 @@ impl Settings {
             thinking: false,
             temperature: default_temperature(),
             user_name: String::new(),
+            pat_text: String::new(),
             persona_relationship: String::new(),
             persona_facts: String::new(),
             persona_jokes: String::new(),
@@ -573,6 +578,8 @@ struct AiSettingsInput {
     temperature: f64,
     user_name: String,
     #[serde(default)]
+    pat_text: String,
+    #[serde(default)]
     persona_relationship: String,
     #[serde(default)]
     persona_facts: String,
@@ -607,6 +614,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.thinking = settings.thinking;
         s.temperature = settings.temperature;
         s.user_name = settings.user_name.trim().to_string();
+        s.pat_text = settings.pat_text.trim().to_string();
         s.persona_relationship = settings.persona_relationship.trim().to_string();
         s.persona_facts = settings.persona_facts.trim().to_string();
         s.persona_jokes = settings.persona_jokes.trim().to_string();

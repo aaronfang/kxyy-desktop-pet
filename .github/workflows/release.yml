@@ -50,6 +50,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Encrypt persona assets
+        run: npm run encrypt-assets
+
+      - name: Strip plaintext persona assets
+        run: node scripts/bundle-assets.mjs strip
+
       - name: Build & Release (Tauri)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -67,3 +73,7 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Restore plaintext persona assets
+        if: always()
+        run: node scripts/bundle-assets.mjs restore
