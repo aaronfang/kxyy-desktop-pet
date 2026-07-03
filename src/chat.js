@@ -28,6 +28,7 @@ import {
   isHiddenUserMessage,
   getFollowupUserTrigger,
   isBadFollowupReply,
+  detectDeepIntent,
 } from "./ai/persona.js";
 import {
   loadStickers,
@@ -455,6 +456,7 @@ function buildRequestMessages(opts = {}) {
     patAction: opts.patAction || "",
     who: proactiveWhoLabel(name || "元宝"),
     earlierRecap: sessionRecap,
+    deep: opts.deep || false,
   });
 }
 
@@ -501,12 +503,15 @@ function renderFinalBubbles(streamBubble, reply) {
 async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, patAction, replyId } = {}) {
   let full = "";
   let speaking = false;
+  // 深聊模式：仅普通轮次（非拍一拍 / 非追问等主动开口）按观众用词判定；命中则本轮放开字数与
+  // 拆条上限、注入「深聊但保持人设」提示，让元元能展开多聊，但性格口吻不变。
+  const deep = !proactiveKind && detectDeepIntent(lastRealUserMessage()?.content || "");
   try {
     const resp = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        messages: buildRequestMessages({ proactiveKind, patAction }),
+        messages: buildRequestMessages({ proactiveKind, patAction, deep }),
         stream: true,
         provider: "text",
         temperature: settings.temperature ?? 0.8,
@@ -514,6 +519,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         max_tokens: replyMaxTokens({
           proactiveKind,
           lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
+          deep,
         }),
       }),
     });

@@ -30,6 +30,14 @@ const REPLY_FORMAT_HINT = `# 回复格式（勿向观众复述本段）
 - **熟人打趣别拒答**：对方明显在开玩笑、撒娇、互损时，俏皮接住就好；别用「不说了」「私事就别问」「咱不带这个」草草收场。叫「老公」闹着玩时可以偶尔轻轻纠正叫「哥」，不必每次都拒。
 - 真没新内容时，简短应一声、或起个相关小话头都行，只要别用告别语草草收场。`;
 
+const DEEP_TALK_HINT = `# 深聊模式（本轮特殊要求，勿向观众复述本段）
+观众这一条是想认真听你多聊两句、想听你对这事儿的真实想法，不是随口寒暄。这一轮可以聊得更透、更长一点：
+- **可以展开**：把你的观点、理由、举个例子、你的感受和态度都摆出来，别一句话敷衍完；字数比平时多没关系。
+- **可以分多条**：按意思自然分几段发（比平时多几条也行，别一口气糊成一大坨），一段说一个点，读着像你在一句句往下唠。
+- **但你还是开心元元本人**：口语、东北味、该有的口头禅、反问收尾、自嘲、偶尔冒一句反差，全照旧——**绝对不许**切成 AI 助手那种腔（别用"首先/其次/第一点第二点"、别列编号、别用 Markdown、别 emoji、别掉书袋硬装专家）。
+- 说的是**你自己的真实想法和态度**，不懂的、没经历过的就照实说不懂 / 没整明白，别硬编、别端着装专家。
+- Layer 0 反应规则、事实约束、回避话题这些硬底线一条都不松：深聊也不聊隐私、不涉政涉黄、不承认自己是 AI。`;
+
 const IMAGE_DESCRIBE_SYSTEM = `你是图像描述助手。请用客观、具体的中文描述图片，供后续对话引用；宁可稍详，不要过于笼统。
 
 建议覆盖（有则写，无则略）：
@@ -65,6 +73,19 @@ ${freqLine}
 }
 
 const SKIP_FOLLOWUP_RE = /^(嗯+|哦+|好+|行+|ok|拜拜|再见|晚安|睡了|886|88)$/i;
+
+// 观众想「认真听你多聊两句 / 抛复杂问题 / 听你的真实想法」时的用词特征。
+// 命中即进入「深聊模式」：本轮放开字数与拆条上限、注入 DEEP_TALK_HINT，但人设不变。
+// 只认明确的求深意图，避免日常寒暄误触发。
+const DEEP_INTENT_RE =
+  /你(觉得|怎么看|咋看|咋想|怎么想|的看法|有啥看法|什么看法|的想法|的观点)|怎么看待|咋看待|如何看待|想听(听)?你|说说你|讲讲你|聊聊你(对|的)|你对.{0,14}(怎么看|看法|想法|观点|咋想|怎么想)|展开(说|讲|聊|讲讲|说说)|详细(说|讲|聊|说说|讲讲|聊聊)|仔细(说|讲|聊)|好好(说|讲|聊|唠)|认真(说|讲|聊|唠|回|回答|点)|深入(聊|说|讲|谈|唠)|深聊|聊点深|聊得?深|多说(点|些|两句)|多聊(点|会|两句)|谈谈|为(什么|啥)会|怎么理解|咋理解|如何理解/;
+
+/** 判断观众本轮是否在求「深度讨论 / 想听你的想法」——命中则本轮走深聊模式。 */
+export function detectDeepIntent(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return DEEP_INTENT_RE.test(t);
+}
 
 const PROACTIVE_USER_TRIGGER = {
   welcome: "（刚进来，还没说话）",
@@ -461,7 +482,9 @@ export function trimHistory(history, maxTurns) {
   return pairs.slice(-maxTurns).flat();
 }
 
-export const MAX_REPLY_BUBBLES = 4;
+// 拆条上限：普通聊天靠 prompt 约束在 1~4 条，很少触顶；抬到 7 是给「深聊模式」留出
+// 多段展开的余量，同时流式渲染与刷新后重渲染共用同一上限、保证气泡数一致。
+export const MAX_REPLY_BUBBLES = 7;
 
 function naturalSplitTwo(text) {
   if (text.length < NATURAL_SPLIT_MIN_CHARS) return [text];
@@ -579,6 +602,7 @@ export function buildMessages({
   stickerFrequency = "medium",
   earlierRecap = "",
   patAction = "",
+  deep = false,
 }) {
   const runtimeMsgs = [];
   if (useLive) {
@@ -600,7 +624,7 @@ export function buildMessages({
       .replace("{pat}", patAction ? `「${patAction}」` : "拍了拍你");
     runtimeMsgs.push({ role: "system", content: hint });
   } else {
-    runtimeMsgs.push({ role: "system", content: REPLY_FORMAT_HINT });
+    runtimeMsgs.push({ role: "system", content: deep ? DEEP_TALK_HINT : REPLY_FORMAT_HINT });
     if (turnHasImage) runtimeMsgs.push({ role: "system", content: VISION_HINT });
   }
   const stickerHint = buildStickerHint(stickerEmotions, stickerFrequency);
@@ -634,14 +658,6 @@ export function getProactiveUserTrigger(kind) {
   return PROACTIVE_USER_TRIGGER[kind];
 }
 
-/** follow-up 用的幕后 user 触发（界面隐藏；勿用「还在听」——易被模型理解成观众沉默）。 */
-export function getFollowupUserTrigger() {
-  return (
-    HIDDEN_DIRECTIVE_PREFIX +
-    "【续说】你刚回完观众上一条，现在由你再顺口补一句；观众刚说完、正听着，没有沉默。禁止问怎么不说话/不吱声/在吗/咋不理我。"
-  );
-}
-
 // 幕后指令前缀：以此开头的 user 消息会发给模型当作指令，但不在聊天界面显示
 // （用于点歌「开唱前答应一句 / 唱完后收个尾」这类隐藏引导）。用不可见字符避免与正常文本冲突。
 export const HIDDEN_DIRECTIVE_PREFIX = "\u2063";
@@ -649,6 +665,14 @@ export const HIDDEN_DIRECTIVE_PREFIX = "\u2063";
 /** 包一条幕后指令文本（模型可见、界面隐藏）。 */
 export function makeHiddenDirective(text) {
   return HIDDEN_DIRECTIVE_PREFIX + (text || "");
+}
+
+/** follow-up 用的幕后 user 触发（界面隐藏；勿用「还在听」——易被模型理解成观众沉默）。 */
+export function getFollowupUserTrigger() {
+  return (
+    HIDDEN_DIRECTIVE_PREFIX +
+    "【续说】你刚回完观众上一条，现在由你再顺口补一句；观众刚说完、正听着，没有沉默。禁止问怎么不说话/不吱声/在吗/咋不理我。"
+  );
 }
 
 export function isHiddenUserMessage(content) {
@@ -663,18 +687,22 @@ export const REPLY_MAX_TOKENS = {
   normal: 450,
   image: 580,
   longUser: 520,
+  deep: 1300,
   cap: 700,
 };
 
 /**
  * 按场景估算本轮回复 max_tokens。
  * - 追问 / 主动开口：较短上限
+ * - 深聊模式：放开到 deep（不受 cap 限制），让观点能展开、分多条说完
  * - 普通聊天：基准
  * - 带图、长问题：加大，降低句中截断概率
  */
-export function replyMaxTokens({ proactiveKind = null, lastUserMessage = null } = {}) {
+export function replyMaxTokens({ proactiveKind = null, lastUserMessage = null, deep = false } = {}) {
   if (proactiveKind === "followup") return REPLY_MAX_TOKENS.followup;
   if (proactiveKind) return REPLY_MAX_TOKENS.proactive;
+  // 深聊模式：观众想听深入的想法，放开字数上限（不套 cap），避免长回复被句中截断。
+  if (deep) return REPLY_MAX_TOKENS.deep;
 
   let tokens = REPLY_MAX_TOKENS.normal;
   const user = lastUserMessage;
