@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 实时语音通话需要麦克风：WKWebView getUserMedia 与进程 TCC 授权均依赖此描述。 -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>开启实时语音通话时，元元需要使用麦克风听你说话。</string>
+	<!-- 桌宠应用：隐藏 Dock 图标，仅保留菜单栏托盘图标（代码里也会设置 Accessory 激活策略以覆盖 dev 模式）。 -->
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>

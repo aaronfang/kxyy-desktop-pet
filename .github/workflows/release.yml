@@ -67,7 +67,7 @@ jobs:
             元元桌宠（Tauri 版）安装包。
 
             - **Windows**：`.exe`（NSIS 安装包，需系统自带 WebView2 运行时，Win10/11 一般已内置）
-            - **macOS**：`.dmg`（Apple Silicon 选 `aarch64`，Intel 选 `x64`）
+            - **macOS**：`.dmg`（Apple Silicon 选 `aarch64`，Intel 选 `x64`）；菜单栏托盘应用，不占用 Dock
 
             > macOS 未做代码签名/公证，首次打开若提示「已损坏 / 无法验证开发者」，请在「访达」中右键「打开」，或终端执行：`xattr -cr /Applications/元元桌宠.app`
           releaseDraft: false

@@ -44,6 +44,26 @@
     </section>
 
     <section>
+      <h2>实时语音通话</h2>
+      <label>
+        <span>实时语音 App ID<small>火山「语音技术」应用 ID</small></span>
+        <input id="realtimeAppId" type="text" placeholder="选填，填了才能实时通话" />
+      </label>
+      <label>
+        <span>实时语音 Access Key<small>Access Token</small></span>
+        <div class="pw-field">
+          <input id="realtimeAccessKey" type="password" placeholder="选填" />
+          <button type="button" class="pw-toggle" data-target="realtimeAccessKey" aria-label="显示 / 隐藏">👁</button>
+        </div>
+      </label>
+      <label>
+        <span>通话音色 voice_id<small>留空则用上面的朗读音色</small></span>
+        <input id="realtimeVoice" type="text" placeholder="S_...（留空复用朗读音色）" />
+      </label>
+      <p class="hint">聊天气泡输入框最左侧的电话按钮开启实时语音通话；通话使用复刻音色，并复用元元的人设。首次使用需允许麦克风权限。</p>
+    </section>
+
+    <section>
       <h2>模型与人格</h2>
       <label>
         <span>文字模型</span>

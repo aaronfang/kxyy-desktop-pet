@@ -1,6 +1,6 @@
 [package]
 name = "kxyy-desktop-pet"
-version = "0.2.2"
+version = "0.2.3"
 description = "元元桌宠"
 authors = ["aaronfang"]
 license = "MIT"
@@ -22,6 +22,12 @@ serde_json = "1"
 # 本地 AI 代理：轻量回环 HTTP 服务 + 上游流式转发
 tiny_http = "0.12"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+# 实时语音：本地 WS 桥接前端 ↔ 火山端到端实时语音大模型（自定义鉴权头 + 二进制帧）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+flate2 = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 panic = "abort"

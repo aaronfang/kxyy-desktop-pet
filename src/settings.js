@@ -9,6 +9,9 @@ const FIELDS = [
   "qwenVlKey",
   "volcTtsKey",
   "ttsVoice",
+  "realtimeAppId",
+  "realtimeAccessKey",
+  "realtimeVoice",
   "textModel",
   "temperature",
   "userName",
@@ -43,6 +46,9 @@ function fill(s) {
   el("qwenVlKey").value = s.qwenVlKey || "";
   el("volcTtsKey").value = s.volcTtsKey || "";
   el("ttsVoice").value = s.ttsVoice || "";
+  el("realtimeAppId").value = s.realtimeAppId || "";
+  el("realtimeAccessKey").value = s.realtimeAccessKey || "";
+  el("realtimeVoice").value = s.realtimeVoice || "";
   el("autoSpeak").checked = !!s.autoSpeak;
   el("textModel").value = s.textModel || "";
   el("thinking").checked = !!s.thinking;
@@ -78,6 +84,9 @@ function collect() {
     qwenVlKey: el("qwenVlKey").value.trim(),
     volcTtsKey: el("volcTtsKey").value.trim(),
     ttsVoice: el("ttsVoice").value.trim(),
+    realtimeAppId: el("realtimeAppId").value.trim(),
+    realtimeAccessKey: el("realtimeAccessKey").value.trim(),
+    realtimeVoice: el("realtimeVoice").value.trim(),
     autoSpeak: el("autoSpeak").checked,
     textModel: el("textModel").value,
     thinking: el("thinking").checked,

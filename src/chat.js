@@ -29,6 +29,7 @@ import {
   getFollowupUserTrigger,
   isBadFollowupReply,
   detectDeepIntent,
+  computeLiveContext,
 } from "./ai/persona.js";
 import {
   loadStickers,
@@ -42,6 +43,8 @@ import {
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
 import { speak, stopSpeak, unlockAudio } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
+// 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
+import { RealtimeSession } from "./ai/realtime.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -130,6 +133,7 @@ const previewEl = document.getElementById("attach-preview");
 const thumbEl = document.getElementById("attach-thumb");
 const attachRemoveBtn = document.getElementById("attach-remove");
 const stickersBtn = document.getElementById("stickers-btn");
+const callBtn = document.getElementById("call-btn");
 const stickerPanel = document.getElementById("sticker-panel");
 const stickerGrid = document.getElementById("sticker-grid");
 const stickerPreviewEl = document.getElementById("sticker-preview");
@@ -287,6 +291,7 @@ function addUserBubble(text, imageDataUrl, sticker, { mid } = {}) {
   row.appendChild(bubble);
   messagesEl.appendChild(row);
   scrollBottom();
+  return bubble;
 }
 
 /** 表情贴纸气泡（gif）。 */
@@ -728,8 +733,254 @@ async function triggerPat(avatarEl) {
   }
 }
 
-// ---- 表情库面板 ----
-let stickerGridBuilt = false;
+// ---- 实时语音通话 ----
+let callSession = null;
+let callActive = false;
+// 一轮一气泡：ASR / 助手流式 token 都写进当前气泡，轮次结束再定稿。
+let callUserBubble = null;
+let callUserText = "";
+let callAsstBubble = null;
+let callAsstText = "";
+let callWaveSpeaking = false;
+
+const callWaveEl = document.getElementById("call-wave");
+const callWaveBarsEl = callWaveEl?.querySelector(".call-wave-bars");
+const CALL_WAVE_BAR_COUNT = 28;
+let callWaveBars = [];
+
+/** 组装实时通话用的人设 system_role：复用文字聊天的 buildSystemPrompt + 实时状态，
+ *  再叠加「语音口语化」提示（说人话、简短、不要括号/表情/贴纸标记）。 */
+function buildRealtimeSystemRole() {
+  if (!assets) return "";
+  const name = (settings.userName || "").trim();
+  const profile = activeProfile
+    || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings));
+  const useUserProfile = settings.loadPersona !== false;
+  let sys = buildSystemPrompt(assets, {
+    name: name || null,
+    useUserProfile,
+    memory,
+    profile,
+  });
+  try {
+    const live = computeLiveContext(new Date(), assets.lore);
+    if (live) sys += "\n\n" + live;
+  } catch (_) {}
+  sys +=
+    "\n\n# 语音通话模式\n\n" +
+    "- 现在是**实时语音通话**，你的话会被念出来给对方听。说得像打电话一样自然口语、简短，一次别说太长。\n" +
+    "- **不要**输出任何括号里的动作/神态描写、方括号、星号、表情符号或「[表情:xx]」这类标记——这些会被原样念出来，很怪。\n" +
+    "- 想表达情绪就用语气词和说话方式本身，别靠文字符号。\n" +
+    "- 你的名字是**元元**。用户叫的就是「元元」。语音识别经常把「元元」误听成「圆圆」「原原」「源源」「园园」等同音字——" +
+    "你必须一律当作「元元」理解，**绝对不要**纠正用户叫错名字、也不要提「不是圆圆」之类的话。";
+  return sys;
+}
+
+/** 通话 bot_name：用「元元」而非「开心元元」，便于 ASR 热词与人设对齐。 */
+function callBotName() {
+  return "元元";
+}
+
+function ensureCallWaveBars() {
+  if (!callWaveBarsEl || callWaveBars.length) return;
+  callWaveBarsEl.innerHTML = "";
+  callWaveBars = [];
+  for (let i = 0; i < CALL_WAVE_BAR_COUNT; i++) {
+    const bar = document.createElement("span");
+    // 中间高、两侧低的静态轮廓，安静时也有形状。
+    const base = 0.18 + 0.55 * Math.sin((Math.PI * i) / (CALL_WAVE_BAR_COUNT - 1));
+    bar.dataset.base = String(base);
+    bar.style.height = `${Math.round(base * 100)}%`;
+    callWaveBarsEl.appendChild(bar);
+    callWaveBars.push(bar);
+  }
+}
+
+function showCallWave(show) {
+  if (!callWaveEl) return;
+  if (show) {
+    ensureCallWaveBars();
+    callWaveEl.hidden = false;
+    callWaveEl.setAttribute("aria-hidden", "false");
+  } else {
+    callWaveEl.hidden = true;
+    callWaveEl.setAttribute("aria-hidden", "true");
+    callWaveEl.classList.remove("speaking");
+    callWaveSpeaking = false;
+    for (const bar of callWaveBars) {
+      const base = Number(bar.dataset.base) || 0.2;
+      bar.style.height = `${Math.round(base * 100)}%`;
+    }
+  }
+}
+
+/** level ∈ [0,1]：麦克风与下行播放的合成电平。 */
+function updateCallWave(level) {
+  if (!callWaveBars.length || callWaveEl?.hidden) return;
+  const t = performance.now() / 1000;
+  const idle = 0.08 + 0.04 * Math.sin(t * 2.2);
+  const amp = Math.max(idle, Math.min(1, level));
+  for (let i = 0; i < callWaveBars.length; i++) {
+    const bar = callWaveBars[i];
+    const base = Number(bar.dataset.base) || 0.2;
+    // 相位错开，形成从中心向外扩散的律动。
+    const phase = t * 6 + i * 0.45;
+    const wobble = 0.55 + 0.45 * Math.sin(phase);
+    const h = Math.min(1, base * (0.35 + amp * 1.35 * wobble));
+    bar.style.height = `${Math.max(12, Math.round(h * 100))}%`;
+  }
+}
+
+function setCallActive(next) {
+  callActive = next;
+  callBtn.classList.toggle("in-call", next);
+  callBtn.title = next ? "挂断" : "实时语音通话";
+  callBtn.setAttribute("aria-label", next ? "挂断" : "实时语音通话");
+  // 通话中锁定文字输入 / 发图 / 表情，避免两路音频与消息冲突。
+  inputEl.disabled = next;
+  sendBtn.disabled = next;
+  attachBtn.disabled = next;
+  stickersBtn.disabled = next;
+  inputEl.placeholder = next
+    ? "通话中…（点电话按钮挂断）"
+    : "和元元说点什么…（Esc 收起）";
+  showCallWave(next);
+}
+
+function finalizeCallUserBubble() {
+  if (!callUserBubble) return;
+  const row = callUserBubble.closest(".row");
+  row?.classList.remove("streaming");
+  callUserBubble = null;
+  callUserText = "";
+}
+
+function finalizeCallAsstBubble() {
+  if (!callAsstBubble) return;
+  const row = callAsstBubble.closest(".row");
+  row?.classList.remove("streaming");
+  callAsstBubble = null;
+  callAsstText = "";
+  callWaveSpeaking = false;
+  callWaveEl?.classList.remove("speaking");
+}
+
+/** 用户一轮：中间态只更新同一气泡，asr_end / 终态后定稿。 */
+function upsertCallUserBubble(text, { interim }) {
+  const t = (text || "").trim();
+  if (!t) return;
+  if (t === callUserText && callUserBubble) return;
+  callUserText = t;
+  if (!callUserBubble) {
+    // 用户开口时，先定稿上一轮助手气泡，避免两轮交错。
+    finalizeCallAsstBubble();
+    callUserBubble = addUserBubble(t, null, null, { mid: genMsgId() });
+    callUserBubble.closest(".row")?.classList.add("streaming");
+    petSignal("user");
+  } else {
+    callUserBubble.textContent = t;
+    scrollBottom();
+  }
+  if (!interim) finalizeCallUserBubble();
+}
+
+/** 助手一轮：token 追加到同一气泡，assistant_end 定稿。 */
+function appendCallAsstBubble(delta) {
+  const d = delta || "";
+  if (!d) return;
+  // 助手开始回复时，定稿用户气泡（若 asr_end 尚未到）。
+  finalizeCallUserBubble();
+  callAsstText += d;
+  if (!callAsstBubble) {
+    callAsstBubble = addBubble("assistant", callAsstText, { mid: genMsgId() });
+    callAsstBubble.closest(".row")?.classList.add("streaming");
+    petSignal("reply");
+  } else {
+    callAsstBubble.textContent = callAsstText;
+    scrollBottom();
+  }
+}
+
+async function startCall() {
+  if (callActive || busy) return;
+  if (!assets) return;
+  unlockAudio();
+  // 通话与朗读互斥：先停掉正在放的朗读。
+  stopSpeak();
+  resetTtsQueue();
+  callUserBubble = null;
+  callUserText = "";
+  callAsstBubble = null;
+  callAsstText = "";
+
+  setCallActive(true);
+  appendPatNotice("📞 正在接通元元…");
+  petSignal("thinking");
+
+  callSession = new RealtimeSession({
+    onState: (state) => {
+      if (state === "started") {
+        appendPatNotice("📞 通话已接通");
+        petSignal("reply");
+      } else if (state === "ended") {
+        endCall({ notice: true });
+      }
+    },
+    onAsrStart: () => {
+      // 新一轮用户说话：定稿上一轮用户气泡（若有），并打断助手。
+      finalizeCallUserBubble();
+      finalizeCallAsstBubble();
+      petSignal("user");
+    },
+    // ASR 全文是覆盖式更新；只在 asr_end 定稿，避免中间态被标成 final 时切成多条。
+    onAsr: (text) => upsertCallUserBubble(text, { interim: true }),
+    onAsrEnd: () => finalizeCallUserBubble(),
+    onAssistant: (text) => appendCallAsstBubble(text),
+    onAssistantEnd: () => finalizeCallAsstBubble(),
+    onSpeaking: () => {
+      callWaveSpeaking = true;
+      callWaveEl?.classList.add("speaking");
+      petSignal("speaking");
+    },
+    onLevel: (level) => updateCallWave(level),
+    onError: (e) => {
+      appendPatNotice(`📞 通话出错：${e.message || e}`);
+      endCall({ notice: false });
+    },
+  });
+
+  // 必须在 await 之前、点击同步栈内解锁 Web Audio，否则首句 TTS 会静音。
+  callSession.prepareAudio();
+
+  try {
+    await callSession.start({
+      systemRole: buildRealtimeSystemRole(),
+      botName: callBotName(),
+    });
+  } catch (e) {
+    appendPatNotice(`📞 无法开始通话：${e.message || e}`);
+    endCall({ notice: false });
+  }
+}
+
+function endCall({ notice = true } = {}) {
+  if (!callActive && !callSession) return;
+  const s = callSession;
+  callSession = null;
+  finalizeCallUserBubble();
+  finalizeCallAsstBubble();
+  setCallActive(false);
+  petSignal("abort");
+  if (notice) appendPatNotice("📞 通话已结束");
+  if (s) s.stop().catch(() => {});
+}
+
+function toggleCall() {
+  if (callActive) endCall({ notice: true });
+  else startCall();
+}
+
+
 
 /** 首次打开时懒填充表情网格（点选后进入待发送，可继续输入文字再发送）。 */
 function buildStickerGrid() {
@@ -789,6 +1040,7 @@ attachBtn.addEventListener("click", () => fileEl.click());
 attachRemoveBtn.addEventListener("click", clearPendingImage);
 stickerRemoveBtn.addEventListener("click", clearPendingSticker);
 stickersBtn.addEventListener("click", toggleStickerPanel);
+callBtn.addEventListener("click", toggleCall);
 
 fileEl.addEventListener("change", async () => {
   const file = fileEl.files?.[0];
@@ -991,6 +1243,7 @@ listen("apply-settings", ({ payload }) => {
 // 聊天窗口收起时：停掉朗读，并把本次对话增量总结进长期记忆（阶段 2·D/E）。
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
+    if (callActive) endCall({ notice: false });
     stopSpeak();
     resetTtsQueue();
     void flushMemory();

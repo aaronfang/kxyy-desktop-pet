@@ -1,5 +1,6 @@
 mod api;
 mod persona_assets;
+mod realtime;
 
 use std::fs;
 use std::path::PathBuf;
@@ -69,6 +70,17 @@ struct Settings {
     /// 朗读音色 voice_id（火山复刻音色，S_ 开头）；空则无法朗读。
     #[serde(default)]
     tts_voice: String,
+
+    // ---- 实时语音通话（火山端到端实时语音大模型 / RealtimeDialog）----
+    /// 实时语音 App ID（火山「语音技术」应用 ID；与 TTS 的 x-api-key 不同）。
+    #[serde(default)]
+    realtime_app_id: String,
+    /// 实时语音 Access Key（Access Token）。
+    #[serde(default)]
+    realtime_access_key: String,
+    /// 实时语音复刻音色；空则回退用 tts_voice（同账号同一 S_ 音色）。
+    #[serde(default)]
+    realtime_voice: String,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-chat / deepseek-reasoner）。
     #[serde(default)]
     text_model: String,
@@ -162,6 +174,9 @@ impl Settings {
             volc_tts_key: String::new(),
             auto_speak: false,
             tts_voice: String::new(),
+            realtime_app_id: String::new(),
+            realtime_access_key: String::new(),
+            realtime_voice: String::new(),
             text_model: String::new(),
             thinking: false,
             temperature: default_temperature(),
@@ -187,6 +202,8 @@ struct AppState {
     settings: Mutex<Settings>,
     /// 本地 AI 代理监听端口。
     api_port: u16,
+    /// 本地实时语音 WS 桥接监听端口（0 表示未启动）。
+    realtime_port: u16,
 }
 
 /// 供本地 HTTP 代理按需读取的 AI 配置快照。
@@ -544,6 +561,16 @@ fn get_api_base(state: tauri::State<AppState>) -> String {
     format!("http://127.0.0.1:{}", state.api_port)
 }
 
+/// 返回本地实时语音 WS 桥接的基址（ws://），前端实时通话据此连接；端口为 0 时返回空串。
+#[tauri::command]
+fn get_realtime_base(state: tauri::State<AppState>) -> String {
+    if state.realtime_port == 0 {
+        String::new()
+    } else {
+        format!("ws://127.0.0.1:{}", state.realtime_port)
+    }
+}
+
 #[tauri::command]
 fn toggle_chat_window(app: AppHandle) {
     toggle_chat(&app);
@@ -573,6 +600,12 @@ struct AiSettingsInput {
     auto_speak: bool,
     #[serde(default)]
     tts_voice: String,
+    #[serde(default)]
+    realtime_app_id: String,
+    #[serde(default)]
+    realtime_access_key: String,
+    #[serde(default)]
+    realtime_voice: String,
     text_model: String,
     thinking: bool,
     temperature: f64,
@@ -610,6 +643,9 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.volc_tts_key = settings.volc_tts_key.trim().to_string();
         s.auto_speak = settings.auto_speak;
         s.tts_voice = settings.tts_voice.trim().to_string();
+        s.realtime_app_id = settings.realtime_app_id.trim().to_string();
+        s.realtime_access_key = settings.realtime_access_key.trim().to_string();
+        s.realtime_voice = settings.realtime_voice.trim().to_string();
         s.text_model = settings.text_model.trim().to_string();
         s.thinking = settings.thinking;
         s.temperature = settings.temperature;
@@ -659,14 +695,35 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            // macOS：桌宠应用隐藏 Dock 图标，仅保留菜单栏托盘图标。
+            // Accessory 策略在 dev 模式下同样生效，弥补 Info.plist(LSUIElement) 仅对打包产物生效的问题。
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             let handle = app.handle().clone();
             let settings = load_settings(&handle);
 
             // 先启动本地 AI 代理，拿到端口后随设置一起纳入全局状态。
             let api_port = api::start(handle.clone()).unwrap_or(0);
+            // 启动本地实时语音 WS 桥接：只提供密钥/音色，人设 system_role 由前端 start 消息带入。
+            let realtime_provider: realtime::ConfigProvider = std::sync::Arc::new(|app: &AppHandle| {
+                let s = app.state::<AppState>().settings.lock().unwrap().clone();
+                let speaker = if s.realtime_voice.trim().is_empty() {
+                    s.tts_voice.trim().to_string()
+                } else {
+                    s.realtime_voice.trim().to_string()
+                };
+                Some(realtime::RealtimeConfig {
+                    app_id: s.realtime_app_id.trim().to_string(),
+                    access_key: s.realtime_access_key.trim().to_string(),
+                    speaker,
+                })
+            });
+            let realtime_port = realtime::start(handle.clone(), realtime_provider).unwrap_or(0);
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
+                realtime_port,
             });
 
             if let Some(win) = app.get_webview_window("main") {
@@ -714,6 +771,7 @@ pub fn run() {
             cursor_pos,
             show_menu,
             get_api_base,
+            get_realtime_base,
             toggle_chat_window,
             hide_chat,
             open_settings,

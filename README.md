@@ -2,9 +2,9 @@
 
 基于 [webmeji](https://github.com/lars-rooij/webmeji) 动画逻辑改造的 **macOS / Windows 跨平台桌面宠物**，用 **[Tauri](https://tauri.app) 2** 封装（前端 Web 动画 + Rust 主进程）。桌宠会在屏幕上走动、坐下、跳舞、攀爬屏幕边缘，可拖拽、可抚摸，右键或托盘可切换形象。
 
-除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型），支持发图看图（通义千问 VL）、语音朗读（火山 TTS）、表情包回复与自定义人设。所有 AI 服务 Key 只保存在本机，请求经内置本地代理直连服务商，不经第三方。
+除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型），支持发图看图（通义千问 VL）、语音朗读（火山 TTS）、**实时语音通话**（火山端到端实时语音大模型）、表情包回复与自定义人设。所有 AI 服务 Key 只保存在本机，请求经内置本地代理直连服务商，不经第三方。
 
-当前内置两套形象：**赛博元元**（`kxyy-cyber`）与 **苗疆元元**（`kxyy-miaojiang`）。
+当前内置两套形象：**赛博元元**（`kxyy-cyber`）与 **苗疆元元**（`kxyy-miaojiang`，默认）。应用图标为苗疆元元头部特写，缩小后仍可辨认。macOS 上为菜单栏托盘应用，**不占用 Dock**。
 
 > 相比早期 Electron 版本：安装包由 ~70MB 降至 **~4MB**，内存占用大幅下降（Tauri 复用系统 WebView，无独立 Chromium）。
 
@@ -19,6 +19,7 @@
   - **DeepSeek API Key**：文字聊天必填（[申请](https://platform.deepseek.com)）。
   - **通义千问 VL Key**：发图看图选填（[申请](https://bailian.console.aliyun.com)）。
   - **火山 TTS Key + 音色 voice_id**：语音朗读选填。
+  - **火山实时语音 App ID + Access Key**（及可选通话音色）：实时语音通话选填；首次通话需允许麦克风权限。
 
 ## 运行
 
@@ -27,14 +28,14 @@ npm install
 npm run dev        # 开发模式（tauri dev）
 ```
 
-启动后桌宠出现在屏幕底部，菜单栏 / 托盘会出现一个图标：
+启动后桌宠出现在屏幕底部，**菜单栏（macOS）/ 系统托盘（Windows）**会出现一个图标（macOS 不显示 Dock 图标）：
 
 - **显示 / 隐藏桌宠**
 - **聊天（Ctrl+Shift+Space）**：唤出 / 收起 AI 聊天气泡
 - **选择形象**：赛博元元 / 苗疆元元
 - **大小**：100% / 125% / 150% / 200%
 - **所在屏幕**：多显示器时可选择固定在某块屏幕，或设为「自动（当前屏幕）」跟随启动时所在屏幕
-- **设置…**：打开聊天设置窗口（Key、模型、人设、头像、快捷键、气泡尺寸等）
+- **设置…**：打开聊天设置窗口（Key、模型、人设、头像、快捷键、气泡尺寸、实时语音等）
 - **开机自启**
 - **退出**
 
@@ -55,14 +56,15 @@ npm run dev        # 开发模式（tauri dev）
 - **文字对话**：由 DeepSeek 驱动，支持流式输出；可在设置里切换 `deepseek-chat`（快）/ `deepseek-reasoner`（会思考）与采样温度。
 - **发图看图**：附带图片时用通义千问 VL 识图（需填 VL Key）。
 - **语音朗读**：开启「自动朗读」后用火山 TTS 朗读回复（需填 TTS Key 与音色 `voice_id`）。
+- **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接连火山端到端实时语音大模型，复用元元人设与复刻音色，支持打断。通话中文字输入、发图与表情库会暂时锁定。需在设置里填实时语音 App ID / Access Key（通话音色可留空，默认复用朗读音色）。macOS 首次使用会弹出麦克风权限提示。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。
 
-> **隐私**：所有 Key、观众画像、头像仅写入本机配置目录的 `settings.json`（Windows 为 `%APPDATA%\<应用ID>\`），**不进仓库、不上传**；请求由内置本地代理（Rust `api.rs`）直连各服务商，不经任何第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
+> **隐私**：所有 Key、观众画像、头像仅写入本机配置目录的 `settings.json`（Windows 为 `%APPDATA%\<应用ID>\`），**不进仓库、不上传**；请求由内置本地代理（Rust `api.rs` / `realtime.rs`）直连各服务商，不经任何第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
 
 ### 配置
 
-托盘菜单选 **设置…** 打开设置窗口，按分区填写：AI 服务 Key、模型与人格、观众画像、头像与外观、快捷键与气泡尺寸。保存后即时生效（快捷键会重注册、聊天窗口按新尺寸重定位）。
+托盘菜单选 **设置…** 打开设置窗口，按分区填写：AI 服务 Key、实时语音通话、模型与人格、观众画像、头像与外观、快捷键与气泡尺寸。保存后即时生效（快捷键会重注册、聊天窗口按新尺寸重定位）。
 
 ## 打包
 
@@ -79,7 +81,7 @@ npm run build:mac        # macOS dmg
 
 > **开发注意**：`npm run dev` 前也会自动执行 `encrypt-assets`；若 `sync-ai` 后更新了语料，需重新加密。`persona-assets.enc` 已加入 `.gitignore`，CI 与本地打包时现场生成。
 >
-> 图标：`src-tauri/icons/` 由 `npx tauri icon <方形png>` 生成；仓库 `build/icon-square.png` 为图标源。
+> 图标：`src-tauri/icons/` 由 `npx tauri icon <方形png>` 生成；仓库 `build/icon-square.png` 为图标源（苗疆元元头部特写）。
 
 ## 目录结构
 
@@ -91,21 +93,25 @@ src/                  前端（渲染层，随前端一起打包）
   pet-engine.js       动画引擎（源自 webmeji 的 Creature）
   app.js              启动、点击穿透命中判定、右键菜单联动（Tauri IPC）
   assets/pets/        两套角色素材：<角色id>/<动作>/<动作>_NN.png
-  chat.html/js/css    AI 聊天气泡窗口（流式对话、图片附件、表情库面板）
-  settings.html/js/css 设置窗口（Key、模型、人设、头像、快捷键、气泡尺寸）
+  chat.html/js/css    AI 聊天气泡窗口（流式对话、图片附件、表情库、实时语音通话）
+  settings.html/js/css 设置窗口（Key、实时语音、模型、人设、头像、快捷键、气泡尺寸）
   ai/                 复用自上游的纯逻辑/语料模块
     persona.js        人设与提示词组装（运行时从 /api/assets 拉取语料）
     persona-assets.js 人设语料（开发用明文；打包时加密嵌入，不随安装包分发）
     stickers.js       表情系统（清单加载与情绪匹配）
     tts.js            火山 TTS 语音合成
+    realtime.js       实时语音通话前端（麦克风采集、下行播放、打断）
+    pcm-worklet.js    麦克风 PCM 重采样 AudioWorklet（16k s16le）
     avatars.js        默认头像
   stickers/           表情包清单 stickers.json + GIF 素材
 src-tauri/            Rust 主进程
-  src/lib.rs          透明置顶穿透窗口、托盘菜单、开机自启、设置持久化、全局快捷键、聊天/设置窗口管理、IPC 命令
+  src/lib.rs          透明置顶穿透窗口、托盘菜单、开机自启、设置持久化、全局快捷键、聊天/设置窗口管理、IPC 命令；macOS 隐藏 Dock
   src/api.rs          本地 AI 代理：聊天 / TTS / 语料下发（/api/assets）
+  src/realtime.rs     本地实时语音 WS 桥接（前端 ↔ 火山端到端实时语音大模型）
   src/persona_assets.rs 人设语料 XOR 解密（编译期嵌入 persona-assets.enc）
   assets/             persona-assets.enc（encrypt-assets 生成，gitignore）
   src/main.rs         入口
+  Info.plist          macOS：麦克风用途说明、LSUIElement（隐藏 Dock）
   tauri.conf.json     窗口 / 打包 / 图标配置
   capabilities/       前端权限
   icons/              应用图标
@@ -154,7 +160,7 @@ npm run encrypt-assets
 
 ## 发布
 
-推送形如 `v0.2.1` 的 tag 会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，自动构建并上传到 GitHub Release：
+推送形如 `v0.2.3` 的 tag 会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，自动构建并上传到 GitHub Release：
 
 - **Windows**：NSIS 安装包（`.exe`）
 - **macOS**：Apple Silicon（`aarch64`）与 Intel（`x64`）各一份 `.dmg`
