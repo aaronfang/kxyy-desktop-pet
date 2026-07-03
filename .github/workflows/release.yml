@@ -20,12 +20,12 @@ jobs:
         include:
           # macOS：分别产出 Apple Silicon 与 Intel 两个 dmg
           - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
+            args: "--target aarch64-apple-darwin --bundles dmg"
           - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
+            args: "--target x86_64-apple-darwin --bundles dmg"
           # Windows：NSIS 安装包
           - platform: windows-latest
-            args: ""
+            args: "--bundles nsis"
 
     runs-on: ${{ matrix.platform }}
     steps:
