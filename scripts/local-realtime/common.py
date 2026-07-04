@@ -767,10 +767,16 @@ class Session:
                     self.speech_pcm = bytearray(frame)
                     self.speech_ms = FRAME_MS
                     self.silence_ms = 0
-                    if while_playing:
-                        # 只旁路录音，不停播、不发 asr_start
-                        self.play_barge_pending = True
-                        log("播报中检测到疑似人声（旁路采集，待确认）")
+                    # 忙碌期（合成中或播报中）一律走「旁路采集」：不停播，
+                    # 且在 ASR 验证通过前绝不发 asr_start。否则外放余音/杂音
+                    # 只要够长就会误触发 asr_start，让前端把「已排队的整段回复」
+                    # flush 掉——因为后端是超速灌音频，一 flush 就是后半句全没。
+                    self.play_barge_pending = True
+                    log(
+                        "播报中检测到疑似人声（旁路采集，待确认）"
+                        if while_playing
+                        else "合成中检测到疑似人声（旁路采集，待确认）"
+                    )
                 return
 
         if not self.in_speech:
@@ -824,9 +830,10 @@ class Session:
         min_rms = SPEECH_RMS * (0.7 if from_play_barge else 0.5)
         if len(pcm) < min_bytes or pcm16_rms(pcm) < min_rms:
             log("丢弃: 片段过短/过静" + ("（播报未中断）" if from_play_barge else ""))
-            if not from_play_barge:
-                await self._emit_asr_end_only()
-                await self._resume_play_if_paused()
+            # 无条件恢复：旁路采集期若回复开始时 in_speech 为真，play_enabled
+            # 会被置 False；此处必须放开，否则发送循环永久卡住（幂等，安全）。
+            await self._emit_asr_end_only()
+            await self._resume_play_if_paused()
             return
 
         if self.asr_task and not self.asr_task.done():
@@ -847,9 +854,8 @@ class Session:
             cleaned = is_valid_asr(text, nsp, pcm)
             if not cleaned:
                 log("无效人声，忽略" + ("（播报未中断）" if from_play_barge else ""))
-                if not from_play_barge:
-                    await self._emit_asr_end_only()
-                    await self._resume_play_if_paused()
+                await self._emit_asr_end_only()
+                await self._resume_play_if_paused()
                 return
 
             # 此时才真正打断：先停播并通知前端 flush
@@ -868,9 +874,8 @@ class Session:
             raise
         except Exception as e:
             log(f"ASR 失败: {e}")
-            if not from_play_barge:
-                await self._emit_asr_end_only()
-                await self._resume_play_if_paused()
+            await self._emit_asr_end_only()
+            await self._resume_play_if_paused()
             await self.send_json({"type": "error", "message": str(e)})
 
     async def _reply_pipeline(self, text: str, my_gen: int) -> None:
@@ -952,7 +957,10 @@ class Session:
                 if my_gen != self.gen_id:
                     break
                 await self.send_pcm(chunk)
-                await asyncio.sleep(0.02)
+                # 每片 80ms 音频。发送节奏贴近实时（0.06s，留 ~20ms 提前量抗抖动），
+                # 不再把整段回复瞬间灌满前端队列——万一真被打断/flush，也只损失一小段，
+                # 而不是「说一半后半句全没」。
+                await asyncio.sleep(0.06)
 
             if my_gen == self.gen_id:
                 self.playing = False
