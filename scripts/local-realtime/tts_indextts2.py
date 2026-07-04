@@ -13,13 +13,13 @@ settings.json（可选）：
   indexTts2ModelDir  权重目录（含 config.yaml）
   indexTts2RepoDir   index-tts 源码目录
 
-参考音默认复用 common.REF_WAV（元元片段）。
+参考音：由用户在「设置 → 语音 → 参考音频」填入（settings.localRefWav / localRefText），
+经 common.ensure_ref_wav() 读取；发行版不再内置任何真人录音。
 """
 
 from __future__ import annotations
 
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
@@ -39,58 +39,16 @@ EMOTION_TEXT = {
     "neutral": "",
 }
 
-SYSTEM_SUFFIX = (
-    "\n口语化一两句，像真人闲聊；需要停顿时用逗号或……；"
-    "可带神态括号如（开心）（小声）（生气）（难过），括号不会被念出。"
-)
+SYSTEM_SUFFIX = common.SYSTEM_SUFFIX
 
 _tts = None
 _ref_wav: Path | None = None
 _model_dir = ""
 
-
-def detect_emotion(raw: str) -> str:
-    t = str(raw or "")
-    cues = " ".join(re.findall(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*", t))
-    hay = f"{cues} {t}"
-
-    def has(pat: str) -> bool:
-        return re.search(pat, hay) is not None
-
-    if has(r"生气|愤怒|哼|讨厌|可恶|不许|不准|凶|烦死|气死"):
-        return "angry"
-    if has(r"难过|伤心|委屈|呜+|哭|失落|叹气|对不起|抱歉|心疼"):
-        return "sad"
-    if has(r"害羞|脸红|小声|不好意思|羞|嘀咕|扭捏"):
-        return "shy"
-    if has(r"温柔|抱抱|乖|安慰|轻声|摸摸|别怕|没事的|来嘛|乖乖"):
-        return "gentle"
-    bangs = len(re.findall(r"[!！]", t))
-    if (
-        has(r"开心|高兴|兴奋|哈哈+|嘿嘿|耶+|太好了|好耶|哇+|嘻嘻|冲鸭|棒")
-        or bangs >= 2
-        or re.search(r"[~～]", t)
-    ):
-        return "excited"
-    return "neutral"
-
-
-def text_for_speech(raw: str) -> str:
-    t = re.sub(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*", "", str(raw or ""))
-    t = t.replace("...", "……").replace("。。。", "……")
-    t = re.sub(r"[~～]{2,}", "～", t)
-    t = re.sub(r"[ \t]+", " ", t).strip()
-    return t
-
-
-def _resolve_path(raw: str, default: Path) -> Path:
-    p = (raw or "").strip()
-    if not p:
-        return default.expanduser().resolve()
-    path = Path(p).expanduser()
-    if not path.is_absolute():
-        path = (common.REPO / path).resolve()
-    return path
+# 情绪推断 / 朗读文本清洗 / 路径解析下沉到 common，三个后端共用。
+detect_emotion = common.detect_emotion
+text_for_speech = common.text_for_speech
+_resolve_path = common.resolve_repo_path
 
 
 def configure_from_settings() -> None:

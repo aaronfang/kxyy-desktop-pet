@@ -19,11 +19,15 @@ def extract(audio: Path) -> dict:
 
     wav = ROOT / "out" / "style_src.wav"
     wav.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(audio), "-ac", "1", "-ar", "16000", str(wav)],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(audio), "-ac", "1", "-ar", "16000", str(wav)],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise SystemExit("ffmpeg 转码超时（120s）") from e
 
     with wave.open(str(wav), "rb") as w:
         rate = w.getframerate()

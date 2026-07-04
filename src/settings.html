@@ -42,6 +42,21 @@
       </label>
       <p id="voicePlatformHint" class="hint" hidden>当前为 macOS：本地模型仅提供 Qwen3-TTS。IndexTTS-2 / CosyVoice3 请在 Windows + NVIDIA 安装包中配置。</p>
 
+      <div id="voiceFieldsRef" class="voice-backend-fields" hidden>
+        <label>
+          <span>参考音频<small>本地克隆音色用；10~20s 单人清晰录音，wav/mp3</small></span>
+          <div class="file-field">
+            <input id="localRefWav" type="text" placeholder="/路径/voice.wav（或相对仓库根路径）" />
+            <button id="localRefWavBrowse" type="button" class="ghost">浏览…</button>
+          </div>
+        </label>
+        <label>
+          <span>参考音文案<small>与录音内容一致，可留空（留空克隆质量略降）</small></span>
+          <input id="localRefText" type="text" placeholder="录音里说的那句话" />
+        </label>
+        <p class="hint">本地模型为<strong>零样本克隆，不训练音色</strong>：填入录音后<strong>保存并重启语音服务</strong>（切换后端或重开 App）即按此录音克隆。留空则无法启动本地语音。</p>
+      </div>
+
       <div id="voiceFieldsVolc" class="voice-backend-fields" hidden>
         <label>
           <span>火山 TTS Key<small>朗读用</small></span>

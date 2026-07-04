@@ -21,6 +21,8 @@ const FIELDS = [
   "cosyvoice3RepoDir",
   "indexTts2ModelDir",
   "indexTts2RepoDir",
+  "localRefWav",
+  "localRefText",
   "voiceVolume",
   "textModel",
   "temperature",
@@ -101,6 +103,11 @@ function syncVoiceFields() {
   el("voiceFieldsCosyvoice3").hidden = backend !== "cosyvoice3";
   const it2 = el("voiceFieldsIndexTts2");
   if (it2) it2.hidden = backend !== "indextts2";
+  // 参考音频仅对使用本地零样本克隆的后端可见（本地 Qwen3 / CosyVoice3 / IndexTTS-2）。
+  const refBox = el("voiceFieldsRef");
+  if (refBox) {
+    refBox.hidden = !["local", "cosyvoice3", "indextts2"].includes(backend);
+  }
 }
 
 function syncVoiceVolumeLabel() {
@@ -123,6 +130,8 @@ function fill(s) {
   el("cosyvoice3RepoDir").value = s.cosyvoice3RepoDir || "";
   el("indexTts2ModelDir").value = s.indexTts2ModelDir || "";
   el("indexTts2RepoDir").value = s.indexTts2RepoDir || "";
+  el("localRefWav").value = s.localRefWav || "";
+  el("localRefText").value = s.localRefText || "";
   applyPlatformOptions();
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
   if (!supportsGpuLocal() && (el("realtimeBackend").value === "cosyvoice3" || el("realtimeBackend").value === "indextts2")) {
@@ -180,6 +189,8 @@ function collect() {
     cosyvoice3RepoDir: el("cosyvoice3RepoDir").value.trim(),
     indexTts2ModelDir: el("indexTts2ModelDir").value.trim(),
     indexTts2RepoDir: el("indexTts2RepoDir").value.trim(),
+    localRefWav: el("localRefWav").value.trim(),
+    localRefText: el("localRefText").value.trim(),
     voiceVolume: Math.max(
       0,
       Math.min(200, parseInt(el("voiceVolume").value, 10) || 100),
@@ -350,6 +361,27 @@ function applyVoiceServiceStatus(payload) {
 saveBtn.addEventListener("click", save);
 el("realtimeBackend").addEventListener("change", syncVoiceFields);
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
+
+// ---- 参考音频「浏览…」：调用系统文件对话框，取本地绝对路径写回输入框 ----
+el("localRefWavBrowse")?.addEventListener("click", async () => {
+  try {
+    const dialog = window.__TAURI__?.dialog;
+    if (!dialog?.open) return;
+    const selected = await dialog.open({
+      multiple: false,
+      directory: false,
+      title: "选择参考音频",
+      filters: [
+        { name: "音频", extensions: ["wav", "mp3", "flac", "m4a", "ogg", "aac"] },
+      ],
+    });
+    if (typeof selected === "string" && selected) {
+      el("localRefWav").value = selected;
+    }
+  } catch (e) {
+    console.error(e);
+  }
+});
 FIELDS.forEach((id) => {
   const node = el(id);
   if (node) node.addEventListener("keydown", (e) => {

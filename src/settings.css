@@ -152,6 +152,29 @@ select {
   margin-top: 0;
   margin-bottom: 14px;
 }
+
+/* 文件选择字段：文本输入 + 右侧「浏览…」按钮同一行 */
+.file-field {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.file-field input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.file-field button {
+  flex: 0 0 auto;
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #eef0f3;
+  color: #6b7280;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
 textarea {
   height: auto;
   padding: 10px 12px;

@@ -77,8 +77,6 @@
       "../scripts/local-realtime/tts_cosyvoice3_local.py": "scripts/local-realtime/tts_cosyvoice3_local.py",
       "../scripts/local-realtime/tts_indextts2.py": "scripts/local-realtime/tts_indextts2.py",
       "../scripts/local-realtime/requirements-macos.txt": "scripts/local-realtime/requirements-macos.txt",
-      "../scripts/local-realtime/assets/yuanyuan_ref_15s.wav": "scripts/local-realtime/assets/yuanyuan_ref_15s.wav",
-      "../scripts/local-realtime/assets/yuanyuan_ref_15s.txt": "scripts/local-realtime/assets/yuanyuan_ref_15s.txt",
       "../scripts/macos/setup-qwen3-tts.sh": "scripts/macos/setup-qwen3-tts.sh",
       "../scripts/windows/setup-gpu-voice.cmd": "scripts/windows/setup-gpu-voice.cmd",
       "../scripts/windows/setup-gpu-voice.ps1": "scripts/windows/setup-gpu-voice.ps1"

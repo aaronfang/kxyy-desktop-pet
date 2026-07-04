@@ -7,9 +7,52 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
+
+/// 子进程最近日志缓存上限（失败时回带设置页）。
+const RECENT_LOG_MAX_LINES: usize = 30;
+/// macOS 自动配置脚本进度缓存上限。
+const SETUP_LOG_MAX_LINES: usize = 40;
+/// 端口就绪等待上限（秒）；模型加载可能较久（本地 Qwen / CosyVoice3）。
+const START_TIMEOUT_SECS: u64 = 180;
+
+/// 进程级共享 secret：拉起本地 TTS 服务时经环境变量 KXYY_TTS_SECRET 注入，
+/// 代理转发 /tts 时带同值 X-Tts-Secret 头，阻止任意本机进程直接刷云端计费。
+///
+/// 持久化到用户配置目录，跨启动/跨进程保持一致——避免上一轮遗留的孤儿服务
+/// 因 secret 变化而返回 401。
+pub fn tts_secret() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let path = dirs_settings_path().map(|p| p.with_file_name("voice-tts.secret"));
+        if let Some(p) = &path {
+            if let Ok(s) = std::fs::read_to_string(p) {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        // 仅用于同机进程隔离，无需密码学强随机：纳秒时钟 + pid 混合即足够。
+        let secret = format!(
+            "{:x}-{:x}-{:x}",
+            now.as_nanos(),
+            std::process::id(),
+            now.subsec_nanos()
+        );
+        if let Some(p) = &path {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(p, &secret);
+        }
+        secret
+    })
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +94,7 @@ impl VoiceServiceManager {
 fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
     if let Ok(mut q) = logs.lock() {
         q.push_back(line);
-        while q.len() > 30 {
+        while q.len() > RECENT_LOG_MAX_LINES {
             q.pop_front();
         }
     }
@@ -139,12 +182,44 @@ fn script_for(backend: &str) -> Option<&'static str> {
     }
 }
 
-fn port_open(port: u16) -> bool {
-    if port == 0 {
+/// 对本地 TTS HTTP 服务（WS 端口 + 100）做 `GET /health`，确认是「本项目的服务」而非
+/// 随机占用同端口的无关程序。仅裸 TCP connect 成功会误判，导致后续 TTS 转发失败却不再自启。
+fn service_running(ws_port: u16) -> bool {
+    use std::io::{Read, Write};
+    if ws_port == 0 {
         return false;
     }
-    let addr = format!("127.0.0.1:{port}");
-    TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200)).is_ok()
+    let http_port = ws_port + 100;
+    let Ok(addr) = format!("127.0.0.1:{http_port}").parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    if stream
+        .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 4096 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.contains("200 OK") && text.contains("kxyy-voice")
 }
 
 /// 定位含 `scripts/local-realtime` 的根目录（开发仓库或安装目录）。
@@ -250,11 +325,34 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
     list
 }
 
+/// 在 PATH 中查找裸命令名，返回首个可执行文件路径（Windows 兼容 .exe）。
+fn which_in_path(name: &Path) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{}.exe", name.display()));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
 fn resolve_python(repo: &Path, backend: &str) -> Option<PathBuf> {
     for p in python_candidates(repo, backend) {
         if p.components().count() == 1 {
-            // bare name — 交给系统 PATH
-            return Some(p);
+            // 裸名：确认 PATH 中确实存在再返回，否则继续下一候选。
+            // 否则几乎总返回 Some，系统真无 Python 时会误报「启动失败」而非「找不到 Python」。
+            if which_in_path(&p).is_some() {
+                return Some(p);
+            }
+            continue;
         }
         if p.is_file() {
             return Some(p);
@@ -385,7 +483,7 @@ fn emit_setup_progress(app: &AppHandle, line: String, lines: &Arc<Mutex<VecDeque
     eprintln!("[setup-qwen3] {line}");
     if let Ok(mut q) = lines.lock() {
         q.push_back(line.clone());
-        while q.len() > 40 {
+        while q.len() > SETUP_LOG_MAX_LINES {
             q.pop_front();
         }
     }
@@ -602,8 +700,8 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         return;
     };
 
-    // 端口已通：外部或先前实例已在跑，不重复拉起。
-    if port_open(port) {
+    // 端口已通且健康检查通过：外部或先前实例已在跑，不重复拉起。
+    if service_running(port) {
         if let Ok(mut inner) = app.state::<VoiceServiceManager>().inner.lock() {
             // 若托管的是别的后端，先清掉记录（端口被占用说明目标服务已在）
             if inner.backend != backend {
@@ -699,12 +797,17 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
             let marker = rt.join(".qwen3-ready");
             let py = rt.join(".venv/bin/python");
             if !(marker.is_file() && py.is_file()) {
-                let already = app
-                    .state::<VoiceServiceManager>()
-                    .inner
-                    .lock()
-                    .map(|i| i.setup_running)
-                    .unwrap_or(false);
+                // 在同一锁作用域内 check-and-set，避免两次 ensure 并发都读到 false 而重复拉起配置脚本。
+                let already = match app.state::<VoiceServiceManager>().inner.lock() {
+                    Ok(mut inner) => {
+                        let was = inner.setup_running;
+                        if !was {
+                            inner.setup_running = true;
+                        }
+                        was
+                    }
+                    Err(_) => false,
+                };
                 if already {
                     emit(
                         app,
@@ -716,9 +819,6 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
                         },
                     );
                     return;
-                }
-                if let Ok(mut inner) = app.state::<VoiceServiceManager>().inner.lock() {
-                    inner.setup_running = true;
                 }
                 emit(
                     app,
@@ -815,7 +915,9 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         .current_dir(&work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // 共享 secret：本服务的 /tts 将据此校验请求，阻止任意本机进程刷云端计费。
+        .env("KXYY_TTS_SECRET", tts_secret());
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);
@@ -844,13 +946,15 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         }
     };
 
-    let logs = {
-        let state = app.state::<VoiceServiceManager>();
-        let inner = state.inner.lock().unwrap();
-        if let Ok(mut q) = inner.recent_logs.lock() {
-            q.clear();
+    let logs = match app.state::<VoiceServiceManager>().inner.lock() {
+        Ok(inner) => {
+            if let Ok(mut q) = inner.recent_logs.lock() {
+                q.clear();
+            }
+            Arc::clone(&inner.recent_logs)
         }
-        Arc::clone(&inner.recent_logs)
+        // 锁 poison 时不 panic，退化为独立缓冲（仅日志汇总丢失，不影响主流程）。
+        Err(_) => Arc::new(Mutex::new(VecDeque::new())),
     };
 
     // 把子进程日志打到桌宠 stderr，并缓存最近行供失败提示。
@@ -887,8 +991,8 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         // 给日志线程一点时间读完短错误输出
         std::thread::sleep(Duration::from_millis(80));
         // 模型加载可能较久（本地 Qwen / CosyVoice3）
-        for _ in 0..180 {
-            if port_open(port) {
+        for _ in 0..START_TIMEOUT_SECS {
+            if service_running(port) {
                 emit(
                     &app2,
                     VoiceServiceStatus {
@@ -922,7 +1026,7 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
                 Err(_) => return,
             };
             if exited {
-                if !port_open(port) {
+                if !service_running(port) {
                     // 等日志线程刷完
                     std::thread::sleep(Duration::from_millis(150));
                     let detail = take_log_summary(&logs2);
@@ -945,7 +1049,7 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
             }
             std::thread::sleep(Duration::from_secs(1));
         }
-        if port_open(port) {
+        if service_running(port) {
             emit(
                 &app2,
                 VoiceServiceStatus {
@@ -961,7 +1065,10 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
                 VoiceServiceStatus {
                     backend: backend2,
                     state: "failed".into(),
-                    message: "启动超时（3 分钟内端口未就绪），进程可能仍在加载模型".into(),
+                    message: format!(
+                        "启动超时（{} 秒内端口未就绪），进程可能仍在加载模型",
+                        START_TIMEOUT_SECS
+                    ),
                     port,
                 },
             );

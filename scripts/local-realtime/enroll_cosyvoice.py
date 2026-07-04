@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import ssl
 import subprocess
 import sys
@@ -31,6 +32,19 @@ SETTINGS = (
 )
 ENROLL_URL = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
 UPLOADS_URL = "https://dashscope.aliyuncs.com/api/v1/uploads"
+
+
+def _https_context() -> ssl.SSLContext:
+    """默认校验证书；仅 KXYY_TTS_INSECURE_SSL=1 时降级为不校验（自担风险）。"""
+    if os.environ.get("KXYY_TTS_INSECURE_SSL") == "1":
+        print("警告：KXYY_TTS_INSECURE_SSL=1，已关闭 TLS 证书校验", file=sys.stderr)
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def load_settings() -> dict:
@@ -51,36 +65,40 @@ def api_key(s: dict) -> str:
 def prepare_clip(src: Path, out: Path, seconds: float = 18.0) -> Path:
     """裁一段适合复刻的干净片段（≤60s，推荐 10~20s）。"""
     out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(src),
-            "-ss",
-            "0",
-            "-t",
-            str(seconds),
-            "-ac",
-            "1",
-            "-ar",
-            "24000",
-            "-c:a",
-            "libmp3lame",
-            "-q:a",
-            "2",
-            str(out),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src),
+                "-ss",
+                "0",
+                "-t",
+                str(seconds),
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                str(out),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("ffmpeg 裁剪样本超时（120s）") from e
     return out
 
 
 def http_json(method: str, url: str, headers: dict, body: dict | None = None) -> dict:
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    ctx = ssl._create_unverified_context()
+    ctx = _https_context()
     try:
         with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
             return json.loads(resp.read().decode("utf-8"))

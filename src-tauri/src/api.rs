@@ -582,6 +582,8 @@ fn proxy_local_tts(
     let resp = match client
         .post(&url)
         .header("Content-Type", "application/json")
+        // 与本地 TTS 服务约定的共享 secret，避免其它本机进程直接调用刷云端计费。
+        .header("X-Tts-Secret", crate::voice_service::tts_secret())
         .body(body_raw.to_string())
         .timeout(std::time::Duration::from_secs(60))
         .send()

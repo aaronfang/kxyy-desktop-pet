@@ -90,6 +90,82 @@ _FILLER_RE = re.compile(
 )
 _HALLUCINATION_RE = re.compile(r"字幕|订阅|点赞|鸣谢|翻译|thanks for watching", re.I)
 
+# 各 TTS 后端共用的 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
+SYSTEM_SUFFIX = (
+    "\n口语化一两句，像真人闲聊；需要停顿时用逗号或……；"
+    "可带神态括号如（开心）（小声）（生气）（难过），括号不会被念出。"
+)
+
+_CUE_RE = re.compile(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*")
+
+
+def detect_emotion(raw: str) -> str:
+    """从原始回复（含神态括号）推断情绪标签，三个本地 TTS 后端共用。
+
+    与前端 tts.js detectEmotion 保持同一套规则；以此函数为后端唯一实现。
+    """
+    t = str(raw or "")
+    cues = " ".join(_CUE_RE.findall(t))
+    hay = f"{cues} {t}"
+
+    def has(pat: str) -> bool:
+        return re.search(pat, hay) is not None
+
+    if has(r"生气|愤怒|哼|讨厌|可恶|不许|不准|凶|烦死|气死"):
+        return "angry"
+    if has(r"难过|伤心|委屈|呜+|哭|失落|叹气|对不起|抱歉|心疼"):
+        return "sad"
+    if has(r"害羞|脸红|小声|不好意思|羞|嘀咕|扭捏"):
+        return "shy"
+    if has(r"温柔|抱抱|乖|安慰|轻声|摸摸|别怕|没事的|来嘛|乖乖"):
+        return "gentle"
+    bangs = len(re.findall(r"[!！]", t))
+    if (
+        has(r"开心|高兴|兴奋|哈哈+|嘿嘿|耶+|太好了|好耶|哇+|嘻嘻|冲鸭|棒")
+        or bangs >= 2
+        or re.search(r"[~～]", t)
+    ):
+        return "excited"
+    return "neutral"
+
+
+def text_for_speech(raw: str) -> str:
+    """去掉神态括号，保留……与顿号，便于节奏表演。三个本地 TTS 后端共用。"""
+    t = _CUE_RE.sub("", str(raw or ""))
+    # 规范省略号，帮助模型拉长停顿
+    t = t.replace("...", "……").replace("。。。", "……")
+    t = re.sub(r"[~～]{2,}", "～", t)
+    t = re.sub(r"[ \t]+", " ", t).strip()
+    return t
+
+
+def resolve_repo_path(raw: str, default: "Path") -> "Path":
+    """把设置里的路径解析为绝对路径：空 → default；相对 → 相对仓库根。"""
+    p = (raw or "").strip()
+    if not p:
+        return default.expanduser().resolve()
+    path = Path(p).expanduser()
+    if not path.is_absolute():
+        path = (REPO / path).resolve()
+    return path
+
+
+def https_context() -> "ssl.SSLContext":
+    """默认走 certifi/系统证书校验的 HTTPS/WSS 上下文。
+
+    仅当显式设置环境变量 KXYY_TTS_INSECURE_SSL=1 时才降级为不校验（自担中间人风险）。
+    此前多处直接用 ssl._create_unverified_context() 携带 Bearer/API Key 连线，存在凭证被窃取的隐患。
+    """
+    if os.environ.get("KXYY_TTS_INSECURE_SSL") == "1":
+        print("[common] 警告：KXYY_TTS_INSECURE_SSL=1，已关闭 TLS 证书校验", flush=True)
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
 # 由入口注入
 _log_prefix = "local-rt"
 _mlx_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
@@ -114,7 +190,46 @@ def load_settings() -> dict:
     return json.loads(SETTINGS.read_text(encoding="utf-8"))
 
 
+def _user_ref_from_settings() -> "tuple[Path | None, str]":
+    """读取用户在设置里填写的参考音路径 / 文案（localRefWav / localRefText）。
+
+    发行版不再内置任何真人录音，改由用户自备参考音；此项为本地克隆音色的唯一来源。
+    路径为空 → 返回 (None, 文案)，交给后续默认查找（仅开发环境有内置样本时才命中）。
+    相对路径按仓库根解析。
+    """
+    try:
+        s = load_settings()
+    except Exception:
+        return None, ""
+    raw = (s.get("localRefWav") or "").strip()
+    text = (s.get("localRefText") or "").strip()
+    if not raw:
+        return None, text
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (REPO / p).resolve()
+    return p, text
+
+
 def ensure_ref_wav() -> tuple[Path, str]:
+    # 优先使用用户在「设置 → 语音 → 参考音频」填写的录音。
+    user_wav, user_text = _user_ref_from_settings()
+    if user_wav is not None:
+        if not user_wav.is_file():
+            raise SystemExit(
+                f"设置里指定的参考音频不存在：{user_wav}\n"
+                "请在「设置 → 语音 → 参考音频」重新填入一段清晰的单人录音（建议 10~20s，wav/mp3），"
+                "保存后重启语音服务。"
+            )
+        text = user_text
+        if not text:
+            sib = user_wav.with_suffix(".txt")
+            if sib.is_file():
+                text = sib.read_text(encoding="utf-8").strip()
+        if not text:
+            text = "对的，这是先实验一个小聚会。"
+        return user_wav, text
+
     wav = ref_wav_path()
     txt = ref_txt_path()
     if wav.is_file():
@@ -147,7 +262,8 @@ def ensure_ref_wav() -> tuple[Path, str]:
 
     if not MERGED_MP3.exists():
         raise SystemExit(
-            f"缺少参考音：请提供打包 assets、{MERGED_MP3}，或先生成参考 wav"
+            "未配置参考音频。请在「设置 → 语音 → 参考音频」填入一段清晰的单人录音"
+            "（建议 10~20s，wav/mp3 均可），保存后重启语音服务即可克隆该音色。"
         )
     import subprocess
 
@@ -157,25 +273,29 @@ def ensure_ref_wav() -> tuple[Path, str]:
         else REF_WAV
     )
     dest.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(MERGED_MP3),
-            "-ss",
-            "0",
-            "-t",
-            "15",
-            "-ac",
-            "1",
-            "-ar",
-            "24000",
-            str(dest),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(MERGED_MP3),
+                "-ss",
+                "0",
+                "-t",
+                "15",
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                str(dest),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise SystemExit("ffmpeg 截取参考音超时（60s）") from e
     dest_txt = dest.with_suffix(".txt")
     text = (
         dest_txt.read_text(encoding="utf-8").strip()
@@ -314,9 +434,29 @@ def start_tts_http(port: int) -> None:
         def log_message(self, fmt: str, *args) -> None:  # noqa: A003
             log(f"http {self.address_string()} {fmt % args}")
 
+        def do_GET(self) -> None:  # noqa: N802
+            # 健康检查：桌宠据此确认「本服务已就绪」，区别于随机占端口的无关程序。
+            if self.path.split("?", 1)[0] != "/health":
+                self.send_error(404)
+                return
+            data = json.dumps(
+                {"service": "kxyy-voice", "backend": _log_prefix}, ensure_ascii=False
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_POST(self) -> None:  # noqa: N802
             if self.path.split("?", 1)[0] != "/tts":
                 self.send_error(404)
+                return
+            # 共享 secret 鉴权：由桌宠启动本服务时经 KXYY_TTS_SECRET 注入，并在代理转发时带 X-Tts-Secret。
+            # 未注入 secret（如开发者手动直跑）时不强制，保持向后兼容；一旦注入则任意本机进程无法再刷云端计费。
+            secret = os.environ.get("KXYY_TTS_SECRET") or ""
+            if secret and (self.headers.get("X-Tts-Secret") or "") != secret:
+                self._json_err(401, "unauthorized")
                 return
             try:
                 n = int(self.headers.get("Content-Length", "0"))
@@ -482,7 +622,7 @@ def chat_llm(system_role: str, history: list[dict], user_text: str) -> tuple[str
         },
         method="POST",
     )
-    ctx = ssl._create_unverified_context()
+    ctx = https_context()
     with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     text = (data["choices"][0]["message"]["content"] or "").strip()

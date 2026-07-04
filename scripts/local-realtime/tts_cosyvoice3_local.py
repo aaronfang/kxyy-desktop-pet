@@ -13,16 +13,16 @@
 settings.json（可选）：
   cosyvoice3ModelDir  权重目录
   cosyvoice3RepoDir   CosyVoice 源码目录
-  cosyvoice3RefWav    参考音频（默认 voice-ab 元元参考音）
-  cosyvoice3RefText   参考音频文案（默认对应 .txt）
+  cosyvoice3RefWav    参考音频（高级覆盖；一般用共享的 localRefWav）
+  cosyvoice3RefText   参考音频文案（高级覆盖；一般用共享的 localRefText）
 
-参考音默认复用 common.REF_WAV / REF_TXT（与本地 Qwen 相同）。
+参考音由用户在「设置 → 语音 → 参考音频」填入（localRefWav / localRefText），
+经 common.ensure_ref_wav() 读取；发行版不再内置任何真人录音。
 """
 
 from __future__ import annotations
 
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -41,10 +41,7 @@ EMOTION_INSTRUCT = {
     "neutral": "",
 }
 
-SYSTEM_SUFFIX = (
-    "\n口语化一两句，像真人闲聊；需要停顿时用逗号或……；"
-    "可带神态括号如（开心）（小声）（生气）（难过），括号不会被念出。"
-)
+SYSTEM_SUFFIX = common.SYSTEM_SUFFIX
 
 _model = None
 _sample_rate = 24000
@@ -52,49 +49,10 @@ _ref_wav: Path | None = None
 _ref_text = ""
 _model_dir = ""
 
-
-def detect_emotion(raw: str) -> str:
-    t = str(raw or "")
-    cues = " ".join(re.findall(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*", t))
-    hay = f"{cues} {t}"
-
-    def has(pat: str) -> bool:
-        return re.search(pat, hay) is not None
-
-    if has(r"生气|愤怒|哼|讨厌|可恶|不许|不准|凶|烦死|气死"):
-        return "angry"
-    if has(r"难过|伤心|委屈|呜+|哭|失落|叹气|对不起|抱歉|心疼"):
-        return "sad"
-    if has(r"害羞|脸红|小声|不好意思|羞|嘀咕|扭捏"):
-        return "shy"
-    if has(r"温柔|抱抱|乖|安慰|轻声|摸摸|别怕|没事的|来嘛|乖乖"):
-        return "gentle"
-    bangs = len(re.findall(r"[!！]", t))
-    if (
-        has(r"开心|高兴|兴奋|哈哈+|嘿嘿|耶+|太好了|好耶|哇+|嘻嘻|冲鸭|棒")
-        or bangs >= 2
-        or re.search(r"[~～]", t)
-    ):
-        return "excited"
-    return "neutral"
-
-
-def text_for_speech(raw: str) -> str:
-    t = re.sub(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*", "", str(raw or ""))
-    t = t.replace("...", "……").replace("。。。", "……")
-    t = re.sub(r"[~～]{2,}", "～", t)
-    t = re.sub(r"[ \t]+", " ", t).strip()
-    return t
-
-
-def _resolve_path(raw: str, default: Path) -> Path:
-    p = (raw or "").strip()
-    if not p:
-        return default.expanduser().resolve()
-    path = Path(p).expanduser()
-    if not path.is_absolute():
-        path = (common.REPO / path).resolve()
-    return path
+# 情绪推断 / 朗读文本清洗 / 路径解析下沉到 common，三个后端共用。
+detect_emotion = common.detect_emotion
+text_for_speech = common.text_for_speech
+_resolve_path = common.resolve_repo_path
 
 
 def _ensure_import_path(repo_dir: Path) -> None:
@@ -152,7 +110,7 @@ def configure_from_settings() -> None:
             common.log("警告：未找到参考音文案，使用占位文本，复刻质量可能下降")
 
     _ensure_import_path(repo_dir)
-    common.log(f"加载 CosyVoice3 权重 {_model_dir or model_dir} …")
+    common.log(f"加载 CosyVoice3 权重 {model_dir} …")
     try:
         from cosyvoice.cli.cosyvoice import AutoModel
     except ImportError as e:

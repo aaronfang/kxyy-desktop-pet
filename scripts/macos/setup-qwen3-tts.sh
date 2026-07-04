@@ -40,8 +40,11 @@ if [[ ! -f "$REQ" ]]; then
   exit 1
 fi
 
+# 兼容 macOS 自带 bash 3.2 + set -u 的已知 quirk：在 [[ ]] 复合表达式中引用过的
+# 变量，若未在 then 分支独立"再次"求值，set -u 可能误报 unbound。
+# 用 ${MARKER:-} 显式给出空默认值绕开。
 if [[ -f "$MARKER" && -x "$RUNTIME/.venv/bin/python" && "${1:-}" != "--force" ]]; then
-  log "已配置，跳过（$MARKER）"
+  log "已配置，跳过（${MARKER:-}）"
   exit 0
 fi
 
@@ -66,16 +69,41 @@ fi
 log "系统 Python：$PY_SYS"
 
 log "STEP 2/5 创建虚拟环境（约数秒）…"
-"$PY_SYS" -m venv "$RUNTIME/.venv"
+# 幂等：venv 已存在就复用，避免 `python -m venv` 在已存在目录上失败。
+if [[ ! -x "$RUNTIME/.venv/bin/python" ]]; then
+  "$PY_SYS" -m venv "$RUNTIME/.venv"
+  log "venv 已创建：$RUNTIME/.venv"
+else
+  log "venv 已存在，跳过创建：$RUNTIME/.venv"
+fi
 # shellcheck disable=SC1091
 source "$RUNTIME/.venv/bin/activate"
-log "venv 已创建：$RUNTIME/.venv"
 
 log "STEP 3/5 安装 Python 依赖（约 1–5 分钟，请稍候）…"
 python -m pip install -U pip wheel
 # 用默认进度；行缓冲由 PYTHONUNBUFFERED 保证
 pip install -r "$REQ"
 log "依赖安装完成"
+
+# —— 兼容性补丁 ——
+# mlx-lm 0.31.3 仍以 4.x 风格调用 AutoTokenizer.register("NewlineTokenizer", ...)，
+# 但 transformers 5.x 的 register() 第一个参数必须是 class 对象，否则 STEP 4 加载
+# Qwen3-TTS 模型时会抛 AttributeError: 'str' object has no attribute '__module__'。
+# 把字符串参数替换为 NewlineTokenizer 类对象即可。
+shopt -s nullglob
+PATCHED=0
+for f in "$RUNTIME/.venv/lib"/python*/site-packages/mlx_lm/tokenizer_utils.py; do
+  if grep -q 'AutoTokenizer\.register("NewlineTokenizer",' "$f"; then
+    sed -i '' 's/^AutoTokenizer\.register("NewlineTokenizer",/AutoTokenizer.register(NewlineTokenizer,/' "$f"
+    log "已修补 mlx_lm NewlineTokenizer 注册方式：$f"
+    PATCHED=1
+  fi
+done
+shopt -u nullglob
+if [[ "$PATCHED" -eq 0 ]]; then
+  log "提示：mlx_lm NewlineTokenizer 注册方式已是新格式，跳过补丁"
+fi
+# —— 补丁结束 ——
 
 log "STEP 4/5 下载 Qwen3-TTS 模型（体积较大，首次可能需数分钟到十几分钟）…"
 export KXYY_VOICE_RUNTIME="$RUNTIME"
@@ -163,5 +191,5 @@ finally:
 print("[setup-qwen3] Whisper 模型就绪", flush=True)
 PY
 
-date -u +"%Y-%m-%dT%H:%M:%SZ" > "$MARKER"
-log "DONE 配置完成（$MARKER）"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "${MARKER:-}"
+log "DONE 配置完成（${MARKER:-}）"

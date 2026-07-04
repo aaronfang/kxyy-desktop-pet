@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import ssl
 import struct
 import sys
@@ -18,7 +19,8 @@ SETTINGS = (
 
 ENDPOINT = "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
 RESOURCE_ID = "volc.speech.dialog"
-APP_KEY = "PlgvMymc7f3tQnJ6"
+# 火山实时对话资源的 App Key（官方 demo 公开值）；可用设置项 realtimeAppKey 或环境变量 VOLC_APP_KEY 覆盖。
+DEFAULT_APP_KEY = "PlgvMymc7f3tQnJ6"
 MODEL_VERSION = "1.2.1.1"
 
 EV_START_CONNECTION = 1
@@ -40,16 +42,34 @@ EVENT_NAMES = {
 }
 
 
-def load_cfg() -> tuple[str, str, str]:
+def _https_context() -> ssl.SSLContext:
+    """默认校验证书；仅 KXYY_TTS_INSECURE_SSL=1 时降级为不校验（自担风险）。"""
+    if os.environ.get("KXYY_TTS_INSECURE_SSL") == "1":
+        print("警告：KXYY_TTS_INSECURE_SSL=1，已关闭 TLS 证书校验", file=sys.stderr)
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def load_cfg() -> tuple[str, str, str, str]:
     s = json.loads(SETTINGS.read_text(encoding="utf-8"))
     app_id = (s.get("realtimeAppId") or "").strip()
     access_key = (s.get("realtimeAccessKey") or "").strip()
     speaker = (s.get("realtimeVoice") or s.get("ttsVoice") or "").strip()
+    app_key = (
+        (s.get("realtimeAppKey") or "").strip()
+        or os.environ.get("VOLC_APP_KEY", "").strip()
+        or DEFAULT_APP_KEY
+    )
     if not app_id or not access_key:
         raise SystemExit("settings 缺少 realtimeAppId / realtimeAccessKey")
     if not speaker.startswith("S_"):
         raise SystemExit(f"需要 S_ 复刻音色，当前 speaker={speaker!r}")
-    return app_id, access_key, speaker
+    return app_id, access_key, speaker, app_key
 
 
 def build_full_client(event: int, session_id: str | None, payload: dict) -> bytes:
@@ -142,7 +162,7 @@ async def main() -> None:
         print("请先: scripts/voice-ab/.venv/bin/pip install websockets", file=sys.stderr)
         raise SystemExit(1)
 
-    app_id, access_key, speaker = load_cfg()
+    app_id, access_key, speaker, app_key = load_cfg()
     print(f"App ID: {app_id}")
     print(f"Speaker: {speaker}")
     print(f"Model: {MODEL_VERSION}")
@@ -152,10 +172,10 @@ async def main() -> None:
         "X-Api-App-ID": app_id,
         "X-Api-Access-Key": access_key,
         "X-Api-Resource-Id": RESOURCE_ID,
-        "X-Api-App-Key": APP_KEY,
+        "X-Api-App-Key": app_key,
         "X-Api-Connect-Id": str(uuid.uuid4()),
     }
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = _https_context()
     session_id = str(uuid.uuid4())
 
     async with websockets.connect(

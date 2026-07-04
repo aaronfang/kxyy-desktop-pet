@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import ssl
 import uuid
 from typing import Any
 
@@ -50,11 +49,8 @@ EMOTION_RATE_DELTA = {
     "neutral": 0.0,
 }
 
-# LLM：短句口语；停顿用标点即可，不要硬写口吃（易假）
-SYSTEM_SUFFIX = (
-    "\n口语化一两句，像真人闲聊；需要停顿时用逗号或……；"
-    "可带神态括号如（开心）（小声）（生气）（难过），括号不会被念出。"
-)
+# LLM 输出约束下沉到 common，避免三个后端各写一份而漂移。
+SYSTEM_SUFFIX = common.SYSTEM_SUFFIX
 
 STYLE_PATH = common.ROOT / "out" / "voice_style.json"
 
@@ -113,38 +109,9 @@ _voice = ""
 _model = DEFAULT_MODEL
 
 
-def detect_emotion(raw: str) -> str:
-    t = str(raw or "")
-    cues = " ".join(re.findall(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*", t))
-    hay = f"{cues} {t}"
-
-    def has(pat: str) -> bool:
-        return re.search(pat, hay) is not None
-
-    if has(r"生气|愤怒|哼|讨厌|可恶|不许|不准|凶|烦死|气死"):
-        return "angry"
-    if has(r"难过|伤心|委屈|呜+|哭|失落|叹气|对不起|抱歉|心疼"):
-        return "sad"
-    if has(r"害羞|脸红|小声|不好意思|羞|嘀咕|扭捏"):
-        return "shy"
-    if has(r"温柔|抱抱|乖|安慰|轻声|摸摸|别怕|没事的|来嘛|乖乖"):
-        return "gentle"
-    bangs = len(re.findall(r"[!！]", t))
-    if has(r"开心|高兴|兴奋|哈哈+|嘿嘿|耶+|太好了|好耶|哇+|嘻嘻|冲鸭|棒") or bangs >= 2 or re.search(
-        r"[~～]", t
-    ):
-        return "excited"
-    return "neutral"
-
-
-def text_for_speech(raw: str) -> str:
-    """去掉神态括号，保留……与顿号口吃，便于节奏表演。"""
-    t = re.sub(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*", "", str(raw or ""))
-    # 规范省略号，帮助模型拉长停顿
-    t = t.replace("...", "……").replace("。。。", "……")
-    t = re.sub(r"[~～]{2,}", "～", t)
-    t = re.sub(r"[ \t]+", " ", t).strip()
-    return t
+# 情绪推断 / 朗读文本清洗下沉到 common，三个后端共用同一套规则。
+detect_emotion = common.detect_emotion
+text_for_speech = common.text_for_speech
 
 
 def configure_from_settings() -> None:
@@ -192,7 +159,7 @@ async def _synthesize_mp3(text: str, *, instruction: str, rate, pitch, volume) -
     if volume is not None:
         params["volume"] = volume
 
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = common.https_context()
     async with websockets.connect(
         WS_URL,
         additional_headers={"Authorization": f"Bearer {_api_key}"},

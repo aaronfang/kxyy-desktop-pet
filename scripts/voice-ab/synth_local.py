@@ -35,21 +35,25 @@ def ensure_prompt_wav() -> tuple[Path, str]:
     if not PROMPT_MP3.exists():
         raise SystemExit(f"缺少火山参考音 {PROMPT_MP3}，请先运行 synth_volc.py")
     PROMPT_WAV.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(PROMPT_MP3),
-            "-ac",
-            "1",
-            "-ar",
-            "24000",
-            str(PROMPT_WAV),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(PROMPT_MP3),
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                str(PROMPT_WAV),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise SystemExit("ffmpeg 转码超时（120s）") from e
     return PROMPT_WAV, prompt_text
 
 
