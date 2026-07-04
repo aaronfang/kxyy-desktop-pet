@@ -122,6 +122,7 @@ let settings = {};
 let busy = false;
 let pendingImage = null; // { dataUrl } —— 待随下条消息发送的图片
 let pendingSticker = null; // { url, emotion, ... } —— 待随下条消息发送的表情
+let stickerGridBuilt = false; // 表情网格是否已懒填充
 const history = []; // { role, content, imageCaption?, images?, sticker?, pat?, id? }
 let lastPatAt = 0;
 let midDragActive = false;
