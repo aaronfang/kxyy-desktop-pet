@@ -1,0 +1,8 @@
+# 本机听测环境（Apple Silicon）。transformers/huggingface_hub 需钉在 4.x/0.36，
+# 否则 mlx_lm 0.31.x 与 transformers 5.x 会在 import 时报错。
+mlx-audio==0.4.4
+mlx-lm==0.31.3
+soundfile==0.14.0
+numpy>=2.0
+transformers==4.57.6
+huggingface_hub==0.36.2

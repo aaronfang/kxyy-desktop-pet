@@ -12,7 +12,7 @@ const VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const VL_MODEL: &str = "qwen3-vl-plus";
 
 // 火山引擎（豆包）声音复刻 TTS：HTTP 一次性合成，voice_id 以 S_ 开头。
-// 桌面端只有火山 Key，故 /api/tts 仅实现火山分支（不含 CosyVoice WebSocket）。
+// 本地 / CosyVoice 后端则转发到 scripts/local-realtime 的 HTTP /tts（WS 端口 +100）。
 const VOLC_TTS_URL: &str = "https://openspeech.bytedance.com/api/v1/tts";
 const VOLC_DEFAULT_CLUSTER: &str = "volcano_icl";
 const TTS_MAX_CHARS: usize = 2000;
@@ -68,7 +68,18 @@ fn cors_headers() -> Vec<Header> {
             "Access-Control-Allow-Headers",
             "Content-Type, x-api-key, x-vl-api-key, x-volc-tts-api-key, x-access-code",
         ),
+        // 前端需读 TTS 计费字符头（CosyVoice / 火山）。
+        header(
+            "Access-Control-Expose-Headers",
+            "X-Tts-Usage-Characters, X-Tts-Usage-Provider",
+        ),
     ]
+}
+
+/// TTS 单次计费用量（按字符，非 LLM token）。
+struct TtsUsage {
+    characters: u64,
+    provider: &'static str,
 }
 
 fn respond_json(request: tiny_http::Request, status: u16, body: String) {
@@ -110,6 +121,10 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
             .to_string();
             respond_json(request, 200, body);
         }
+        // DeepSeek 账户余额（金额，非剩余 token）。通义千问无对等接口。
+        (Method::Get, "/api/balance") => {
+            proxy_balance(app, client, request);
+        }
         (Method::Post, "/api/chat") => {
             proxy_chat(app, client, request);
         }
@@ -127,6 +142,56 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
             error_json(request, 404, "Not Found");
         }
     }
+}
+
+/// 查询 DeepSeek 账户余额，供 debug 面板展示「剩余额度」。
+fn proxy_balance(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_http::Request) {
+    let cfg = crate::ai_config(app);
+    if cfg.deepseek_key.is_empty() {
+        return error_json(request, 401, "未配置 DeepSeek API Key");
+    }
+    let resp = match client
+        .get(format!("{TEXT_BASE_URL}/user/balance"))
+        .header("Authorization", format!("Bearer {}", cfg.deepseek_key))
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => return error_json(request, 502, &format!("查询余额失败：{e}")),
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let body = serde_json::json!({
+            "error": format!("DeepSeek 余额查询错误 {status}"),
+            "detail": text.chars().take(300).collect::<String>(),
+        })
+        .to_string();
+        return respond_json(request, status, body);
+    }
+    let data: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return error_json(request, 502, "余额响应不是合法 JSON"),
+    };
+    // 优先 CNY，否则取第一条。
+    let infos = data
+        .get("balance_infos")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let info = infos
+        .iter()
+        .find(|i| i.get("currency").and_then(|c| c.as_str()) == Some("CNY"))
+        .or_else(|| infos.first());
+    let body = serde_json::json!({
+        "provider": "DeepSeek",
+        "isAvailable": data.get("is_available").and_then(|v| v.as_bool()).unwrap_or(false),
+        "currency": info.and_then(|i| i.get("currency")).cloned().unwrap_or(serde_json::Value::Null),
+        "totalBalance": info.and_then(|i| i.get("total_balance")).cloned().unwrap_or(serde_json::Value::Null),
+        "grantedBalance": info.and_then(|i| i.get("granted_balance")).cloned().unwrap_or(serde_json::Value::Null),
+        "toppedUpBalance": info.and_then(|i| i.get("topped_up_balance")).cloned().unwrap_or(serde_json::Value::Null),
+    })
+    .to_string();
+    respond_json(request, 200, body);
 }
 
 fn messages_have_image(messages: &serde_json::Value) -> bool {
@@ -225,6 +290,10 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         "max_tokens": max_tokens,
         "stream": stream,
     });
+    // 流式默认不带 usage；打开后最后一帧会带 prompt/completion/total tokens。
+    if stream {
+        payload["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
     // deepseek-reasoner 会忽略 temperature，非 reasoner 时照常下发。
     if !is_reasoner {
         payload["temperature"] = serde_json::json!(temperature);
@@ -368,7 +437,35 @@ fn tts_reqid() -> String {
     format!("kxyy-{n:x}")
 }
 
-/// 一次火山 HTTP 合成：成功返回 mp3 字节，失败返回 (火山错误码, 说明)。
+/// 从火山 JSON 响应里抠计费字符；V1 常不带 usage，则按原文 Unicode 字数估算。
+fn volc_usage_chars(data: &serde_json::Value, text: &str) -> u64 {
+    let from_usage = data
+        .get("usage")
+        .and_then(|u| {
+            u.get("text_words")
+                .or_else(|| u.get("characters"))
+                .or_else(|| u.get("text_length"))
+        })
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)));
+    if let Some(n) = from_usage.filter(|n| *n > 0) {
+        return n;
+    }
+    let from_addition = data
+        .get("addition")
+        .and_then(|a| a.get("text_words").or_else(|| a.get("characters")))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().map(|n| n.max(0) as u64))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        });
+    if let Some(n) = from_addition.filter(|n| *n > 0) {
+        return n;
+    }
+    // 声音复刻 HTTP V1 通常不回 usage；按字计费，用原文长度作近似。
+    text.chars().count() as u64
+}
+
+/// 一次火山 HTTP 合成：成功返回 (mp3, 计费字符)，失败返回 (火山错误码, 说明)。
 fn volc_tts_once(
     client: &reqwest::blocking::Client,
     api_key: &str,
@@ -378,7 +475,7 @@ fn volc_tts_once(
     speed: Option<f64>,
     pitch: Option<f64>,
     emotion: &str,
-) -> Result<Vec<u8>, (Option<i64>, String)> {
+) -> Result<(Vec<u8>, u64), (Option<i64>, String)> {
     let mut audio = serde_json::json!({
         "voice_type": voice,
         "encoding": "mp3",
@@ -403,6 +500,8 @@ fn volc_tts_once(
         .post(VOLC_TTS_URL)
         .header("Content-Type", "application/json")
         .header("x-api-key", api_key)
+        // V3 流式接口靠此头回 usage；V1 若支持则一并带上。
+        .header("X-Control-Require-Usage-Tokens-Return", "true")
         .json(&payload)
         .send()
         .map_err(|e| (None, e.to_string()))?;
@@ -427,13 +526,28 @@ fn volc_tts_once(
     if bytes.is_empty() {
         return Err((code, "合成结果为空".to_string()));
     }
-    Ok(bytes)
+    let chars = volc_usage_chars(&data, text);
+    Ok((bytes, chars))
 }
 
-fn respond_audio(request: tiny_http::Request, bytes: Vec<u8>) {
+fn respond_audio(
+    request: tiny_http::Request,
+    bytes: Vec<u8>,
+    content_type: &str,
+    usage: Option<TtsUsage>,
+) {
     let mut headers = cors_headers();
-    headers.push(header("Content-Type", "audio/mpeg"));
+    headers.push(header("Content-Type", content_type));
     headers.push(header("Cache-Control", "no-store"));
+    if let Some(u) = usage {
+        if u.characters > 0 {
+            headers.push(header(
+                "X-Tts-Usage-Characters",
+                &u.characters.to_string(),
+            ));
+            headers.push(header("X-Tts-Usage-Provider", u.provider));
+        }
+    }
     let len = bytes.len();
     let resp = Response::new(StatusCode(200), headers, std::io::Cursor::new(bytes), Some(len), None);
     let _ = request.respond(resp);
@@ -450,7 +564,95 @@ fn proxy_tts(app: &AppHandle, client: &reqwest::blocking::Client, mut request: t
     };
 
     let cfg = crate::ai_config(app);
+    // 本地 / CosyVoice：转发到本机 Python 服务，不走火山。
+    if let Some(port) = crate::local_tts_http_port(&cfg.voice_backend) {
+        return proxy_local_tts(client, request, port, &raw);
+    }
+    proxy_volc_tts(client, request, &cfg, &body);
+}
 
+/// 本地语音后端朗读：POST http://127.0.0.1:{port}/tts → audio/wav。
+fn proxy_local_tts(
+    client: &reqwest::blocking::Client,
+    request: tiny_http::Request,
+    port: u16,
+    body_raw: &str,
+) {
+    let url = format!("http://127.0.0.1:{port}/tts");
+    let resp = match client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body_raw.to_string())
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return error_json(
+                request,
+                503,
+                &format!("本地语音服务未启动或不可达（{url}）：{e}"),
+            );
+        }
+    };
+    let status = resp.status().as_u16();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/wav")
+        .to_string();
+    // CosyVoice 等云端后端会在本地 Python 服务上挂计费字符头。
+    let usage_chars = resp
+        .headers()
+        .get("x-tts-usage-characters")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let usage_provider = resp
+        .headers()
+        .get("x-tts-usage-provider")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = match resp.bytes() {
+        Ok(b) => b.to_vec(),
+        Err(e) => return error_json(request, 502, &format!("读取本地 TTS 响应失败：{e}")),
+    };
+    if !(200..300).contains(&status) {
+        let detail = String::from_utf8_lossy(&bytes);
+        let body = serde_json::json!({
+            "error": "TTS 合成失败（本地服务）",
+            "detail": detail.chars().take(300).collect::<String>(),
+        })
+        .to_string();
+        return respond_json(request, if status == 0 { 502 } else { status }, body);
+    }
+    let usage = if usage_chars > 0 {
+        // provider 字符串来自本地服务；仅 CosyVoice 会带，用静态标签即可。
+        let provider: &'static str = if usage_provider.eq_ignore_ascii_case("cosyvoice") {
+            "CosyVoice"
+        } else if !usage_provider.is_empty() {
+            "TTS"
+        } else {
+            "CosyVoice"
+        };
+        Some(TtsUsage {
+            characters: usage_chars,
+            provider,
+        })
+    } else {
+        None
+    };
+    respond_audio(request, bytes, &ct, usage);
+}
+
+fn proxy_volc_tts(
+    client: &reqwest::blocking::Client,
+    request: tiny_http::Request,
+    cfg: &crate::AiConfig,
+    body: &serde_json::Value,
+) {
     // 音色：前端传入的合法火山音色（S_ 开头）> 设置里的默认音色。
     let body_voice = body.get("voice").and_then(|v| v.as_str()).unwrap_or("").trim();
     let voice = if body_voice.starts_with("S_") {
@@ -462,7 +664,7 @@ fn proxy_tts(app: &AppHandle, client: &reqwest::blocking::Client, mut request: t
         return error_json(request, 400, "未配置朗读音色（voice_id），请在设置里填写 S_ 开头的火山音色");
     }
     if !voice.starts_with("S_") {
-        return error_json(request, 400, "桌面端只支持火山引擎音色（voice_id 需以 S_ 开头）");
+        return error_json(request, 400, "火山后端需 S_ 开头的复刻音色");
     }
 
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -503,11 +705,12 @@ fn proxy_tts(app: &AppHandle, client: &reqwest::blocking::Client, mut request: t
 
     let cluster = VOLC_DEFAULT_CLUSTER;
     // 带重试：瞬时错误码同参数换 reqid 重试；最终仍失败且带情绪则去掉 emotion 兜底一次。
-    let mut result: Result<Vec<u8>, (Option<i64>, String)> = Err((None, "未执行".to_string()));
+    let mut result: Result<(Vec<u8>, u64), (Option<i64>, String)> =
+        Err((None, "未执行".to_string()));
     for i in 0..3 {
         match volc_tts_once(client, &volc_key, cluster, &voice, &text_trunc, speed, pitch, emotion) {
-            Ok(bytes) => {
-                result = Ok(bytes);
+            Ok(ok) => {
+                result = Ok(ok);
                 break;
             }
             Err((code, msg)) => {
@@ -521,13 +724,21 @@ fn proxy_tts(app: &AppHandle, client: &reqwest::blocking::Client, mut request: t
         }
     }
     if result.is_err() && !emotion.is_empty() {
-        if let Ok(bytes) = volc_tts_once(client, &volc_key, cluster, &voice, &text_trunc, speed, pitch, "") {
-            result = Ok(bytes);
+        if let Ok(ok) = volc_tts_once(client, &volc_key, cluster, &voice, &text_trunc, speed, pitch, "") {
+            result = Ok(ok);
         }
     }
 
     match result {
-        Ok(bytes) => respond_audio(request, bytes),
+        Ok((bytes, chars)) => respond_audio(
+            request,
+            bytes,
+            "audio/mpeg",
+            Some(TtsUsage {
+                characters: chars,
+                provider: "火山引擎",
+            }),
+        ),
         Err((_, detail)) => {
             let body = serde_json::json!({
                 "error": "TTS 合成失败（火山引擎）",

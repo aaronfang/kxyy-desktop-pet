@@ -66,6 +66,29 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../scripts/local-realtime/common.py": "scripts/local-realtime/common.py",
+      "../scripts/local-realtime/server.py": "scripts/local-realtime/server.py",
+      "../scripts/local-realtime/server_cosyvoice.py": "scripts/local-realtime/server_cosyvoice.py",
+      "../scripts/local-realtime/server_cosyvoice3_local.py": "scripts/local-realtime/server_cosyvoice3_local.py",
+      "../scripts/local-realtime/server_indextts2.py": "scripts/local-realtime/server_indextts2.py",
+      "../scripts/local-realtime/tts_cosyvoice.py": "scripts/local-realtime/tts_cosyvoice.py",
+      "../scripts/local-realtime/tts_cosyvoice3_local.py": "scripts/local-realtime/tts_cosyvoice3_local.py",
+      "../scripts/local-realtime/tts_indextts2.py": "scripts/local-realtime/tts_indextts2.py",
+      "../scripts/local-realtime/requirements-macos.txt": "scripts/local-realtime/requirements-macos.txt",
+      "../scripts/local-realtime/assets/yuanyuan_ref_15s.wav": "scripts/local-realtime/assets/yuanyuan_ref_15s.wav",
+      "../scripts/local-realtime/assets/yuanyuan_ref_15s.txt": "scripts/local-realtime/assets/yuanyuan_ref_15s.txt",
+      "../scripts/macos/setup-qwen3-tts.sh": "scripts/macos/setup-qwen3-tts.sh",
+      "../scripts/windows/setup-gpu-voice.cmd": "scripts/windows/setup-gpu-voice.cmd",
+      "../scripts/windows/setup-gpu-voice.ps1": "scripts/windows/setup-gpu-voice.ps1"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }

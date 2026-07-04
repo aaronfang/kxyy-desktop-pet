@@ -1,0 +1,10 @@
+# macOS Apple Silicon：本地 Qwen3-TTS + Whisper + 实时服务
+# 由 setup-qwen3-tts.sh / 桌宠自动配置写入 Application Support 的 venv。
+mlx-audio==0.4.4
+mlx-lm==0.31.3
+mlx-whisper
+websockets>=12.0
+soundfile==0.14.0
+numpy>=2.0
+transformers==4.57.6
+huggingface_hub==0.36.2

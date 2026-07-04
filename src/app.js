@@ -85,10 +85,14 @@ function handlePetChat(type, emotion) {
   }
 }
 
+function refreshPetBounds() {
+  for (const c of window.webmejiCreatures || []) c.resizeHandler?.();
+}
+
 function applyPetSize(sizePercent) {
   const px = computePetSizePx(sizePercent);
   document.documentElement.style.setProperty("--pet-size", `${px}px`);
-  for (const c of window.webmejiCreatures || []) c.resizeHandler?.();
+  refreshPetBounds();
 }
 
 /** 指针是否在桌宠外接矩形附近（含 margin），用于决定轮询频率 */
@@ -213,6 +217,14 @@ async function boot() {
   await window.initPet(petId);
   applyPetSize(settings.sizePercent ?? 150);
 
+  // 主窗口铺满工作区在 macOS 上异步完成，可能晚于桌宠初始化；
+  // 若边界停在默认 800×600，角色会看起来只在左上角一块区域活动。
+  refreshPetBounds();
+  for (const ms of [50, 200, 500]) {
+    setTimeout(refreshPetBounds, ms);
+  }
+  listen("stage-resized", () => refreshPetBounds());
+
   hidden = !!settings.hidden;
   applyHidden(hidden);
   bindMouseTracking();
@@ -235,6 +247,8 @@ async function boot() {
       hidden = !!data.hidden;
       applyHidden(hidden);
     }
+    // 切换显示器时主窗口会重新铺满，补一次边界刷新。
+    refreshPetBounds();
   });
 
   // 聊天窗口发来的对话状态：驱动桌宠思考 / 说话 / 按情绪做动作。

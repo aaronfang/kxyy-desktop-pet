@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>语音 A/B 听测 · 火山 vs 本地</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1115;
+      --card: #1a1d24;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --accent: #7aa2ff;
+      --volc: #ff8a65;
+      --local: #81c784;
+      --border: #2a2f3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 24px;
+    }
+    h1 { font-size: 1.35rem; margin: 0 0 8px; }
+    .note { color: var(--muted); font-size: 0.92rem; max-width: 720px; margin-bottom: 20px; }
+    .note code { background: #252a33; padding: 1px 6px; border-radius: 4px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin-bottom: 14px;
+      max-width: 860px;
+    }
+    .id { font-weight: 600; color: var(--accent); }
+    .text { margin: 6px 0 12px; }
+    .emo { color: var(--muted); font-size: 0.85rem; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+    .side {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .side.volc { border-color: color-mix(in srgb, var(--volc) 45%, var(--border)); }
+    .side.local { border-color: color-mix(in srgb, var(--local) 45%, var(--border)); }
+    .label { font-size: 0.8rem; font-weight: 600; margin-bottom: 6px; }
+    .side.volc .label { color: var(--volc); }
+    .side.local .label { color: var(--local); }
+    audio { width: 100%; margin-top: 4px; }
+    .meta { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+    .missing { color: #ef9a9a; font-size: 0.85rem; }
+    .score {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .score button {
+      border: 1px solid var(--border);
+      background: #252a33;
+      color: var(--text);
+      border-radius: 999px;
+      padding: 4px 12px;
+      cursor: pointer;
+    }
+    .score button.active { outline: 2px solid var(--accent); }
+    #summary {
+      max-width: 860px;
+      margin-top: 18px;
+      padding: 14px 16px;
+      background: var(--card);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>语音 A/B 听测 · 火山 vs 本地 Qwen3-TTS</h1>
+  <p class="note">
+    请用本地静态服务打开本页（直接双击可能因浏览器安全策略读不到音频）：
+    <code>cd scripts/voice-ab && python3 -m http.server 8765</code>
+    然后访问 <code>http://127.0.0.1:8765/listen.html</code>。
+    当前本地侧参考音为元元原始录音 <code>merged.mp3</code> 前 15 秒（零样本复刻）。
+  </p>
+  <div id="list"></div>
+  <div id="summary">评分会显示在这里。</div>
+
+  <script>
+    const SCORES_KEY = "kxyy-voice-ab-scores-orig-ref";
+
+    async function loadJson(path) {
+      try {
+        const r = await fetch(path);
+        if (!r.ok) return [];
+        return await r.json();
+      } catch {
+        return [];
+      }
+    }
+
+    function loadScores() {
+      try { return JSON.parse(localStorage.getItem(SCORES_KEY) || "{}"); }
+      catch { return {}; }
+    }
+    function saveScores(s) {
+      localStorage.setItem(SCORES_KEY, JSON.stringify(s));
+      renderSummary(s);
+    }
+
+    function renderSummary(scores) {
+      const ids = Object.keys(scores);
+      if (!ids.length) {
+        document.getElementById("summary").textContent = "听完每条后点「更像元元 / 更自然」做记录。";
+        return;
+      }
+      let volc = 0, local = 0, tie = 0;
+      for (const id of ids) {
+        const v = scores[id];
+        if (v === "volc") volc++;
+        else if (v === "local") local++;
+        else if (v === "tie") tie++;
+      }
+      document.getElementById("summary").textContent =
+        `已评 ${ids.length} 条\n火山更好：${volc}\n本地更好：${local}\n难分高下：${tie}\n\n` +
+        ids.map((id) => `${id}: ${scores[id]}`).join("\n");
+    }
+
+    function side(label, cls, path, latency) {
+      const el = document.createElement("div");
+      el.className = `side ${cls}`;
+      const lab = document.createElement("div");
+      lab.className = "label";
+      lab.textContent = label;
+      el.appendChild(lab);
+      if (path) {
+        const a = document.createElement("audio");
+        a.controls = true;
+        a.preload = "metadata";
+        a.src = path;
+        el.appendChild(a);
+        if (latency != null) {
+          const m = document.createElement("div");
+          m.className = "meta";
+          m.textContent = `合成耗时 ${latency}s`;
+          el.appendChild(m);
+        }
+      } else {
+        const m = document.createElement("div");
+        m.className = "missing";
+        m.textContent = "尚未生成";
+        el.appendChild(m);
+      }
+      return el;
+    }
+
+    async function main() {
+      const [phrases, volcMeta, localMeta] = await Promise.all([
+        loadJson("phrases.json"),
+        loadJson("out/volc/meta.json"),
+        loadJson("out/local/meta.json"),
+      ]);
+      const volcMap = Object.fromEntries((volcMeta || []).map((x) => [x.id, x]));
+      const localMap = Object.fromEntries((localMeta || []).map((x) => [x.id, x]));
+      const scores = loadScores();
+      const list = document.getElementById("list");
+
+      const items = phrases.items || [];
+      for (const item of items) {
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `<div class="id">${item.id} <span class="emo">${item.emotion || ""}</span></div>
+          <div class="text">${item.text}</div>`;
+        const row = document.createElement("div");
+        row.className = "row";
+        const v = volcMap[item.id] || {};
+        const l = localMap[item.id] || {};
+        row.appendChild(side("火山引擎", "volc", v.path || null, v.latency_s));
+        row.appendChild(side("本地复刻（原始录音）", "local", l.path || null, l.latency_s));
+        card.appendChild(row);
+
+        const score = document.createElement("div");
+        score.className = "score";
+        score.innerHTML = "<span class='emo'>这条谁更好？</span>";
+        for (const [val, label] of [
+          ["volc", "火山"],
+          ["local", "本地"],
+          ["tie", "难分"],
+        ]) {
+          const b = document.createElement("button");
+          b.textContent = label;
+          if (scores[item.id] === val) b.classList.add("active");
+          b.onclick = () => {
+            scores[item.id] = val;
+            saveScores(scores);
+            score.querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+            b.classList.add("active");
+          };
+          score.appendChild(b);
+        }
+        card.appendChild(score);
+        list.appendChild(card);
+      }
+      renderSummary(scores);
+    }
+    main();
+  </script>
+</body>
+</html>

@@ -81,6 +81,77 @@ select {
   outline: none;
   width: 100%;
 }
+
+.range-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.range-row input[type="range"] {
+  flex: 1 1 auto;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: #ff8fb1;
+}
+.range-val {
+  flex: 0 0 3.2em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.voice-service-status {
+  margin-top: 4px;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.45;
+}
+.voice-service-log {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 140px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #4b5563;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.voice-service-log[hidden] {
+  display: none;
+}
+.voice-service-status.state-running {
+  color: #15803d;
+}
+.voice-service-status.state-starting {
+  color: #a16207;
+}
+.voice-service-status.state-failed {
+  color: #dc2626;
+}
+.voice-service-status.state-stopped,
+.voice-service-status.state-skipped {
+  color: #6b7280;
+}
+
+.voice-backend-fields[hidden] {
+  display: none;
+}
+.voice-backend-fields > label:last-of-type {
+  margin-bottom: 14px;
+}
+.voice-backend-fields > .hint {
+  margin-top: 0;
+  margin-bottom: 14px;
+}
 textarea {
   height: auto;
   padding: 10px 12px;
@@ -181,6 +252,33 @@ select:focus {
   color: #9aa1ab;
   font-size: 12px;
   margin-top: -4px;
+}
+
+.memory-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0 6px;
+}
+button.danger {
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 13px;
+  cursor: pointer;
+}
+button.danger:hover {
+  background: #fee2e2;
+}
+button.danger:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+#clearMemoryStatus {
+  margin: 0;
 }
 code {
   background: #eef0f3;

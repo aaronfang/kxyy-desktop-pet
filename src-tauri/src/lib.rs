@@ -1,18 +1,21 @@
 mod api;
 mod persona_assets;
 mod realtime;
+mod voice_service;
 
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
     window::Monitor,
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WindowEvent, Wry,
+    AppHandle, Emitter, Manager, WindowEvent, Wry,
 };
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -78,9 +81,38 @@ struct Settings {
     /// 实时语音 Access Key（Access Token）。
     #[serde(default)]
     realtime_access_key: String,
-    /// 实时语音复刻音色；空则回退用 tts_voice（同账号同一 S_ 音色）。
+    /// 旧版「通话音色」字段；已与 `tts_voice` 合并，读入时迁移后清空。
     #[serde(default)]
     realtime_voice: String,
+    /// 语音后端（朗读 + 实时通话共用）：
+    /// `volc` / `local`（Qwen3）/ `cosyvoice`（通义）/
+    /// `cosyvoice3` / `indextts2`（Windows+NVIDIA 本地开源）。
+    #[serde(default = "default_realtime_backend")]
+    realtime_backend: String,
+    /// CosyVoice 复刻音色 id（`cosyvoice-…`），仅 `realtimeBackend=cosyvoice` 时用。
+    #[serde(default)]
+    cosyvoice_voice: String,
+    /// CosyVoice 模型，默认 `cosyvoice-v3.5-flash`（支持 instruction）。
+    #[serde(default)]
+    cosyvoice_model: String,
+    /// Fun-CosyVoice3 本地权重目录。
+    #[serde(default)]
+    cosyvoice3_model_dir: String,
+    /// FunAudioLLM/CosyVoice 源码目录（含 cosyvoice 包）。
+    #[serde(default)]
+    cosyvoice3_repo_dir: String,
+    /// IndexTTS-2 本地权重目录（含 config.yaml）。
+    #[serde(default)]
+    index_tts2_model_dir: String,
+    /// index-tts 源码目录。
+    #[serde(default)]
+    index_tts2_repo_dir: String,
+    /// AI 语音播放音量（0–200，100 = 原音量）；作用于朗读与实时通话下行。
+    #[serde(default = "default_voice_volume")]
+    voice_volume: u32,
+    /// 是否在聊天 UI 显示语音调试信息（后端 / 合成进度）。
+    #[serde(default = "default_true")]
+    show_chat_debug: bool,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-chat / deepseek-reasoner）。
     #[serde(default)]
     text_model: String,
@@ -142,6 +174,24 @@ struct Settings {
 fn default_temperature() -> f64 {
     0.8
 }
+
+fn default_realtime_backend() -> String {
+    "volc".into()
+}
+
+fn default_voice_volume() -> u32 {
+    100
+}
+
+/// 本地语音服务端口（scripts/local-realtime/）：WS 通话 + HTTP 朗读（port+100）。
+const LOCAL_REALTIME_PORT: u16 = 9876; // Qwen3-TTS
+const COSYVOICE_REALTIME_PORT: u16 = 9877; // CosyVoice 通义 API
+const COSYVOICE3_REALTIME_PORT: u16 = 9878; // Fun-CosyVoice3 本地开源
+const INDEXTTS2_REALTIME_PORT: u16 = 9879; // IndexTTS-2 本地开源
+const LOCAL_TTS_HTTP_PORT: u16 = LOCAL_REALTIME_PORT + 100;
+const COSYVOICE_TTS_HTTP_PORT: u16 = COSYVOICE_REALTIME_PORT + 100;
+const COSYVOICE3_TTS_HTTP_PORT: u16 = COSYVOICE3_REALTIME_PORT + 100;
+const INDEXTTS2_TTS_HTTP_PORT: u16 = INDEXTTS2_REALTIME_PORT + 100;
 fn default_true() -> bool {
     true
 }
@@ -177,6 +227,15 @@ impl Settings {
             realtime_app_id: String::new(),
             realtime_access_key: String::new(),
             realtime_voice: String::new(),
+            realtime_backend: default_realtime_backend(),
+            cosyvoice_voice: String::new(),
+            cosyvoice_model: String::new(),
+            cosyvoice3_model_dir: String::new(),
+            cosyvoice3_repo_dir: String::new(),
+            index_tts2_model_dir: String::new(),
+            index_tts2_repo_dir: String::new(),
+            voice_volume: default_voice_volume(),
+            show_chat_debug: true,
             text_model: String::new(),
             thinking: false,
             temperature: default_temperature(),
@@ -204,6 +263,8 @@ struct AppState {
     api_port: u16,
     /// 本地实时语音 WS 桥接监听端口（0 表示未启动）。
     realtime_port: u16,
+    /// 正在走「先刷长期记忆再退出」流程，避免托盘连点重复触发。
+    quitting: AtomicBool,
 }
 
 /// 供本地 HTTP 代理按需读取的 AI 配置快照。
@@ -212,21 +273,43 @@ pub(crate) struct AiConfig {
     pub qwen_vl_key: String,
     pub text_model: String,
     pub thinking_default: bool,
-    /// 火山 TTS Key（/api/tts 用）。
+    /// 语音后端：`volc` / `local` / `cosyvoice` / `cosyvoice3` / `indextts2`。
+    pub voice_backend: String,
+    /// 火山 TTS Key（仅 volc）。
     pub volc_tts_key: String,
-    /// 默认朗读音色（前端未显式指定 voice 时的兜底）。
+    /// 火山复刻音色（朗读与通话共用，S_ 开头）。
     pub tts_voice: String,
 }
 
 pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
     let s = app.state::<AppState>().settings.lock().unwrap().clone();
+    let backend = s.realtime_backend.trim().to_ascii_lowercase();
+    let voice_backend = match backend.as_str() {
+        "local" => "local".into(),
+        "cosyvoice" | "cosy" => "cosyvoice".into(),
+        "cosyvoice3" | "cosyvoice3-local" | "cv3" => "cosyvoice3".into(),
+        "indextts2" | "index-tts2" | "itts2" => "indextts2".into(),
+        _ => "volc".into(),
+    };
     AiConfig {
         deepseek_key: s.deepseek_key,
         qwen_vl_key: s.qwen_vl_key,
         text_model: s.text_model,
         thinking_default: s.thinking,
+        voice_backend,
         volc_tts_key: s.volc_tts_key,
         tts_voice: s.tts_voice,
+    }
+}
+
+/// 本地语音后端的朗读 HTTP 端口（WS 端口 + 100）。
+pub(crate) fn local_tts_http_port(backend: &str) -> Option<u16> {
+    match backend.trim().to_ascii_lowercase().as_str() {
+        "local" => Some(LOCAL_TTS_HTTP_PORT),
+        "cosyvoice" | "cosy" => Some(COSYVOICE_TTS_HTTP_PORT),
+        "cosyvoice3" | "cosyvoice3-local" | "cv3" => Some(COSYVOICE3_TTS_HTTP_PORT),
+        "indextts2" | "index-tts2" | "itts2" => Some(INDEXTTS2_TTS_HTTP_PORT),
+        _ => None,
     }
 }
 
@@ -240,7 +323,17 @@ fn settings_path(app: &AppHandle) -> Option<PathBuf> {
 fn load_settings(app: &AppHandle) -> Settings {
     if let Some(p) = settings_path(app) {
         if let Ok(raw) = fs::read_to_string(&p) {
-            if let Ok(s) = serde_json::from_str::<Settings>(&raw) {
+            if let Ok(mut s) = serde_json::from_str::<Settings>(&raw) {
+                // 旧版通话音色合并进朗读音色。
+                if s.tts_voice.trim().is_empty() && !s.realtime_voice.trim().is_empty() {
+                    s.tts_voice = s.realtime_voice.trim().to_string();
+                }
+                s.realtime_voice.clear();
+                // macOS：GPU 本地后端回退到 Qwen3。
+                #[cfg(target_os = "macos")]
+                if matches!(s.realtime_backend.as_str(), "cosyvoice3" | "indextts2") {
+                    s.realtime_backend = "local".into();
+                }
                 return s;
             }
         }
@@ -394,7 +487,8 @@ fn apply_hidden_to_window(app: &AppHandle, hidden: bool) {
     }
 }
 
-/// 根据用户选择的显示器标识解析出目标 Monitor；未选择或选择的显示器已不存在时，回退到当前所在屏幕。
+/// 根据用户选择的显示器标识解析出目标 Monitor。
+/// 未选择或选择的显示器已不存在时，依次回退：窗口当前屏 → 主屏 → 任一可用屏。
 fn resolve_monitor(win: &tauri::WebviewWindow, monitor_id: &Option<String>) -> Option<Monitor> {
     if let Some(id) = monitor_id {
         if let Ok(monitors) = win.available_monitors() {
@@ -406,16 +500,46 @@ fn resolve_monitor(win: &tauri::WebviewWindow, monitor_id: &Option<String>) -> O
             }
         }
     }
-    win.current_monitor().ok().flatten()
+    win.current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| win.primary_monitor().ok().flatten())
+        .or_else(|| {
+            win.available_monitors()
+                .ok()
+                .and_then(|ms| ms.into_iter().next())
+        })
+}
+
+/// 把 Monitor::work_area（标注为物理像素）还原成逻辑坐标。
+///
+/// 必须用 **monitor.scale_factor()**（生成 work_area 时的同一个因子），不能用
+/// window.scale_factor()。在部分 macOS Retina 上 monitor.scale_factor() 会误报为 1.0，
+/// 此时 work_area 数值其实已是逻辑点；若再按窗口真实 sf=2 去除，舞台会被缩成半屏，
+/// 桌宠看起来就像只在左上角活动。
+fn work_area_logical(monitor: &Monitor) -> (f64, f64, f64, f64) {
+    let wa = monitor.work_area();
+    let sf = monitor.scale_factor().max(0.1);
+    (
+        wa.position.x as f64 / sf,
+        wa.position.y as f64 / sf,
+        wa.size.width as f64 / sf,
+        wa.size.height as f64 / sf,
+    )
 }
 
 /// 将主窗口铺满目标显示器的工作区（排除任务栏）。
+/// 桌宠活动范围 = 该窗口客户区。
 fn apply_monitor_to_window(app: &AppHandle, monitor_id: &Option<String>) {
     if let Some(win) = app.get_webview_window("main") {
         if let Some(monitor) = resolve_monitor(&win, monitor_id) {
-            let wa = monitor.work_area();
-            let _ = win.set_position(PhysicalPosition::new(wa.position.x, wa.position.y));
-            let _ = win.set_size(PhysicalSize::new(wa.size.width, wa.size.height));
+            let (lx, ly, lw, lh) = work_area_logical(&monitor);
+            // 避免 min/max 约束把尺寸锁在初始 800×600。
+            let _ = win.set_min_size(None::<tauri::LogicalSize<f64>>);
+            let _ = win.set_max_size(None::<tauri::LogicalSize<f64>>);
+            let _ = win.set_position(tauri::LogicalPosition::new(lx, ly));
+            let _ = win.set_size(tauri::LogicalSize::new(lw, lh));
+            let _ = app.emit("stage-resized", ());
         }
     }
 }
@@ -425,15 +549,14 @@ fn position_chat_window(app: &AppHandle) {
     let s = app.state::<AppState>().settings.lock().unwrap().clone();
     if let Some(win) = app.get_webview_window("chat") {
         if let Some(monitor) = resolve_monitor(&win, &s.monitor_id) {
-            let wa = monitor.work_area();
-            let sf = monitor.scale_factor();
-            let w = (s.chat_width as f64 * sf).round() as u32;
-            let h = (s.chat_height as f64 * sf).round() as u32;
-            let offset = (s.chat_bottom_offset as f64 * sf).round() as i32;
-            let x = wa.position.x + ((wa.size.width as i32 - w as i32) / 2);
-            let y = wa.position.y + wa.size.height as i32 - h as i32 - offset;
-            let _ = win.set_size(PhysicalSize::new(w, h));
-            let _ = win.set_position(PhysicalPosition::new(x, y));
+            let (lx, ly, lw, lh) = work_area_logical(&monitor);
+            let w = s.chat_width as f64;
+            let h = s.chat_height as f64;
+            let offset = s.chat_bottom_offset as f64;
+            let x = lx + (lw - w) / 2.0;
+            let y = ly + lh - h - offset;
+            let _ = win.set_size(tauri::LogicalSize::new(w, h));
+            let _ = win.set_position(tauri::LogicalPosition::new(x, y));
         }
     }
 }
@@ -484,9 +607,31 @@ fn commit_settings<F: FnOnce(&mut Settings)>(app: &AppHandle, f: F) {
     rebuild_tray(app);
 }
 
+/// 托盘「退出」：先通知 chat 窗口把未落盘的对话总结进长期记忆，再退出。
+/// chat 完成后会 invoke `memory_flushed`；超时兜底，避免总结卡住导致退不出。
+fn request_quit_with_memory_flush(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.quitting.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.emit("flush-memory-before-quit", ());
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(12));
+        app2.exit(0);
+    });
+}
+
+#[tauri::command]
+fn memory_flushed(app: AppHandle) {
+    if app.state::<AppState>().quitting.load(Ordering::SeqCst) {
+        app.exit(0);
+    }
+}
+
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
-        "quit" => app.exit(0),
+        "quit" => request_quit_with_memory_flush(app),
         "toggle_hidden" => commit_settings(app, |s| s.hidden = !s.hidden),
         "toggle_chat" => toggle_chat(app),
         "open_settings" => open_settings_window(app),
@@ -561,13 +706,28 @@ fn get_api_base(state: tauri::State<AppState>) -> String {
     format!("http://127.0.0.1:{}", state.api_port)
 }
 
-/// 返回本地实时语音 WS 桥接的基址（ws://），前端实时通话据此连接；端口为 0 时返回空串。
+/// 返回实时语音 WS 基址（ws://）。
+/// `local` / `cosyvoice` 直连本机 Python 服务；否则走火山桥接端口。
 #[tauri::command]
 fn get_realtime_base(state: tauri::State<AppState>) -> String {
-    if state.realtime_port == 0 {
-        String::new()
-    } else {
-        format!("ws://127.0.0.1:{}", state.realtime_port)
+    let backend = state
+        .settings
+        .lock()
+        .unwrap()
+        .realtime_backend
+        .trim()
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "local" => format!("ws://127.0.0.1:{LOCAL_REALTIME_PORT}"),
+        "cosyvoice" | "cosy" => format!("ws://127.0.0.1:{COSYVOICE_REALTIME_PORT}"),
+        "cosyvoice3" | "cosyvoice3-local" | "cv3" => {
+            format!("ws://127.0.0.1:{COSYVOICE3_REALTIME_PORT}")
+        }
+        "indextts2" | "index-tts2" | "itts2" => {
+            format!("ws://127.0.0.1:{INDEXTTS2_REALTIME_PORT}")
+        }
+        _ if state.realtime_port == 0 => String::new(),
+        _ => format!("ws://127.0.0.1:{}", state.realtime_port),
     }
 }
 
@@ -606,6 +766,24 @@ struct AiSettingsInput {
     realtime_access_key: String,
     #[serde(default)]
     realtime_voice: String,
+    #[serde(default = "default_realtime_backend")]
+    realtime_backend: String,
+    #[serde(default)]
+    cosyvoice_voice: String,
+    #[serde(default)]
+    cosyvoice_model: String,
+    #[serde(default)]
+    cosyvoice3_model_dir: String,
+    #[serde(default)]
+    cosyvoice3_repo_dir: String,
+    #[serde(default)]
+    index_tts2_model_dir: String,
+    #[serde(default)]
+    index_tts2_repo_dir: String,
+    #[serde(default = "default_voice_volume")]
+    voice_volume: u32,
+    #[serde(default = "default_true")]
+    show_chat_debug: bool,
     text_model: String,
     thinking: bool,
     temperature: f64,
@@ -634,6 +812,12 @@ struct AiSettingsInput {
     chat_bottom_offset: u32,
 }
 
+/// 前端用于按平台显示语音后端选项（macos / windows / linux）。
+#[tauri::command]
+fn get_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
 /// 保存 AI / 聊天设置：持久化 + 通知聊天窗口热更新 + 重注册快捷键 + 重定位聊天窗口。
 #[tauri::command]
 fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
@@ -642,10 +826,36 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.qwen_vl_key = settings.qwen_vl_key.trim().to_string();
         s.volc_tts_key = settings.volc_tts_key.trim().to_string();
         s.auto_speak = settings.auto_speak;
-        s.tts_voice = settings.tts_voice.trim().to_string();
+        // 朗读与通话共用音色；兼容旧配置里单独的 realtimeVoice。
+        let mut voice = settings.tts_voice.trim().to_string();
+        if voice.is_empty() {
+            voice = settings.realtime_voice.trim().to_string();
+        }
+        s.tts_voice = voice;
+        s.realtime_voice = String::new();
         s.realtime_app_id = settings.realtime_app_id.trim().to_string();
         s.realtime_access_key = settings.realtime_access_key.trim().to_string();
-        s.realtime_voice = settings.realtime_voice.trim().to_string();
+        let backend = settings.realtime_backend.trim().to_ascii_lowercase();
+        s.realtime_backend = match backend.as_str() {
+            "local" => "local".into(),
+            "cosyvoice" | "cosy" => "cosyvoice".into(),
+            "cosyvoice3" | "cosyvoice3-local" | "cv3" => "cosyvoice3".into(),
+            "indextts2" | "index-tts2" | "itts2" => "indextts2".into(),
+            _ => "volc".into(),
+        };
+        // macOS：不允许保存 GPU 本地后端，回退到 Qwen3。
+        #[cfg(target_os = "macos")]
+        if matches!(s.realtime_backend.as_str(), "cosyvoice3" | "indextts2") {
+            s.realtime_backend = "local".into();
+        }
+        s.cosyvoice_voice = settings.cosyvoice_voice.trim().to_string();
+        s.cosyvoice_model = settings.cosyvoice_model.trim().to_string();
+        s.cosyvoice3_model_dir = settings.cosyvoice3_model_dir.trim().to_string();
+        s.cosyvoice3_repo_dir = settings.cosyvoice3_repo_dir.trim().to_string();
+        s.index_tts2_model_dir = settings.index_tts2_model_dir.trim().to_string();
+        s.index_tts2_repo_dir = settings.index_tts2_repo_dir.trim().to_string();
+        s.voice_volume = settings.voice_volume.min(200);
+        s.show_chat_debug = settings.show_chat_debug;
         s.text_model = settings.text_model.trim().to_string();
         s.thinking = settings.thinking;
         s.temperature = settings.temperature;
@@ -667,6 +877,15 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
     });
     re_register_hotkey(&app);
     position_chat_window(&app);
+    // 按所选语音后端自动拉起 / 切换本地 Python 服务。
+    let backend = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .realtime_backend
+        .clone();
+    voice_service::ensure(&app, &backend);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -706,30 +925,52 @@ pub fn run() {
             // 先启动本地 AI 代理，拿到端口后随设置一起纳入全局状态。
             let api_port = api::start(handle.clone()).unwrap_or(0);
             // 启动本地实时语音 WS 桥接：只提供密钥/音色，人设 system_role 由前端 start 消息带入。
+            // 非火山后端时直接 Err，拒绝建连，确保不会消耗火山 token。
             let realtime_provider: realtime::ConfigProvider = std::sync::Arc::new(|app: &AppHandle| {
                 let s = app.state::<AppState>().settings.lock().unwrap().clone();
-                let speaker = if s.realtime_voice.trim().is_empty() {
-                    s.tts_voice.trim().to_string()
-                } else {
-                    s.realtime_voice.trim().to_string()
-                };
-                Some(realtime::RealtimeConfig {
-                    app_id: s.realtime_app_id.trim().to_string(),
-                    access_key: s.realtime_access_key.trim().to_string(),
+                let backend = s.realtime_backend.trim().to_ascii_lowercase();
+                if backend != "volc" {
+                    return Err(
+                        "当前语音后端为本地服务，不会连接火山（无 token 消耗）".into(),
+                    );
+                }
+                // 朗读与通话共用 tts_voice。
+                let speaker = s.tts_voice.trim().to_string();
+                let app_id = s.realtime_app_id.trim().to_string();
+                let access_key = s.realtime_access_key.trim().to_string();
+                if app_id.is_empty() || access_key.is_empty() || !speaker.starts_with("S_") {
+                    return Err(
+                        "未配置火山语音（需 App ID、Access Key 与 S_ 开头的复刻音色）".into(),
+                    );
+                }
+                Ok(realtime::RealtimeConfig {
+                    app_id,
+                    access_key,
                     speaker,
                 })
             });
             let realtime_port = realtime::start(handle.clone(), realtime_provider).unwrap_or(0);
+            app.manage(voice_service::VoiceServiceManager::new());
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
                 realtime_port,
+                quitting: AtomicBool::new(false),
             });
+            // 启动时按已保存的语音后端自动拉起本地服务。
+            voice_service::ensure(&handle, &settings.realtime_backend);
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
                 win.show()?;
                 apply_monitor_to_window(&handle, &settings.monitor_id);
+                // 尺寸异步落地后再次通知前端刷新边界（与 apply_monitor 内的即时 emit 互补）。
+                let resized_handle = handle.clone();
+                win.on_window_event(move |event| {
+                    if let WindowEvent::Resized(_) = event {
+                        let _ = resized_handle.emit("stage-resized", ());
+                    }
+                });
                 win.set_always_on_top(true)?;
                 win.set_ignore_cursor_events(true)?;
                 if settings.hidden {
@@ -775,8 +1016,15 @@ pub fn run() {
             toggle_chat_window,
             hide_chat,
             open_settings,
-            set_ai_settings
+            set_ai_settings,
+            get_platform,
+            memory_flushed
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                voice_service::stop(app);
+            }
+        });
 }

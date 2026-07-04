@@ -12,12 +12,75 @@
  *     对「朗读」场景体验更稳。 */
 
 import { getStoredVlApiKey, getStoredVolcKey } from "./persona.js";
+import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
 
 // ── 播放状态 ──
 let currentToken = null; // 标记当前正在播放/请求的来源，用于 toggle 判断
 let playing = false;     // 是否有音频正在播放
 let playGen = 0;         // 播放代号：每次停止/重放自增，让旧回调失效
 let speechBlobSettle = null; // 当前 playSpeechBlob 的 done 解析器：被外部 stopSpeak 打断时用它收尾，避免队列卡死
+
+// ── 合成进度（供 debug 进度条）──
+// phase: idle | synth | done | error
+const ttsProgressListeners = new Set();
+let ttsProgressTick = 0;
+let ttsProgressSeq = 0;
+
+/** @param {(ev: { phase: string, chars?: number, elapsedMs?: number, cached?: boolean, bytes?: number, billedChars?: number, provider?: string, error?: string }) => void} fn */
+export function onTtsProgress(fn) {
+  if (typeof fn !== "function") return () => {};
+  ttsProgressListeners.add(fn);
+  return () => ttsProgressListeners.delete(fn);
+}
+
+function emitTtsProgress(ev) {
+  for (const fn of ttsProgressListeners) {
+    try {
+      fn(ev);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function beginSynthProgress(chars) {
+  const seq = ++ttsProgressSeq;
+  const t0 = performance.now();
+  if (ttsProgressTick) clearInterval(ttsProgressTick);
+  emitTtsProgress({ phase: "synth", chars, elapsedMs: 0, cached: false });
+  ttsProgressTick = setInterval(() => {
+    if (seq !== ttsProgressSeq) return;
+    emitTtsProgress({
+      phase: "synth",
+      chars,
+      elapsedMs: performance.now() - t0,
+      cached: false,
+    });
+  }, 50);
+  return {
+    seq,
+    t0,
+    end(extra = {}) {
+      if (seq !== ttsProgressSeq) return;
+      if (ttsProgressTick) {
+        clearInterval(ttsProgressTick);
+        ttsProgressTick = 0;
+      }
+      emitTtsProgress({
+        phase: extra.phase || "done",
+        chars,
+        elapsedMs: performance.now() - t0,
+        ...extra,
+      });
+    },
+  };
+}
+
+// ── 播放音量（Web Audio GainNode，支持 >100%）──
+let outCtx = null;
+let outGain = null;
+let outSource = null;
+let volUnsub = null;
 
 /** 解析（结束）当前 playSpeechBlob 的等待 Promise，并清空引用。 */
 function resolveSpeechBlob() {
@@ -41,6 +104,38 @@ function getSharedAudio() {
     sharedAudio.setAttribute("playsinline", ""); // iOS 必须，避免尝试全屏/被拦
   }
   return sharedAudio;
+}
+
+/** 把共享 <audio> 接到 GainNode，使设置里的音量（含 >100%）生效。 */
+function ensurePlaybackGain() {
+  const audio = getSharedAudio();
+  const g = getVoiceGain();
+  if (outGain) {
+    outGain.gain.value = g;
+    if (outCtx?.state === "suspended") outCtx.resume().catch(() => {});
+    return;
+  }
+  try {
+    outCtx = new (window.AudioContext || window.webkitAudioContext)();
+    outSource = outCtx.createMediaElementSource(audio);
+    outGain = outCtx.createGain();
+    outGain.gain.value = g;
+    outSource.connect(outGain);
+    outGain.connect(outCtx.destination);
+    audio.volume = 1;
+    volUnsub = onVoiceGainChange((next) => {
+      if (outGain) outGain.gain.value = next;
+    });
+    if (outCtx.state === "suspended") outCtx.resume().catch(() => {});
+  } catch {
+    // 回退：HTMLMediaElement.volume 只能 0–1，无法放大。
+    audio.volume = Math.min(1, g);
+    if (!volUnsub) {
+      volUnsub = onVoiceGainChange((next) => {
+        if (!outGain && sharedAudio) sharedAudio.volume = Math.min(1, next);
+      });
+    }
+  }
 }
 
 /** 生成一段极短静音 WAV 的 object URL，仅用于在用户手势内「加持」共享元素。 */
@@ -78,6 +173,7 @@ export function unlockAudio() {
   // 已经在放真实音频时不要抢占元素；等下次手势再加持（极少发生）。
   if (playing) return;
   try {
+    ensurePlaybackGain();
     if (!silentUrl) silentUrl = silentWavUrl();
     a.src = silentUrl; // 静音 WAV，无需 mute，播放也听不见
     const p = a.play();
@@ -144,6 +240,14 @@ export function stopSpeak() {
   playGen++; // 使上一段播放挂的回调失效
   playing = false;
   currentToken = null;
+  // 打断进行中的合成计时（下一次 synth 会开新 seq）。
+  const wasSynth = !!ttsProgressTick;
+  ttsProgressSeq++;
+  if (ttsProgressTick) {
+    clearInterval(ttsProgressTick);
+    ttsProgressTick = 0;
+  }
+  if (wasSynth) emitTtsProgress({ phase: "idle" });
   resolveSpeechBlob(); // 让等待该次播放结束的队列任务收尾，避免被外部打断后卡住
 }
 
@@ -153,12 +257,16 @@ export function isSpeaking(token) {
   return token == null ? true : currentToken === token;
 }
 
+/** 朗读文本上限（码点）。过长合成慢且易糊，与本地服务 HTTP_TTS_MAX_CHARS 对齐。 */
+const MAX_SPEECH_CHARS = 160;
+
 /** 把回复文本整理成更适合朗读的纯文本：
  *  - 去掉括号内的动作/神态/语气描述（中文（）、英文()、【】、*星号*），避免被逐字念出；
  *    保留正常文字与标点，让模型自行按语境推断语气。
  *  - 关键：按行保留「句末语调」。换行不再一律压成逗号，而是行尾若没有句末标点就补「。」，
  *    让模型在句子之间有真正的停顿与语调收束——否则整段被读成「逗号流水句」，
- *    听起来平、语速均匀、机械。省略号「……」、波浪号「~」保留，自带迟疑/延音的起伏。 */
+ *    听起来平、语速均匀、机械。省略号「……」、波浪号「~」保留，自带迟疑/延音的起伏。
+ *  - 超长截断到句末，避免单次合成拖到几十秒且后半段失真。 */
 export function textForSpeech(text) {
   const stripped = (text || "")
     .replace(/（[^（）]*）/g, "") // 中文括号
@@ -180,11 +288,24 @@ export function textForSpeech(text) {
     )
     .join("");
 
-  return joined
+  let out = joined
     .replace(/[ \t]+/g, " ")
     .replace(/([，,。.！!？?、；;：:])\1+/g, "$1") // 合并删括号后产生的重复标点（不动「……」）
     .replace(/^[，,、。.！!？?；;\s]+/, "")          // 去掉开头多余标点
     .trim();
+
+  const chars = [...out];
+  if (chars.length > MAX_SPEECH_CHARS) {
+    let cut = chars.slice(0, MAX_SPEECH_CHARS).join("");
+    const seps = ["。", "！", "？", "；", "，", ",", " "];
+    let best = -1;
+    for (const sep of seps) {
+      const i = cut.lastIndexOf(sep);
+      if (i >= Math.floor(MAX_SPEECH_CHARS / 3) && i > best) best = i;
+    }
+    out = best >= 0 ? cut.slice(0, best + 1) : `${cut}…`;
+  }
+  return out;
 }
 
 /** 朗读情绪 → CosyVoice 的 rate(语速) / pitch(音调) / volume(音量) 预设。
@@ -243,6 +364,7 @@ const EMOTION_INSTRUCTIONS = {
 async function playAudio(blob, myGen, { onStart, onEnd, onError }) {
   const url = URL.createObjectURL(blob);
   const audio = getSharedAudio();
+  ensurePlaybackGain();
   currentUrl = url;
   audio.src = url;
 
@@ -270,42 +392,74 @@ async function playAudio(blob, myGen, { onStart, onEnd, onError }) {
 /** 真正向上游请求合成（带会话缓存）：同一「音色|model|参数|指令|情绪|文本」只请求一次。 */
 async function synthOnce(clean, voice, model, params, instruction, emotion) {
   const key = cacheKey(clean, voice, model, params, instruction, emotion);
+  const chars = [...clean].length;
   const cached = audioCache.get(key);
-  if (cached) return cached;
-
-  // 未命中缓存才真正请求上游合成（会消耗额度）。
-  // 自带 key 时随请求带上：CosyVoice 用通义千问/DashScope key（x-vl-api-key），
-  // 火山(豆包)音色用火山 TTS key（x-volc-tts-api-key）；服务器配了 env 则可留空。
-  const vlKey = getStoredVlApiKey();
-  const volcKey = getStoredVolcKey();
-  const resp = await fetch("/api/tts", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(vlKey ? { "x-vl-api-key": vlKey } : {}),
-      ...(volcKey ? { "x-volc-tts-api-key": volcKey } : {}),
-    },
-    body: JSON.stringify({
-      text: clean,
-      params,
-      emotion, // 火山分支据此选 audio.emotion；CosyVoice 分支忽略（它走 instruction）
-      ...(instruction ? { instruction } : {}),
-      ...(voice ? { voice } : {}),
-      ...(model ? { model } : {}),
-    }),
-  });
-  if (!resp.ok) {
-    let msg = `TTS 请求失败 ${resp.status}`;
-    try {
-      const j = await resp.json();
-      // detail 里是上游（火山/CosyVoice）真正的错误码与原因，带出来便于定位。
-      msg = j.error ? (j.detail ? `${j.error}：${j.detail}` : j.error) : msg;
-    } catch { /* ignore */ }
-    throw new Error(msg);
+  if (cached) {
+    emitTtsProgress({
+      phase: "done",
+      chars,
+      elapsedMs: 0,
+      cached: true,
+      bytes: cached.size || 0,
+      // 缓存命中不重复计费。
+      billedChars: 0,
+    });
+    return cached;
   }
-  const blob = await resp.blob();
-  putCache(audioCache, key, blob);
-  return blob;
+
+  const prog = beginSynthProgress(chars);
+  try {
+    // 未命中缓存才真正请求上游合成（会消耗额度）。
+    // 自带 key 时随请求带上：CosyVoice 用通义千问/DashScope key（x-vl-api-key），
+    // 火山(豆包)音色用火山 TTS key（x-volc-tts-api-key）；服务器配了 env 则可留空。
+    const vlKey = getStoredVlApiKey();
+    const volcKey = getStoredVolcKey();
+    const resp = await fetch("/api/tts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(vlKey ? { "x-vl-api-key": vlKey } : {}),
+        ...(volcKey ? { "x-volc-tts-api-key": volcKey } : {}),
+      },
+      body: JSON.stringify({
+        text: clean,
+        params,
+        emotion, // 火山分支据此选 audio.emotion；CosyVoice 分支忽略（它走 instruction）
+        ...(instruction ? { instruction } : {}),
+        ...(voice ? { voice } : {}),
+        ...(model ? { model } : {}),
+      }),
+    });
+    if (!resp.ok) {
+      let msg = `TTS 请求失败 ${resp.status}`;
+      try {
+        const j = await resp.json();
+        // detail 里是上游（火山/CosyVoice）真正的错误码与原因，带出来便于定位。
+        msg = j.error ? (j.detail ? `${j.error}：${j.detail}` : j.error) : msg;
+      } catch { /* ignore */ }
+      throw new Error(msg);
+    }
+    // CosyVoice / 火山：代理透传计费字符（按字，非 LLM token）。
+    const billedChars = Number(resp.headers.get("X-Tts-Usage-Characters")) || 0;
+    const provider = (resp.headers.get("X-Tts-Usage-Provider") || "").trim();
+    const blob = await resp.blob();
+    putCache(audioCache, key, blob);
+    prog.end({
+      phase: "done",
+      cached: false,
+      bytes: blob.size || 0,
+      billedChars,
+      provider,
+    });
+    return blob;
+  } catch (e) {
+    prog.end({
+      phase: "error",
+      cached: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    throw e;
+  }
 }
 
 /** 推导一段文本的合成参数（情绪 → instruction / params）。 */
@@ -335,6 +489,7 @@ export function playSpeechBlob(blob, { onStart, onError } = {}) {
   const myGen = playGen;
   const url = URL.createObjectURL(blob);
   const audio = getSharedAudio();
+  ensurePlaybackGain();
   currentUrl = url;
   audio.src = url;
 

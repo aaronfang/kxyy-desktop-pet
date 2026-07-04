@@ -263,6 +263,11 @@ export function clearMemory(nickname) {
   localStorage.setItem(MEMORY_KEY, JSON.stringify(all));
 }
 
+/** 清空全部观众的长期记忆（本机 localStorage）。 */
+export function clearAllMemory() {
+  localStorage.removeItem(MEMORY_KEY);
+}
+
 export function loadAllMemory() {
   try {
     return JSON.parse(localStorage.getItem(MEMORY_KEY) || "{}");

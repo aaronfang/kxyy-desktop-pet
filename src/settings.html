@@ -12,55 +12,129 @@
     <section>
       <h2>AI 服务 Key</h2>
       <label>
-        <span>DeepSeek API Key<small>文字聊天必填</small></span>
+        <span>DeepSeek API Key<small>文字聊天必填；本地语音对话也用</small></span>
         <div class="pw-field">
           <input id="deepseekKey" type="password" placeholder="sk-..." />
           <button type="button" class="pw-toggle" data-target="deepseekKey" aria-label="显示 / 隐藏">👁</button>
         </div>
       </label>
       <label>
-        <span>通义千问 VL Key<small>看图（选填，阶段 2）</small></span>
+        <span>通义千问 / DashScope Key<small>看图；CosyVoice 也用</small></span>
         <div class="pw-field">
           <input id="qwenVlKey" type="password" placeholder="sk-..." />
           <button type="button" class="pw-toggle" data-target="qwenVlKey" aria-label="显示 / 隐藏">👁</button>
         </div>
       </label>
-      <label>
-        <span>火山 TTS Key<small>朗读（选填，阶段 2）</small></span>
-        <div class="pw-field">
-          <input id="volcTtsKey" type="password" placeholder="选填" />
-          <button type="button" class="pw-toggle" data-target="volcTtsKey" aria-label="显示 / 隐藏">👁</button>
-        </div>
-      </label>
-      <label>
-        <span>朗读音色 voice_id<small>火山复刻音色，S_ 开头</small></span>
-        <input id="ttsVoice" type="text" placeholder="S_..." />
-      </label>
-      <label class="row-inline">
-        <input id="autoSpeak" type="checkbox" />
-        <span>自动朗读元元的回复（需填火山 Key 与音色）</span>
-      </label>
       <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商，不经任何第三方。</p>
     </section>
 
     <section>
-      <h2>实时语音通话</h2>
+      <h2>语音服务</h2>
       <label>
-        <span>实时语音 App ID<small>火山「语音技术」应用 ID</small></span>
-        <input id="realtimeAppId" type="text" placeholder="选填，填了才能实时通话" />
+        <span>语音后端<small>文字朗读与实时通话共用</small></span>
+        <select id="realtimeBackend">
+          <option value="volc">火山引擎 API</option>
+          <option value="local">本地 Qwen3-TTS</option>
+          <option value="cosyvoice">CosyVoice（通义云）</option>
+          <option value="indextts2" data-gpu-local="1">IndexTTS-2 本地开源</option>
+          <option value="cosyvoice3" data-gpu-local="1">CosyVoice3 本地开源</option>
+        </select>
+      </label>
+      <p id="voicePlatformHint" class="hint" hidden>当前为 macOS：本地模型仅提供 Qwen3-TTS。IndexTTS-2 / CosyVoice3 请在 Windows + NVIDIA 安装包中配置。</p>
+
+      <div id="voiceFieldsVolc" class="voice-backend-fields" hidden>
+        <label>
+          <span>火山 TTS Key<small>朗读用</small></span>
+          <div class="pw-field">
+            <input id="volcTtsKey" type="password" placeholder="x-api-key" />
+            <button type="button" class="pw-toggle" data-target="volcTtsKey" aria-label="显示 / 隐藏">👁</button>
+          </div>
+        </label>
+        <label>
+          <span>实时语音 App ID<small>通话用</small></span>
+          <input id="realtimeAppId" type="text" placeholder="火山语音技术应用 ID" />
+        </label>
+        <label>
+          <span>实时语音 Access Key<small>通话用</small></span>
+          <div class="pw-field">
+            <input id="realtimeAccessKey" type="password" placeholder="Access Token" />
+            <button type="button" class="pw-toggle" data-target="realtimeAccessKey" aria-label="显示 / 隐藏">👁</button>
+          </div>
+        </label>
+        <label>
+          <span>音色 voice_id<small>朗读与通话共用，S_ 开头</small></span>
+          <input id="ttsVoice" type="text" placeholder="S_..." />
+        </label>
+        <p class="hint">朗读走火山 TTS，通话走火山端到端实时语音；音色共用上方 voice_id。</p>
+      </div>
+
+      <div id="voiceFieldsLocal" class="voice-backend-fields" hidden>
+        <p class="hint">
+          macOS：保存后<strong>自动配置</strong> Qwen3-TTS（创建 venv、安装依赖、下载模型到
+          <code>~/Library/Application Support/…/voice-runtime</code>，首次需网络、可能数分钟），然后启动服务（:9876 / :9976）。
+          开发模式也可使用已有的 <code>scripts/voice-ab/.venv</code>。不消耗火山 token。
+        </p>
+      </div>
+
+      <div id="voiceFieldsCosyvoice" class="voice-backend-fields" hidden>
+        <label>
+          <span>CosyVoice 音色 id<small>cosyvoice- 开头</small></span>
+          <input id="cosyvoiceVoice" type="text" placeholder="cosyvoice-v3.5-flash-…" />
+        </label>
+        <label>
+          <span>CosyVoice 模型<small>需支持 instruction，默认 v3.5-flash</small></span>
+          <input id="cosyvoiceModel" type="text" placeholder="cosyvoice-v3.5-flash" />
+        </label>
+        <p class="hint">保存后自动启动 <code>server_cosyvoice.py</code>（通话 :9877，朗读 :9977）。本机 Whisper + DeepSeek，TTS 走通义云端（上方通义 Key），不消耗火山 token。</p>
+      </div>
+
+      <div id="voiceFieldsIndexTts2" class="voice-backend-fields" hidden>
+        <label>
+          <span>权重目录<small>含 config.yaml，可留空用默认</small></span>
+          <input id="indexTts2ModelDir" type="text" placeholder="scripts/local-realtime/pretrained_models/IndexTTS-2" />
+        </label>
+        <label>
+          <span>源码目录<small>index-tts 仓库，可留空用默认</small></span>
+          <input id="indexTts2RepoDir" type="text" placeholder="scripts/local-realtime/index-tts" />
+        </label>
+        <p class="hint">
+          Windows + NVIDIA。保存后自动启动 <code>server_indextts2.py</code>（通话 :9879，朗读 :9979）。
+          安装程序可勾选配置；也可运行 <code>scripts/windows/setup-gpu-voice.cmd</code>。
+        </p>
+      </div>
+
+      <div id="voiceFieldsCosyvoice3" class="voice-backend-fields" hidden>
+        <label>
+          <span>权重目录<small>Fun-CosyVoice3-0.5B，可留空用默认路径</small></span>
+          <input id="cosyvoice3ModelDir" type="text" placeholder="scripts/local-realtime/pretrained_models/Fun-CosyVoice3-0.5B" />
+        </label>
+        <label>
+          <span>CosyVoice 源码目录<small>FunAudioLLM/CosyVoice 仓库，可留空用默认</small></span>
+          <input id="cosyvoice3RepoDir" type="text" placeholder="scripts/local-realtime/CosyVoice" />
+        </label>
+        <p class="hint">
+          Windows + NVIDIA。保存后自动启动 <code>server_cosyvoice3_local.py</code>（通话 :9878，朗读 :9978）。
+          安装程序可勾选配置；也可运行 <code>scripts/windows/setup-gpu-voice.cmd</code>。
+        </p>
+      </div>
+
+      <label class="row-inline">
+        <input id="autoSpeak" type="checkbox" />
+        <span>自动朗读元元的回复</span>
+      </label>
+      <label class="row-inline">
+        <input id="showChatDebug" type="checkbox" />
+        <span>显示聊天界面语音调试信息（后端 / 合成进度）</span>
       </label>
       <label>
-        <span>实时语音 Access Key<small>Access Token</small></span>
-        <div class="pw-field">
-          <input id="realtimeAccessKey" type="password" placeholder="选填" />
-          <button type="button" class="pw-toggle" data-target="realtimeAccessKey" aria-label="显示 / 隐藏">👁</button>
+        <span>AI 语音播放音量<small>朗读与通话，100% 为原音量，最高 200%</small></span>
+        <div class="range-row">
+          <input id="voiceVolume" type="range" min="0" max="200" step="5" value="100" />
+          <span id="voiceVolumeVal" class="range-val">100%</span>
         </div>
       </label>
-      <label>
-        <span>通话音色 voice_id<small>留空则用上面的朗读音色</small></span>
-        <input id="realtimeVoice" type="text" placeholder="S_...（留空复用朗读音色）" />
-      </label>
-      <p class="hint">聊天气泡输入框最左侧的电话按钮开启实时语音通话；通话使用复刻音色，并复用元元的人设。首次使用需允许麦克风权限。</p>
+      <p id="voiceServiceStatus" class="hint voice-service-status">本地服务：保存设置后自动启动</p>
+      <pre id="voiceServiceLog" class="voice-service-log" hidden></pre>
     </section>
 
     <section>
@@ -90,6 +164,11 @@
         <input id="patText" type="text" placeholder="{name}拍了拍{ai}" />
       </label>
       <p class="hint">双击聊天里元元的头像即可「拍一拍」，她会主动回你一句。</p>
+      <div class="memory-actions">
+        <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
+        <span id="clearMemoryStatus" class="hint"></span>
+      </div>
+      <p class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后她不再记得过往，当前聊天气泡不会自动消失。</p>
     </section>
 
     <section>

@@ -41,10 +41,11 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { speak, stopSpeak, unlockAudio } from "./ai/tts.js";
+import { speak, stopSpeak, unlockAudio, onTtsProgress } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
+import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -67,16 +68,43 @@ function resetTtsQueue() {
   ttsQueue = Promise.resolve();
 }
 
+/** 当前语音后端是否已具备自动朗读条件。 */
+function canAutoSpeak() {
+  if (!settings.autoSpeak) return false;
+  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  if (backend === "local") return true;
+  if (
+    backend === "cosyvoice3" ||
+    backend === "cosyvoice3-local" ||
+    backend === "cv3" ||
+    backend === "indextts2" ||
+    backend === "index-tts2" ||
+    backend === "itts2"
+  ) {
+    return true;
+  }
+  if (backend === "cosyvoice" || backend === "cosy") {
+    return !!(settings.cosyvoiceVoice || "").trim();
+  }
+  return !!(settings.ttsVoice || "").trim();
+}
+
 /** 把一段回复排进朗读队列（上一条播完再播下一条）。 */
-function enqueueAutoSpeak(text, { token, voice }) {
+function enqueueAutoSpeak(text, { token, voice } = {}) {
   const gen = ttsQueueGen;
+  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  // 火山才传 voice；本地 / CosyVoice(云/开源) 由后端按设置合成。
+  const voiceOpt =
+    backend === "volc" || backend === ""
+      ? voice || (settings.ttsVoice || "").trim() || null
+      : null;
   ttsQueue = ttsQueue
     .then(async () => {
       if (gen !== ttsQueueGen) return;
       await new Promise((resolve) => {
         speak(text, {
           token,
-          voice,
+          voice: voiceOpt,
           onEnd: resolve,
           onError: resolve,
         }).then((started) => {
@@ -217,6 +245,298 @@ function createAvatar(role) {
   return av;
 }
 
+const voiceDebugEl = document.getElementById("voice-debug");
+const voiceDebugLabelEl = document.getElementById("voice-debug-label");
+const voiceDebugBarEl = document.getElementById("voice-debug-bar");
+const voiceDebugTtsMetaEl = document.getElementById("voice-debug-tts-meta");
+const apiDebugMetaEl = document.getElementById("api-debug-meta");
+const callDebugMetaEl = document.getElementById("call-debug-meta");
+
+/** 在线 API 用量 debug 态（单次 usage + DeepSeek 余额；无「剩余 token」接口）。 */
+const apiDebug = {
+  provider: "",
+  last: null, // { prompt, completion, total }
+  sessionTotal: 0,
+  balanceText: "",
+};
+/** TTS 计费字符（CosyVoice / 火山按字计费，非 LLM token）。 */
+const ttsUsageDebug = {
+  provider: "",
+  lastBilled: 0,
+  sessionBilled: 0,
+};
+/** 实时通话用量（火山端到端 token，或本地 DeepSeek+云端 TTS）。 */
+const callUsageDebug = {
+  provider: "",
+  lastLine: "",
+  sessionTokens: 0,
+  sessionTtsChars: 0,
+  estimated: false,
+};
+let balanceFetchSeq = 0;
+
+/** 当前语音后端文案（朗读与通话共用）。 */
+function voiceBackendLabel() {
+  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  if (backend === "local") return "本地 Qwen3-TTS（:9876 / :9976）";
+  if (backend === "cosyvoice" || backend === "cosy") {
+    return "CosyVoice 通义（:9877 / :9977）";
+  }
+  if (backend === "cosyvoice3" || backend === "cosyvoice3-local" || backend === "cv3") {
+    return "CosyVoice3 本地开源（:9878 / :9978）";
+  }
+  if (backend === "indextts2" || backend === "index-tts2" || backend === "itts2") {
+    return "IndexTTS-2 本地开源（:9879 / :9979）";
+  }
+  const voice = (settings.ttsVoice || "").trim();
+  return voice ? `火山引擎 API（${voice}）` : "火山引擎 API";
+}
+
+function chatDebugEnabled() {
+  return settings.showChatDebug !== false;
+}
+
+function formatTokenCount(n) {
+  const v = Math.max(0, Number(n) || 0);
+  if (v >= 10000) return `${(v / 1000).toFixed(1)}k`;
+  if (v >= 1000) return `${(v / 1000).toFixed(2).replace(/\.?0+$/, "")}k`;
+  return String(v);
+}
+
+/** 从 OpenAI 兼容响应体 / SSE chunk 提取 usage。 */
+function extractUsage(obj) {
+  const u = obj?.usage;
+  if (!u || typeof u !== "object") return null;
+  const prompt = Number(u.prompt_tokens) || 0;
+  const completion = Number(u.completion_tokens) || 0;
+  const total = Number(u.total_tokens) || prompt + completion;
+  if (!prompt && !completion && !total) return null;
+  return { prompt, completion, total };
+}
+
+function formatUsageLine(usage) {
+  if (!usage) return "";
+  return `本次 ${formatTokenCount(usage.total)}（入${formatTokenCount(usage.prompt)}/出${formatTokenCount(usage.completion)}）`;
+}
+
+function updateApiDebug() {
+  if (!apiDebugMetaEl) return;
+  if (!chatDebugEnabled()) {
+    apiDebugMetaEl.textContent = "";
+    updateCallDebug();
+    return;
+  }
+  const parts = ["API"];
+  if (apiDebug.provider) parts.push(apiDebug.provider);
+  if (apiDebug.last) {
+    parts.push(formatUsageLine(apiDebug.last));
+    if (apiDebug.sessionTotal > 0) {
+      parts.push(`会话 ${formatTokenCount(apiDebug.sessionTotal)}`);
+    }
+  }
+  if (apiDebug.balanceText) parts.push(apiDebug.balanceText);
+  // 尚无任何用量/余额时不占行。
+  if (parts.length <= 1) {
+    apiDebugMetaEl.textContent = "";
+  } else {
+    const text = parts.join(" · ");
+    apiDebugMetaEl.textContent = text;
+    apiDebugMetaEl.title = text;
+  }
+  updateCallDebug();
+}
+
+function updateCallDebug() {
+  if (!callDebugMetaEl) return;
+  if (!chatDebugEnabled() || !callUsageDebug.lastLine) {
+    callDebugMetaEl.textContent = "";
+    return;
+  }
+  const parts = ["通话"];
+  if (callUsageDebug.provider) parts.push(callUsageDebug.provider);
+  parts.push(callUsageDebug.lastLine);
+  if (callUsageDebug.sessionTokens > 0) {
+    parts.push(`会话 ${formatTokenCount(callUsageDebug.sessionTokens)} tok`);
+  }
+  if (callUsageDebug.sessionTtsChars > 0) {
+    parts.push(`TTS ${formatTokenCount(callUsageDebug.sessionTtsChars)}字`);
+  }
+  if (callUsageDebug.estimated) parts.push("约");
+  const text = parts.join(" · ");
+  callDebugMetaEl.textContent = text;
+  callDebugMetaEl.title = text;
+}
+
+/** 实时通话一轮用量（火山 token 明细，或本地 LLM + TTS 字符）。 */
+function noteCallUsage(msg) {
+  if (!msg || typeof msg !== "object") return;
+  const provider = (msg.provider || "").trim();
+  if (provider) callUsageDebug.provider = provider;
+  callUsageDebug.estimated = !!msg.estimated;
+
+  const llm = msg.llm && typeof msg.llm === "object" ? msg.llm : null;
+  const ttsChars = Number(msg.ttsCharacters) || 0;
+  const total = Number(msg.total) || 0;
+
+  if (llm) {
+    const prompt = Number(llm.prompt) || 0;
+    const completion = Number(llm.completion) || 0;
+    const llmTotal = Number(llm.total) || prompt + completion;
+    callUsageDebug.sessionTokens += llmTotal;
+    const bits = [`LLM ${formatTokenCount(llmTotal)}`];
+    if (ttsChars > 0) {
+      callUsageDebug.sessionTtsChars += ttsChars;
+      bits.push(`TTS ${formatTokenCount(ttsChars)}字`);
+    }
+    callUsageDebug.lastLine = `本轮 ${bits.join(" · ")}`;
+  } else if (total > 0 || msg.inputAudioTokens != null) {
+    const inText = Number(msg.inputTextTokens) || 0;
+    const inAudio = Number(msg.inputAudioTokens) || 0;
+    const outText = Number(msg.outputTextTokens) || 0;
+    const outAudio = Number(msg.outputAudioTokens) || 0;
+    const cached =
+      (Number(msg.cachedTextTokens) || 0) + (Number(msg.cachedAudioTokens) || 0);
+    const turnTotal =
+      total || inText + inAudio + outText + outAudio + cached;
+    callUsageDebug.sessionTokens += turnTotal;
+    const detail = [
+      inAudio ? `入音${formatTokenCount(inAudio)}` : "",
+      inText ? `入文${formatTokenCount(inText)}` : "",
+      outAudio ? `出音${formatTokenCount(outAudio)}` : "",
+      outText ? `出文${formatTokenCount(outText)}` : "",
+      cached ? `缓存${formatTokenCount(cached)}` : "",
+    ]
+      .filter(Boolean)
+      .join("/");
+    callUsageDebug.lastLine = detail
+      ? `本轮 ${formatTokenCount(turnTotal)}（${detail}）`
+      : `本轮 ${formatTokenCount(turnTotal)}`;
+  } else {
+    return;
+  }
+  updateCallDebug();
+}
+
+/** 记录一次在线 API 的 token 用量，并在 DeepSeek 时刷新余额。 */
+function noteApiUsage(provider, usage, { refreshBalance = false } = {}) {
+  if (!usage) return;
+  apiDebug.provider = provider || apiDebug.provider;
+  apiDebug.last = usage;
+  apiDebug.sessionTotal += usage.total || 0;
+  updateApiDebug();
+  if (refreshBalance && provider === "DeepSeek") {
+    void fetchDeepSeekBalance();
+  }
+}
+
+function formatBalanceText(data) {
+  const currency = (data?.currency || "").toString();
+  const total = (data?.totalBalance ?? "").toString().trim();
+  if (!total) return "";
+  const symbol = currency === "USD" ? "$" : "¥";
+  const avail = data?.isAvailable === false ? "（不足）" : "";
+  return `余额 ${symbol}${total}${avail}`;
+}
+
+/** 拉取 DeepSeek 账户余额（金额；API 不提供「剩余 token」）。 */
+async function fetchDeepSeekBalance() {
+  if (!apiBase || !chatDebugEnabled()) return;
+  const seq = ++balanceFetchSeq;
+  try {
+    const resp = await fetch(`${apiBase}/api/balance`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (seq !== balanceFetchSeq) return;
+    apiDebug.balanceText = formatBalanceText(data);
+    updateApiDebug();
+  } catch (_) {
+    /* 余额查询失败静默，不影响聊天 */
+  }
+}
+
+function updateVoiceDebug() {
+  if (!voiceDebugEl) return;
+  const show = chatDebugEnabled();
+  voiceDebugEl.hidden = !show;
+  voiceDebugEl.setAttribute("aria-hidden", show ? "false" : "true");
+  if (!show || !voiceDebugLabelEl) {
+    updateApiDebug();
+    return;
+  }
+  const vol = Number(settings.voiceVolume);
+  const volPct = Number.isFinite(vol) ? Math.max(0, Math.min(200, vol)) : 100;
+  const text = `语音 · ${voiceBackendLabel()} · 音量 ${volPct}%`;
+  voiceDebugLabelEl.textContent = text;
+  voiceDebugEl.title = text;
+  updateApiDebug();
+}
+
+function formatTtsSeconds(ms) {
+  const s = Math.max(0, Number(ms) || 0) / 1000;
+  return s < 10 ? s.toFixed(2) : s.toFixed(1);
+}
+
+function formatTtsBillingSuffix() {
+  if (!ttsUsageDebug.lastBilled && !ttsUsageDebug.sessionBilled) return "";
+  const parts = [];
+  if (ttsUsageDebug.provider) parts.push(ttsUsageDebug.provider);
+  if (ttsUsageDebug.lastBilled > 0) {
+    parts.push(`计费 ${formatTokenCount(ttsUsageDebug.lastBilled)}字`);
+  }
+  if (ttsUsageDebug.sessionBilled > 0) {
+    parts.push(`会话 ${formatTokenCount(ttsUsageDebug.sessionBilled)}字`);
+  }
+  return parts.length ? ` · ${parts.join(" · ")}` : "";
+}
+
+/** TTS 合成进度 → debug 进度条与字速；在线后端附带计费字符。 */
+function applyTtsProgress(ev) {
+  if (!chatDebugEnabled() || !voiceDebugBarEl || !voiceDebugTtsMetaEl) return;
+  const chars = Number(ev.chars) || 0;
+  const ms = Number(ev.elapsedMs) || 0;
+  const phase = ev.phase || "idle";
+  const billed = Number(ev.billedChars) || 0;
+
+  voiceDebugBarEl.classList.remove("idle", "synth", "done", "error", "cached");
+  if (phase === "synth") {
+    voiceDebugBarEl.classList.add("synth");
+    const rate = ms > 0 ? ((chars / ms) * 1000).toFixed(1) : "…";
+    voiceDebugTtsMetaEl.textContent = `合成中 ${formatTtsSeconds(ms)}s · ${chars}字 · ${rate}字/s`;
+    return;
+  }
+  if (phase === "done") {
+    if (ev.cached) {
+      voiceDebugBarEl.classList.add("cached");
+      const sess =
+        ttsUsageDebug.sessionBilled > 0
+          ? ` · 会话 ${formatTokenCount(ttsUsageDebug.sessionBilled)}字`
+          : "";
+      voiceDebugTtsMetaEl.textContent = `缓存命中 · ${chars}字（不计费）${sess}`;
+    } else {
+      if (billed > 0) {
+        ttsUsageDebug.lastBilled = billed;
+        ttsUsageDebug.sessionBilled += billed;
+        if (ev.provider) ttsUsageDebug.provider = ev.provider;
+      }
+      voiceDebugBarEl.classList.add("done");
+      const rate = ms > 0 ? ((chars / ms) * 1000).toFixed(1) : "—";
+      const kb = ev.bytes ? ` · ${(ev.bytes / 1024).toFixed(1)}KB` : "";
+      voiceDebugTtsMetaEl.textContent =
+        `合成 ${formatTtsSeconds(ms)}s · ${chars}字 · ${rate}字/s${kb}${formatTtsBillingSuffix()}`;
+    }
+    return;
+  }
+  if (phase === "error") {
+    voiceDebugBarEl.classList.add("error");
+    voiceDebugTtsMetaEl.textContent = `失败 ${formatTtsSeconds(ms)}s · ${ev.error || "未知错误"}`;
+    return;
+  }
+  // idle：只收起进度条动画，保留上次合成结果文案。
+  voiceDebugBarEl.classList.add("idle");
+}
+
+onTtsProgress(applyTtsProgress);
+
 /** 应用外观设置（字号）到根元素，并把已渲染气泡的头像刷新为最新设置。 */
 function applyAppearance() {
   const fs = Number(settings.chatFontSize) || 14;
@@ -226,6 +546,9 @@ function applyAppearance() {
     if (!img) return;
     img.src = row.classList.contains("user") ? userAvatarSrc() : aiAvatarSrc();
   });
+  const vol = Number(settings.voiceVolume);
+  setVoiceVolumePercent(Number.isFinite(vol) ? vol : 100);
+  updateVoiceDebug();
 }
 
 function scrollBottom() {
@@ -385,6 +708,7 @@ async function loadConfig() {
   } catch (_) {}
   applyAppearance();
   refreshIdentity();
+  if (chatDebugEnabled()) void fetchDeepSeekBalance();
 }
 
 /** 把设置里的观众画像字段拼成一份「画像」对象（不含 nickname，昵称走 userName）。 */
@@ -416,21 +740,28 @@ function refreshIdentity() {
   lastRememberedLen = 0;
 }
 
-/** 会话结束（窗口收起）时：把本次对话里的新增内容增量总结进长期记忆并落盘。
- *  无有效昵称、或自上次总结以来无新消息则跳过，避免空跑与重复消耗额度。 */
+/** 会话结束（窗口收起 / 退出应用）时：把本次对话里的新增内容增量总结进长期记忆并落盘。
+ *  无有效昵称、或自上次总结以来无新消息则跳过，避免空跑与重复消耗额度。
+ *  并发调用共用同一个 Promise，避免收起与退出同时触发时重复总结。 */
+let flushMemoryPromise = null;
 async function flushMemory() {
-  if (!activeName) return;
-  if (history.length <= lastRememberedLen) return;
-  // 记住当前长度：即便下面的异步总结失败，也不至于每次收起都重复整段总结。
-  const snapshotLen = history.length;
-  try {
-    // apiKey 传空：桌面端 DeepSeek Key 在 Rust 代理侧读取，前端无需带 x-api-key。
-    const updated = await updateMemoryAfterSession("", activeName, memory, history, sessionId);
-    if (updated) {
-      memory = updated;
-      lastRememberedLen = snapshotLen;
-    }
-  } catch (_) {}
+  if (flushMemoryPromise) return flushMemoryPromise;
+  flushMemoryPromise = (async () => {
+    if (!activeName) return;
+    if (history.length <= lastRememberedLen) return;
+    const snapshotLen = history.length;
+    try {
+      // apiKey 传空：桌面端 DeepSeek Key 在 Rust 代理侧读取，前端无需带 x-api-key。
+      const updated = await updateMemoryAfterSession("", activeName, memory, history, sessionId);
+      if (updated) {
+        memory = updated;
+        lastRememberedLen = snapshotLen;
+      }
+    } catch (_) {}
+  })().finally(() => {
+    flushMemoryPromise = null;
+  });
+  return flushMemoryPromise;
 }
 
 function buildRequestMessages(opts = {}) {
@@ -487,6 +818,7 @@ async function describeImage(imageDataUrl, userText) {
     throw new Error(err);
   }
   const data = await resp.json();
+  noteApiUsage("通义千问", extractUsage(data));
   const caption = data.choices?.[0]?.message?.content?.trim();
   if (!caption) throw new Error("识图描述为空");
   return caption;
@@ -541,6 +873,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let usage = null;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -553,6 +886,8 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         if (payload === "[DONE]") continue;
         try {
           const chunk = JSON.parse(payload);
+          const chunkUsage = extractUsage(chunk);
+          if (chunkUsage) usage = chunkUsage;
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
             full += delta;
@@ -568,6 +903,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         }
       }
     }
+    noteApiUsage("DeepSeek", usage, { refreshBalance: true });
 
     const raw = sanitizeReply(full);
     const { text: reply, emotion } = extractSticker(raw);
@@ -593,11 +929,8 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
 
     petSignal("reply", emotion);
 
-    if (settings.autoSpeak && (settings.ttsVoice || "").trim() && reply) {
-      enqueueAutoSpeak(reply, {
-        token: replyId,
-        voice: settings.ttsVoice.trim(),
-      });
+    if (canAutoSpeak() && reply) {
+      enqueueAutoSpeak(reply, { token: replyId });
     }
     void maybeUpdateRecap();
     return { skipped: false };
@@ -849,20 +1182,30 @@ function setCallActive(next) {
 
 function finalizeCallUserBubble() {
   if (!callUserBubble) return;
+  const text = (callUserText || "").trim();
+  const mid = callUserBubble.dataset.mid || genMsgId();
   const row = callUserBubble.closest(".row");
   row?.classList.remove("streaming");
   callUserBubble = null;
   callUserText = "";
+  // 语音轮次写入 history，收起/退出时才能进长期记忆，也与文字聊天共用上下文窗口。
+  if (text) history.push({ role: "user", content: text, id: mid, call: true });
 }
 
 function finalizeCallAsstBubble() {
   if (!callAsstBubble) return;
+  const text = (callAsstText || "").trim();
+  const mid = callAsstBubble.dataset.mid || genMsgId();
   const row = callAsstBubble.closest(".row");
   row?.classList.remove("streaming");
   callAsstBubble = null;
   callAsstText = "";
   callWaveSpeaking = false;
   callWaveEl?.classList.remove("speaking");
+  if (text) {
+    history.push({ role: "assistant", content: text, id: mid, call: true });
+    void maybeUpdateRecap();
+  }
 }
 
 /** 用户一轮：中间态只更新同一气泡，asr_end / 终态后定稿。 */
@@ -942,6 +1285,7 @@ async function startCall() {
       callWaveEl?.classList.add("speaking");
       petSignal("speaking");
     },
+    onUsage: (msg) => noteCallUsage(msg),
     onLevel: (level) => updateCallWave(level),
     onError: (e) => {
       appendPatNotice(`📞 通话出错：${e.message || e}`);
@@ -1235,18 +1579,44 @@ listen("apply-settings", ({ payload }) => {
   const identityChanged = identityKeys.some(
     (k) => k in payload && payload[k] !== settings[k]
   );
+  const debugWasOn = settings.showChatDebug !== false;
   settings = { ...settings, ...payload };
   if (identityChanged) refreshIdentity();
   applyAppearance();
+  // 刚打开 debug，或 DeepSeek Key 可能变更时，补拉一次余额。
+  if (chatDebugEnabled() && (!debugWasOn || "deepseekKey" in payload)) {
+    void fetchDeepSeekBalance();
+  }
 });
+
+// 设置页清空长期记忆：同步内存态，并避免收起窗口时把当前会话再写回记忆。
+listen("memory-cleared", () => {
+  memory = {};
+  lastRememberedLen = history.length;
+});
+
+/** 收起或退出前：挂断通话（把最后一轮写入 history）、停朗读，再刷长期记忆。 */
+async function prepareAndFlushMemory() {
+  if (callActive) endCall({ notice: false });
+  stopSpeak();
+  resetTtsQueue();
+  await flushMemory();
+}
 
 // 聊天窗口收起时：停掉朗读，并把本次对话增量总结进长期记忆（阶段 2·D/E）。
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    if (callActive) endCall({ notice: false });
-    stopSpeak();
-    resetTtsQueue();
-    void flushMemory();
+    void prepareAndFlushMemory();
+  }
+});
+
+// 托盘「退出」：Rust 先发事件等我们落盘，完成后 invoke memory_flushed 再真正退出。
+listen("flush-memory-before-quit", async () => {
+  try {
+    await prepareAndFlushMemory();
+  } catch (_) {
+  } finally {
+    invoke("memory_flushed").catch(() => {});
   }
 });
 

@@ -5,6 +5,19 @@ dist/
 .DS_Store
 .env
 
+# 语音 A/B 听测产物与本地模型 venv
+/scripts/voice-ab/out/
+/scripts/voice-ab/.venv/
+# 用户提供的原始录音（勿提交）
+/merged.mp3
+# GPU 本地语音源码与权重（体积大，自行下载 / 安装程序配置）
+/scripts/local-realtime/CosyVoice/
+/scripts/local-realtime/index-tts/
+/scripts/local-realtime/pretrained_models/
+/scripts/local-realtime/out/
+/scripts/local-realtime/.venv*/
+/scripts/local-realtime/__pycache__/
+
 # Rust / Tauri 构建产物
 /src-tauri/target/
 /src-tauri/gen/

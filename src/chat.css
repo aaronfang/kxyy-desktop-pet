@@ -250,6 +250,98 @@ body {
   align-items: center;
   flex: 0 0 auto;
 }
+
+/* 当前语音后端 debug 提示：与输入框左缘对齐
+   左 = 通话40+gap8+发图40+gap8 */
+#voice-debug {
+  flex: 0 0 auto;
+  margin: 2px 116px 0 96px;
+  text-align: left;
+  font-size: 11px;
+  line-height: 1.3;
+  color: rgba(255, 255, 255, 0.45);
+  font-variant-numeric: tabular-nums;
+  user-select: text;
+  pointer-events: none;
+}
+#voice-debug[hidden] {
+  display: none;
+}
+#voice-debug-label,
+#api-debug-meta,
+#call-debug-meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#api-debug-meta:empty,
+#call-debug-meta:empty {
+  display: none;
+}
+#api-debug-meta,
+#call-debug-meta {
+  margin-top: 2px;
+  color: rgba(255, 255, 255, 0.4);
+}
+#voice-debug-tts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 3px;
+  min-height: 12px;
+}
+#voice-debug-bar {
+  flex: 1 1 auto;
+  height: 3px;
+  min-width: 48px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+  position: relative;
+}
+#voice-debug-bar > i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(183, 156, 255, 0.85), rgba(122, 94, 219, 0.9));
+  transition: width 0.08s linear;
+}
+#voice-debug-bar.idle > i {
+  width: 0%;
+  opacity: 0.35;
+}
+#voice-debug-bar.synth > i {
+  width: 36%;
+  animation: voice-debug-indeterminate 1.1s ease-in-out infinite;
+}
+#voice-debug-bar.done > i {
+  width: 100%;
+  animation: none;
+  background: linear-gradient(90deg, rgba(110, 231, 183, 0.85), rgba(52, 211, 153, 0.9));
+}
+#voice-debug-bar.error > i {
+  width: 100%;
+  animation: none;
+  background: rgba(248, 113, 113, 0.85);
+}
+#voice-debug-bar.cached > i {
+  width: 100%;
+  animation: none;
+  background: rgba(148, 163, 184, 0.7);
+}
+@keyframes voice-debug-indeterminate {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
+#voice-debug-tts-meta {
+  flex: 0 0 auto;
+  max-width: 55%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.4);
+}
 /* 图标按钮（表情库 / 发图 / 通话）：暗色半透明毛玻璃，与气泡风格统一 */
 #stickers-btn,
 #attach,
@@ -340,22 +432,19 @@ body {
   cursor: default;
 }
 
-/* 通话声波：输入栏下方，接通后显示，随麦克风/播放电平起伏。 */
+/* 通话声波：输入栏下方，接通后显示，随麦克风/播放电平起伏（无底板/外框）。 */
 #call-wave {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 36px;
+  height: 28px;
   margin: 0 2px;
-  padding: 0 12px;
-  border-radius: 18px;
-  background: rgba(38, 34, 56, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.18);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  overflow: hidden;
+  padding: 0 8px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  overflow: visible;
 }
 #call-wave[hidden] {
   display: none;

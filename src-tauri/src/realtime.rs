@@ -15,13 +15,89 @@
 //!   前端 → Rust：binary = 原始上行 PCM16 mono 16k；text = 控制 JSON，如 {"type":"hangup"}。
 //!   Rust → 前端：binary = 下行播放 PCM 24k；text = 事件 JSON（见 to_frontend_* ）。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use tauri::AppHandle;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+
+/// 火山端到端按 token 计费；无 UsageResponse 时用官方折算比例估算本轮用量。
+/// 输入音频 ≈6.25 tok/s（16k PCM）；输出音频 ≈25 tok/s（24k PCM）；文本按字近似。
+struct TurnMeter {
+    input_pcm: u64,
+    output_pcm: u64,
+    input_text_chars: u64,
+    output_text_chars: u64,
+    system_role_chars: u64,
+    system_counted: bool,
+    got_official: bool,
+}
+
+impl TurnMeter {
+    fn new(system_role_chars: u64) -> Self {
+        Self {
+            input_pcm: 0,
+            output_pcm: 0,
+            input_text_chars: 0,
+            output_text_chars: 0,
+            system_role_chars,
+            system_counted: false,
+            got_official: false,
+        }
+    }
+
+    fn begin_turn(&mut self) {
+        self.input_pcm = 0;
+        self.output_pcm = 0;
+        self.input_text_chars = 0;
+        self.output_text_chars = 0;
+        self.got_official = false;
+    }
+
+    fn has_activity(&self) -> bool {
+        self.input_pcm > 0
+            || self.output_pcm > 0
+            || self.input_text_chars > 0
+            || self.output_text_chars > 0
+    }
+
+    fn estimate_json(&mut self) -> Option<String> {
+        if self.got_official || !self.has_activity() {
+            return None;
+        }
+        let input_audio_sec = self.input_pcm as f64 / 32_000.0;
+        let output_audio_sec = self.output_pcm as f64 / 48_000.0;
+        let input_audio_tokens = (input_audio_sec * 6.25).round().max(0.0) as u64;
+        let output_audio_tokens = (output_audio_sec * 25.0).round().max(0.0) as u64;
+        let mut input_text_tokens = self.input_text_chars;
+        if !self.system_counted && self.system_role_chars > 0 {
+            input_text_tokens = input_text_tokens.saturating_add(self.system_role_chars);
+            self.system_counted = true;
+        }
+        let output_text_tokens = self.output_text_chars;
+        let total = input_text_tokens
+            .saturating_add(input_audio_tokens)
+            .saturating_add(output_text_tokens)
+            .saturating_add(output_audio_tokens);
+        Some(
+            serde_json::json!({
+                "type": "usage",
+                "provider": "火山引擎",
+                "estimated": true,
+                "inputTextTokens": input_text_tokens,
+                "inputAudioTokens": input_audio_tokens,
+                "cachedTextTokens": 0,
+                "cachedAudioTokens": 0,
+                "outputTextTokens": output_text_tokens,
+                "outputAudioTokens": output_audio_tokens,
+                "total": total,
+            })
+            .to_string(),
+        )
+    }
+}
 
 /// ============================================================================
 /// 火山「端到端实时语音大模型」协议常量
@@ -80,6 +156,8 @@ mod protocol {
     pub const EV_SESSION_STARTED: i32 = 150;
     pub const EV_SESSION_FINISHED: i32 = 152;
     pub const EV_SESSION_FAILED: i32 = 153;
+    /// 每轮用量（文档曾标注删除，仍尝试解析；无则按音频/文本估算）。
+    pub const EV_USAGE_RESPONSE: i32 = 154;
     pub const EV_TTS_SENTENCE_START: i32 = 350;
     pub const EV_TTS_RESPONSE: i32 = 352; // 下行音频（也可能走 AUDIO_ONLY_SERVER 帧）
     pub const EV_TTS_ENDED: i32 = 359;
@@ -105,8 +183,8 @@ pub struct RealtimeConfig {
 }
 
 /// 供 lib.rs 实现：读取设置，产出本次实时会话的密钥/音色。
-/// 返回 None 表示未配置（缺 App ID / Access Key / 音色），前端会收到错误提示。
-pub type ConfigProvider = Arc<dyn Fn(&AppHandle) -> Option<RealtimeConfig> + Send + Sync>;
+/// `Err(msg)` 表示不应连火山（例如当前后端是本地服务，或密钥未配齐）。
+pub type ConfigProvider = Arc<dyn Fn(&AppHandle) -> Result<RealtimeConfig, String> + Send + Sync>;
 
 /// 启动本地实时语音 WS 桥接服务，返回监听端口（127.0.0.1 随机口）。
 /// 在独立线程里跑一个多线程 tokio 运行时（Tauri 主流程本身非 async）。
@@ -166,15 +244,12 @@ async fn handle_frontend(
         .map_err(|e| format!("前端 WS 握手失败: {e}"))?;
     let (mut front_tx, mut front_rx) = front_ws.split();
 
-    // 读取密钥/音色（缺失则告知前端并结束）。
+    // 读取密钥/音色；非火山后端或配置缺失时直接拒绝，绝不向上游建连（避免误耗 token）。
     let cfg = match provider(&app) {
-        Some(c) if !c.app_id.is_empty() && !c.access_key.is_empty() && c.speaker.starts_with("S_") => c,
-        _ => {
+        Ok(c) => c,
+        Err(msg) => {
             let _ = front_tx
-                .send(Message::Text(
-                    to_frontend_error("未配置实时语音（需 App ID、Access Key 与 S_ 开头的复刻音色）")
-                        .to_string(),
-                ))
+                .send(Message::Text(to_frontend_error(&msg).to_string()))
                 .await;
             return Ok(());
         }
@@ -228,10 +303,12 @@ async fn handle_frontend(
 
     // 用 mpsc 把「发往火山」的帧汇聚到单一写端，避免两个任务同时借用 volc_tx。
     let (to_volc_tx, mut to_volc_rx) = mpsc::unbounded_channel::<Message>();
+    let meter = Arc::new(Mutex::new(TurnMeter::new(system_role.chars().count() as u64)));
 
     // 任务 A：前端 → 火山。
     let a_session = session_id.clone();
     let to_volc_a = to_volc_tx.clone();
+    let meter_up = Arc::clone(&meter);
     let front_to_volc = async move {
         while let Some(msg) = front_rx.next().await {
             let msg = match msg {
@@ -240,6 +317,9 @@ async fn handle_frontend(
             };
             match msg {
                 Message::Binary(pcm) => {
+                    if let Ok(mut m) = meter_up.lock() {
+                        m.input_pcm = m.input_pcm.saturating_add(pcm.len() as u64);
+                    }
                     // 上行音频帧（TaskRequest）。
                     if to_volc_a.send(Message::Binary(build_audio_request(&a_session, &pcm))).is_err() {
                         break;
@@ -261,7 +341,8 @@ async fn handle_frontend(
         }
     };
 
-    // 任务 B：火山 → 前端（解析二进制事件）。
+    // 任务 B：火山 → 前端（解析二进制事件；转发/估算用量）。
+    let meter_down = Arc::clone(&meter);
     let volc_to_front = async move {
         while let Some(msg) = volc_rx.next().await {
             let data = match msg {
@@ -271,21 +352,74 @@ async fn handle_frontend(
             };
             match parse_server_frame(&data) {
                 Some(ServerFrame::Audio(pcm)) => {
+                    if let Ok(mut m) = meter_down.lock() {
+                        m.output_pcm = m.output_pcm.saturating_add(pcm.len() as u64);
+                    }
                     if front_tx.send(Message::Binary(pcm)).await.is_err() {
                         break;
                     }
                 }
                 Some(ServerFrame::Event { event, payload }) => {
+                    // 新一轮用户开口：先冲刷上一轮估算用量。
+                    if event == protocol::EV_ASR_INFO {
+                        let est = meter_down.lock().ok().and_then(|mut m| {
+                            let j = m.estimate_json();
+                            m.begin_turn();
+                            j
+                        });
+                        if let Some(j) = est {
+                            if front_tx.send(Message::Text(j)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+
+                    note_turn_text(event, &payload, &meter_down);
+
+                    // 官方 UsageResponse（或 payload 自带 usage）。
+                    if let Some(usage_msg) = extract_usage_event(&payload) {
+                        if let Ok(mut m) = meter_down.lock() {
+                            m.got_official = true;
+                            m.begin_turn();
+                        }
+                        if front_tx.send(Message::Text(usage_msg)).await.is_err() {
+                            break;
+                        }
+                    }
+
                     if let Some(text) = server_event_to_frontend(event, &payload) {
                         if front_tx.send(Message::Text(text)).await.is_err() {
                             break;
                         }
                     }
+
+                    // TTS 结束再估算（等下行音频收齐）；CHAT_ENDED 可能早于尾包音频。
+                    if event == protocol::EV_TTS_ENDED {
+                        let est = meter_down.lock().ok().and_then(|mut m| {
+                            let j = m.estimate_json();
+                            if j.is_some() {
+                                m.begin_turn();
+                            }
+                            j
+                        });
+                        if let Some(j) = est {
+                            if front_tx.send(Message::Text(j)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+
                     if event == protocol::EV_SESSION_FINISHED
                         || event == protocol::EV_SESSION_FAILED
                         || event == protocol::EV_CONNECTION_FAILED
                     {
-                        let _ = front_tx.send(Message::Text(to_frontend_session("ended").to_string())).await;
+                        let est = meter_down.lock().ok().and_then(|mut m| m.estimate_json());
+                        if let Some(j) = est {
+                            let _ = front_tx.send(Message::Text(j)).await;
+                        }
+                        let _ = front_tx
+                            .send(Message::Text(to_frontend_session("ended").to_string()))
+                            .await;
                         break;
                     }
                 }
@@ -514,6 +648,83 @@ fn parse_server_frame(data: &[u8]) -> Option<ServerFrame> {
         protocol::MT_AUDIO_SERVER => Some(ServerFrame::Audio(payload)),
         protocol::MT_FULL_SERVER | protocol::MT_ERROR => Some(ServerFrame::Event { event, payload }),
         _ => None,
+    }
+}
+
+/// 从事件 payload 提取官方 usage（若有），转成前端 `{type:"usage",...}`。
+fn extract_usage_event(payload: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let usage = json.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    let input_text = usage_u64(usage, "input_text_tokens");
+    let input_audio = usage_u64(usage, "input_audio_tokens");
+    let cached_text = usage_u64(usage, "cached_text_tokens");
+    let cached_audio = usage_u64(usage, "cached_audio_tokens");
+    let output_text = usage_u64(usage, "output_text_tokens");
+    let output_audio = usage_u64(usage, "output_audio_tokens");
+    let total = input_text
+        .saturating_add(input_audio)
+        .saturating_add(cached_text)
+        .saturating_add(cached_audio)
+        .saturating_add(output_text)
+        .saturating_add(output_audio);
+    if total == 0 {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "type": "usage",
+            "provider": "火山引擎",
+            "estimated": false,
+            "inputTextTokens": input_text,
+            "inputAudioTokens": input_audio,
+            "cachedTextTokens": cached_text,
+            "cachedAudioTokens": cached_audio,
+            "outputTextTokens": output_text,
+            "outputAudioTokens": output_audio,
+            "total": total,
+        })
+        .to_string(),
+    )
+}
+
+fn usage_u64(usage: &serde_json::Value, key: &str) -> u64 {
+    usage
+        .get(key)
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
+        .unwrap_or(0)
+}
+
+/// 累计本轮 ASR / 助手文本字数，供无官方 usage 时估算。
+fn note_turn_text(event: i32, payload: &[u8], meter: &Arc<Mutex<TurnMeter>>) {
+    let json: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+    let Ok(mut m) = meter.lock() else {
+        return;
+    };
+    match event {
+        protocol::EV_ASR_RESPONSE => {
+            let (text, interim) = extract_asr(&json);
+            if !interim && !text.is_empty() {
+                m.input_text_chars = text.chars().count() as u64;
+            } else if interim && !text.is_empty() {
+                // 中间态也更新，终态/asr_end 前取最长识别。
+                let n = text.chars().count() as u64;
+                if n > m.input_text_chars {
+                    m.input_text_chars = n;
+                }
+            }
+        }
+        protocol::EV_CHAT_RESPONSE => {
+            let text = extract_text(&json);
+            if !text.is_empty() {
+                m.output_text_chars = m
+                    .output_text_chars
+                    .saturating_add(text.chars().count() as u64);
+            }
+        }
+        _ => {}
     }
 }
 

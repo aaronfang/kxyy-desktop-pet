@@ -8,11 +8,13 @@
 //       {type:"session",state} / {type:"asr_start"} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} /
-//       {type:"speaking"} / {type:"error",message}。
+//       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
 //   挂断发 {type:"hangup"}。
 //
 // 音频采集/播放放前端而非 Rust 的原因：getUserMedia 自带回声消除(AEC)/降噪/AGC，
 // 桌宠是外放场景，没有 AEC 会自己听到自己造成啸叫与误打断。
+
+import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
 
 const invoke = window.__TAURI__.core.invoke;
 
@@ -29,6 +31,7 @@ export class RealtimeSession {
     onAssistant,
     onAssistantEnd,
     onSpeaking,
+    onUsage,
     onLevel,
     onError,
   } = {}) {
@@ -40,6 +43,7 @@ export class RealtimeSession {
       onAssistant,
       onAssistantEnd,
       onSpeaking,
+      onUsage,
       onLevel,
       onError,
     };
@@ -60,6 +64,8 @@ export class RealtimeSession {
     this._assistantActive = false; // 助手正在出字/出声
     this._keepAliveOsc = null;
     this._keepAliveGain = null;
+    this._outGain = null; // 下行播放主音量
+    this._unsubVol = null;
   }
 
   /**
@@ -166,6 +172,9 @@ export class RealtimeSession {
         this._assistantActive = true;
         this.cb.onSpeaking?.();
         break;
+      case "usage":
+        this.cb.onUsage?.(msg);
+        break;
       case "error":
         this.cb.onError?.(new Error(msg.message || "实时语音出错"));
         break;
@@ -225,6 +234,14 @@ export class RealtimeSession {
     const ctx = this.audioCtx;
     if (ctx.state === "suspended") {
       ctx.resume().catch(() => {});
+    }
+    if (!this._outGain) {
+      this._outGain = ctx.createGain();
+      this._outGain.gain.value = getVoiceGain();
+      this._outGain.connect(ctx.destination);
+      this._unsubVol = onVoiceGainChange((g) => {
+        if (this._outGain) this._outGain.gain.value = g;
+      });
     }
     // 手势栈内播一帧近乎静音的缓冲，真正「解锁」WKWebView 音频会话。
     try {
@@ -330,7 +347,7 @@ export class RealtimeSession {
     buf.getChannelData(0).set(f32);
     const src = this.audioCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(this.audioCtx.destination);
+    src.connect(this._outGain || this.audioCtx.destination);
     // 略加超前量，避免 now 与调度竞态导致首帧被跳过。
     const now = this.audioCtx.currentTime + 0.02;
     if (this.playHead < now) this.playHead = now;
@@ -394,6 +411,12 @@ export class RealtimeSession {
     this._levelRaf = 0;
     this.cb.onLevel?.(0);
     try {
+      this._unsubVol?.();
+    } catch {
+      /* ignore */
+    }
+    this._unsubVol = null;
+    try {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: "hangup" }));
       }
@@ -408,6 +431,7 @@ export class RealtimeSession {
     }
     this._keepAliveOsc = null;
     this._keepAliveGain = null;
+    this._outGain = null;
     try {
       this.workletNode?.disconnect();
       this.micSource?.disconnect();
