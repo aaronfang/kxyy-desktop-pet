@@ -71,6 +71,10 @@ jobs:
             - **Windows**：`.exe`（NSIS，需 WebView2；Win10/11 一般已内置）。安装时可勾选配置 GPU 本地语音模型（IndexTTS-2 / CosyVoice3）。
             - **macOS**：`.dmg`（Apple Silicon 选 `aarch64`，Intel 选 `x64`）；菜单栏托盘应用，不占用 Dock。
 
+            ### v0.2.6
+
+            - 修复本地语音播报期间误打断，以及后半句丢失
+
             ### v0.2.5
 
             - 修复表情包面板打开时报错（补全 `stickerGridBuilt` 声明）

@@ -183,12 +183,16 @@ npm run encrypt-assets
 
 版本号需在 **`package.json`**、**`src-tauri/tauri.conf.json`**、**`src-tauri/Cargo.toml`**（及 `Cargo.lock`）四处保持一致。
 
-推送形如 `v0.2.5` 的 tag 会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，自动构建并上传到 GitHub Release：
+推送形如 `v0.2.6` 的 tag 会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，自动构建并上传到 GitHub Release：
 
 - **Windows**：NSIS 安装包（`.exe`）；安装时可勾选配置 GPU 本地语音模型
 - **macOS**：Apple Silicon（`aarch64`）与 Intel（`x64`）各一份 `.dmg`；菜单栏托盘应用，不占用 Dock
 
 也可在 GitHub Actions 页面手动 **workflow_dispatch** 重跑。
+
+### 更新日志（v0.2.6）
+
+- 修复本地语音播报期间误打断，以及后半句丢失
 
 ### 更新日志（v0.2.5）
 
