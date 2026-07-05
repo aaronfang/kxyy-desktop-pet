@@ -84,14 +84,17 @@ def configure_from_settings() -> None:
     common.log(f"加载 IndexTTS-2 权重 {model_dir} …")
     try:
         from indextts.infer_v2 import IndexTTS2
-    except ImportError:
-        try:
-            from indextts import IndexTTS2  # type: ignore
-        except ImportError as e:
-            raise SystemExit(
-                f"无法 import indextts（repo={repo_dir}）：{e}\n"
-                "请在 IndexTTS-2 环境中安装依赖后再启动。"
-            ) from e
+    except ImportError as e:
+        # 注意：不要 fallback 到 `from indextts import IndexTTS2` 再吞掉本条异常。
+        # infer_v2 导入失败通常是它内部依赖缺失（如 librosa/transformers），
+        # fallback 只会把真实原因换成误导性的 "cannot import name IndexTTS2"。
+        # 直接把真实 ImportError（含缺失模块名）透出，便于定位。
+        raise SystemExit(
+            f"无法 import IndexTTS2（repo={repo_dir}）：{e}\n"
+            "多为 IndexTTS-2 依赖未装全，请在其 venv 里执行：\n"
+            f"  cd \"{repo_dir}\" && pip install -e .   （或 pip install -r requirements.txt）\n"
+            "缺 librosa 等常见依赖时也可先单独 pip install 该模块。"
+        ) from e
 
     # Windows+NVIDIA：fp16；无 CUDA 时由库自行回退
     use_fp16 = True

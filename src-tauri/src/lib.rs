@@ -107,6 +107,12 @@ struct Settings {
     /// index-tts 源码目录。
     #[serde(default)]
     index_tts2_repo_dir: String,
+    /// 本地零样本克隆参考音频路径（Qwen3 / CosyVoice3 / IndexTTS-2 共用）。
+    #[serde(default)]
+    local_ref_wav: String,
+    /// 参考音频对应文案（可留空）。
+    #[serde(default)]
+    local_ref_text: String,
     /// AI 语音播放音量（0–200，100 = 原音量）；作用于朗读与实时通话下行。
     #[serde(default = "default_voice_volume")]
     voice_volume: u32,
@@ -234,6 +240,8 @@ impl Settings {
             cosyvoice3_repo_dir: String::new(),
             index_tts2_model_dir: String::new(),
             index_tts2_repo_dir: String::new(),
+            local_ref_wav: String::new(),
+            local_ref_text: String::new(),
             voice_volume: default_voice_volume(),
             show_chat_debug: true,
             text_model: String::new(),
@@ -780,6 +788,10 @@ struct AiSettingsInput {
     index_tts2_model_dir: String,
     #[serde(default)]
     index_tts2_repo_dir: String,
+    #[serde(default)]
+    local_ref_wav: String,
+    #[serde(default)]
+    local_ref_text: String,
     #[serde(default = "default_voice_volume")]
     voice_volume: u32,
     #[serde(default = "default_true")]
@@ -854,6 +866,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.cosyvoice3_repo_dir = settings.cosyvoice3_repo_dir.trim().to_string();
         s.index_tts2_model_dir = settings.index_tts2_model_dir.trim().to_string();
         s.index_tts2_repo_dir = settings.index_tts2_repo_dir.trim().to_string();
+        s.local_ref_wav = settings.local_ref_wav.trim().to_string();
+        s.local_ref_text = settings.local_ref_text.trim().to_string();
         s.voice_volume = settings.voice_volume.min(200);
         s.show_chat_debug = settings.show_chat_debug;
         s.text_model = settings.text_model.trim().to_string();

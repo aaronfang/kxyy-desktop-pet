@@ -100,6 +100,32 @@ fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
     }
 }
 
+/// 逐行读取子进程输出并缓存。按字节 `read_until('\n')` + lossy 解码，
+/// 兼容非 UTF-8 输出（Windows GBK 等）——避免中文报错行被整行丢弃。
+fn read_child_lines<R: std::io::Read>(
+    reader: R,
+    tag: &str,
+    logs: &Arc<Mutex<VecDeque<String>>>,
+) {
+    let mut br = BufReader::new(reader);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match br.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                    buf.pop();
+                }
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                eprintln!("[voice-service:{tag}] {line}");
+                push_log(logs, line);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 fn take_log_summary(logs: &Arc<Mutex<VecDeque<String>>>) -> String {
     let Ok(q) = logs.lock() else {
         return String::new();
@@ -319,6 +345,38 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
     list.push(repo.join("scripts/voice-ab/.venv/Scripts/python.exe"));
     list.push(repo.join("scripts/local-realtime/.venv/bin/python"));
     list.push(repo.join("scripts/local-realtime/.venv/Scripts/python.exe"));
+    // Windows：显式探测已知 Python 安装位置（绝对路径）。
+    // GUI 进程从 explorer 启动时继承的 PATH 常**不包含**用户 shell 的 PATH，
+    // 容易落到 `WindowsApps\python.exe`（0 字节 App Execution Alias → 跳 Store）。
+    // 提前探测这些已知位置，绕开 PATH 搜索。
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            // Python Launcher（Windows 官方，会自动选最高版本）
+            list.push(PathBuf::from(&local).join("Programs/Python/Launcher/py.exe"));
+            // 用户级 Python 安装（python.org 安装器默认位置）
+            for ver in &["314", "313", "312", "311", "310", "39"] {
+                list.push(
+                    PathBuf::from(&local)
+                        .join(format!("Programs/Python/Python{ver}/python.exe")),
+                );
+            }
+        }
+        if let Ok(pf) = std::env::var("PROGRAMFILES") {
+            for ver in &["314", "313", "312", "311", "310", "39"] {
+                list.push(
+                    PathBuf::from(&pf).join(format!("Python{ver}/python.exe")),
+                );
+            }
+        }
+        if let Ok(pf86) = std::env::var("PROGRAMFILES(x86)") {
+            for ver in &["314", "313", "312", "311", "310", "39"] {
+                list.push(
+                    PathBuf::from(&pf86).join(format!("Python{ver}/python.exe")),
+                );
+            }
+        }
+    }
     // PATH 里的解释器
     list.push(PathBuf::from("python3"));
     list.push(PathBuf::from("python"));
@@ -326,18 +384,30 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
 }
 
 /// 在 PATH 中查找裸命令名，返回首个可执行文件路径（Windows 兼容 .exe）。
+///
+/// Windows 上会跳过 0 字节文件——`C:\Users\<u>\AppData\Local\Microsoft\WindowsApps\python.exe`
+/// 是 App Execution Alias（reparse point + 0 字节），spawn 它会跳 Microsoft Store，
+/// 触发 "Python was not found; run without arguments to install from the Microsoft Store" 误报。
 fn which_in_path(name: &Path) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand);
-        }
+        // 先尝试原名（含 .exe / 无后缀），再尝试 Windows 下追加 .exe
+        let mut candidates: [PathBuf; 2] = [dir.join(name), dir.join(name)];
         #[cfg(windows)]
         {
-            let exe = dir.join(format!("{}.exe", name.display()));
-            if exe.is_file() {
-                return Some(exe);
+            candidates[1] = dir.join(format!("{}.exe", name.display()));
+        }
+        for cand in &candidates {
+            match std::fs::metadata(cand) {
+                Ok(md) if md.is_file() => {
+                    // Windows App Execution Alias 是 0 字节 + reparse point；
+                    // 这里用长度过滤避免命中 Store 跳转器。
+                    if cfg!(windows) && md.len() == 0 {
+                        continue;
+                    }
+                    return Some(cand.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -375,13 +445,21 @@ fn stop_inner(inner: &mut Inner) {
 }
 
 /// CosyVoice3：启动前检查源码/权重是否就绪，避免只看到「进程已退出」。
-fn preflight_cosyvoice3(repo: &Path) -> Result<(), String> {
+///
+/// 返回值是"激活的 repo 根"——若源码/权重实际位于 install 目录（NSIS 默认位置），
+/// 会返回 install 根；否则返回原 repo。调用方应用这个根去生成 venv / 脚本路径。
+fn preflight_cosyvoice3(repo: &Path) -> Result<PathBuf, String> {
     let model_dir_s = read_setting_str("cosyvoice3ModelDir");
     let repo_dir_s = read_setting_str("cosyvoice3RepoDir");
 
-    let cv_repo = resolve_user_path(repo, &repo_dir_s, "scripts/local-realtime/CosyVoice");
+    let active = pick_active_root(repo, &repo_dir_s, "scripts/local-realtime/CosyVoice");
+    let cv_repo = if repo_dir_s.trim().is_empty() {
+        active.join("scripts/local-realtime/CosyVoice")
+    } else {
+        resolve_user_path(&active, &repo_dir_s, "scripts/local-realtime/CosyVoice")
+    };
     let model_dir = resolve_user_path(
-        repo,
+        &active,
         &model_dir_s,
         "scripts/local-realtime/pretrained_models/Fun-CosyVoice3-0.5B",
     );
@@ -389,7 +467,7 @@ fn preflight_cosyvoice3(repo: &Path) -> Result<(), String> {
     if !cv_repo.is_dir() {
         return Err(format!(
             "未找到 CosyVoice 源码。请先：git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git {}",
-            repo.join("scripts/local-realtime/CosyVoice").display()
+            active.join("scripts/local-realtime/CosyVoice").display()
         ));
     }
     if !model_dir.is_dir() {
@@ -418,7 +496,7 @@ fn preflight_cosyvoice3(repo: &Path) -> Result<(), String> {
             model_dir.display()
         ));
     }
-    Ok(())
+    Ok(active)
 }
 
 fn dirs_settings_path() -> Option<PathBuf> {
@@ -460,6 +538,68 @@ fn resolve_user_path(repo: &Path, configured: &str, default_rel: &str) -> PathBu
     } else {
         repo.join(path)
     }
+}
+
+/// Windows：NSIS 安装默认根目录。
+/// 多数情况下就是 `%LOCALAPPDATA%\元元桌宠`；老版本可能是 `Programs\元元桌宠`。
+fn install_roots() -> Vec<PathBuf> {
+    let mut list = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        list.push(PathBuf::from(&local).join("元元桌宠"));
+        list.push(PathBuf::from(&local).join("Programs").join("元元桌宠"));
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        list.push(
+            PathBuf::from(&userprofile)
+                .join("AppData")
+                .join("Local")
+                .join("元元桌宠"),
+        );
+    }
+    list
+}
+
+/// 解析"实际包含目标子目录"的根目录（repo 概念上的根 = scripts 的父级）。
+///
+/// - 用户未配置：先看 `repo/<sub>`，存在则用 repo；否则依次试 install 根。
+///   都没有则返回 repo（保留原错误信息，UI 表现不变）。
+/// - 用户显式配置了相对路径：拼到 repo 后用 repo 作 root。
+/// - 用户显式配置了绝对路径：尝试把 path 解析为"scripts/local-realtime/..."的某层；
+///   是的话往上回溯到"scripts 的父级"；否则直接用 path 自身作 root（保守兜底）。
+fn pick_active_root(repo: &Path, configured: &str, sub: &str) -> PathBuf {
+    let p = configured.trim();
+    if p.is_empty() {
+        let primary = repo.join(sub);
+        if primary.is_dir() {
+            return repo.to_path_buf();
+        }
+        for r in install_roots() {
+            if r.join(sub).is_dir() {
+                return r;
+            }
+        }
+        return repo.to_path_buf();
+    }
+    let path = PathBuf::from(p);
+    if !path.is_absolute() {
+        return repo.to_path_buf();
+    }
+    // 绝对路径：探测是否形如 <root>/scripts/local-realtime/<...> 或
+    // <root>/scripts/local-realtime/pretrained_models/<...>。是的话回溯到 root。
+    let mut cur: Option<&Path> = Some(path.as_path());
+    while let Some(c) = cur {
+        if c.file_name().map(|n| n == "local-realtime").unwrap_or(false) {
+            if let Some(scripts) = c.parent() {
+                if scripts.file_name().map(|n| n == "scripts").unwrap_or(false) {
+                    if let Some(root) = scripts.parent() {
+                        return root.to_path_buf();
+                    }
+                }
+            }
+        }
+        cur = c.parent();
+    }
+    path
 }
 
 fn read_setting_str(key: &str) -> String {
@@ -622,19 +762,29 @@ fn run_macos_qwen3_setup(
     Ok(())
 }
 
-fn preflight_indextts2(repo: &Path) -> Result<(), String> {
+/// IndexTTS-2：启动前检查源码/权重是否就绪，避免只看到「进程已退出」。
+///
+/// 返回值是"激活的 repo 根"——若源码/权重实际位于 install 目录（NSIS 默认位置），
+/// 会返回 install 根；否则返回原 repo。调用方应用这个根去生成 venv / 脚本路径。
+fn preflight_indextts2(repo: &Path) -> Result<PathBuf, String> {
     let model_dir_s = read_setting_str("indexTts2ModelDir");
     let repo_dir_s = read_setting_str("indexTts2RepoDir");
-    let it_repo = resolve_user_path(repo, &repo_dir_s, "scripts/local-realtime/index-tts");
+
+    let active = pick_active_root(repo, &repo_dir_s, "scripts/local-realtime/index-tts");
+    let it_repo = if repo_dir_s.trim().is_empty() {
+        active.join("scripts/local-realtime/index-tts")
+    } else {
+        resolve_user_path(&active, &repo_dir_s, "scripts/local-realtime/index-tts")
+    };
     let model_dir = resolve_user_path(
-        repo,
+        &active,
         &model_dir_s,
         "scripts/local-realtime/pretrained_models/IndexTTS-2",
     );
     if !it_repo.is_dir() {
         return Err(format!(
             "未找到 IndexTTS-2 源码。请先：git clone --recursive https://github.com/index-tts/index-tts.git {}",
-            repo.join("scripts/local-realtime/index-tts").display()
+            active.join("scripts/local-realtime/index-tts").display()
         ));
     }
     let cfg = model_dir.join("config.yaml");
@@ -644,7 +794,7 @@ fn preflight_indextts2(repo: &Path) -> Result<(), String> {
             model_dir.display()
         ));
     }
-    Ok(())
+    Ok(active)
 }
 
 /// 停止本应用托管的本地语音服务。
@@ -761,32 +911,41 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         return;
     };
 
+    // preflight 返回"激活的 repo 根"——若源码/权重实际位于 install 目录（NSIS 默认
+    // 位置），返回 install 根，后续 python_candidates / spawn 走该路径。
+    let mut repo = repo;
     if backend == "cosyvoice3" {
-        if let Err(msg) = preflight_cosyvoice3(&repo) {
-            emit(
-                app,
-                VoiceServiceStatus {
-                    backend: backend.clone(),
-                    state: "failed".into(),
-                    message: msg,
-                    port,
-                },
-            );
-            return;
+        match preflight_cosyvoice3(&repo) {
+            Ok(active) => repo = active,
+            Err(msg) => {
+                emit(
+                    app,
+                    VoiceServiceStatus {
+                        backend: backend.clone(),
+                        state: "failed".into(),
+                        message: msg,
+                        port,
+                    },
+                );
+                return;
+            }
         }
     }
     if backend == "indextts2" {
-        if let Err(msg) = preflight_indextts2(&repo) {
-            emit(
-                app,
-                VoiceServiceStatus {
-                    backend: backend.clone(),
-                    state: "failed".into(),
-                    message: msg,
-                    port,
-                },
-            );
-            return;
+        match preflight_indextts2(&repo) {
+            Ok(active) => repo = active,
+            Err(msg) => {
+                emit(
+                    app,
+                    VoiceServiceStatus {
+                        backend: backend.clone(),
+                        state: "failed".into(),
+                        message: msg,
+                        port,
+                    },
+                );
+                return;
+            }
         }
     }
 
@@ -917,7 +1076,12 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 共享 secret：本服务的 /tts 将据此校验请求，阻止任意本机进程刷云端计费。
-        .env("KXYY_TTS_SECRET", tts_secret());
+        .env("KXYY_TTS_SECRET", tts_secret())
+        // 强制子进程用 UTF-8 写 stdout/stderr。否则 Windows 上 Python 默认按系统代码页
+        // （如 GBK）输出，我们的中文错误（SystemExit 提示等）会成为非法 UTF-8 字节，
+        // 下方按行读取时被丢弃，导致设置页只看到空的「进程已退出」兜底文案。
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);
@@ -928,6 +1092,16 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         use std::os::unix::process::CommandExt;
         // 独立进程组，退出时便于整体杀掉
         cmd.process_group(0);
+    }
+
+    // Windows：python.exe 是控制台程序，默认 spawn 会弹出黑色 cmd 窗口。
+    // CREATE_NO_WINDOW 让子进程不分配控制台窗口（stdout/stderr 仍走管道，
+    // 日志读取与上面的按行解析完全不受影响）。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
     let mut child = match cmd.spawn() {
@@ -958,23 +1132,16 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
     };
 
     // 把子进程日志打到桌宠 stderr，并缓存最近行供失败提示。
+    // 注意：用按字节读取 + lossy 解码，而非 BufReader::lines()。后者要求每行是合法
+    // UTF-8，否则返回 Err 被 .flatten() 静默丢弃——Windows 下子进程若输出非 UTF-8
+    // （中文报错等）会导致日志缓存为空，设置页只能显示兜底文案。
     if let Some(out) = child.stdout.take() {
         let logs = Arc::clone(&logs);
-        std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().flatten() {
-                eprintln!("[voice-service:out] {line}");
-                push_log(&logs, line);
-            }
-        });
+        std::thread::spawn(move || read_child_lines(out, "out", &logs));
     }
     if let Some(err) = child.stderr.take() {
         let logs = Arc::clone(&logs);
-        std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().flatten() {
-                eprintln!("[voice-service:err] {line}");
-                push_log(&logs, line);
-            }
-        });
+        std::thread::spawn(move || read_child_lines(err, "err", &logs));
     }
 
     let pid = child.id();

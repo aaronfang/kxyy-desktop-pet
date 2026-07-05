@@ -12,6 +12,7 @@ import os
 import re
 import ssl
 import struct
+import sys
 import tempfile
 import time
 import urllib.request
@@ -25,6 +26,142 @@ REPO = ROOT.parent.parent
 VOICE_AB = REPO / "scripts" / "voice-ab"
 # 打包后由桌宠注入：可写运行时（venv / 参考音副本）
 _RUNTIME = Path(os.environ["KXYY_VOICE_RUNTIME"]).expanduser() if os.environ.get("KXYY_VOICE_RUNTIME") else None
+
+
+def _subprocess_no_window() -> dict:
+    """Windows：给 subprocess 加 CREATE_NO_WINDOW，避免 ffmpeg 等控制台子进程弹出黑框。
+
+    桌宠拉起本服务时已用 CREATE_NO_WINDOW 隐藏了 python 控制台；但本进程再调用 ffmpeg
+    这类控制台程序时，因当前进程无控制台，子进程会**新分配**一个控制台窗口一闪而过。
+    这里为子进程显式带上同一标志，把这些一闪的黑框也消掉。非 Windows 返回空 kwargs。
+    """
+    if os.name == "nt":
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
+
+def _patch_kaldifst_nonascii_paths() -> None:
+    """Windows 下 kaldifst 无法打开含非 ASCII 字符的路径（其 C++ kaldi-io 用窄字符
+    ifstream 打开文件，遇到中文/日文等路径会失败）。而本应用默认装在
+    ``%LOCALAPPDATA%\\元元桌宠\\...``（中文目录），导致 wetext 在加载内置 .fst 时报
+    ``Error opening input stream``，IndexTTS-2 / CosyVoice 的文本归一化随之挂掉。
+
+    这里包住 ``kaldifst.TextNormalizer``：凡传入路径含非 ASCII 字符，就先把该文件复制到
+    一个纯 ASCII 的缓存目录，再用 ASCII 路径打开。必须在 ``import wetext`` 之前生效——
+    ``wetext.constants`` 在被导入时即用 ``kaldifst.TextNormalizer`` 预加载全部 FST。
+    仅在 Windows 生效；任何异常都静默跳过，绝不影响正常路径下的启动。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import hashlib
+        import shutil
+
+        import kaldifst  # type: ignore
+    except Exception:
+        return
+
+    def _is_ascii(s: str) -> bool:
+        try:
+            s.encode("ascii")
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    def _ascii_cache_root() -> str | None:
+        cands: list[str] = []
+        pub = os.environ.get("PUBLIC")
+        if pub:
+            cands.append(os.path.join(pub, "kxyy-tts", "kaldifst"))
+        tmp = os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir()
+        if tmp:
+            cands.append(os.path.join(tmp, "kxyy-tts-kaldifst"))
+        sysdrv = os.environ.get("SystemDrive", "C:")
+        cands.append(os.path.join(sysdrv + os.sep, "kxyy-tts-kaldifst"))
+        for c in cands:
+            if not _is_ascii(c):
+                continue
+            try:
+                os.makedirs(c, exist_ok=True)
+                return c
+            except OSError:
+                continue
+        return None
+
+    root = _ascii_cache_root()
+    if not root:
+        return
+
+    def _ascii_path(path) -> str:
+        p = str(path)
+        if _is_ascii(p) or not os.path.isfile(p):
+            return p
+        # 以原始路径的 hash 建子目录、保留原文件名，避免不同语言目录下同名 .fst 冲突。
+        key = hashlib.md5(p.encode("utf-8")).hexdigest()
+        dst_dir = os.path.join(root, key)
+        dst = os.path.join(dst_dir, os.path.basename(p))
+        try:
+            if not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(p):
+                os.makedirs(dst_dir, exist_ok=True)
+                shutil.copy2(p, dst)
+        except OSError:
+            return p
+        return dst
+
+    orig = kaldifst.TextNormalizer
+
+    def _patched(path, *args, **kwargs):
+        return orig(_ascii_path(path), *args, **kwargs)
+
+    try:
+        kaldifst.TextNormalizer = _patched
+    except Exception:
+        pass
+
+
+def _patch_sentencepiece_nonascii_paths() -> None:
+    """Windows 下 sentencepiece 的 C++ ``LoadFromFile`` 同样打不开含非 ASCII 字符的
+    路径（本应用装在中文目录 ``元元桌宠`` 下时，加载 ``bpe.model`` 报 ``Not found``）。
+
+    这里包住 ``SentencePieceProcessor.LoadFromFile``：路径含非 ASCII 时，改用 Python 读取
+    文件字节并走 ``LoadFromSerializedProto``（纯内存加载，绕开 C++ 的窄字符路径打开）。
+    仅在 Windows 生效；任何异常都静默跳过。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import sentencepiece as spm  # type: ignore
+    except Exception:
+        return
+
+    def _is_ascii(s: str) -> bool:
+        try:
+            s.encode("ascii")
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    orig_load = spm.SentencePieceProcessor.LoadFromFile
+
+    def _patched_load(self, arg):
+        try:
+            p = str(arg) if arg is not None else arg
+            if p and not _is_ascii(p) and os.path.isfile(p):
+                with open(p, "rb") as f:
+                    return self.LoadFromSerializedProto(f.read())
+        except Exception:
+            pass
+        return orig_load(self, arg)
+
+    try:
+        spm.SentencePieceProcessor.LoadFromFile = _patched_load
+    except Exception:
+        pass
+
+
+# 在任何后端 import wetext / sentencepiece 之前打上补丁（本模块被所有入口最先 import）。
+_patch_kaldifst_nonascii_paths()
+_patch_sentencepiece_nonascii_paths()
 
 
 def _ref_candidates() -> list[Path]:
@@ -53,10 +190,30 @@ def ref_txt_path() -> Path:
 REF_WAV = VOICE_AB / "out" / "yuanyuan_ref_15s.wav"  # 兼容旧引用；运行时请用 ref_wav_path()
 REF_TXT = VOICE_AB / "out" / "yuanyuan_ref_15s.txt"
 MERGED_MP3 = REPO / "merged.mp3"
-SETTINGS = (
-    Path.home()
-    / "Library/Application Support/com.aaronfang.kxyydesktoppet/settings.json"
-)
+
+
+def _settings_path() -> Path:
+    """settings.json 的跨平台位置，须与 Rust 侧 dirs_settings_path() 保持一致。
+
+    - macOS:   ~/Library/Application Support/<bundleId>/settings.json
+    - Windows: %APPDATA%\\<bundleId>\\settings.json（Roaming，Tauri app_config_dir）
+    - Linux:   ~/.config/<bundleId>/settings.json
+    此前写死为 macOS 路径，导致 Windows 上永远读不到设置，
+    本地语音服务因缺 deepseekKey / 模型路径而启动即退出。
+    """
+    bundle = "com.aaronfang.kxyydesktoppet"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support" / bundle / "settings.json"
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+        root = Path(base) if base else (Path.home() / "AppData" / "Roaming")
+        return root / bundle / "settings.json"
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else (Path.home() / ".config")
+    return root / bundle / "settings.json"
+
+
+SETTINGS = _settings_path()
 
 INPUT_RATE = 16000
 OUTPUT_RATE = 24000
@@ -293,6 +450,7 @@ def ensure_ref_wav() -> tuple[Path, str]:
             check=True,
             capture_output=True,
             timeout=60,
+            **_subprocess_no_window(),
         )
     except subprocess.TimeoutExpired as e:
         raise SystemExit("ffmpeg 截取参考音超时（60s）") from e
@@ -662,6 +820,7 @@ def mp3_to_pcm24k(mp3: bytes) -> bytes:
             capture_output=True,
             check=True,
             timeout=30,
+            **_subprocess_no_window(),
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError("ffmpeg 转码超时") from e

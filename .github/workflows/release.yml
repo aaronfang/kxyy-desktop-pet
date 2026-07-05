@@ -71,6 +71,13 @@ jobs:
             - **Windows**：`.exe`（NSIS，需 WebView2；Win10/11 一般已内置）。安装时可勾选配置 GPU 本地语音模型（IndexTTS-2 / CosyVoice3）。
             - **macOS**：`.dmg`（Apple Silicon 选 `aarch64`，Intel 选 `x64`）；菜单栏托盘应用，不占用 Dock。
 
+            ### v0.2.7
+
+            - 文字与语音同步出现：开启朗读时，每句在其语音开始播放的瞬间才显示，长回复逐句同步
+            - 追问（followup）第二句改为在第一句「文字+语音」出现完成后再出现，避免两行光标同时空等
+            - Windows：隐藏本地语音服务及 ffmpeg 转码的 cmd 黑窗
+            - 修复本地 CosyVoice3 参考音频保存后不生效（补齐 `local_ref_wav` 持久化字段）
+
             ### v0.2.6
 
             - 修复本地语音播报期间误打断，以及后半句丢失

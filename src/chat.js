@@ -41,7 +41,7 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { speak, stopSpeak, unlockAudio, onTtsProgress } from "./ai/tts.js";
+import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, onTtsProgress } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
@@ -89,30 +89,95 @@ function canAutoSpeak() {
   return !!(settings.ttsVoice || "").trim();
 }
 
-/** 把一段回复排进朗读队列（上一条播完再播下一条）。 */
-function enqueueAutoSpeak(text, { token, voice } = {}) {
+/** 逐句显示器：保证每条气泡按顺序、只显示一次（不论来自音频回调、打断兜底还是合成失败）。
+ *  首句复用流式气泡（去掉闪烁光标并填字），其余句在显示时才新建气泡。 */
+function makeBubbleRevealer(parts, firstBubble, firstRow) {
+  let next = 0;
+  const revealUpTo = (target) => {
+    while (next <= target && next < parts.length) {
+      const i = next++;
+      if (i === 0) {
+        firstRow?.classList.remove("streaming");
+        firstBubble.textContent = parts[0];
+      } else {
+        addBubble("assistant", parts[i]);
+      }
+    }
+    scrollBottom();
+  };
+  return {
+    revealUpTo,
+    revealAll: () => revealUpTo(parts.length - 1),
+  };
+}
+
+/** 同步朗读一段（已切分好的）回复：逐句合成音频，并在每句音频「开始播放」的瞬间
+ *  才显示该句文字，实现文字与语音同步出现。采用预合成流水线：播放当前句时提前
+ *  合成下一句，尽量消除句间空档。gen 变化（清空/通话/收起打断）或合成失败时，
+ *  兜底把剩余文字直接补全，避免气泡永远停在闪烁光标。 */
+async function speakPartsSynced(parts, { revealer, voice, gen }) {
+  let nextSynth = synthesizeSpeech(parts[0], { voice }).catch(() => null);
+  for (let i = 0; i < parts.length; i++) {
+    if (gen !== ttsQueueGen) {
+      revealer.revealAll();
+      return;
+    }
+    const blob = await nextSynth;
+    // 播放本句前先起下一句的合成，藏进本句播放时长里。
+    nextSynth =
+      i + 1 < parts.length
+        ? synthesizeSpeech(parts[i + 1], { voice }).catch(() => null)
+        : null;
+
+    if (!blob) {
+      // 合成失败：无音频，直接把这句显示出来，继续下一句。
+      revealer.revealUpTo(i);
+      continue;
+    }
+    await new Promise((resolve) => {
+      playSpeechBlob(blob, {
+        onStart: () => revealer.revealUpTo(i),
+        onError: () => revealer.revealUpTo(i),
+      }).then(() => {
+        revealer.revealUpTo(i);
+        resolve();
+      });
+    });
+  }
+}
+
+/** 把一段回复排进朗读队列，并让文字随语音逐句同步出现（上一条播完再播下一条）。
+ *  parts 为已切分好的句子数组；首句复用流式气泡 firstBubble。 */
+function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, stickerMid } = {}) {
   const gen = ttsQueueGen;
   const backend = (settings.realtimeBackend || "volc").toLowerCase();
   // 火山才传 voice；本地 / CosyVoice(云/开源) 由后端按设置合成。
   const voiceOpt =
     backend === "volc" || backend === ""
-      ? voice || (settings.ttsVoice || "").trim() || null
+      ? (settings.ttsVoice || "").trim() || null
       : null;
+  const revealer = makeBubbleRevealer(parts, firstBubble, firstRow);
+  const finishSticker = () => {
+    if (sticker) addStickerBubble(sticker, { linkedMid: stickerMid });
+  };
   ttsQueue = ttsQueue
     .then(async () => {
-      if (gen !== ttsQueueGen) return;
-      await new Promise((resolve) => {
-        speak(text, {
-          token,
-          voice: voiceOpt,
-          onEnd: resolve,
-          onError: resolve,
-        }).then((started) => {
-          if (!started) resolve();
-        });
-      });
+      if (gen !== ttsQueueGen) {
+        // 入队前已被打断：直接补全文字，不再合成。
+        revealer.revealAll();
+        finishSticker();
+        return;
+      }
+      await speakPartsSynced(parts, { revealer, voice: voiceOpt, gen });
+      revealer.revealAll();
+      finishSticker();
     })
-    .catch(() => {});
+    .catch(() => {
+      revealer.revealAll();
+      finishSticker();
+    });
+  // 返回「本条朗读全部完成」的 promise：供 followup 等第一行文字+语音出现后再出第二行。
+  return ttsQueue;
 }
 
 let apiBase = "";
@@ -841,6 +906,9 @@ function renderFinalBubbles(streamBubble, reply) {
 async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, patAction, replyId } = {}) {
   let full = "";
   let speaking = false;
+  // 是否会自动朗读本条回复。会朗读时，流式期间**不**实时灌字进气泡（保持闪烁光标），
+  // 待整段生成完后逐句「文字 + 语音」同步出现；否则维持即时流式显示。
+  const willSync = canAutoSpeak();
   // 深聊模式：仅普通轮次（非拍一拍 / 非追问等主动开口）按观众用词判定；命中则本轮放开字数与
   // 拆条上限、注入「深聊但保持人设」提示，让元元能展开多聊，但性格口吻不变。
   const deep = !proactiveKind && detectDeepIntent(lastRealUserMessage()?.content || "");
@@ -896,8 +964,11 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
               speaking = true;
               petSignal("speaking");
             }
-            streamBubble.textContent = stripStickerForDisplay(full);
-            scrollBottom();
+            // 会朗读时先不显示文字，等对应句音频开始播放再显示（同步出现）。
+            if (!willSync) {
+              streamBubble.textContent = stripStickerForDisplay(full);
+              scrollBottom();
+            }
           }
         } catch (_) {
           /* 忽略半包 JSON */
@@ -922,19 +993,33 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       ...(emotion ? { sticker: { emotion } } : {}),
     });
 
-    streamRow.classList.remove("streaming");
-    renderFinalBubbles(streamBubble, reply);
-
-    const replySticker = emotion ? pickSticker(emotion) : null;
-    if (replySticker) addStickerBubble(replySticker, { linkedMid: replyId });
-
     petSignal("reply", emotion);
 
-    if (canAutoSpeak() && reply) {
-      enqueueAutoSpeak(reply, { token: replyId });
+    const replySticker = emotion ? pickSticker(emotion) : null;
+    // 会朗读时：切句后走「文字随语音逐句同步出现」流水线（首句复用流式气泡）。
+    const syncParts =
+      willSync && canAutoSpeak() && reply
+        ? splitReply(reply).filter(Boolean)
+        : null;
+
+    // speechDone：本条回复「文字+语音」全部同步出现完成的 promise（不朗读时为 null）。
+    let speechDone = null;
+    if (syncParts && syncParts.length) {
+      speechDone = enqueueAutoSpeakSynced(syncParts, {
+        firstBubble: streamBubble,
+        firstRow: streamRow,
+        sticker: replySticker,
+        stickerMid: replyId,
+      });
+    } else {
+      // 不朗读（或纯表情回复）：按原有逻辑立即定稿多条气泡。
+      streamRow.classList.remove("streaming");
+      renderFinalBubbles(streamBubble, reply);
+      if (replySticker) addStickerBubble(replySticker, { linkedMid: replyId });
     }
+
     void maybeUpdateRecap();
-    return { skipped: false };
+    return { skipped: false, speechDone };
   } catch (e) {
     streamRow.classList.remove("streaming");
     streamRow.classList.add("error");
@@ -981,10 +1066,18 @@ async function send(text, opts = {}) {
       ...(sticker ? { sticker } : {}),
     });
 
-    await streamAssistantReply(streamBubble, streamRow, { replyId });
+    const mainResult = await streamAssistantReply(streamBubble, streamRow, { replyId });
 
     const reply = history[history.length - 1]?.content || "";
     if (shouldDoFollowup(text, reply, DEFAULT_FOLLOWUP_CHANCE)) {
+      // 先等主回复「文字+语音」同步出现完成，再出 followup 第二行，避免两行光标同时冒出。
+      if (mainResult?.speechDone) {
+        try {
+          await mainResult.speechDone;
+        } catch (_) {
+          /* 朗读异常不阻塞 followup */
+        }
+      }
       try {
         history.push({
           role: "user",

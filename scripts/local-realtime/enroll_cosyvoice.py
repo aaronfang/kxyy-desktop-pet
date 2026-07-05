@@ -26,10 +26,29 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
 DEFAULT_AUDIO = REPO / "merged.mp3"
-SETTINGS = (
-    Path.home()
-    / "Library/Application Support/com.aaronfang.kxyydesktoppet/settings.json"
-)
+
+
+def _settings_path() -> Path:
+    """settings.json 的跨平台位置，须与 Rust 侧 dirs_settings_path() 保持一致。
+
+    - macOS:   ~/Library/Application Support/<bundleId>/settings.json
+    - Windows: %APPDATA%\\<bundleId>\\settings.json（Roaming，Tauri app_config_dir）
+    - Linux:   ~/.config/<bundleId>/settings.json
+    此前写死为 macOS 路径，导致 Windows 上永远读不到设置。
+    """
+    bundle = "com.aaronfang.kxyydesktoppet"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support" / bundle / "settings.json"
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+        root = Path(base) if base else (Path.home() / "AppData" / "Roaming")
+        return root / bundle / "settings.json"
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else (Path.home() / ".config")
+    return root / bundle / "settings.json"
+
+
+SETTINGS = _settings_path()
 ENROLL_URL = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
 UPLOADS_URL = "https://dashscope.aliyuncs.com/api/v1/uploads"
 
