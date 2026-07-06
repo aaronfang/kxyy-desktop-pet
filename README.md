@@ -192,6 +192,10 @@ npm run encrypt-assets
 
 也可在 GitHub Actions 页面手动 **workflow_dispatch** 重跑。
 
+### 更新日志（v0.2.10）
+
+- 修复 Windows `setup-qwen3-tts.ps1` 全新安装时最后一步误报 `Import check failed / SyntaxError: invalid syntax`：`Start-Process -ArgumentList` 不会为含空格的内联 `python -c` 代码加引号，导致 `-c` 仅收到 `import` 一个词。改为将校验代码写入临时 `.py` 文件执行，彻底规避引号拆分（依赖安装本身此前即已成功，仅校验步骤误报）
+
 ### 更新日志（v0.2.9）
 
 - 内置兜底参考音改用 15s 版本 `kxyy-wechat-record-cut01_15s`，移除 30s 版本，减小安装包体积

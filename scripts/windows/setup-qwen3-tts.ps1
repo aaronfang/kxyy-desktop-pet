@@ -154,10 +154,19 @@ if ($asr -eq '' -or $asr -match '^[Yy]') {
 }
 
 # ---- Verify ----
+# NOTE: run the check from a temp .py file rather than `python -c "<code>"`.
+# Start-Process -ArgumentList does NOT quote array elements that contain spaces,
+# so passing the code inline gets split on whitespace and Python's -c receives
+# only the first token ("import") -> SyntaxError.
 Write-Host ""
 Write-Host "Verifying qwen_tts import..." -ForegroundColor Yellow
 $check = Join-Path $env:TEMP "kxyy-qwen3-check.log"
-$vp = Start-Process -FilePath $VenvPy -ArgumentList @('-c','import torch, qwen_tts; print("torch", torch.__version__, "cuda", torch.cuda.is_available())') `
+$checkPy = Join-Path $env:TEMP ("kxyy-qwen3-check-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".py")
+@'
+import torch, qwen_tts
+print("torch", torch.__version__, "cuda", torch.cuda.is_available())
+'@ | Set-Content -Path $checkPy -Encoding UTF8
+$vp = Start-Process -FilePath $VenvPy -ArgumentList @("$checkPy") `
   -Wait -PassThru -NoNewWindow -RedirectStandardOutput $check -RedirectStandardError "$check.err"
 if ($vp.ExitCode -eq 0) {
   Get-Content $check -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" -ForegroundColor Green }
@@ -167,7 +176,7 @@ if ($vp.ExitCode -eq 0) {
   Write-Host "Import check failed. Last lines:" -ForegroundColor Red
   if (Test-Path "$check.err") { Get-Content "$check.err" -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkRed } }
 }
-Remove-Item $check,"$check.err" -ErrorAction SilentlyContinue
+Remove-Item $check,"$check.err",$checkPy -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Next: in the pet Settings, pick voice backend = local Qwen3-TTS, add a 10-20s reference clip, then save to start the service." -ForegroundColor Cyan
