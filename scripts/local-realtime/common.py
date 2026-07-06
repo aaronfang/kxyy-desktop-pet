@@ -167,9 +167,9 @@ _patch_sentencepiece_nonascii_paths()
 def _ref_candidates() -> list[Path]:
     paths: list[Path] = []
     if _RUNTIME is not None:
-        paths.append(_RUNTIME / "out" / "kxyy-wechat-record-cut01_30s.wav")
-    paths.append(ROOT / "assets" / "kxyy-wechat-record-cut01_30s.wav")
-    paths.append(VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav")
+        paths.append(_RUNTIME / "out" / "kxyy-wechat-record-cut01_15s.wav")
+    paths.append(ROOT / "assets" / "kxyy-wechat-record-cut01_15s.wav")
+    paths.append(VOICE_AB / "out" / "kxyy-wechat-record-cut01_15s.wav")
     return paths
 
 
@@ -178,8 +178,8 @@ def ref_wav_path() -> Path:
         if p.is_file():
             return p
     if _RUNTIME is not None:
-        return _RUNTIME / "out" / "kxyy-wechat-record-cut01_30s.wav"
-    return VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav"
+        return _RUNTIME / "out" / "kxyy-wechat-record-cut01_15s.wav"
+    return VOICE_AB / "out" / "kxyy-wechat-record-cut01_15s.wav"
 
 
 def ref_txt_path() -> Path:
@@ -187,15 +187,16 @@ def ref_txt_path() -> Path:
     return wav.with_suffix(".txt")
 
 
-REF_WAV = VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav"  # 兼容旧引用；运行时请用 ref_wav_path()
-REF_TXT = VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.txt"
+REF_WAV = VOICE_AB / "out" / "kxyy-wechat-record-cut01_15s.wav"  # 兼容旧引用；运行时请用 ref_wav_path()
+REF_TXT = VOICE_AB / "out" / "kxyy-wechat-record-cut01_15s.txt"
 MERGED_MP3 = REPO / "merged.mp3"
 
-# 内置兜底参考音文案（与 assets/kxyy-wechat-record-cut01_30s.txt 一致）。
+# 内置兜底参考音文案（与 assets/kxyy-wechat-record-cut01_15s.txt 一致）。
 # 当用户未填写文案、且同名 .txt 也找不到时使用。
 _DEFAULT_REF_TEXT = (
     "对的，这是先实验一个小聚会，然后这个要是成功了的话，咱们之后就可以再换一个地方，"
     "然后之后咱们办一个稍微大一点的，然后去的可以稍微多一点，因为现在太敏感了。"
+    "现在的话, 这个时候, 嗯这两天就很敏感"
 )
 
 
@@ -403,13 +404,13 @@ def ensure_ref_wav() -> tuple[Path, str]:
         return wav, text
 
     # 打包资源里的参考音（只读）→ 复制到 runtime/out
-    bundled = ROOT / "assets" / "kxyy-wechat-record-cut01_30s.wav"
-    bundled_txt = ROOT / "assets" / "kxyy-wechat-record-cut01_30s.txt"
+    bundled = ROOT / "assets" / "kxyy-wechat-record-cut01_15s.wav"
+    bundled_txt = ROOT / "assets" / "kxyy-wechat-record-cut01_15s.txt"
     if bundled.is_file():
         dest = (
-            (_RUNTIME / "out" / "kxyy-wechat-record-cut01_30s.wav")
+            (_RUNTIME / "out" / "kxyy-wechat-record-cut01_15s.wav")
             if _RUNTIME is not None
-            else (VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav")
+            else (VOICE_AB / "out" / "kxyy-wechat-record-cut01_15s.wav")
         )
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.is_file():

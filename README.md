@@ -192,6 +192,10 @@ npm run encrypt-assets
 
 也可在 GitHub Actions 页面手动 **workflow_dispatch** 重跑。
 
+### 更新日志（v0.2.9）
+
+- 内置兜底参考音改用 15s 版本 `kxyy-wechat-record-cut01_15s`，移除 30s 版本，减小安装包体积
+
 ### 更新日志（v0.2.8）
 
 - 本地 Qwen3-TTS 扩展为跨平台：macOS 继续走 mlx-audio，Windows / Linux 走官方 PyTorch 包 `qwen-tts`（默认 1.7B 模型 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`）

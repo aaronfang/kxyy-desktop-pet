@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "元元桌宠",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "identifier": "com.aaronfang.kxyydesktoppet",
   "build": {
     "frontendDist": "../src"
@@ -84,8 +84,8 @@
       "../scripts/windows/setup-gpu-voice.ps1": "scripts/windows/setup-gpu-voice.ps1",
       "../scripts/windows/setup-qwen3-tts.cmd": "scripts/windows/setup-qwen3-tts.cmd",
       "../scripts/windows/setup-qwen3-tts.ps1": "scripts/windows/setup-qwen3-tts.ps1",
-      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_30s.wav": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_30s.wav",
-      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_30s.txt": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_30s.txt"
+      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.wav": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.wav",
+      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt"
     },
     "windows": {
       "nsis": {
