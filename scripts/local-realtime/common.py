@@ -167,9 +167,9 @@ _patch_sentencepiece_nonascii_paths()
 def _ref_candidates() -> list[Path]:
     paths: list[Path] = []
     if _RUNTIME is not None:
-        paths.append(_RUNTIME / "out" / "yuanyuan_ref_15s.wav")
-    paths.append(ROOT / "assets" / "yuanyuan_ref_15s.wav")
-    paths.append(VOICE_AB / "out" / "yuanyuan_ref_15s.wav")
+        paths.append(_RUNTIME / "out" / "kxyy-wechat-record-cut01_30s.wav")
+    paths.append(ROOT / "assets" / "kxyy-wechat-record-cut01_30s.wav")
+    paths.append(VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav")
     return paths
 
 
@@ -178,8 +178,8 @@ def ref_wav_path() -> Path:
         if p.is_file():
             return p
     if _RUNTIME is not None:
-        return _RUNTIME / "out" / "yuanyuan_ref_15s.wav"
-    return VOICE_AB / "out" / "yuanyuan_ref_15s.wav"
+        return _RUNTIME / "out" / "kxyy-wechat-record-cut01_30s.wav"
+    return VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav"
 
 
 def ref_txt_path() -> Path:
@@ -187,9 +187,16 @@ def ref_txt_path() -> Path:
     return wav.with_suffix(".txt")
 
 
-REF_WAV = VOICE_AB / "out" / "yuanyuan_ref_15s.wav"  # 兼容旧引用；运行时请用 ref_wav_path()
-REF_TXT = VOICE_AB / "out" / "yuanyuan_ref_15s.txt"
+REF_WAV = VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav"  # 兼容旧引用；运行时请用 ref_wav_path()
+REF_TXT = VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.txt"
 MERGED_MP3 = REPO / "merged.mp3"
+
+# 内置兜底参考音文案（与 assets/kxyy-wechat-record-cut01_30s.txt 一致）。
+# 当用户未填写文案、且同名 .txt 也找不到时使用。
+_DEFAULT_REF_TEXT = (
+    "对的，这是先实验一个小聚会，然后这个要是成功了的话，咱们之后就可以再换一个地方，"
+    "然后之后咱们办一个稍微大一点的，然后去的可以稍微多一点，因为现在太敏感了。"
+)
 
 
 def _settings_path() -> Path:
@@ -384,7 +391,7 @@ def ensure_ref_wav() -> tuple[Path, str]:
             if sib.is_file():
                 text = sib.read_text(encoding="utf-8").strip()
         if not text:
-            text = "对的，这是先实验一个小聚会。"
+            text = _DEFAULT_REF_TEXT
         return user_wav, text
 
     wav = ref_wav_path()
@@ -392,17 +399,17 @@ def ensure_ref_wav() -> tuple[Path, str]:
     if wav.is_file():
         text = txt.read_text(encoding="utf-8").strip() if txt.is_file() else ""
         if not text:
-            text = "对的，这是先实验一个小聚会。"
+            text = _DEFAULT_REF_TEXT
         return wav, text
 
     # 打包资源里的参考音（只读）→ 复制到 runtime/out
-    bundled = ROOT / "assets" / "yuanyuan_ref_15s.wav"
-    bundled_txt = ROOT / "assets" / "yuanyuan_ref_15s.txt"
+    bundled = ROOT / "assets" / "kxyy-wechat-record-cut01_30s.wav"
+    bundled_txt = ROOT / "assets" / "kxyy-wechat-record-cut01_30s.txt"
     if bundled.is_file():
         dest = (
-            (_RUNTIME / "out" / "yuanyuan_ref_15s.wav")
+            (_RUNTIME / "out" / "kxyy-wechat-record-cut01_30s.wav")
             if _RUNTIME is not None
-            else (VOICE_AB / "out" / "yuanyuan_ref_15s.wav")
+            else (VOICE_AB / "out" / "kxyy-wechat-record-cut01_30s.wav")
         )
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.is_file():
@@ -413,55 +420,17 @@ def ensure_ref_wav() -> tuple[Path, str]:
         text = (
             dest_txt.read_text(encoding="utf-8").strip()
             if dest_txt.is_file()
-            else "对的，这是先实验一个小聚会。"
+            else _DEFAULT_REF_TEXT
         )
         return dest, text
 
-    if not MERGED_MP3.exists():
-        raise SystemExit(
-            "未配置参考音频。请在「设置 → 语音 → 参考音频」填入一段清晰的单人录音"
-            "（建议 10~20s，wav/mp3 均可），保存后重启语音服务即可克隆该音色。"
-        )
-    import subprocess
-
-    dest = (
-        (_RUNTIME / "out" / "yuanyuan_ref_15s.wav")
-        if _RUNTIME is not None
-        else REF_WAV
+    # 走到这里说明内置兜底参考音也找不到（安装包资源缺失 / 仓库被裁剪）。
+    # 不再 fallback 到 merged.mp3 截取（该文件被 gitignore，dev / 发行版均无），
+    # 直接报错并引导用户自行填入参考音频。
+    raise SystemExit(
+        "未找到参考音频。请在「设置 → 语音 → 参考音频」填入一段清晰的单人录音"
+        "（建议 10~20s，wav/mp3 均可），保存后重启语音服务即可克隆该音色。"
     )
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(MERGED_MP3),
-                "-ss",
-                "0",
-                "-t",
-                "15",
-                "-ac",
-                "1",
-                "-ar",
-                "24000",
-                str(dest),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=60,
-            **_subprocess_no_window(),
-        )
-    except subprocess.TimeoutExpired as e:
-        raise SystemExit("ffmpeg 截取参考音超时（60s）") from e
-    dest_txt = dest.with_suffix(".txt")
-    text = (
-        dest_txt.read_text(encoding="utf-8").strip()
-        if dest_txt.is_file()
-        else "对的，这是先实验一个小聚会。"
-    )
-    dest_txt.write_text(text + "\n", encoding="utf-8")
-    return dest, text
 
 
 def load_llm_settings() -> None:

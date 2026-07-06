@@ -1,6 +1,6 @@
 [package]
 name = "kxyy-desktop-pet"
-version = "0.2.7"
+version = "0.2.8"
 description = "元元桌宠"
 authors = ["aaronfang"]
 license = "MIT"

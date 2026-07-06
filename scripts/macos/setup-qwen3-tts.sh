@@ -51,14 +51,14 @@ fi
 mkdir -p "$RUNTIME/out"
 
 log "STEP 1/5 复制参考音…"
-if [[ -f "$LR/assets/yuanyuan_ref_15s.wav" ]]; then
-  cp -f "$LR/assets/yuanyuan_ref_15s.wav" "$RUNTIME/out/yuanyuan_ref_15s.wav"
-  log "已复制 yuanyuan_ref_15s.wav"
+if [[ -f "$LR/assets/kxyy-wechat-record-cut01_30s.wav" ]]; then
+  cp -f "$LR/assets/kxyy-wechat-record-cut01_30s.wav" "$RUNTIME/out/kxyy-wechat-record-cut01_30s.wav"
+  log "已复制 kxyy-wechat-record-cut01_30s.wav"
 else
   log "警告：打包内无参考音，稍后若缺失需自行提供"
 fi
-if [[ -f "$LR/assets/yuanyuan_ref_15s.txt" ]]; then
-  cp -f "$LR/assets/yuanyuan_ref_15s.txt" "$RUNTIME/out/yuanyuan_ref_15s.txt"
+if [[ -f "$LR/assets/kxyy-wechat-record-cut01_30s.txt" ]]; then
+  cp -f "$LR/assets/kxyy-wechat-record-cut01_30s.txt" "$RUNTIME/out/kxyy-wechat-record-cut01_30s.txt"
 fi
 
 PY_SYS="$(command -v python3 || true)"
@@ -124,7 +124,7 @@ def heartbeat(label: str, stop: threading.Event) -> None:
         )
 
 runtime = Path(os.environ["KXYY_VOICE_RUNTIME"])
-ref = runtime / "out" / "yuanyuan_ref_15s.wav"
+ref = runtime / "out" / "kxyy-wechat-record-cut01_30s.wav"
 print(f"[setup-qwen3] 参考音：{ref} exists={ref.exists()}", flush=True)
 
 stop = threading.Event()

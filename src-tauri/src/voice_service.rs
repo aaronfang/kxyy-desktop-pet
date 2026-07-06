@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// 子进程最近日志缓存上限（失败时回带设置页）。
 const RECENT_LOG_MAX_LINES: usize = 30;
 /// macOS 自动配置脚本进度缓存上限。
+#[cfg(target_os = "macos")]
 const SETUP_LOG_MAX_LINES: usize = 40;
 /// 端口就绪等待上限（秒）；模型加载可能较久（本地 Qwen / CosyVoice3）。
 const START_TIMEOUT_SECS: u64 = 180;
@@ -75,6 +76,7 @@ struct Inner {
     /// 子进程最近日志（失败时带回设置页）。
     recent_logs: Arc<Mutex<VecDeque<String>>>,
     /// macOS 正在跑 setup-qwen3-tts.sh
+    #[cfg(target_os = "macos")]
     setup_running: bool,
 }
 
@@ -85,6 +87,7 @@ impl VoiceServiceManager {
                 backend: String::new(),
                 child: None,
                 recent_logs: Arc::new(Mutex::new(VecDeque::new())),
+                #[cfg(target_os = "macos")]
                 setup_running: false,
             }),
         }
@@ -178,7 +181,8 @@ fn normalize_backend(backend: &str) -> String {
     }
 }
 
-/// macOS 本地模型仅 Qwen3-TTS；GPU 大模型（IndexTTS-2 / CosyVoice3）面向 Windows(+NVIDIA)。
+/// Qwen3-TTS 跨平台（macOS mlx-audio / Windows+Linux PyTorch qwen-tts）；
+/// GPU 大模型（IndexTTS-2 / CosyVoice3）仅面向 Windows(+NVIDIA)，macOS 不可用。
 fn is_gpu_local_backend(backend: &str) -> bool {
     matches!(backend, "cosyvoice3" | "indextts2")
 }
@@ -327,6 +331,10 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
         if let Some(rt) = macos_voice_runtime() {
             list.push(rt.join(".venv/bin/python"));
         }
+        // Windows / Linux：本地 Qwen3-TTS 走官方 PyTorch 包（qwen-tts），
+        // 用独立环境 .venv-qwen3（由 scripts/windows/setup-qwen3-tts.ps1 创建）。
+        list.push(repo.join("scripts/local-realtime/.venv-qwen3/bin/python"));
+        list.push(repo.join("scripts/local-realtime/.venv-qwen3/Scripts/python.exe"));
     }
     // GPU 后端优先用各自独立环境
     if backend == "cosyvoice3" {
@@ -619,6 +627,7 @@ fn read_setting_str(key: &str) -> String {
         .to_string()
 }
 
+#[cfg(target_os = "macos")]
 fn emit_setup_progress(app: &AppHandle, line: String, lines: &Arc<Mutex<VecDeque<String>>>) {
     eprintln!("[setup-qwen3] {line}");
     if let Ok(mut q) = lines.lock() {
@@ -639,6 +648,7 @@ fn emit_setup_progress(app: &AppHandle, line: String, lines: &Arc<Mutex<VecDeque
 }
 
 /// 清洗脚本输出，供设置页展示。
+#[cfg(target_os = "macos")]
 fn format_setup_line(raw: &str) -> Option<String> {
     let line = raw.trim();
     if line.is_empty() {
@@ -753,14 +763,6 @@ fn run_macos_qwen3_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn run_macos_qwen3_setup(
-    _app: &AppHandle,
-    _repo: &Path,
-    _runtime: &Path,
-) -> Result<(), String> {
-    Ok(())
-}
 
 /// IndexTTS-2：启动前检查源码/权重是否就绪，避免只看到「进程已退出」。
 ///
@@ -839,7 +841,7 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
             VoiceServiceStatus {
                 backend: backend.clone(),
                 state: "failed".into(),
-                message: "macOS 本地模型仅支持 Qwen3-TTS；IndexTTS-2 / CosyVoice3 请在 Windows+NVIDIA 上使用".into(),
+                message: "macOS 不支持 GPU 本地模型（IndexTTS-2 / CosyVoice3）；请改用 Qwen3-TTS 本地后端（macOS / Windows / Linux 均可用）".into(),
                 port: port_for(&backend),
             },
         );
@@ -1050,6 +1052,8 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
                 state: "failed".into(),
                 message: if cfg!(target_os = "macos") {
                     "找不到 Python。请安装 Python 3.10+（Apple Silicon），将自动创建语音运行时。".into()
+                } else if backend == "local" {
+                    "找不到本地 Qwen3-TTS 运行环境。请运行 scripts/windows/setup-qwen3-tts.cmd 自动配置（创建 .venv-qwen3 并安装 qwen-tts）。".into()
                 } else {
                     "找不到 Python。请先创建 scripts/voice-ab/.venv 并安装依赖。".into()
                 },

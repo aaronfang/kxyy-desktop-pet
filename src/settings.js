@@ -144,7 +144,7 @@ function fill(s) {
   syncVoiceVolumeLabel();
   syncVoiceFields();
   el("autoSpeak").checked = !!s.autoSpeak;
-  el("showChatDebug").checked = s.showChatDebug !== false;
+  el("showChatDebug").checked = s.showChatDebug === true;
   el("textModel").value = s.textModel || "";
   el("thinking").checked = !!s.thinking;
   el("temperature").value = s.temperature ?? 0.8;
@@ -284,11 +284,11 @@ document.querySelectorAll(".pw-toggle").forEach((btn) => {
 const voiceSetupLogLines = [];
 
 function backendLabel(backend) {
-  if (backend === "local") return "本地 Qwen3";
-  if (backend === "cosyvoice") return "CosyVoice 通义";
-  if (backend === "cosyvoice3") return "CosyVoice3 开源";
-  if (backend === "indextts2") return "IndexTTS-2";
-  if (backend === "volc") return "火山";
+  if (backend === "local") return "Qwen3-TTS（本地）";
+  if (backend === "cosyvoice") return "CosyVoice（通义云端）";
+  if (backend === "cosyvoice3") return "CosyVoice3（本地）";
+  if (backend === "indextts2") return "IndexTTS-2（本地）";
+  if (backend === "volc") return "火山引擎（云端）";
   return backend || "本地服务";
 }
 

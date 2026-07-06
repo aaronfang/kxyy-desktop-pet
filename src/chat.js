@@ -359,7 +359,7 @@ function voiceBackendLabel() {
 }
 
 function chatDebugEnabled() {
-  return settings.showChatDebug !== false;
+  return settings.showChatDebug === true;
 }
 
 function formatTokenCount(n) {
@@ -902,6 +902,28 @@ function renderFinalBubbles(streamBubble, reply) {
   for (let i = 1; i < parts.length; i++) addBubble("assistant", parts[i]);
 }
 
+/**
+ * 正文为空时，依据流式过程中收集到的线索判定「回复为空」的真实原因，
+ * 便于排查：连接其实是通的（否则前面就报「连接DeepSeek失败/错误码」了）。
+ */
+function emptyReplyReason({ finishReason, hasReasoning, sawData } = {}) {
+  if (!sawData) {
+    return "回复为空：未收到任何模型数据（响应体空或被截断，检查网络/上游状态）";
+  }
+  if (finishReason === "content_filter") {
+    return "回复为空：内容被 DeepSeek 安全策略过滤，换个说法再试";
+  }
+  if (hasReasoning) {
+    return finishReason === "length"
+      ? "回复为空：深度思考占满了 max_tokens，正文没生成完（关闭「深度思考」或调大 max_tokens）"
+      : "回复为空：模型只输出了思考内容、没有正文";
+  }
+  if (finishReason === "length") {
+    return "回复为空：输出被长度限制截断";
+  }
+  return "回复为空";
+}
+
 /** 流式请求元元回复（普通聊天 / 拍一拍共用）。调用前须已把本轮 user 消息写入 history。 */
 async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, patAction, replyId } = {}) {
   let full = "";
@@ -943,6 +965,10 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     const decoder = new TextDecoder();
     let buffer = "";
     let usage = null;
+    // 排查「回复为空」用的线索：是否真收到过 SSE 数据、是否只有思考内容、上游给的结束原因。
+    let reasoning = "";
+    let finishReason = "";
+    let sawData = false;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -951,13 +977,18 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       buffer = lines.pop() || "";
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue;
+        sawData = true;
         const payload = line.slice(6).trim();
         if (payload === "[DONE]") continue;
         try {
           const chunk = JSON.parse(payload);
           const chunkUsage = extractUsage(chunk);
           if (chunkUsage) usage = chunkUsage;
-          const delta = chunk.choices?.[0]?.delta?.content;
+          const choice = chunk.choices?.[0];
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
+          const rc = choice?.delta?.reasoning_content;
+          if (rc) reasoning += rc;
+          const delta = choice?.delta?.content;
           if (delta) {
             full += delta;
             if (!speaking) {
@@ -979,7 +1010,12 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
 
     const raw = sanitizeReply(full);
     const { text: reply, emotion } = extractSticker(raw);
-    if (!reply && !emotion) throw new Error("回复为空");
+    if (!reply && !emotion) {
+      if (chatDebugEnabled()) {
+        console.warn("[chat] 回复为空", { finishReason, hasReasoning: !!reasoning, sawData, fullLen: full.length });
+      }
+      throw new Error(emptyReplyReason({ finishReason, hasReasoning: !!reasoning, sawData }));
+    }
 
     if (proactiveKind === "followup" && isBadFollowupReply(reply)) {
       streamRow.remove();
@@ -1673,7 +1709,7 @@ listen("apply-settings", ({ payload }) => {
   const identityChanged = identityKeys.some(
     (k) => k in payload && payload[k] !== settings[k]
   );
-  const debugWasOn = settings.showChatDebug !== false;
+  const debugWasOn = settings.showChatDebug === true;
   settings = { ...settings, ...payload };
   if (identityChanged) refreshIdentity();
   applyAppearance();

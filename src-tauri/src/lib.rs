@@ -243,7 +243,7 @@ impl Settings {
             local_ref_wav: String::new(),
             local_ref_text: String::new(),
             voice_volume: default_voice_volume(),
-            show_chat_debug: true,
+            show_chat_debug: false,
             text_model: String::new(),
             thinking: false,
             temperature: default_temperature(),
