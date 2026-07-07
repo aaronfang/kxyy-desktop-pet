@@ -239,9 +239,20 @@ async fn handle_frontend(
     provider: ConfigProvider,
 ) -> Result<(), String> {
     let _ = stream.set_nodelay(true);
-    let front_ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| format!("前端 WS 握手失败: {e}"))?;
+    let front_ws = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            // 多半是 Webview2 / 上层进程对本机端口的 HTTP 探活（GET /favicon.ico、/health 等），
+            // 浏览器 WebSocket 握手要求 `Connection: upgrade`，缺这个头 tungstenite 会拒；
+            // 这类请求是噪声，不算异常。真正的前端连不上时，`realtime.js` 的 onopen
+            // 不会触发，`start()` 会向用户抛"连接实时语音服务失败"，那条链路才需要排查。
+            let msg = e.to_string();
+            if !msg.contains("Connection: upgrade") && !msg.contains("Connection: Upgrade") {
+                eprintln!("[realtime] 忽略非 WS 握手请求: {msg}");
+            }
+            return Ok(());
+        }
+    };
     let (mut front_tx, mut front_rx) = front_ws.split();
 
     // 读取密钥/音色；非火山后端或配置缺失时直接拒绝，绝不向上游建连（避免误耗 token）。
