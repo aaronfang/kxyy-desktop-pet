@@ -496,16 +496,14 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .default_window_icon()
         .cloned()
         .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"));
-    let mut builder = TrayIconBuilder::with_id("main")
+    let builder = TrayIconBuilder::with_id("main")
         .tooltip("元元桌宠")
         .menu(&menu)
         .icon(icon)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
     #[cfg(target_os = "macos")]
-    {
-        builder = builder.icon_as_template(false);
-    }
+    let builder = builder.icon_as_template(false);
     let tray = builder.build(app)?;
     app.manage(TrayHolder(tray));
     Ok(())
