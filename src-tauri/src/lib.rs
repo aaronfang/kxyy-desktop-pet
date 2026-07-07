@@ -275,6 +275,10 @@ struct AppState {
     quitting: AtomicBool,
 }
 
+/// 持有托盘图标引用，防止 setup 结束后被 drop 移除。
+#[allow(dead_code)]
+struct TrayHolder(tauri::tray::TrayIcon<Wry>);
+
 /// 供本地 HTTP 代理按需读取的 AI 配置快照。
 pub(crate) struct AiConfig {
     pub deepseek_key: String,
@@ -483,6 +487,28 @@ fn rebuild_tray(app: &AppHandle) {
             let _ = tray.set_menu(Some(menu));
         }
     }
+}
+
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    let handle = app.handle().clone();
+    let menu = build_tray_menu(&handle)?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .unwrap_or_else(|| tauri::include_image!("icons/32x32.png"));
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("元元桌宠")
+        .menu(&menu)
+        .icon(icon)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon_as_template(false);
+    }
+    let tray = builder.build(app)?;
+    app.manage(TrayHolder(tray));
+    Ok(())
 }
 
 fn apply_hidden_to_window(app: &AppHandle, hidden: bool) {
@@ -695,16 +721,68 @@ fn cursor_pos(window: tauri::WebviewWindow) -> Result<(f64, f64), String> {
     Ok(((cur.x - pos.x as f64) / sf, (cur.y - pos.y as f64) / sf))
 }
 
+/// 在光标处（相对主窗口）弹出托盘菜单；失败则打开设置窗口。
+fn popup_tray_menu_at_cursor(app: &AppHandle) {
+    let Ok(menu) = build_tray_menu(app) else {
+        open_settings_window(app);
+        return;
+    };
+    let Some(win) = app.get_webview_window("main") else {
+        open_settings_window(app);
+        return;
+    };
+    if let Ok(pos) = win.cursor_position() {
+        if win.popup_menu_at(&menu, pos).is_ok() {
+            return;
+        }
+    }
+    let _ = win.popup_menu(&menu);
+}
+
+/// dev 模式 Dock 点击：菜单栏托盘在 macOS 26+ dev 常不可见，于主窗口中央弹出托盘菜单。
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn popup_tray_menu_centered(app: &AppHandle) {
+    let Ok(menu) = build_tray_menu(app) else {
+        open_settings_window(app);
+        return;
+    };
+    let Some(win) = app.get_webview_window("main") else {
+        open_settings_window(app);
+        return;
+    };
+    if !win.is_visible().unwrap_or(false) {
+        open_settings_window(app);
+        return;
+    }
+    if let Ok(size) = win.inner_size() {
+        let _ = win.popup_menu_at(
+            &menu,
+            tauri::Position::Logical(tauri::LogicalPosition {
+                x: (size.width / 2) as f64,
+                y: (size.height / 2) as f64,
+            }),
+        );
+        return;
+    }
+    let _ = win.popup_menu(&menu);
+}
+
+/// dev 模式 Dock 图标点击：macOS 26+ 上菜单栏托盘常不可见，Dock 作为备用入口。
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn handle_macos_dock_reopen(app: &AppHandle) {
+    let app2 = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        let _ = app2.show();
+        popup_tray_menu_centered(&app2);
+    });
+}
+
 /// 右键桌宠时在光标处弹出上下文菜单（须在主线程执行）。
 #[tauri::command]
 fn show_menu(app: AppHandle) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if let Some(win) = handle.get_webview_window("main") {
-            if let Ok(menu) = build_tray_menu(&handle) {
-                let _ = win.popup_menu(&menu);
-            }
-        }
+        popup_tray_menu_at_cursor(&handle);
     });
 }
 
@@ -929,10 +1007,15 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            // macOS：桌宠应用隐藏 Dock 图标，仅保留菜单栏托盘图标。
-            // Accessory 策略在 dev 模式下同样生效，弥补 Info.plist(LSUIElement) 仅对打包产物生效的问题。
+            // macOS：正式包隐藏 Dock，仅保留菜单栏托盘。
+            // dev 裸二进制在 macOS 26+ 上常不显示菜单栏图标，开发模式保留 Dock 入口。
             #[cfg(target_os = "macos")]
-            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            {
+                #[cfg(debug_assertions)]
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                #[cfg(not(debug_assertions))]
+                let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
 
             let handle = app.handle().clone();
             let settings = load_settings(&handle);
@@ -972,6 +1055,8 @@ pub fn run() {
                 realtime_port,
                 quitting: AtomicBool::new(false),
             });
+            // 尽早创建托盘，避免语音服务等后台任务拖慢菜单栏图标出现。
+            install_tray(app)?;
             // 启动时按已保存的语音后端自动拉起本地服务。
             voice_service::ensure(&handle, &settings.realtime_backend);
 
@@ -1008,17 +1093,6 @@ pub fn run() {
                 });
             }
 
-            let menu = build_tray_menu(&handle)?;
-            let mut builder = TrayIconBuilder::with_id("main")
-                .tooltip("元元桌宠")
-                .menu(&menu)
-                .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| handle_menu_event(app, event.id.as_ref()));
-            if let Some(icon) = app.default_window_icon() {
-                builder = builder.icon(icon.clone());
-            }
-            let _tray = builder.build(app)?;
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1038,8 +1112,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                voice_service::stop(app);
+            match event {
+                tauri::RunEvent::Exit => voice_service::stop(app),
+                #[cfg(all(target_os = "macos", debug_assertions))]
+                tauri::RunEvent::Reopen { .. } => handle_macos_dock_reopen(app),
+                _ => {}
             }
         });
 }

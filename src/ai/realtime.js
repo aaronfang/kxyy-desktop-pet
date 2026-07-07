@@ -66,6 +66,7 @@ export class RealtimeSession {
     this._keepAliveGain = null;
     this._outGain = null; // 下行播放主音量
     this._unsubVol = null;
+    this._micPrepare = null; // 在用户手势栈内发起的 getUserMedia Promise
   }
 
   /**
@@ -74,19 +75,41 @@ export class RealtimeSession {
    */
   prepareAudio() {
     this._initAudioCtx();
+    // 必须在用户点击的同步栈内发起 getUserMedia；打包版 WKWebView 在 await 之后再调
+    // 可能拿不到合法 MediaStream（createMediaStreamSource 报类型错误）。
+    if (!this._micPrepare) this._micPrepare = this._acquireMicStream();
+  }
+
+  _acquireMicStream() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      return Promise.reject(new Error("当前环境不支持麦克风采集"));
+    }
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
   }
 
   /** 开始通话：连桥接 → 发 start → 起麦克风与播放。 */
   async start({ systemRole, botName }) {
     // 若 chat.js 已在点击栈调用 prepareAudio，这里是幂等补齐。
     this._initAudioCtx();
+    if (!this._micPrepare) this._micPrepare = this._acquireMicStream();
 
     const base = await invoke("get_realtime_base");
+    if (this.stopped) return;
     if (!base) throw new Error("实时语音服务未启动");
 
     await this._openSocket(base, { systemRole, botName });
+    if (this.stopped) return;
     await this._resumeAudioCtx();
+    if (this.stopped) return;
     await this._startMic();
+    if (this.stopped) return;
     // 麦克风授权弹窗可能再次把 context 挂起，授权回来后再 resume 一次。
     await this._resumeAudioCtx();
     this._startLevelLoop();
@@ -376,18 +399,32 @@ export class RealtimeSession {
 
   // ---- 上行采集：麦克风 → worklet → WS（与播放共用 audioCtx）----
   async _startMic() {
-    this.micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-      },
-    });
+    const pending = this._micPrepare || this._acquireMicStream();
+    this._micPrepare = null;
+    let stream;
+    try {
+      stream = await pending;
+    } catch (e) {
+      const name = e?.name || "";
+      if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+        throw new Error("未获得麦克风权限，请在「系统设置 → 隐私与安全性 → 麦克风」中允许元元桌宠");
+      }
+      throw e;
+    }
+    if (this.stopped) {
+      stream?.getTracks?.().forEach((t) => t.stop());
+      return;
+    }
+    if (!(stream instanceof MediaStream)) {
+      throw new Error("麦克风未就绪，请重试并允许访问麦克风");
+    }
+    this.micStream = stream;
     const ctx = this.audioCtx;
     if (!ctx) throw new Error("音频上下文未初始化");
     if (ctx.state === "suspended") await ctx.resume();
+    if (this.stopped) return;
     await ctx.audioWorklet.addModule("./ai/pcm-worklet.js");
+    if (this.stopped) return;
     this.micSource = ctx.createMediaStreamSource(this.micStream);
     this.workletNode = new AudioWorkletNode(ctx, "pcm-capture", {
       processorOptions: { targetRate: TARGET_RATE },
@@ -443,6 +480,7 @@ export class RealtimeSession {
     } catch {
       /* ignore */
     }
+    this._micPrepare = null;
     try {
       await this.audioCtx?.close();
     } catch {

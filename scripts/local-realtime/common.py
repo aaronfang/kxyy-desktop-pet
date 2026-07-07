@@ -28,6 +28,35 @@ VOICE_AB = REPO / "scripts" / "voice-ab"
 _RUNTIME = Path(os.environ["KXYY_VOICE_RUNTIME"]).expanduser() if os.environ.get("KXYY_VOICE_RUNTIME") else None
 
 
+def _ensure_cli_path() -> None:
+    """GUI 启动的进程 PATH 常缺 Homebrew，补全常见工具路径（ffmpeg 等）。"""
+    extra: list[str] = []
+    if sys.platform == "darwin":
+        extra.extend(["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"])
+    elif sys.platform.startswith("linux"):
+        extra.extend(["/usr/local/bin", "/snap/bin"])
+    current = os.environ.get("PATH", "")
+    seen = {p for p in current.split(os.pathsep) if p}
+    prepend = [p for p in extra if p not in seen]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + ([current] if current else []))
+
+
+def _ffmpeg_cmd() -> str:
+    import shutil
+
+    _ensure_cli_path()
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    raise RuntimeError(
+        "未找到 ffmpeg（实时通话 ASR 需要）。macOS 请运行：brew install ffmpeg，然后重启语音服务。"
+    )
+
+
+_ensure_cli_path()
+
+
 def _subprocess_no_window() -> dict:
     """Windows：给 subprocess 加 CREATE_NO_WINDOW，避免 ffmpeg 等控制台子进程弹出黑框。
 
@@ -392,7 +421,14 @@ def ensure_ref_wav() -> tuple[Path, str]:
             if sib.is_file():
                 text = sib.read_text(encoding="utf-8").strip()
         if not text:
-            text = _DEFAULT_REF_TEXT
+            # _DEFAULT_REF_TEXT 仅对应内置 kxyy-wechat-record-cut01_15s.wav；
+            # 套到用户自备参考音上会造成文案长于实际录音，Qwen3 克隆会在合成开头
+            # 「漏」出多出来的参考句（听感像多一个嗯/哦）。
+            raise SystemExit(
+                f"参考音频已设置但未填写对应文案：{user_wav}\n"
+                "请在「设置 → 语音 → 参考音频文案」填入录音里说的话（须与音频逐字一致），"
+                "或在同目录放置同名 .txt 文件，保存后重启语音服务。"
+            )
         return user_wav, text
 
     wav = ref_wav_path()
@@ -699,6 +735,28 @@ def transcribe(pcm16: bytes) -> tuple[str, float]:
         path.unlink(missing_ok=True)
 
 
+def warmup_asr() -> None:
+    """启动后预热 ASR，避免第一通电话冷加载模型造成「点了没反应」。
+
+    mlx 路径下 ``load_whisper_on_mlx_thread`` 只做了 ``import mlx_whisper``，真正的权重
+    （whisper-large-v3-turbo，约 1.6GB，日志里的 ``Fetching N files`` + 数百帧处理）要到
+    首次 ``transcribe()`` 才加载；而 ASR 又跑在单线程的 ``_mlx_pool`` 上，加载期间那通电话
+    完全出不了结果。这里在服务就绪后用一段静音空跑一次，把权重与 JIT 预热掉，让首通电话即时响应。
+
+    必须在 ``_mlx_pool`` 线程上执行（与 TTS/ASR 同一 MLX Metal 上下文）；由 ``run()`` 在
+    ``start_tts_http`` 之后 ``submit`` 触发，故不阻塞 HTTP /health 与朗读的就绪。
+    """
+    if _asr_backend == "none":
+        return
+    try:
+        t0 = time.perf_counter()
+        silence = b"\x00\x00" * (INPUT_RATE // 2)  # 0.5s 静音
+        transcribe(silence)
+        log(f"ASR 预热完成 ({time.perf_counter()-t0:.1f}s, backend={_asr_backend})")
+    except Exception as e:
+        log(f"ASR 预热跳过：{e}")
+
+
 def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
     if no_speech_prob >= NO_SPEECH_PROB_MAX:
         log(f"过滤: no_speech_prob={no_speech_prob:.2f}")
@@ -773,7 +831,7 @@ def mp3_to_pcm24k(mp3: bytes) -> bytes:
     try:
         proc = subprocess.run(
             [
-                "ffmpeg",
+                _ffmpeg_cmd(),
                 "-v",
                 "error",
                 "-i",
@@ -1159,8 +1217,11 @@ def run(
         raise SystemExit("缺少 websockets：在 voice-ab/.venv 里 pip install websockets") from e
 
     load_llm_settings()
+    _ensure_cli_path()
     prepare()
     start_tts_http(port)
+    # HTTP /health 与朗读已就绪，再后台预热 ASR：首通电话不必等 whisper 冷加载。
+    _mlx_pool.submit(warmup_asr)
     log(f"监听 ws://127.0.0.1:{port}")
 
     async def main_async() -> None:

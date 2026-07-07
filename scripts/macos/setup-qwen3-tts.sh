@@ -61,6 +61,13 @@ if [[ -f "$LR/assets/kxyy-wechat-record-cut01_15s.txt" ]]; then
   cp -f "$LR/assets/kxyy-wechat-record-cut01_15s.txt" "$RUNTIME/out/kxyy-wechat-record-cut01_15s.txt"
 fi
 
+log "检查 ffmpeg（实时通话 ASR 需要）…"
+if command -v ffmpeg >/dev/null 2>&1; then
+  log "ffmpeg 已安装：$(command -v ffmpeg)"
+else
+  log "警告：未找到 ffmpeg。请安装后重启桌宠：brew install ffmpeg"
+fi
+
 PY_SYS="$(command -v python3 || true)"
 if [[ -z "$PY_SYS" ]]; then
   log "错误：未找到 python3，请先安装 Python 3.10+（Apple Silicon）"

@@ -1,5 +1,5 @@
 //! 按设置自动拉起 / 切换本地语音 Python 服务（Qwen3 / CosyVoice 云桥 / CosyVoice3 开源）。
-//! 火山后端不启 Python；若端口已被占用则视为外部已启动，不再重复拉起。
+//! 火山后端不启 Python；若端口健康检查通过则视为已就绪；若端口被占但检查失败则自动清理残留进程后重拉。
 
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -163,6 +163,32 @@ fn take_log_summary(logs: &Arc<Mutex<VecDeque<String>>>) -> String {
     msg
 }
 
+/// macOS 从 Finder 启动时 PATH 常不含 Homebrew；本地语音 ASR（mlx-whisper）依赖 ffmpeg CLI。
+fn augmented_tool_path() -> std::ffi::OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let cur = current.to_string_lossy();
+    #[cfg(target_os = "macos")]
+    let extras = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let extras = ["/usr/local/bin", "/snap/bin"];
+    #[cfg(windows)]
+    let extras: [&str; 0] = [];
+    let prepend: Vec<&str> = extras
+        .iter()
+        .copied()
+        .filter(|p| !cur.split(':').any(|part| part == *p))
+        .collect();
+    if prepend.is_empty() {
+        return current;
+    }
+    let joined = prepend.join(":");
+    if cur.is_empty() {
+        std::ffi::OsString::from(joined)
+    } else {
+        std::ffi::OsString::from(format!("{joined}:{cur}"))
+    }
+}
+
 fn emit(app: &AppHandle, status: VoiceServiceStatus) {
     let _ = app.emit("voice-service-status", &status);
     eprintln!(
@@ -250,6 +276,121 @@ fn service_running(ws_port: u16) -> bool {
     }
     let text = String::from_utf8_lossy(&buf);
     text.contains("200 OK") && text.contains("kxyy-voice")
+}
+
+/// 127.0.0.1 上是否已有进程在监听该端口。
+fn port_listener_busy(port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
+#[cfg(unix)]
+fn pids_listening_on_port(port: u16) -> Vec<u32> {
+    for bin in ["/usr/sbin/lsof", "/usr/bin/lsof", "lsof"] {
+        let Ok(output) = Command::new(bin)
+            .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
+            .output()
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let self_pid = std::process::id();
+        let mut pids: Vec<u32> = text
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .filter(|pid| *pid != self_pid)
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        return pids;
+    }
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn pids_listening_on_port(port: u16) -> Vec<u32> {
+    let Ok(output) = Command::new("netstat").args(["-ano", "-p", "tcp"]).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!(":{port}");
+    let self_pid = std::process::id();
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        if !line.contains("LISTENING") || !line.contains(&needle) {
+            continue;
+        }
+        let Some(pid) = line.split_whitespace().last().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid != 0 && pid != self_pid {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32, force: bool) {
+    if force {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    } else {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32, _force: bool) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
+}
+
+/// 清理占用语音后端 WS/HTTP 端口的残留进程（上次崩溃或重复拉起留下的孤儿）。
+fn clear_stale_voice_listeners(ws_port: u16) -> bool {
+    let mut killed = false;
+    for port in [ws_port, ws_port.saturating_add(100)] {
+        for pid in pids_listening_on_port(port) {
+            eprintln!("[voice-service] 清理占用 :{port} 的进程 pid={pid}");
+            kill_process(pid, false);
+            killed = true;
+        }
+    }
+    if !killed {
+        return false;
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    for port in [ws_port, ws_port.saturating_add(100)] {
+        for pid in pids_listening_on_port(port) {
+            eprintln!("[voice-service] 强制结束 pid={pid}（:{port}）");
+            kill_process(pid, true);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    !port_listener_busy(ws_port) && !port_listener_busy(ws_port.saturating_add(100))
+}
+
+/// 端口被占但健康检查未通过时，清理残留监听进程；成功清理返回 true。
+fn reclaim_voice_ports_if_stale(ws_port: u16) -> bool {
+    if service_running(ws_port) {
+        return false;
+    }
+    if !port_listener_busy(ws_port) && !port_listener_busy(ws_port.saturating_add(100)) {
+        return false;
+    }
+    eprintln!(
+        "[voice-service] :{ws_port} 被占用但健康检查未通过，清理残留进程后重试…"
+    );
+    clear_stale_voice_listeners(ws_port)
 }
 
 /// 定位含 `scripts/local-realtime` 的根目录（开发仓库或安装目录）。
@@ -400,11 +541,13 @@ fn which_in_path(name: &Path) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         // 先尝试原名（含 .exe / 无后缀），再尝试 Windows 下追加 .exe
-        let mut candidates: [PathBuf; 2] = [dir.join(name), dir.join(name)];
         #[cfg(windows)]
-        {
-            candidates[1] = dir.join(format!("{}.exe", name.display()));
-        }
+        let candidates: [PathBuf; 2] = [
+            dir.join(name),
+            dir.join(format!("{}.exe", name.display())),
+        ];
+        #[cfg(not(windows))]
+        let candidates: [PathBuf; 2] = [dir.join(name), dir.join(name)];
         for cand in &candidates {
             match std::fs::metadata(cand) {
                 Ok(md) if md.is_file() => {
@@ -872,22 +1015,43 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         return;
     }
 
+    // 端口被占但健康检查失败：优先清理残留（必须在 child_starting 之前，否则永远卡在「正在启动」）。
+    if reclaim_voice_ports_if_stale(port) {
+        if service_running(port) {
+            emit(
+                app,
+                VoiceServiceStatus {
+                    backend: backend.clone(),
+                    state: "running".into(),
+                    message: format!("已恢复（:{port}）"),
+                    port,
+                },
+            );
+            return;
+        }
+    }
+
     // 已托管同一后端且进程仍在
     if let Ok(mut inner) = app.state::<VoiceServiceManager>().inner.lock() {
         if inner.backend == backend {
             if let Some(child) = inner.child.as_mut() {
                 match child.try_wait() {
                     Ok(None) => {
-                        emit(
-                            app,
-                            VoiceServiceStatus {
-                                backend: backend.clone(),
-                                state: "starting".into(),
-                                message: "正在启动（加载模型中）…".into(),
-                                port,
-                            },
-                        );
-                        return;
+                        // 进程还在，但端口被占且不健康 → 冲突/僵尸，停掉后重拉。
+                        if port_listener_busy(port) && !service_running(port) {
+                            stop_inner(&mut inner);
+                        } else {
+                            emit(
+                                app,
+                                VoiceServiceStatus {
+                                    backend: backend.clone(),
+                                    state: "starting".into(),
+                                    message: "正在启动（加载模型中）…".into(),
+                                    port,
+                                },
+                            );
+                            return;
+                        }
                     }
                     _ => {
                         let _ = inner.child.take();
@@ -1063,6 +1227,9 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         return;
     };
 
+    // 拉起前再清一次，避免与外部残留 server.py 抢端口。
+    let _ = reclaim_voice_ports_if_stale(port);
+
     emit(
         app,
         VoiceServiceStatus {
@@ -1085,7 +1252,8 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         // （如 GBK）输出，我们的中文错误（SystemExit 提示等）会成为非法 UTF-8 字节，
         // 下方按行读取时被丢弃，导致设置页只看到空的「进程已退出」兜底文案。
         .env("PYTHONUTF8", "1")
-        .env("PYTHONIOENCODING", "utf-8");
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PATH", augmented_tool_path());
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);

@@ -79,8 +79,10 @@ function beginSynthProgress(chars) {
 // ── 播放音量（Web Audio GainNode，支持 >100%）──
 let outCtx = null;
 let outGain = null;
-let outSource = null;
+let outSource = null; // 可选：<audio> 元素接入（手动朗读 / 移动端加持）
 let volUnsub = null;
+/** 当前 decodeAudioData → BufferSource 播放（自动朗读队列专用，避免 WKWebView 播长 WAV 提前结束）。 */
+let activeBufferSource = null;
 
 /** 解析（结束）当前 playSpeechBlob 的等待 Promise，并清空引用。 */
 function resolveSpeechBlob() {
@@ -106,34 +108,51 @@ function getSharedAudio() {
   return sharedAudio;
 }
 
-/** 把共享 <audio> 接到 GainNode，使设置里的音量（含 >100%）生效。 */
-function ensurePlaybackGain() {
-  const audio = getSharedAudio();
+/** 初始化 Web Audio 输出链（Gain → destination），与 <audio> 是否接入无关。 */
+function ensureAudioContext() {
   const g = getVoiceGain();
-  if (outGain) {
+  if (outCtx && outGain) {
     outGain.gain.value = g;
-    if (outCtx?.state === "suspended") outCtx.resume().catch(() => {});
-    return;
+    if (outCtx.state === "suspended") outCtx.resume().catch(() => {});
+    return true;
   }
   try {
     outCtx = new (window.AudioContext || window.webkitAudioContext)();
-    outSource = outCtx.createMediaElementSource(audio);
     outGain = outCtx.createGain();
     outGain.gain.value = g;
-    outSource.connect(outGain);
     outGain.connect(outCtx.destination);
-    audio.volume = 1;
-    volUnsub = onVoiceGainChange((next) => {
-      if (outGain) outGain.gain.value = next;
-    });
+    if (!volUnsub) {
+      volUnsub = onVoiceGainChange((next) => {
+        if (outGain) outGain.gain.value = next;
+      });
+    }
     if (outCtx.state === "suspended") outCtx.resume().catch(() => {});
+    return true;
   } catch {
-    // 回退：HTMLMediaElement.volume 只能 0–1，无法放大。
+    return false;
+  }
+}
+
+/** 把共享 <audio> 接到 GainNode（移动端加持 / MP3 回退）；自动朗读优先走 BufferSource。 */
+function ensurePlaybackGain() {
+  const audio = getSharedAudio();
+  const g = getVoiceGain();
+  if (!ensureAudioContext()) {
     audio.volume = Math.min(1, g);
     if (!volUnsub) {
       volUnsub = onVoiceGainChange((next) => {
         if (!outGain && sharedAudio) sharedAudio.volume = Math.min(1, next);
       });
+    }
+    return;
+  }
+  if (!outSource) {
+    try {
+      outSource = outCtx.createMediaElementSource(audio);
+      outSource.connect(outGain);
+      audio.volume = 1;
+    } catch {
+      /* 已接入或环境不支持：仅 BufferSource / element.volume 回退 */
     }
   }
 }
@@ -174,6 +193,7 @@ export function unlockAudio() {
   if (playing) return;
   try {
     ensurePlaybackGain();
+    if (outCtx?.state === "suspended") outCtx.resume().catch(() => {});
     if (!silentUrl) silentUrl = silentWavUrl();
     a.src = silentUrl; // 静音 WAV，无需 mute，播放也听不见
     const p = a.play();
@@ -218,8 +238,21 @@ export function setExternalStop(fn) {
   externalStop = typeof fn === "function" ? fn : null;
 }
 
+/** 停掉 BufferSource 播放（与 <audio> 无关）。 */
+function stopBufferPlayback() {
+  if (!activeBufferSource) return;
+  try {
+    activeBufferSource.onended = null;
+    activeBufferSource.stop();
+  } catch {
+    /* ignore */
+  }
+  activeBufferSource = null;
+}
+
 /** 停掉共享 <audio> 元素并释放上一个 blob URL（保留加持态，不销毁元素）。 */
 function stopAudio() {
+  stopBufferPlayback();
   if (sharedAudio) {
     // 先摘掉事件处理器再清 src：否则清 src 会让浏览器对元素抛 error，误触发 onError。
     try {
@@ -360,33 +393,90 @@ const EMOTION_INSTRUCTIONS = {
   neutral: "", // 中性不下发指令，用默认语气
 };
 
-/** 用共享 <audio> 元素播放（已被手势加持后，自动朗读也能 play）。 */
-async function playAudio(blob, myGen, { onStart, onEnd, onError }) {
+/** 用共享 <audio> 元素播放（MP3 / decode 失败时的回退）。 */
+function playBlobViaMediaElement(blob, myGen, { onStart, onEnd, onError }) {
   const url = URL.createObjectURL(blob);
   const audio = getSharedAudio();
   ensurePlaybackGain();
   currentUrl = url;
   audio.src = url;
 
-  audio.onended = () => {
-    if (myGen !== playGen) return; // 已被替换/停止，忽略
-    stopAudio();
-    playing = false;
-    currentToken = null;
-    onEnd?.();
-  };
-  audio.onerror = () => {
-    if (myGen !== playGen) return; // 拆除/换源触发的 error，忽略
-    stopAudio();
-    playing = false;
-    currentToken = null;
-    onError?.(new Error("音频播放失败"));
-  };
+  return new Promise((resolve) => {
+    const finish = (err) => {
+      audio.onended = null;
+      audio.onerror = null;
+      if (myGen === playGen) {
+        stopAudio();
+        playing = false;
+        currentToken = null;
+      }
+      if (err) onError?.(err);
+      onEnd?.();
+      resolve();
+    };
+    audio.onended = () => finish(null);
+    audio.onerror = () =>
+      finish(myGen === playGen ? new Error("音频播放失败") : null);
+    audio
+      .play()
+      .then(() => {
+        if (myGen !== playGen) return;
+        playing = true;
+        onStart?.(audio.duration);
+      })
+      .catch((e) => finish(e instanceof Error ? e : new Error(String(e))));
+  });
+}
 
-  await audio.play();
-  playing = true;
-  onStart?.();
-  return true;
+/** 用 decodeAudioData + BufferSource 播放（WKWebView 播本地 48k WAV 更完整）。 */
+async function playBlobViaDecode(blob, myGen, { onStart, onError }) {
+  if (!ensureAudioContext()) {
+    throw new Error("Web Audio 不可用");
+  }
+  const arrayBuffer = await blob.arrayBuffer();
+  if (myGen !== playGen) return;
+  const audioBuffer = await outCtx.decodeAudioData(arrayBuffer.slice(0));
+  if (myGen !== playGen) return;
+
+  stopBufferPlayback();
+  const source = outCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(outGain);
+  activeBufferSource = source;
+  if (outCtx.state === "suspended") await outCtx.resume().catch(() => {});
+
+  return new Promise((resolve) => {
+    const finish = (err) => {
+      if (activeBufferSource === source) activeBufferSource = null;
+      source.onended = null;
+      if (myGen === playGen) {
+        playing = false;
+        currentToken = null;
+      }
+      if (err) onError?.(err);
+      resolve();
+    };
+    source.onended = () => finish(null);
+    try {
+      source.start(0);
+      playing = true;
+      onStart?.(audioBuffer.duration);
+    } catch (e) {
+      finish(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+}
+
+/** 用共享 <audio> 元素播放（已被手势加持后，自动朗读也能 play）。 */
+async function playAudio(blob, myGen, { onStart, onEnd, onError }) {
+  try {
+    await playBlobViaDecode(blob, myGen, { onStart, onError });
+    onEnd?.();
+    return true;
+  } catch {
+    await playBlobViaMediaElement(blob, myGen, { onStart, onEnd, onError });
+    return true;
+  }
 }
 
 /** 真正向上游请求合成（带会话缓存）：同一「音色|model|参数|指令|情绪|文本」只请求一次。 */
@@ -480,44 +570,30 @@ export async function synthesizeSpeech(text, { voice = null, model = null } = {}
 }
 
 /** 播放一段已合成的音频 Blob，返回一个在「播放结束 / 出错 / 被外部停止」时 resolve 的 Promise。
- *  与 speak 共用同一个被加持的 <audio> 元素，会抢占当前播放——专供自动朗读队列顺序播放。
- *  @param onStart 真正开始播放的回调，参数为音频时长（秒，可能为 NaN）。 */
+ *  自动朗读走 decodeAudioData（WKWebView 用 <audio> 播长 WAV 易提前 onended）；
+ *  失败时回退共享 <audio>。 */
 export function playSpeechBlob(blob, { onStart, onError } = {}) {
-  stopSpeak();      // 抢占之前的播放（也会 resolve 上一条的等待 Promise）
-  externalStop?.(); // 朗读开始前，先停掉正在放的歌，避免两个声音叠在一起
+  stopSpeak();
+  externalStop?.();
   currentToken = "auto";
   const myGen = playGen;
-  const url = URL.createObjectURL(blob);
-  const audio = getSharedAudio();
-  ensurePlaybackGain();
-  currentUrl = url;
-  audio.src = url;
-
   return new Promise((resolve) => {
-    speechBlobSettle = resolve; // 供外部 stopSpeak 打断时收尾
-    const finish = (err) => {
-      audio.onended = null;
-      audio.onerror = null;
-      if (myGen === playGen) {
-        stopAudio();
-        playing = false;
-        currentToken = null;
-      }
-      if (err) onError?.(err);
+    speechBlobSettle = resolve;
+    const finish = () => {
       if (speechBlobSettle === resolve) speechBlobSettle = null;
       resolve();
     };
-    audio.onended = () => finish(null);
-    // 被换源/拆除触发的 error（已被新播放抢占）不当作真错误。
-    audio.onerror = () => finish(myGen === playGen ? new Error("音频播放失败") : null);
-    audio
-      .play()
-      .then(() => {
-        if (myGen !== playGen) return;
-        playing = true;
-        onStart?.(audio.duration);
-      })
-      .catch((e) => finish(e instanceof Error ? e : new Error(String(e))));
+    (async () => {
+      try {
+        await playBlobViaDecode(blob, myGen, { onStart, onError });
+      } catch {
+        await playBlobViaMediaElement(blob, myGen, { onStart, onError });
+      }
+      finish();
+    })().catch((e) => {
+      onError?.(e instanceof Error ? e : new Error(String(e)));
+      finish();
+    });
   });
 }
 
