@@ -1,8 +1,11 @@
 name: Release
 
 # 触发方式：
-#   1) 推送形如 v0.2.0 的 tag（主路径，自动建 Release 并上传产物）
-#   2) 手动 workflow_dispatch（用于重跑，会以当前分支名建 Release）
+#   1) 推送形如 v0.2.0 的 tag（主路径）
+#   2) 手动 workflow_dispatch（重跑）
+#
+# 流程：verify（ubuntu 校验四处版本号与 tag 一致）→ release（3 平台并行构建
+# + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
 on:
   workflow_dispatch:
   push:
@@ -13,7 +16,30 @@ permissions:
   contents: write
 
 jobs:
+  # 第一关：版本号一致性校验。任何一处不一致都让整个 release 失败。
+  # 解决"bump 完忘打 tag"与"打 tag 前忘 bump"两种旧坑。
+  verify:
+    name: Verify tag version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag ↔ package.json ↔ tauri.conf.json ↔ Cargo.toml
+        run: |
+          TAG="${{ github.ref_name }}"
+          TAG_VER="${TAG#v}"
+          PKG_VER=$(node -p "require('./package.json').version")
+          TAURI_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          CARGO_VER=$(grep '^version' src-tauri/Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=$TAG_VER  package.json=$PKG_VER  tauri.conf.json=$TAURI_VER  Cargo.toml=$CARGO_VER"
+          if [ "$TAG_VER" != "$PKG_VER" ] || [ "$TAG_VER" != "$TAURI_VER" ] || [ "$TAG_VER" != "$CARGO_VER" ]; then
+            echo "::error::tag 与三处版本号必须完全一致；请先 bump 再打 tag"
+            exit 1
+          fi
+
+  # 第二关：构建并发布。changelog 在这一步自动从 git log 生成，
+  # 彻底消除"忘改 release.yml"的可能。
   release:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -26,11 +52,12 @@ jobs:
           # Windows：NSIS 安装包
           - platform: windows-latest
             args: "--bundles nsis"
-
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: Checkout
+      - name: Checkout (full history for changelog)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要完整 tag 历史以生成 changelog
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -50,6 +77,61 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      # 从上一个 tag 到本 tag 的 commit，按 conventional commit 类型分桶
+      # 自动归类：feat* → 新增，fix* → 修复，其余（跳过 chore(release)/docs/ci/build）→ 其他
+      # merge commits 用 --no-merges 排除
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -n1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+            COMPARE_URL="https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          else
+            RANGE="HEAD"
+            COMPARE_URL=""
+          fi
+
+          FEAT=$(git log --no-merges --pretty=format:"%s" "$RANGE" \
+                 | grep -E "^(feat|✨)" \
+                 | sed -E 's/^(feat|✨)(\([^)]+\))?!?:\s*/- /' || true)
+          FIX=$(git log --no-merges --pretty=format:"%s" "$RANGE" \
+                | grep -E "^(fix|🐛)" \
+                | sed -E 's/^(fix|🐛)(\([^)]+\))?!?:\s*/- /' || true)
+          OTHER=$(git log --no-merges --pretty=format:"%s" "$RANGE" \
+                  | grep -vE "^(feat|fix|✨|🐛|chore\(release\)|docs|ci|build)" \
+                  | sed 's/^/- /' || true)
+
+          cat > release_notes.md <<EOF
+          元元桌宠（Tauri 版）安装包。
+
+          ### 安装包
+
+          - **Windows**：\`.exe\`（NSIS，需 WebView2；Win10/11 一般已内置）。安装时可勾选配置 GPU 本地语音模型（IndexTTS-2 / CosyVoice3）。
+          - **macOS**：\`.dmg\`（Apple Silicon 选 \`aarch64\`，Intel 选 \`x64\`）；菜单栏托盘应用，不占用 Dock。
+
+          ## ${TAG} 更新内容
+
+          EOF
+
+          if [ -n "$FEAT" ]; then
+            printf "### 新增\n\n%s\n\n" "$FEAT" >> release_notes.md
+          fi
+          if [ -n "$FIX" ]; then
+            printf "### 修复\n\n%s\n\n" "$FIX" >> release_notes.md
+          fi
+          if [ -n "$OTHER" ]; then
+            printf "### 其他\n\n%s\n\n" "$OTHER" >> release_notes.md
+          fi
+          if [ -n "$COMPARE_URL" ]; then
+            printf "[变更对比 %s → %s](%s)\n\n" "$PREV_TAG" "$TAG" "$COMPARE_URL" >> release_notes.md
+          fi
+          printf '> macOS 未做代码签名/公证，首次打开若提示「已损坏 / 无法验证开发者」，请在「访达」中右键「打开」，或终端执行：`xattr -cr /Applications/元元桌宠.app`\n' >> release_notes.md
+
+          echo "===== release_notes.md ====="
+          cat release_notes.md
+
       - name: Encrypt persona assets
         run: npm run encrypt-assets
 
@@ -63,57 +145,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "元元桌宠 ${{ github.ref_name }}"
-          releaseBody: |
-            元元桌宠（Tauri 版）安装包。
-
-            ### 安装包
-
-            - **Windows**：`.exe`（NSIS，需 WebView2；Win10/11 一般已内置）。安装时可勾选配置 GPU 本地语音模型（IndexTTS-2 / CosyVoice3）。
-            - **macOS**：`.dmg`（Apple Silicon 选 `aarch64`，Intel 选 `x64`）；菜单栏托盘应用，不占用 Dock。
-
-            ### v0.2.11
-
-            - 本地语音：启动后台预热语音识别（Whisper），首次实时通话不再因冷加载而「点了没反应」
-            - 本地语音：自动补全 ffmpeg 路径（从访达 / 托盘启动缺 Homebrew PATH 时也能找到）
-            - 本地语音：端口被占但服务不健康时，自动清理残留进程后重启，避免卡在「正在启动」
-            - 本地语音：参考音频缺少对应文案时给出明确提示，避免克隆音色开头串音
-            - macOS：菜单栏托盘图标更快出现；开发模式保留 Dock 入口；右键桌宠在光标处弹出菜单
-            - 通话：优化麦克风获取时机与权限提示；自动朗读改用更稳的解码播放，修复长语音后半段被截断
-
-            ### v0.2.10
-
-            - 修复 Windows 安装脚本 `setup-qwen3-tts.ps1` 校验步骤误报 SyntaxError
-
-            ### v0.2.9
-
-            - 兜底参考音改用 15s 版本并移除 30s
-
-            ### v0.2.8
-
-            - 本地 Qwen3-TTS 跨平台化：Windows / Linux 改走官方 PyTorch 包 `qwen-tts`
-
-            ### v0.2.7
-
-            - 文字与语音同步出现：开启朗读时，每句在其语音开始播放的瞬间才显示，长回复逐句同步
-            - 追问（followup）第二句改为在第一句「文字+语音」出现完成后再出现，避免两行光标同时空等
-            - Windows：隐藏本地语音服务及 ffmpeg 转码的 cmd 黑窗
-            - 修复本地 CosyVoice3 参考音频保存后不生效（补齐 `local_ref_wav` 持久化字段）
-
-            ### v0.2.6
-
-            - 修复本地语音播报期间误打断，以及后半句丢失
-
-            ### v0.2.5
-
-            - 修复表情包面板打开时报错（补全 `stickerGridBuilt` 声明）
-
-            ### v0.2.4
-
-            - 多语音后端：火山引擎、本地 Qwen3-TTS、CosyVoice（通义云）、IndexTTS-2 / CosyVoice3（Windows + NVIDIA）
-            - 朗读与实时通话共用后端；本地模型零样本克隆参考音频
-            - AI 语音播放音量 0–200%
-
-            > macOS 未做代码签名/公证，首次打开若提示「已损坏 / 无法验证开发者」，请在「访达」中右键「打开」，或终端执行：`xattr -cr /Applications/元元桌宠.app`
+          releaseBodyFile: release_notes.md
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
