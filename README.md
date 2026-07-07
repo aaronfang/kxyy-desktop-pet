@@ -183,44 +183,45 @@ npm run encrypt-assets
 
 ## 发布
 
-版本号需在 **`package.json`**、**`src-tauri/tauri.conf.json`**、**`src-tauri/Cargo.toml`**（及 `Cargo.lock`）四处保持一致。
+版本号需在 **`package.json`**、**`src-tauri/tauri.conf.json`**、**`src-tauri/Cargo.toml`**（及 `Cargo.lock`）四处保持一致。`.github/workflows/release.yml` 第一步就是**预校验四处版本号与 tag 一致**——任何一处不对都会让整个 release 直接失败，根除「bump 完忘打 tag」「打 tag 前忘 bump」的旧坑。
 
-推送形如 `v0.2.6` 的 tag 会触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，自动构建并上传到 GitHub Release：
+### 发布流程
 
-- **Windows**：NSIS 安装包（`.exe`）；安装时可勾选配置 GPU 本地语音模型
-- **macOS**：Apple Silicon（`aarch64`）与 Intel（`x64`）各一份 `.dmg`；菜单栏托盘应用，不占用 Dock
+1. **Bump 版本号**：在 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处把版本号同步改成 `X.Y.Z`（`Cargo.lock` 由 `cargo` 自动同步）。
+2. **Commit 版本号变更**：`git commit -am "chore(release): vX.Y.Z"`。
+3. **推 commit + 推 tag**：`git push` 推 commit，再 `git push origin vX.Y.Z` 推 tag（**只推 tag 不推 commit 不行**——`verify` job 必须能 checkout 到带新版本号的 commit）。
+4. **CI 自动完成**：
+   - `verify` job（ubuntu）：四处版本号与 tag 比对，不一致立即失败；
+   - `release` job（macOS aarch64 / macOS x64 / Windows 三台 runner 并行）：构建 + 签名后产物上传到 GitHub Release 对应 tag 页。
 
-也可在 GitHub Actions 页面手动 **workflow_dispatch** 重跑。
+### Changelog：自动生成，零维护
 
-### 更新日志（v0.2.10）
+`release.yml` 会从 `git log <prev_tag>..vX.Y.Z` **自动生成 changelog**，按 [Conventional Commits](https://www.conventionalcommits.org/) 类型分桶：
 
-- 修复 Windows `setup-qwen3-tts.ps1` 全新安装时最后一步误报 `Import check failed / SyntaxError: invalid syntax`：`Start-Process -ArgumentList` 不会为含空格的内联 `python -c` 代码加引号，导致 `-c` 仅收到 `import` 一个词。改为将校验代码写入临时 `.py` 文件执行，彻底规避引号拆分（依赖安装本身此前即已成功，仅校验步骤误报）
+- `feat:` / `feat(scope):` → 归到「新增」段
+- `fix:` / `fix(scope):` → 归到「修复」段
+- 其余非维护性 commit → 归到「其他」段
+- `chore(release):` / `docs:` / `ci:` / `build:` → **跳过**（不出现）
+- merge commits 默认排除
 
-### 更新日志（v0.2.9）
+完整历史 changelog 见 [GitHub Releases](https://github.com/aaronfang/kxyy-desktop-pet/releases)。
 
-- 内置兜底参考音改用 15s 版本 `kxyy-wechat-record-cut01_15s`，移除 30s 版本，减小安装包体积
+### Commit 规范（影响 changelog 质量）
 
-### 更新日志（v0.2.8）
+为了让 auto-generated changelog 读起来像样，commit message 建议遵循 Conventional Commits：
 
-- 本地 Qwen3-TTS 扩展为跨平台：macOS 继续走 mlx-audio，Windows / Linux 走官方 PyTorch 包 `qwen-tts`（默认 1.7B 模型 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`）
-- 新增 `scripts/windows/setup-qwen3-tts.ps1` / `.cmd`：自动创建 `.venv-qwen3` 环境并安装 torch + qwen-tts（按 GPU 自动选 wheel，RTX 50 系用 cu128）
-- 设置页语音后端列表整理为「在线服务」在上、「本地服务」在下，命名统一标注在线 / 本地
-- 修复 Windows 选「本地 Qwen3-TTS」时报 `ModuleNotFoundError: No module named 'mlx_audio'`
+- `feat: xxx` / `feat(scope): xxx` → 进入「新增」段
+- `fix: xxx` / `fix(scope): xxx` → 进入「修复」段
+- `chore(release): vX.Y.Z` / `docs:` / `ci:` / `build:` → 跳过
 
-### 更新日志（v0.2.6）
+### CI 与 Release 的分工
 
-- 修复本地语音播报期间误打断，以及后半句丢失
+| 触发 | Workflow | 行为 |
+|---|---|---|
+| `push` 到 main / `pull_request` → main | [`ci.yml`](.github/workflows/ci.yml) | 三平台 build-only 校验，**不发版** |
+| `push: tags: ['v*']` | [`release.yml`](.github/workflows/release.yml) | 版本号校验 + 构建 + 上传 GitHub Release |
 
-### 更新日志（v0.2.5）
-
-- 修复表情包面板：补全 `stickerGridBuilt` 声明，避免打开表情库时报错
-
-### 更新日志（v0.2.4）
-
-- 支持多语音后端：火山引擎、本地 Qwen3-TTS、CosyVoice（通义云）、IndexTTS-2 / CosyVoice3（Windows + NVIDIA）
-- 朗读与实时通话共用后端；本地模型零样本克隆参考音频
-- AI 语音播放音量 0–200%（朗读与通话共用）
-- macOS 自动配置 Qwen3-TTS 运行时；Windows 安装包可选 GPU 本地模型配置
+两者互不干扰。可在 GitHub Actions 页面手动 `workflow_dispatch` 重跑 release。
 
 ## 致谢
 
