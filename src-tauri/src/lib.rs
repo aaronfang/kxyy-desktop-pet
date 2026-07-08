@@ -417,7 +417,10 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .unwrap_or_default();
     monitors.sort_by_key(|m| m.position().x);
 
-    let monitor_menu = if monitors.len() > 1 {
+    // 始终保留「所在屏幕」子菜单：单屏时仍可显式选择「自动」；
+    // 多屏时按 position().x 排序展示（1-based 序号 + 物理分辨率 + OS 内部名）。
+    // 菜单项 ID 仍为 `monitor:{raw_name}`，与 `handle_menu_event` / `resolve_monitor` 兼容。
+    let monitor_menu = if !monitors.is_empty() {
         let menu = Submenu::new(app, "所在屏幕", true)?;
         let auto_item = CheckMenuItem::with_id(
             app,
@@ -430,16 +433,19 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         menu.append(&auto_item)?;
         menu.append(&PredefinedMenuItem::separator(app)?)?;
         for (i, m) in monitors.iter().enumerate() {
-            let name = match m.name() {
-                Some(n) => n.clone(),
-                None => continue,
-            };
+            // raw_name 为 None 或为空时（极少数 Windows / Linux 情况），
+            // 退化为纯索引 id，仅本机有效，重启失效——但至少菜单可见可选。
+            let raw_name = m
+                .name()
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("__kxyy_no_name_{i}"));
             let size = m.size();
             let label = format!("显示器 {} ({}×{})", i + 1, size.width, size.height);
-            let checked = s.monitor_id.as_deref() == Some(name.as_str());
+            let checked = s.monitor_id.as_deref() == Some(raw_name.as_str());
             let item = CheckMenuItem::with_id(
                 app,
-                format!("monitor:{name}"),
+                format!("monitor:{raw_name}"),
                 &label,
                 true,
                 checked,
@@ -543,12 +549,21 @@ fn resolve_monitor(win: &tauri::WebviewWindow, monitor_id: &Option<String>) -> O
         })
 }
 
-/// 把 Monitor::work_area（标注为物理像素）还原成逻辑坐标。
+/// 把 `Monitor::work_area()` 还原成「与 webview 一致」的逻辑坐标。
 ///
-/// 必须用 **monitor.scale_factor()**（生成 work_area 时的同一个因子），不能用
-/// window.scale_factor()。在部分 macOS Retina 上 monitor.scale_factor() 会误报为 1.0，
-/// 此时 work_area 数值其实已是逻辑点；若再按窗口真实 sf=2 去除，舞台会被缩成半屏，
-/// 桌宠看起来就像只在左上角活动。
+/// 跨平台 tauri/tao 实现对 work_area 的单位处理不一致（实测见
+/// `tao-0.35.3/platform_impl/{windows,macos}/monitor.rs`）：
+/// - **Windows**：`size()` / `work_area()` 直接是物理像素，`scale_factor = dpi / 96`。
+///   物理 / sf = 与 webview CSS 像素一致的逻辑值（但 `apply_monitor_to_window` 已改走物理
+///   直传，本函数实际不被 Windows 调用，保留 cfg gate 仅供文档/回退）。
+/// - **macOS**：`size()` 内部把 `CGDisplay::pixels_wide() * scale_factor` 再返回，
+///   且 `scale_factor()` 在 `ns_screen()` 不可用时回退 1.0。work_area 是「物理 × sf」，
+///   用 monitor.sf 除回来才能拿到与 webview 一致的值。
+/// - **Linux**：依赖 WM，未实测，保守跟随 macOS 逻辑。
+///
+/// 共享规则：统一用 `monitor.scale_factor()` 把 work_area 换算成 webview 的逻辑坐标；
+/// set_position / set_size 用 `LogicalPosition/LogicalSize`（tauri 会再用窗口真实 sf 渲染）。
+#[cfg(not(windows))]
 fn work_area_logical(monitor: &Monitor) -> (f64, f64, f64, f64) {
     let wa = monitor.work_area();
     let sf = monitor.scale_factor().max(0.1);
@@ -560,35 +575,118 @@ fn work_area_logical(monitor: &Monitor) -> (f64, f64, f64, f64) {
     )
 }
 
+/// 把主窗口铺满目标显示器的工作区（排除任务栏），并打一行诊断日志到
+/// `%APPDATA%\com.aaronfang.kxyydesktoppet\stage.log`，便于跨平台核对
+/// tauri 实际报上来的 sf / work_area 数值（与 webview `window.innerWidth/innerHeight`
+/// 对照可一眼看出 1/4 area / 偏位之类问题的根因）。
+fn debug_log_stage(monitor: &Monitor, lw: f64, lh: f64, sf: f64) {
+    #[cfg(windows)]
+    let path = std::env::var("APPDATA")
+        .ok()
+        .map(|p| std::path::PathBuf::from(p).join("com.aaronfang.kxyydesktoppet").join("stage.log"));
+    #[cfg(not(windows))]
+    let path: Option<std::path::PathBuf> = None;
+    let Some(path) = path else { return };
+    let wa = monitor.work_area();
+    let line = format!(
+        "[stage] name={:?} sf={} wa_phys=({},{},{}x{}) -> logical=({:.0},{:.0},{:.0}x{:.0})\n",
+        monitor.name(),
+        sf,
+        wa.position.x,
+        wa.position.y,
+        wa.size.width,
+        wa.size.height,
+        0.0,
+        0.0,
+        lw,
+        lh,
+    );
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// 将主窗口铺满目标显示器的工作区（排除任务栏）。
 /// 桌宠活动范围 = 该窗口客户区。
+///
+/// 平台分流（实测 tao 0.35.3 `platform_impl/{windows,macos}/monitor.rs`）：
+/// - **Windows**：`Monitor::work_area()` 直接是物理像素；
+///   `set_position/set_size` 用 `PhysicalPosition/PhysicalSize`，让 tauri 用窗口
+///   真实 sf 转给 webview，避免再除一次 sf 导致 1/2 ~ 1/4 area。
+/// - **macOS / Linux**：`work_area` 可能被 tauri 内部乘过 sf（macOS 已知 bug），
+///   用 `work_area_logical` 转回与 webview 一致的逻辑坐标。
 fn apply_monitor_to_window(app: &AppHandle, monitor_id: &Option<String>) {
     if let Some(win) = app.get_webview_window("main") {
         if let Some(monitor) = resolve_monitor(&win, monitor_id) {
-            let (lx, ly, lw, lh) = work_area_logical(&monitor);
             // 避免 min/max 约束把尺寸锁在初始 800×600。
-            let _ = win.set_min_size(None::<tauri::LogicalSize<f64>>);
-            let _ = win.set_max_size(None::<tauri::LogicalSize<f64>>);
-            let _ = win.set_position(tauri::LogicalPosition::new(lx, ly));
-            let _ = win.set_size(tauri::LogicalSize::new(lw, lh));
+            let _ = win.set_min_size(None::<tauri::PhysicalSize<u32>>);
+            let _ = win.set_max_size(None::<tauri::PhysicalSize<u32>>);
+            let wa = monitor.work_area();
+            let sf = monitor.scale_factor().max(0.1);
+            #[cfg(windows)]
+            {
+                // Windows: work_area 已是物理像素，直接 set。
+                let _ = win.set_position(tauri::PhysicalPosition::new(wa.position.x, wa.position.y));
+                let _ = win.set_size(tauri::PhysicalSize::new(wa.size.width, wa.size.height));
+                debug_log_stage(&monitor, wa.size.width as f64 / sf, wa.size.height as f64 / sf, sf);
+            }
+            #[cfg(not(windows))]
+            {
+                // macOS / Linux: work_area 单位与 sf 不一致，统一按 monitor.sf 还原逻辑坐标。
+                let (lx, ly, lw, lh) = work_area_logical(&monitor);
+                let _ = win.set_position(tauri::LogicalPosition::new(lx, ly));
+                let _ = win.set_size(tauri::LogicalSize::new(lw, lh));
+                debug_log_stage(&monitor, lw, lh, sf);
+            }
             let _ = app.emit("stage-resized", ());
         }
     }
 }
 
 /// 把聊天窗口按设置的尺寸定位到目标显示器工作区的「底部居中」。
+///
+/// 与 `apply_monitor_to_window` 保持平台分流：Windows 直接用物理像素，
+/// macOS / Linux 走 `work_area_logical`。
 fn position_chat_window(app: &AppHandle) {
     let s = app.state::<AppState>().settings.lock().unwrap().clone();
     if let Some(win) = app.get_webview_window("chat") {
         if let Some(monitor) = resolve_monitor(&win, &s.monitor_id) {
-            let (lx, ly, lw, lh) = work_area_logical(&monitor);
-            let w = s.chat_width as f64;
-            let h = s.chat_height as f64;
-            let offset = s.chat_bottom_offset as f64;
-            let x = lx + (lw - w) / 2.0;
-            let y = ly + lh - h - offset;
-            let _ = win.set_size(tauri::LogicalSize::new(w, h));
-            let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+            let wa = monitor.work_area();
+            let sf = monitor.scale_factor().max(0.1);
+            let w_logical = s.chat_width as f64;
+            let h_logical = s.chat_height as f64;
+            let offset_logical = s.chat_bottom_offset as f64;
+            let win_sf = win.scale_factor().unwrap_or(sf).max(0.1);
+            #[cfg(windows)]
+            {
+                // work_area 物理像素；窗口 sf 把 logical 尺寸转成物理。
+                let lx = wa.position.x as f64;
+                let ly = wa.position.y as f64;
+                let lw = wa.size.width as f64;
+                let lh = wa.size.height as f64;
+                let w_phys = (w_logical * win_sf) as u32;
+                let h_phys = (h_logical * win_sf) as u32;
+                let x_phys = (lx + (lw - w_phys as f64) / 2.0) as i32;
+                let y_phys = (ly + lh - h_phys as f64 - offset_logical * win_sf) as i32;
+                let _ = win.set_size(tauri::PhysicalSize::new(w_phys, h_phys));
+                let _ = win.set_position(tauri::PhysicalPosition::new(x_phys, y_phys));
+            }
+            #[cfg(not(windows))]
+            {
+                let (lx, ly, lw, lh) = work_area_logical(&monitor);
+                let x = lx + (lw - w_logical) / 2.0;
+                let y = ly + lh - h_logical - offset_logical;
+                let _ = win.set_size(tauri::LogicalSize::new(w_logical, h_logical));
+                let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+            }
         }
     }
 }
@@ -788,6 +886,123 @@ fn show_menu(app: AppHandle) {
 #[tauri::command]
 fn get_api_base(state: tauri::State<AppState>) -> String {
     format!("http://127.0.0.1:{}", state.api_port)
+}
+
+/// 查询当前语音后端服务就绪状态，供前端在聊天窗口打开时主动探测
+/// （`voice-service-status` 事件是 push 式，窗口打开前的事件会被丢失）。
+#[tauri::command]
+fn check_voice_service(state: tauri::State<AppState>) -> serde_json::Value {
+    let backend = state
+        .settings
+        .lock()
+        .unwrap()
+        .realtime_backend
+        .trim()
+        .to_ascii_lowercase();
+    let normalized = voice_service::normalize_backend(&backend);
+    if normalized == "volc" {
+        return serde_json::json!({
+            "backend": "volc",
+            "state": "running",
+            "message": "火山云端，无需本地服务"
+        });
+    }
+    let port = voice_service::port_for(&normalized);
+    let running = voice_service::service_running(port);
+    serde_json::json!({
+        "backend": normalized,
+        "state": if running { "running" } else { "unknown" },
+        "message": if running { format!("已在运行（:{}）", port) } else { "未检测到运行中服务".into() },
+        "port": port,
+    })
+}
+
+/// 探测任意语音后端状态（不启动服务），供设置页切换下拉时立即反馈。
+/// 返回值 state 可能为：running / ready / stopped / failed / warning。
+#[tauri::command]
+fn probe_voice_backend(backend: String) -> serde_json::Value {
+    let backend = voice_service::normalize_backend(&backend);
+
+    // volc / cosyvoice 云端后端始终视为就绪
+    if backend == "volc" {
+        return serde_json::json!({
+            "backend": "volc",
+            "state": "ready",
+            "message": "云端服务，无需本地启动"
+        });
+    }
+    if backend == "cosyvoice" {
+        let port = voice_service::port_for(&backend);
+        let running = voice_service::service_running(port);
+        if running {
+            return serde_json::json!({
+                "backend": "cosyvoice",
+                "state": "running",
+                "message": format!("已在运行（:{}）", port),
+                "port": port,
+            });
+        }
+        // 检查通义 Key 是否已配置（从持久化 settings 读取）
+        let has_key = !voice_service::read_setting_str("qwenVlKey").trim().is_empty();
+        return serde_json::json!({
+            "backend": "cosyvoice",
+            "state": if has_key { "ready" } else { "warning" },
+            "message": if has_key { "已配置，保存后启动" } else { "需填写通义 Key" },
+            "port": port,
+        });
+    }
+
+    // 本地后端：先看端口是否已有服务在跑
+    let port = voice_service::port_for(&backend);
+    if voice_service::service_running(port) {
+        return serde_json::json!({
+            "backend": backend,
+            "state": "running",
+            "message": format!("已在运行（:{}）", port),
+            "port": port,
+        });
+    }
+
+    // GPU 本地后端：macOS 不可用
+    if backend == "cosyvoice3" || backend == "indextts2" {
+        if !voice_service::gpu_backends_supported() {
+            return serde_json::json!({
+                "backend": backend,
+                "state": "failed",
+                "message": "macOS 不支持此后端；请改用 Qwen3-TTS",
+                "port": port,
+            });
+        }
+        // 跑预检查（源码/权重目录是否存在）
+        if let Some(repo) = voice_service::repo_root() {
+            let result = if backend == "cosyvoice3" {
+                voice_service::preflight_cosyvoice3(&repo)
+            } else {
+                voice_service::preflight_indextts2(&repo)
+            };
+            return match result {
+                Ok(_) => serde_json::json!({
+                    "backend": backend,
+                    "state": "ready",
+                    "message": "就绪，保存后启动",
+                    "port": port,
+                }),
+                Err(msg) => serde_json::json!({
+                    "backend": backend,
+                    "state": "failed",
+                    "message": msg,
+                    "port": port,
+                }),
+            };
+        }
+    }
+
+    serde_json::json!({
+        "backend": backend,
+        "state": "stopped",
+        "message": "未启动，保存后自动启动",
+        "port": port,
+    })
 }
 
 /// 返回实时语音 WS 基址（ws://）。
@@ -1100,6 +1315,8 @@ pub fn run() {
             show_menu,
             get_api_base,
             get_realtime_base,
+            check_voice_service,
+            probe_voice_backend,
             toggle_chat_window,
             hide_chat,
             open_settings,

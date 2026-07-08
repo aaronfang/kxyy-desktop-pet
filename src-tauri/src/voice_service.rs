@@ -13,8 +13,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// 子进程最近日志缓存上限（失败时回带设置页）。
 const RECENT_LOG_MAX_LINES: usize = 30;
-/// macOS 自动配置脚本进度缓存上限。
-#[cfg(target_os = "macos")]
+/// 自动配置脚本进度缓存上限（macOS/Windows 共用）。
 const SETUP_LOG_MAX_LINES: usize = 40;
 /// 端口就绪等待上限（秒）；模型加载可能较久（本地 Qwen / CosyVoice3）。
 const START_TIMEOUT_SECS: u64 = 180;
@@ -75,8 +74,7 @@ struct Inner {
     child: Option<Child>,
     /// 子进程最近日志（失败时带回设置页）。
     recent_logs: Arc<Mutex<VecDeque<String>>>,
-    /// macOS 正在跑 setup-qwen3-tts.sh
-    #[cfg(target_os = "macos")]
+    /// 正在跑自动配置脚本（macOS Qwen3 / Windows GPU）
     setup_running: bool,
 }
 
@@ -87,7 +85,6 @@ impl VoiceServiceManager {
                 backend: String::new(),
                 child: None,
                 recent_logs: Arc::new(Mutex::new(VecDeque::new())),
-                #[cfg(target_os = "macos")]
                 setup_running: false,
             }),
         }
@@ -197,7 +194,7 @@ fn emit(app: &AppHandle, status: VoiceServiceStatus) {
     );
 }
 
-fn normalize_backend(backend: &str) -> String {
+pub fn normalize_backend(backend: &str) -> String {
     match backend.trim().to_ascii_lowercase().as_str() {
         "local" => "local".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
@@ -213,12 +210,12 @@ fn is_gpu_local_backend(backend: &str) -> bool {
     matches!(backend, "cosyvoice3" | "indextts2")
 }
 
-fn gpu_backends_supported() -> bool {
+pub fn gpu_backends_supported() -> bool {
     // 安装器只在 Windows 提供配置向导；Linux 也可手动跑，macOS 禁用自动拉起。
     !cfg!(target_os = "macos")
 }
 
-fn port_for(backend: &str) -> u16 {
+pub fn port_for(backend: &str) -> u16 {
     match backend {
         "local" => 9876,
         "cosyvoice" => 9877,
@@ -240,7 +237,7 @@ fn script_for(backend: &str) -> Option<&'static str> {
 
 /// 对本地 TTS HTTP 服务（WS 端口 + 100）做 `GET /health`，确认是「本项目的服务」而非
 /// 随机占用同端口的无关程序。仅裸 TCP connect 成功会误判，导致后续 TTS 转发失败却不再自启。
-fn service_running(ws_port: u16) -> bool {
+pub fn service_running(ws_port: u16) -> bool {
     use std::io::{Read, Write};
     if ws_port == 0 {
         return false;
@@ -599,7 +596,7 @@ fn stop_inner(inner: &mut Inner) {
 ///
 /// 返回值是"激活的 repo 根"——若源码/权重实际位于 install 目录（NSIS 默认位置），
 /// 会返回 install 根；否则返回原 repo。调用方应用这个根去生成 venv / 脚本路径。
-fn preflight_cosyvoice3(repo: &Path) -> Result<PathBuf, String> {
+pub fn preflight_cosyvoice3(repo: &Path) -> Result<PathBuf, String> {
     let model_dir_s = read_setting_str("cosyvoice3ModelDir");
     let repo_dir_s = read_setting_str("cosyvoice3RepoDir");
 
@@ -753,7 +750,7 @@ fn pick_active_root(repo: &Path, configured: &str, sub: &str) -> PathBuf {
     path
 }
 
-fn read_setting_str(key: &str) -> String {
+pub fn read_setting_str(key: &str) -> String {
     let Some(p) = dirs_settings_path() else {
         return String::new();
     };
@@ -770,9 +767,25 @@ fn read_setting_str(key: &str) -> String {
         .to_string()
 }
 
-#[cfg(target_os = "macos")]
-fn emit_setup_progress(app: &AppHandle, line: String, lines: &Arc<Mutex<VecDeque<String>>>) {
-    eprintln!("[setup-qwen3] {line}");
+/// HF 镜像站点：默认用 hf-mirror.com（国内可用），可通过 settings.json 的 hfEndpoint 覆盖。
+fn hf_mirror() -> String {
+    let custom = read_setting_str("hfEndpoint");
+    if !custom.is_empty() {
+        return custom;
+    }
+    // 检查环境变量 HOSTNAME / 网络
+    std::env::var("HF_ENDPOINT")
+        .unwrap_or_else(|_| "https://hf-mirror.com".into())
+}
+
+fn emit_setup_progress(
+    app: &AppHandle,
+    line: String,
+    lines: &Arc<Mutex<VecDeque<String>>>,
+    backend: &str,
+    port: u16,
+) {
+    eprintln!("[setup-{backend}] {line}");
     if let Ok(mut q) = lines.lock() {
         q.push_back(line.clone());
         while q.len() > SETUP_LOG_MAX_LINES {
@@ -782,32 +795,43 @@ fn emit_setup_progress(app: &AppHandle, line: String, lines: &Arc<Mutex<VecDeque
     emit(
         app,
         VoiceServiceStatus {
-            backend: "local".into(),
+            backend: backend.into(),
             state: "starting".into(),
             message: line,
-            port: 9876,
+            port,
         },
     );
 }
 
 /// 清洗脚本输出，供设置页展示。
-#[cfg(target_os = "macos")]
 fn format_setup_line(raw: &str) -> Option<String> {
     let line = raw.trim();
     if line.is_empty() {
         return None;
     }
-    // 去掉前缀，避免 UI 重复
-    let line = line
-        .strip_prefix("[setup-qwen3] ")
-        .or_else(|| line.strip_prefix("[setup-qwen3]"))
-        .unwrap_or(line)
-        .trim();
+    // 去掉 ANSI 转义序列（颜色/光标控制）
+    let mut cleaned = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            // 跳过 CSI 序列直到字母
+            i += 2;
+            while i < chars.len() && !chars[i].is_alphabetic() {
+                i += 1;
+            }
+            if i < chars.len() { i += 1; } // 跳过结尾字母
+            continue;
+        }
+        cleaned.push(chars[i]);
+        i += 1;
+    }
+    let line = cleaned.trim();
     if line.is_empty() {
         return None;
     }
-    // pip / hf 进度条里的纯控制字符行跳过
-    if line.chars().all(|c| c.is_whitespace() || c == '\u{1b}' || c == '[') {
+    // 纯控制字符行跳过
+    if line.chars().all(|c| c.is_whitespace() || c == '[' || c == ']') {
         return None;
     }
     Some(line.to_string())
@@ -844,6 +868,7 @@ fn run_macos_qwen3_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result
         .map_err(|e| format!("无法启动配置脚本：{e}"))?;
 
     let last_lines = Arc::new(Mutex::new(VecDeque::<String>::new()));
+    let backend_port = port_for("local");
 
     let mut handles = vec![];
     if let Some(out) = child.stdout.take() {
@@ -852,7 +877,7 @@ fn run_macos_qwen3_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result
         handles.push(std::thread::spawn(move || {
             for line in BufReader::new(out).lines().flatten() {
                 if let Some(msg) = format_setup_line(&line) {
-                    emit_setup_progress(&app2, msg, &lines);
+                    emit_setup_progress(&app2, msg, &lines, "local", backend_port);
                 }
             }
         }));
@@ -863,7 +888,7 @@ fn run_macos_qwen3_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result
         handles.push(std::thread::spawn(move || {
             for line in BufReader::new(err).lines().flatten() {
                 if let Some(msg) = format_setup_line(&line) {
-                    emit_setup_progress(&app2, msg, &lines);
+                    emit_setup_progress(&app2, msg, &lines, "local", backend_port);
                 }
             }
         }));
@@ -906,12 +931,121 @@ fn run_macos_qwen3_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result
     Ok(())
 }
 
+/// 运行 Windows GPU 后端自动配置 PowerShell 脚本（阻塞，可能数分钟）；逐行 emit 进度。
+#[cfg(target_os = "windows")]
+fn run_gpu_auto_setup(app: &AppHandle, repo: &Path, backend: &str) -> Result<(), String> {
+    let setup = repo.join("scripts/windows/setup-gpu-voice.ps1");
+    if !setup.is_file() {
+        return Err(format!(
+            "缺少配置脚本：{}。请确认安装包完整。",
+            setup.display()
+        ));
+    }
+    let port = port_for(backend);
+
+    emit(
+        app,
+        VoiceServiceStatus {
+            backend: backend.into(),
+            state: "starting".into(),
+            message: format!("首次使用 {}：正在自动配置（git clone + 下载权重 + 安装依赖，可能数分钟）…", backend_label(backend)),
+            port,
+        },
+    );
+
+    let mut child = Command::new("powershell")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&setup)
+        .arg("-NonInteractive")
+        .arg("-Backend")
+        .arg(backend)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法启动配置脚本 powershell：{e}"))?;
+
+    let last_lines = Arc::new(Mutex::new(VecDeque::<String>::new()));
+    let bk = backend.to_string();
+
+    let mut handles = vec![];
+    if let Some(out) = child.stdout.take() {
+        let app2 = app.clone();
+        let lines = Arc::clone(&last_lines);
+        let bk2 = bk.clone();
+        handles.push(std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().flatten() {
+                if let Some(msg) = format_setup_line(&line) {
+                    emit_setup_progress(&app2, msg, &lines, &bk2, port);
+                }
+            }
+        }));
+    }
+    if let Some(err) = child.stderr.take() {
+        let app2 = app.clone();
+        let lines = Arc::clone(&last_lines);
+        let bk3 = bk.clone();
+        handles.push(std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().flatten() {
+                if let Some(msg) = format_setup_line(&line) {
+                    emit_setup_progress(&app2, msg, &lines, &bk3, port);
+                }
+            }
+        }));
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("等待配置脚本失败：{e}"))?;
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if !status.success() {
+        let detail = last_lines
+            .lock()
+            .ok()
+            .map(|q| {
+                q.iter()
+                    .rev()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default();
+        return Err(if detail.is_empty() {
+            format!("{} 自动配置失败（exit {status}）", backend_label(backend))
+        } else {
+            detail
+        });
+    }
+    Ok(())
+}
+
+fn backend_label(backend: &str) -> String {
+    match backend {
+        "local" => "Qwen3-TTS".into(),
+        "cosyvoice" => "CosyVoice".into(),
+        "cosyvoice3" => "CosyVoice3".into(),
+        "indextts2" => "IndexTTS-2".into(),
+        "volc" => "火山引擎".into(),
+        _ => backend.to_string(),
+    }
+}
+
+
+
 
 /// IndexTTS-2：启动前检查源码/权重是否就绪，避免只看到「进程已退出」。
 ///
 /// 返回值是"激活的 repo 根"——若源码/权重实际位于 install 目录（NSIS 默认位置），
 /// 会返回 install 根；否则返回原 repo。调用方应用这个根去生成 venv / 脚本路径。
-fn preflight_indextts2(repo: &Path) -> Result<PathBuf, String> {
+pub fn preflight_indextts2(repo: &Path) -> Result<PathBuf, String> {
     let model_dir_s = read_setting_str("indexTts2ModelDir");
     let repo_dir_s = read_setting_str("indexTts2RepoDir");
 
@@ -1080,37 +1214,98 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
     // preflight 返回"激活的 repo 根"——若源码/权重实际位于 install 目录（NSIS 默认
     // 位置），返回 install 根，后续 python_candidates / spawn 走该路径。
     let mut repo = repo;
-    if backend == "cosyvoice3" {
-        match preflight_cosyvoice3(&repo) {
+    #[cfg(windows)]
+    if gpu_backends_supported() && (backend == "cosyvoice3" || backend == "indextts2") {
+        let preflight_result = if backend == "cosyvoice3" {
+            preflight_cosyvoice3(&repo).map(|active| active).map_err(|e| e)
+        } else {
+            preflight_indextts2(&repo).map(|active| active).map_err(|e| e)
+        };
+        match preflight_result {
             Ok(active) => repo = active,
-            Err(msg) => {
+            Err(_msg) => {
+                // 预检查失败：启动自动配置（git clone + 下载权重 + venv）
                 emit(
                     app,
                     VoiceServiceStatus {
                         backend: backend.clone(),
-                        state: "failed".into(),
-                        message: msg,
+                        state: "starting".into(),
+                        message: format!("首次使用 {}：正在自动配置环境（需网络，可能数分钟）…", backend_label(&backend)),
                         port,
                     },
                 );
+                let app2 = app.clone();
+                let repo2 = repo.clone();
+                let backend2 = backend.clone();
+                std::thread::spawn(move || {
+                    let result = run_gpu_auto_setup(&app2, &repo2, &backend2);
+                    if let Ok(mut inner) = app2.state::<VoiceServiceManager>().inner.lock() {
+                        inner.setup_running = false;
+                    }
+                    match result {
+                        Ok(()) => {
+                            emit(
+                                &app2,
+                                VoiceServiceStatus {
+                                    backend: backend2.clone(),
+                                    state: "starting".into(),
+                                    message: "配置完成，正在启动语音服务…".into(),
+                                    port: port_for(&backend2),
+                                },
+                            );
+                            ensure(&app2, &backend2);
+                        }
+                        Err(err_msg) => {
+                            emit(
+                                &app2,
+                                VoiceServiceStatus {
+                                    backend: backend2.clone(),
+                                    state: "failed".into(),
+                                    message: err_msg,
+                                    port: port_for(&backend2),
+                                },
+                            );
+                        }
+                    }
+                });
                 return;
             }
         }
     }
-    if backend == "indextts2" {
-        match preflight_indextts2(&repo) {
-            Ok(active) => repo = active,
-            Err(msg) => {
-                emit(
-                    app,
-                    VoiceServiceStatus {
-                        backend: backend.clone(),
-                        state: "failed".into(),
-                        message: msg,
-                        port,
-                    },
-                );
-                return;
+    #[cfg(not(windows))]
+    {
+        if backend == "cosyvoice3" {
+            match preflight_cosyvoice3(&repo) {
+                Ok(active) => repo = active,
+                Err(msg) => {
+                    emit(
+                        app,
+                        VoiceServiceStatus {
+                            backend: backend.clone(),
+                            state: "failed".into(),
+                            message: msg,
+                            port,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        if backend == "indextts2" {
+            match preflight_indextts2(&repo) {
+                Ok(active) => repo = active,
+                Err(msg) => {
+                    emit(
+                        app,
+                        VoiceServiceStatus {
+                            backend: backend.clone(),
+                            state: "failed".into(),
+                            message: msg,
+                            port,
+                        },
+                    );
+                    return;
+                }
             }
         }
     }
@@ -1253,6 +1448,13 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         // 下方按行读取时被丢弃，导致设置页只看到空的「进程已退出」兜底文案。
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
+        // HuggingFace 国内镜像（IndexTTS-2/CosyVoice3 需下载模型）;
+        // 已在 pip 里配过镜像的可通过 settings.json 的 hfEndpoint 覆盖。
+        .env("HF_ENDPOINT", hf_mirror())
+        // IndexTTS-2 自带网络探测（TCP 443 握手）可能在墙内误判为"可直连"，
+        // 导致 huggingface_hub.hf_hub_download 直连 HF 超时崩溃。
+        // 强制 USE_MODELSCOPE=true 让其走 ModelScope → hf-mirror 回退链。
+        .env("USE_MODELSCOPE", "true")
         .env("PATH", augmented_tool_path());
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
