@@ -161,7 +161,7 @@ fn take_log_summary(logs: &Arc<Mutex<VecDeque<String>>>) -> String {
 }
 
 /// macOS 从 Finder 启动时 PATH 常不含 Homebrew；本地语音 ASR（mlx-whisper）依赖 ffmpeg CLI。
-fn augmented_tool_path() -> std::ffi::OsString {
+pub(crate) fn augmented_tool_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let cur = current.to_string_lossy();
     #[cfg(target_os = "macos")]
@@ -285,9 +285,13 @@ fn port_listener_busy(port: u16) -> bool {
 
 #[cfg(unix)]
 fn pids_listening_on_port(port: u16) -> Vec<u32> {
+    // 注意：`-tiTCP:9876` 必须写成「一个」参数（含冒号）。若拆成 `-tiTCP` + `9876`，
+    // macOS/BSD lsof 会把 `9876` 当成文件名，清理永远失败，残留 server.py 就会报
+    // Address already in use。
+    let selector = format!("-tiTCP:{port}");
     for bin in ["/usr/sbin/lsof", "/usr/bin/lsof", "lsof"] {
         let Ok(output) = Command::new(bin)
-            .args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"])
+            .args([&selector, "-sTCP:LISTEN"])
             .output()
         else {
             continue;
@@ -363,16 +367,18 @@ fn clear_stale_voice_listeners(ws_port: u16) -> bool {
         }
     }
     if !killed {
-        return false;
+        // bind 显示忙但 lsof 没列出 PID 时，仍当作失败（调用方决定是否继续 spawn）。
+        return !port_listener_busy(ws_port) && !port_listener_busy(ws_port.saturating_add(100));
     }
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(Duration::from_millis(400));
     for port in [ws_port, ws_port.saturating_add(100)] {
         for pid in pids_listening_on_port(port) {
             eprintln!("[voice-service] 强制结束 pid={pid}（:{port}）");
             kill_process(pid, true);
         }
     }
-    std::thread::sleep(Duration::from_millis(150));
+    // TIME_WAIT / 进程退出后再给一点时间，避免立刻 bind 仍 EADDRINUSE。
+    std::thread::sleep(Duration::from_millis(350));
     !port_listener_busy(ws_port) && !port_listener_busy(ws_port.saturating_add(100))
 }
 
@@ -534,7 +540,7 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
 /// Windows 上会跳过 0 字节文件——`C:\Users\<u>\AppData\Local\Microsoft\WindowsApps\python.exe`
 /// 是 App Execution Alias（reparse point + 0 字节），spawn 它会跳 Microsoft Store，
 /// 触发 "Python was not found; run without arguments to install from the Microsoft Store" 误报。
-fn which_in_path(name: &Path) -> Option<PathBuf> {
+pub(crate) fn which_in_path(name: &Path) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         // 先尝试原名（含 .exe / 无后缀），再尝试 Windows 下追加 .exe
@@ -1027,6 +1033,7 @@ fn run_gpu_auto_setup(app: &AppHandle, repo: &Path, backend: &str) -> Result<(),
     Ok(())
 }
 
+#[cfg(windows)]
 fn backend_label(backend: &str) -> String {
     match backend {
         "local" => "Qwen3-TTS".into(),

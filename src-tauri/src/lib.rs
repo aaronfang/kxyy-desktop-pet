@@ -629,10 +629,10 @@ fn apply_monitor_to_window(app: &AppHandle, monitor_id: &Option<String>) {
             // 避免 min/max 约束把尺寸锁在初始 800×600。
             let _ = win.set_min_size(None::<tauri::PhysicalSize<u32>>);
             let _ = win.set_max_size(None::<tauri::PhysicalSize<u32>>);
-            let wa = monitor.work_area();
             let sf = monitor.scale_factor().max(0.1);
             #[cfg(windows)]
             {
+                let wa = monitor.work_area();
                 // Windows: work_area 已是物理像素，直接 set。
                 let _ = win.set_position(tauri::PhysicalPosition::new(wa.position.x, wa.position.y));
                 let _ = win.set_size(tauri::PhysicalSize::new(wa.size.width, wa.size.height));
@@ -659,14 +659,14 @@ fn position_chat_window(app: &AppHandle) {
     let s = app.state::<AppState>().settings.lock().unwrap().clone();
     if let Some(win) = app.get_webview_window("chat") {
         if let Some(monitor) = resolve_monitor(&win, &s.monitor_id) {
-            let wa = monitor.work_area();
-            let sf = monitor.scale_factor().max(0.1);
             let w_logical = s.chat_width as f64;
             let h_logical = s.chat_height as f64;
             let offset_logical = s.chat_bottom_offset as f64;
-            let win_sf = win.scale_factor().unwrap_or(sf).max(0.1);
             #[cfg(windows)]
             {
+                let wa = monitor.work_area();
+                let sf = monitor.scale_factor().max(0.1);
+                let win_sf = win.scale_factor().unwrap_or(sf).max(0.1);
                 // work_area 物理像素；窗口 sf 把 logical 尺寸转成物理。
                 let lx = wa.position.x as f64;
                 let ly = wa.position.y as f64;
