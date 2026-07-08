@@ -332,6 +332,10 @@ function applyVoiceServiceStatus(payload) {
         }
       }, 4000);
     }
+  } else if (state === "ready") {
+    node.textContent = msg ? `${label}：${msg}` : `${label}：就绪`;
+  } else if (state === "warning") {
+    node.textContent = msg ? `${label}：${msg}` : `${label}：请注意配置`;
   } else if (state === "failed") {
     node.textContent = msg ? `${label}：${msg}` : `${label}：失败`;
     if (logEl && voiceSetupLogLines.length) {
@@ -354,12 +358,33 @@ function applyVoiceServiceStatus(payload) {
     "state-failed",
     "state-stopped",
     "state-skipped",
+    "state-ready",
+    "state-warning",
   );
   if (state) node.classList.add(`state-${state}`);
 }
 
+/** 探测当前选中后端的状态（不启动服务），立即更新状态提示。 */
+async function probeBackendStatus() {
+  const backend = currentBackend();
+  try {
+    const status = await invoke("probe_voice_backend", { backend });
+    applyVoiceServiceStatus(status);
+  } catch (e) {
+    console.error("probe_voice_backend failed:", e);
+    const node = el("voiceServiceStatus");
+    if (node) {
+      node.textContent = `${backendLabel(backend)}：无法探测状态`;
+      node.className = "hint voice-service-status state-failed";
+    }
+  }
+}
+
 saveBtn.addEventListener("click", save);
-el("realtimeBackend").addEventListener("change", syncVoiceFields);
+el("realtimeBackend").addEventListener("change", () => {
+  syncVoiceFields();
+  probeBackendStatus();
+});
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
 
 // ---- 参考音频「浏览…」：调用系统文件对话框，取本地绝对路径写回输入框 ----
@@ -424,6 +449,8 @@ async function init() {
   }
   applyPlatformOptions();
   await load();
+  // 页面加载后立即探测当前后端的就绪状态
+  probeBackendStatus();
 }
 
 init();

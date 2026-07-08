@@ -137,6 +137,12 @@ select {
 .voice-service-status.state-failed {
   color: #dc2626;
 }
+.voice-service-status.state-ready {
+  color: #15803d;
+}
+.voice-service-status.state-warning {
+  color: #a16207;
+}
 .voice-service-status.state-stopped,
 .voice-service-status.state-skipped {
   color: #6b7280;
