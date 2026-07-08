@@ -1,20 +1,20 @@
 name: Release
 
 # 触发方式：
-#   1) 推送形如 v0.2.0 的 tag（主路径）—— 已临时停用，见下方说明
+#   1) 推送形如 v0.2.0 的 tag（主路径）
 #   2) 手动 workflow_dispatch（重跑 / 手动发布）
 #
 # 流程：verify（ubuntu 校验四处版本号与 tag 一致）→ release（3 平台并行构建
 # + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
 #
-# ⚠️ 2026-07 临时停用「推送 tag 自动触发」：本月 GitHub Actions 免费额度（2000 min）
-#    已用尽，为避免超额计费暂时关闭自动触发。额度将于 2026-08-01 重置。
-#    恢复方法：取消下方 push/tags 三行的注释即可（额度重置后）。
+# 成本保险：GitHub 账号 Settings → Billing → Budgets 已对 Actions 设置 $0 预算
+# 且 Stop usage=Yes。免费额度（2000 min/月）用尽后会被硬性拦截，永不产生超额计费，
+# 因此无需再手动停用触发；额度每月 1 号自动重置后照常工作。
 on:
   workflow_dispatch:
-  # push:
-  #   tags:
-  #     - "v*"
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
