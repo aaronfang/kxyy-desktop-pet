@@ -5,13 +5,23 @@ name: CI
 #   2) pull_request 任意分支 → main
 #   3) 手动 workflow_dispatch（本地复跑）
 #
-# 作用：在每个 PR / 推送里对 3 个目标平台都做一次构建，提前暴露
-#       Windows / macOS aarch64 / macOS x64 任一端的编译错误与 cfg 守卫问题。
+# 作用：在每个 PR / 推送里对 2 个目标平台都做一次构建，提前暴露
+#       Windows / macOS aarch64 任一端的编译错误与 cfg 守卫问题。
 #       仅构建、不发布、不打 tag 也不写 Release。
+#       砍掉 macos-x86_64 target 的原因见下方 matrix 注释。
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    # 路径过滤：纯文档/纯脚本/纯 .gitignore 改动不消耗 CI 分钟。
+    # （scripts/** 里的 Python/PowerShell 是用户手动跑的本地脚本，不 embed 到 Rust 二进制，
+    #   跟 Tauri 编译无关；*.md / docs/** 同理。）
+    # PR 不加此过滤——PR 是 merge 前的安全网，必须全跑防止代码混进。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'scripts/**'
+      - '.gitignore'
   pull_request:
     branches: [main]
 
@@ -29,16 +39,19 @@ jobs:
     name: build (${{ matrix.label }})
     strategy:
       # 任一平台失败立刻停（fail-fast: true 是默认行为，显式写出便于后人读懂）。
-      # macOS 两个 target 在同一台 macOS runner 上先后跑、互不阻塞。
       fail-fast: true
       matrix:
+        # 只跑 Apple Silicon + Windows 两个 target。
+        # 砍掉 macos-x86_64 的原因：
+        #   1) GitHub macos-latest runner 是 M1 (aarch64)，跑 x64 是 Rosetta + 交叉编译，
+        #      既慢又不算真实用户场景；
+        #   2) 几乎所有 cfg 守卫都是 target_os 层级、不分 arch，x64 出问题概率极低；
+        #   3) 真正发版时（release.yml 推到 GitHub Release）x64 仍然全跑，发版质量不受影响。
+        # 单次 push 消耗从 ~630 min 降到 ~330 min（省 48%）。
         include:
           - platform: macos-latest
             target: aarch64-apple-darwin
             label: macos-aarch64
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            label: macos-x64
           - platform: windows-latest
             target: ""            # windows-latest 默认 target，不强制交叉
             label: windows-x64
