@@ -218,8 +218,8 @@ npm run encrypt-assets
 
 | 触发 | Workflow | 行为 |
 |---|---|---|
-| `push` 到 main / `pull_request` → main | [`ci.yml`](.github/workflows/ci.yml) | 三平台 build-only 校验，**不发版** |
-| `push: tags: ['v*']` | [`release.yml`](.github/workflows/release.yml) | 版本号校验 + 构建 + 上传 GitHub Release |
+| `push` 到 main / `pull_request` → main | [`ci.yml`](.github/workflows/ci.yml) | 两平台 build-only 校验（macos-aarch64 + windows-x64），**不发版**；纯文档/纯脚本/纯 `.gitignore` 改动跳过（`paths-ignore`） |
+| `push: tags: ['v*']` | [`release.yml`](.github/workflows/release.yml) | 版本号校验 + 三平台（含 macos-x64）构建 + 上传 GitHub Release |
 
 两者互不干扰。可在 GitHub Actions 页面手动 `workflow_dispatch` 重跑 release。
 
