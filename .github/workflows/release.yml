@@ -1,17 +1,26 @@
 name: Release
 
 # 触发方式：
-#   1) 推送形如 v0.2.0 的 tag（主路径）
-#   2) 手动 workflow_dispatch（重跑 / 手动发布）
+#   1) 推送形如 v0.2.0 的 tag（主路径）—— 仅自动构建 Windows，省额度
+#   2) 手动 workflow_dispatch —— 可勾选 include_macos 追加构建 macOS（.dmg）
 #
-# 流程：verify（ubuntu 校验四处版本号与 tag 一致）→ release（3 平台并行构建
-# + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
+# 为什么这么设计：私有仓库 Actions 计费倍率 macOS ×10、Windows ×2、Linux ×1，
+# macOS 占了单次发版约九成的额度。故日常推 tag 只出 Windows；需要 macOS 版时，
+# 在 Actions 页面对该 tag 手动 Run workflow 并勾选 include_macos 即可（会追加 dmg
+# 到同一个 Release）。
+#
+# 流程：verify（校验四处版本号与 tag 一致）→ setup-matrix（按触发方式决定构建平台）
+# → release（按矩阵并行构建 + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
 #
 # 成本保险：GitHub 账号 Settings → Billing → Budgets 已对 Actions 设置 $0 预算
-# 且 Stop usage=Yes。免费额度（2000 min/月）用尽后会被硬性拦截，永不产生超额计费，
-# 因此无需再手动停用触发；额度每月 1 号自动重置后照常工作。
+# 且 Stop usage=Yes。免费额度（2000 min/月）用尽后会被硬性拦截，永不产生超额计费。
 on:
   workflow_dispatch:
+    inputs:
+      include_macos:
+        description: "同时构建 macOS (.dmg)？会额外消耗约 10x 的 Actions 额度"
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -40,22 +49,35 @@ jobs:
             exit 1
           fi
 
-  # 第二关：构建并发布。changelog 在这一步自动从 git log 生成，
+  # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；仅当手动触发且勾选
+  # include_macos 时才追加两个 macOS 目标（省下 ×10 的 macOS 额度）。
+  setup-matrix:
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Compute build matrix
+        id: set
+        run: |
+          WIN='{"platform":"windows-latest","args":"--bundles nsis"}'
+          MAC_ARM='{"platform":"macos-latest","args":"--target aarch64-apple-darwin --bundles dmg"}'
+          MAC_X64='{"platform":"macos-latest","args":"--target x86_64-apple-darwin --bundles dmg"}'
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_macos }}" = "true" ]; then
+            echo "matrix={\"include\":[$WIN,$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
+            echo "构建平台：Windows + macOS(aarch64/x64)"
+          else
+            echo "matrix={\"include\":[$WIN]}" >> "$GITHUB_OUTPUT"
+            echo "构建平台：仅 Windows（如需 macOS 请手动触发并勾选 include_macos）"
+          fi
+
+  # 第三关：构建并发布。changelog 在这一步自动从 git log 生成，
   # 彻底消除"忘改 release.yml"的可能。
   release:
-    needs: verify
+    needs: [verify, setup-matrix]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # macOS：分别产出 Apple Silicon 与 Intel 两个 dmg
-          - platform: macos-latest
-            args: "--target aarch64-apple-darwin --bundles dmg"
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin --bundles dmg"
-          # Windows：NSIS 安装包
-          - platform: windows-latest
-            args: "--bundles nsis"
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout (full history for changelog)
