@@ -278,6 +278,10 @@ class Creature {
     this.thinkingMode = true;
     this.reactionActive = true;
     this.currentAction = 'forcethink';
+    if (this.currentEdge !== 'bottom') {
+      this.positionY = this.bottomY;
+      this.container.style.top = `${this.bottomY}px`;
+    }
     this.currentEdge = 'bottom';
     this.updateEdgeClass();
     this._loopThinking();
@@ -302,6 +306,10 @@ class Creature {
     this.speakingMode = true;
     this.reactionActive = true;
     this.currentAction = 'dance';
+    if (this.currentEdge !== 'bottom') {
+      this.positionY = this.bottomY;
+      this.container.style.top = `${this.bottomY}px`;
+    }
     this.currentEdge = 'bottom';
     this.updateEdgeClass();
     this._loopSpeaking();
@@ -328,6 +336,10 @@ class Creature {
     this.stopReactionModes();
     this.reactionActive = true;
     this.currentAction = action;
+    if (this.currentEdge !== 'bottom') {
+      this.positionY = this.bottomY;
+      this.container.style.top = `${this.bottomY}px`;
+    }
     this.currentEdge = 'bottom';
     this.updateEdgeClass();
 
@@ -900,6 +912,13 @@ class Creature {
     if (['top', 'left', 'right'].includes(this.currentEdge)) {
         this.edgeAction();
         return;
+    }
+
+    // 兜底：currentEdge 是 'bottom' 但物理位置不在底部（可能被 reaction 方法误设状态），
+    // 此时先下落到底部，避免在非底部位置执行 walk 等地面动作。
+    if (this.currentEdge === 'bottom' && this.positionY < this.bottomY - 4) {
+      this.fallToBottom();
+      return;
     }
 
     if (!this.isJumping && this.positionY >= this.bottomY) {
