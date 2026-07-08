@@ -35,6 +35,60 @@ body {
   gap: 8px;
 }
 
+/* 启动服务就绪状态：各服务启动进度提示，就绪后自动消失。
+   位置：聊天窗底部（最末子元素），与上面的 voice-debug 间隔 8px。 */
+#startup-status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0 32px 0 32px;
+  padding: 4px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 12px;
+  font-variant-numeric: tabular-nums;
+  opacity: 1;
+  transition: opacity 0.4s ease;
+  min-height: 24px;
+}
+#startup-status.dismissed {
+  opacity: 0;
+  pointer-events: none;
+  margin-top: -8px; /* 收起时不占空隙 */
+}
+#startup-status .svc-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  transition: background 0.3s;
+}
+#startup-status .svc-dot.pending {
+  background: rgba(255, 255, 255, 0.22);
+}
+#startup-status .svc-dot.loading {
+  background: #f59e0b;
+  animation: svc-pulse 1s ease-in-out infinite;
+}
+#startup-status .svc-dot.ready {
+  background: #10b981;
+}
+#startup-status .svc-dot.failed {
+  background: #ef4444;
+}
+#startup-status .svc-label {
+  white-space: nowrap;
+  margin-right: 8px;
+}
+@keyframes svc-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 #messages {
   flex: 1 1 auto;
   overflow-y: auto;
@@ -47,9 +101,13 @@ body {
   mask-image: linear-gradient(to bottom, transparent 0, #000 22px);
 }
 /* 最新消息始终贴着底部输入栏，消息变多时向上生长直到溢出顶部才滚动。
-   用首条 margin-top:auto 顶到底部；溢出时该 auto 收缩为 0，正常滚动。 */
-#messages > .row:first-child {
+   用一个不可见占位元素 ::before 吸收 #messages 顶部所有剩余空间，
+   这样不论子元素是 .row（消息）还是 .pat-notice（系统提示），都会贴底；
+   溢出时 margin-top:auto 自动失效为 0，占位不占空间，内容从顶部正常滚动。 */
+#messages::before {
+  content: "";
   margin-top: auto;
+  flex: 0 0 0;
 }
 /* 滚动条完全隐藏，仍可滚动 */
 #messages {

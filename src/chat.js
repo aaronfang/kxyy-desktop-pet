@@ -185,6 +185,10 @@ let apiBase = "";
 let assets = null;
 let settings = {};
 let busy = false;
+// 启动服务就绪状态：语音(voice) / AI 文字 API(api)
+const svcState = { voice: "pending", api: "pending" };
+let svcVoiceEventReceived = false;
+let svcDismissTimer = null;
 let pendingImage = null; // { dataUrl } —— 待随下条消息发送的图片
 let pendingSticker = null; // { url, emotion, ... } —— 待随下条消息发送的表情
 let stickerGridBuilt = false; // 表情网格是否已懒填充
@@ -520,6 +524,74 @@ async function fetchDeepSeekBalance() {
   }
 }
 
+/** 更新启动状态栏：用语音 / AI 两个圆点表示服务就绪情况。 */
+function updateStartupStatus() {
+  const bar = document.getElementById("startup-status");
+  console.log("[startup-status] updateStartupStatus", { bar: !!bar, dismissed: bar?.classList.contains("dismissed"), svcState });
+  if (!bar || bar.classList.contains("dismissed")) return;
+  const dots = bar.querySelectorAll(".svc-dot");
+  const labels = bar.querySelectorAll(".svc-label");
+  // 更新圆点 class
+  for (const key of Object.keys(svcState)) {
+    const dot = bar.querySelector(`.svc-dot.${key}`);
+    const label = bar.querySelector(`.svc-dot.${key} + .svc-label`);
+    if (!dot) continue;
+    dot.className = `svc-dot ${key} ${svcState[key]}`;
+    // 状态文字提示
+    const statusText =
+      svcState[key] === "ready" ? "就绪" :
+      svcState[key] === "loading" ? "启动中…" :
+      svcState[key] === "failed" ? "异常" :
+      svcState[key] === "pending" ? "待检测" : "";
+    if (label) label.textContent = `${key === "voice" ? "语音" : "AI"} ${statusText}`;
+  }
+  // 全部就绪 → 短暂停留后消失
+  if (svcState.voice === "ready" && svcState.api === "ready") {
+    if (!svcDismissTimer) {
+      svcDismissTimer = setTimeout(() => {
+        bar.classList.add("dismissed");
+      }, 4000);
+    }
+  }
+  // 出现失败项 → 不清除，保留错误可视
+}
+
+/** 确保 apiBase 可用：为空时尝试通过 IPC 再次获取，失败则等 1s 后重试（最多 5 次）。 */
+async function ensureApiBase() {
+  if (apiBase) return true;
+  for (let i = 0; i < 5; i++) {
+    try {
+      apiBase = await invoke("get_api_base");
+      if (apiBase) return true;
+    } catch (_) { /* 重试 */ }
+    if (i < 4) await new Promise((r) => setTimeout(r, 1000));
+  }
+  return !!apiBase;
+}
+
+/** 同步检查 AI 文字 API 连通性（走 Rust 代理的 GET /api/chat 探针，零费用）。 */
+async function checkApiReady() {
+  if (!apiBase) {
+    // apiBase 未被 loadConfig 成功设置：尝试补救（可能 IPC 就绪晚于 DOM）
+    const ok = await ensureApiBase();
+    if (!ok) {
+      svcState.api = "failed";
+      updateStartupStatus();
+      return;
+    }
+  }
+  svcState.api = "loading";
+  updateStartupStatus();
+  try {
+    const resp = await fetch(`${apiBase}/api/chat`, { signal: AbortSignal.timeout(5000) });
+    // 本地 Rust 代理只要响应即就绪（Key 未配 ≠ 服务不可用）
+    svcState.api = resp.ok ? "ready" : "failed";
+  } catch (_) {
+    svcState.api = "failed";
+  }
+  updateStartupStatus();
+}
+
 function updateVoiceDebug() {
   if (!voiceDebugEl) return;
   const show = chatDebugEnabled();
@@ -750,6 +822,7 @@ function readFileAsDataUrl(file) {
 }
 
 async function loadConfig() {
+  console.log("[startup-status] loadConfig called");
   try {
     apiBase = await invoke("get_api_base");
   } catch (_) {}
@@ -775,6 +848,44 @@ async function loadConfig() {
   applyAppearance();
   refreshIdentity();
   if (chatDebugEnabled()) void fetchDeepSeekBalance();
+  // 启动服务状态探测
+  scheduleStartupStatusCheck();
+}
+
+/** 聊天窗口首次加载时，探测语音/AI 服务就绪状态。 */
+function scheduleStartupStatusCheck() {
+  console.log("[startup-status] scheduleStartupStatusCheck, backend:", settings.realtimeBackend);
+  // 语音：volc 无需本地服务 → 直接视为就绪；本地后端等 voice-service-status 事件。
+  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  if (backend === "volc") {
+    svcState.voice = "ready";
+  } else {
+    svcState.voice = "loading";
+  }
+  updateStartupStatus();
+  // 如果 2 秒内未收到 voice-service-status 事件 → 用 Rust 命令主动查询（窗口晚于服务启动的情况）
+  setTimeout(() => {
+    if (svcState.voice === "loading" && !svcVoiceEventReceived) {
+      void checkVoiceServiceViaRust();
+    }
+  }, 2000);
+  // AI API 异步探针
+  void checkApiReady();
+}
+
+/** 通过 Rust IPC 命令查询当前语音后端服务是否在跑。 */
+async function checkVoiceServiceViaRust() {
+  try {
+    const result = await invoke("check_voice_service");
+    if (result && result.state === "running") {
+      svcState.voice = "ready";
+    } else if (result && result.state === "unknown") {
+      // 仍在加载中，保持 loading；不会标记为 failed（可能模型较大加载慢）
+    }
+  } catch (_) {
+    /* 静默 */
+  }
+  updateStartupStatus();
 }
 
 /** 把设置里的观众画像字段拼成一份「画像」对象（不含 nickname，昵称走 userName）。 */
@@ -864,6 +975,9 @@ function buildRequestMessages(opts = {}) {
 
 /** 识图：通义千问 VL 只描述本轮图片（无历史、无人设），返回文字描述。 */
 async function describeImage(imageDataUrl, userText) {
+  if (!apiBase || !apiBase.startsWith("http://")) {
+    throw new Error("API 代理未就绪，无法识图");
+  }
   const resp = await fetch(`${apiBase}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -908,7 +1022,7 @@ function renderFinalBubbles(streamBubble, reply) {
  */
 function emptyReplyReason({ finishReason, hasReasoning, sawData } = {}) {
   if (!sawData) {
-    return "回复为空：未收到任何模型数据（响应体空或被截断，检查网络/上游状态）";
+    return "回复为空：未收到任何模型数据（响应体空或被截断，检查网络/上游状态；也可能是 API 代理端口未就绪：尝试重启应用）";
   }
   if (finishReason === "content_filter") {
     return "回复为空：内容被 DeepSeek 安全策略过滤，换个说法再试";
@@ -935,6 +1049,14 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
   // 拆条上限、注入「深聊但保持人设」提示，让元元能展开多聊，但性格口吻不变。
   const deep = !proactiveKind && detectDeepIntent(lastRealUserMessage()?.content || "");
   try {
+    // 防御：apiBase 必须是以 http 开头的绝对地址，否则会变成相对 URL
+    // 发到 tauri://localhost/api/chat（返回 HTML 无 data: 行 → "回复为空"）。
+    if (!apiBase || !apiBase.startsWith("http://")) {
+      const ok = await ensureApiBase();
+      if (!ok || !apiBase.startsWith("http://")) {
+        throw new Error("API 代理未就绪：请先确保本地服务端口可用，或重启应用后重试");
+      }
+    }
     const resp = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1695,6 +1817,25 @@ setupMiddleDragScroll();
 setupContextMenu();
 setupPatAndDeletion();
 
+// 语音服务状态推送（Rust → 前端）：更新启动状态栏。
+// 注意这是 push 事件，窗口打开前的事件会丢失；loadConfig 内有主动探活兜底。
+listen("voice-service-status", ({ payload }) => {
+  if (!payload) return;
+  svcVoiceEventReceived = true;
+  const state = payload.state;
+  if (state === "running") {
+    svcState.voice = "ready";
+  } else if (state === "failed") {
+    svcState.voice = "failed";
+  } else if (state === "starting") {
+    svcState.voice = "loading";
+  } else if (state === "skipped" || state === "stopped") {
+    // volc 标记为 skipped，或无服务 → 对启动栏也视为就绪（无需本地服务）
+    svcState.voice = "ready";
+  }
+  updateStartupStatus();
+});
+
 // 设置页保存后热更新（昵称 / 温度 / 思考模式 / 朗读音色 / 画像 / 头像 / 字号等）；
 // 昵称或画像字段变更时重载画像与记忆。
 listen("apply-settings", ({ payload }) => {
@@ -1751,3 +1892,16 @@ listen("flush-memory-before-quit", async () => {
 });
 
 loadConfig().then(() => inputEl.focus());
+
+// 聊天窗口 show/hide 时 DOM 不重载，需要在窗口可见时重置启动状态探测
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  // 重置状态并重新探测
+  svcState.voice = "pending";
+  svcState.api = "pending";
+  svcVoiceEventReceived = false;
+  if (svcDismissTimer) { clearTimeout(svcDismissTimer); svcDismissTimer = null; }
+  const bar = document.getElementById("startup-status");
+  if (bar) bar.classList.remove("dismissed");
+  scheduleStartupStatusCheck();
+});
