@@ -2,7 +2,7 @@
 
 基于 [webmeji](https://github.com/lars-rooij/webmeji) 动画逻辑改造的 **macOS / Windows 跨平台桌面宠物**，用 **[Tauri](https://tauri.app) 2** 封装（前端 Web 动画 + Rust 主进程）。桌宠会在屏幕上走动、坐下、跳舞、攀爬屏幕边缘，可拖拽、可抚摸，右键或托盘可切换形象。
 
-除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型），支持发图看图（通义千问 VL）、语音朗读与**实时语音通话**（可切换火山云端 / 本地模型 / CosyVoice）、表情包回复与自定义人设。朗读与通话共用一套语音后端，并支持 **0–200% 播放音量**。所有 AI 服务 Key 只保存在本机，请求经内置本地代理直连服务商或本机模型，不经第三方。
+除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型，也可切换本地 Ollama 模型离线使用），支持发图看图（通义千问 VL）、语音朗读与**实时语音通话**（可切换火山云端 / 本地模型 / CosyVoice）、表情包回复与自定义人设。朗读与通话共用一套语音后端，并支持 **0–200% 播放音量**。所有 AI 服务 Key 只保存在本机，请求经内置本地代理直连服务商或本机模型，不经第三方。
 
 当前内置两套形象：**赛博元元**（`kxyy-cyber`）与 **苗疆元元**（`kxyy-miaojiang`，默认）。应用图标为苗疆元元头部特写，缩小后仍可辨认。macOS 上为菜单栏托盘应用，**不占用 Dock**。
 
@@ -20,6 +20,7 @@
   - **通义千问 / DashScope Key**：发图看图、CosyVoice（通义云）选填（[申请](https://bailian.console.aliyun.com)）。
   - **火山引擎**（语音后端选「火山」时）：TTS Key、实时语音 App ID / Access Key、音色 `voice_id`。
   - **本地语音**：需本机 Python 环境；macOS 选 Qwen3-TTS 时应用会自动配置运行时；Windows / Linux 选本地 Qwen3-TTS 走 PyTorch（运行 `scripts/windows/setup-qwen3-tts.cmd` 配置 `.venv-qwen3`）；Windows + NVIDIA 亦可选 IndexTTS-2 / CosyVoice3（安装包可勾选配置，或运行 `scripts/windows/setup-gpu-voice.cmd`）。本地克隆需提供 10–20s 参考音频。
+  - **本地文字模型（离线可用）**：设置里「文字服务商」切到「本地模型」需先安装 [Ollama](https://ollama.com/download)（Windows / macOS 均可，5080 / M4 Pro 由 Ollama 自动调用 CUDA / Metal 加速），保存后应用会自动探测并尝试拉起 Ollama 服务，再在设置里点「下载 / 更新模型」拉取模型（默认推荐 `qwen3:14b`，也可填 `qwen3:8b` / `qwen3:32b` 等任意 tag）。
   - 首次实时通话需允许麦克风权限。
 
 ## 运行
@@ -54,7 +55,7 @@ npm run dev        # 开发模式（tauri dev）
 
 按 **`Ctrl+Shift+Space`**（可在设置中改）或点托盘「聊天」，在桌宠上方唤出聊天气泡，与「元元」对话；再按一次或点窗口外收起。
 
-- **文字对话**：由 DeepSeek 驱动，支持流式输出；可在设置里切换 `deepseek-chat`（快）/ `deepseek-reasoner`（会思考）与采样温度。
+- **文字对话**：默认由 DeepSeek 驱动，支持流式输出；可在设置里切换 `deepseek-chat`（快）/ `deepseek-reasoner`（会思考）与采样温度。也可在「文字服务商」切到**本地模型（Ollama）**离线对话（无网络时兜底），需先安装 Ollama 并下载模型；设置里的「思考模式」对本地 Qwen3 同样生效（关=`reasoning_effort: none`，开=`medium`，并自动加大 `max_tokens`）。
 - **发图看图**：附带图片时用通义千问 VL 识图（需填通义 Key）。
 - **语音朗读 / 实时通话**：朗读与通话共用「语音后端」，在设置里切换：
   | 后端 | 类型 | 说明 |

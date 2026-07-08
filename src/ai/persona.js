@@ -120,11 +120,12 @@ const PROACTIVE_HINT = {
 你刚回答完{who}，像真人唠嗑那样**再补 1 句**（单独一条消息）：
 - 就顺着你俩**刚才那个话题**往下半步：补个小细节、递个态度、或随口反问一句（「你呢」「是不是」「对吧」）——反问也**只许接话题**，不许质问对方怎么不回。
 - **紧扣上一条、别开新话题、别硬转折**：这一句要跟你上一条明显是同一段话，绝对不要突然跳到不相干的事上（也别硬塞什么妆造 / 人气 / 直播环节当新话头）。
+- **严禁复读上一条**（最高优先级）：禁止照抄、同义改写、换个标点再说一遍；禁止再次甩同一个表情标记。这一句必须是**新信息**——多半步细节 / 反问 / 态度即可。
 - **别像要结束 / 别收线**：绝对不要说"行了不跟你扯了""我去忙 / 收拾一下 / 收拾造型去""晚上见 / 晚上直播间见""不聊了""该睡了 / 困了"这类离场、告别、催散场的话——除非对方自己刚明确说要走 / 要睡。
 - **严禁「催说话 / 嫌沉默」**（最高优先级）：观众刚说完，**绝对禁止**「你怎么不说话」「咋不说话」「不吱声」「在吗」「还在吗」「咋不理我」「就光我一个人说」「没动静」「倒是回一句」——这类是 idle 场景才偶尔用的，续说时一字不许碰。
-- 好的续说示例：「反正我觉着还行」「你那边咋样」「不过话说回来…」「对了还有个事」；坏的续说：「你怎么不说话」「在吗」「理我一下」。
+- 好的续说示例：「反正我觉着还行」「你那边咋样」「不过话说回来…」「对了还有个事」；坏的续说：「你怎么不说话」「在吗」「理我一下」；坏的还有：把上一条原句再发一次。
 
-别重复你上一条刚说过的话；就 **1 句**短消息，一行说完。`,
+就 **1 句**短消息，一行说完。`,
   pat: `# 本轮任务（勿向观众复述本段）
 观众{who}刚刚在聊天里{pat}。像被熟人轻轻戳了一下那样，自然、俏皮地回一句，**1 句、最多 2 句**。
 - 可以假装吓一跳、撒娇、吐槽、或顺势接话，别像客服。
@@ -491,6 +492,17 @@ export function trimHistory(history, maxTurns) {
 // 多段展开的余量，同时流式渲染与刷新后重渲染共用同一上限、保证气泡数一致。
 export const MAX_REPLY_BUBBLES = 7;
 
+/**
+ * 本地小模型常把换行「写成」字面量 `\n` / `\r\n`（两个字符），界面就会显示反斜杠+n。
+ * DeepSeek 一般吐真正换行；在拆条 / 展示前统一正规化。
+ */
+export function normalizeModelNewlines(text) {
+  return String(text || "")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n");
+}
+
 function naturalSplitTwo(text) {
   if (text.length < NATURAL_SPLIT_MIN_CHARS) return [text];
   const marks = [];
@@ -505,7 +517,7 @@ function naturalSplitTwo(text) {
 }
 
 export function splitReply(text, { maxBubbles = MAX_REPLY_BUBBLES } = {}) {
-  const t = (text || "").trim();
+  const t = normalizeModelNewlines(text).trim();
   if (!t) return [];
   let parts = t.split(/\n+/).map((s) => s.trim()).filter(Boolean);
   if (parts.length === 1) parts = naturalSplitTwo(parts[0]);
@@ -528,13 +540,48 @@ export function shouldDoFollowup(userText, assistantReply, chance = DEFAULT_FOLL
   return Math.random() < p;
 }
 
-/** follow-up 续说若滑向「催观众说话 / 嫌沉默」，应丢弃不展示。 */
-export function isBadFollowupReply(text) {
+/** 去掉标点 / 空白 / 表情标记后，便于比「是不是同一句话」。 */
+function normalizeReplyForDup(text) {
+  return String(text || "")
+    .replace(/\[[^\]]*]/g, "")
+    .replace(/（[^）]*）|\([^)]*\)/g, "")
+    .replace(/[\s\u3000]+/g, "")
+    .replace(/[，。！？、…~～.!?,;:：；""''「」【】\-—_]/g, "")
+    .toLowerCase();
+}
+
+/**
+ * 续说是否与上一条助手回复近重复（本地小模型常复读全文；DeepSeek 较少）。
+ * 完全相等、或较短一方被较长一方「整段吃进」且长度比 ≥ 0.82，视为复读。
+ */
+export function isNearDuplicateReply(a, b) {
+  const na = normalizeReplyForDup(a);
+  const nb = normalizeReplyForDup(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const [shorter, longer] = na.length <= nb.length ? [na, nb] : [nb, na];
+  if (shorter.length < 6) return false;
+  if (!longer.includes(shorter)) return false;
+  return shorter.length / longer.length >= 0.82;
+}
+
+/**
+ * follow-up 续说若滑向「催观众说话 / 嫌沉默」，或几乎复读上一条助手回复，应丢弃不展示。
+ * @param {string} text 本轮续说正文
+ * @param {string} [previousAssistant] 上一条助手回复（主回复），用于本地模型复读拦截
+ */
+export function isBadFollowupReply(text, previousAssistant = "") {
   const t = (text || "").trim();
   if (!t) return true;
-  return /(你怎么|你咋|咋).{0,6}不说话|(怎么|咋).{0,4}不吱声|不吱声|没吱声|就光我(一个|人)?说|光我一个人|咋不理|不理我|还不回|倒是回|倒是说|没动静|怎么没声|还不说话|理我一下|回我一下|在吗[？?]?$|还在吗[？?]?$|沉默/.test(
-    t,
-  );
+  if (
+    /(你怎么|你咋|咋).{0,6}不说话|(怎么|咋).{0,4}不吱声|不吱声|没吱声|就光我(一个|人)?说|光我一个人|咋不理|不理我|还不回|倒是回|倒是说|没动静|怎么没声|还不说话|理我一下|回我一下|在吗[？?]?$|还在吗[？?]?$|沉默/.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (previousAssistant && isNearDuplicateReply(t, previousAssistant)) return true;
+  return false;
 }
 
 export function joinReply(parts) {
@@ -693,7 +740,8 @@ export const REPLY_MAX_TOKENS = {
   image: 580,
   longUser: 520,
   deep: 1300,
-  cap: 700,
+  // 普通聊天上限；本地模型在 api.rs 还会再抬（关思考 ≥512，开思考 ×6 且 ≥4096）。
+  cap: 900,
 };
 
 /**

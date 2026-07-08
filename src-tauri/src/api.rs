@@ -10,6 +10,41 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 const TEXT_BASE_URL: &str = "https://api.deepseek.com";
 const VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const VL_MODEL: &str = "qwen3-vl-plus";
+// 本地文字模型：Ollama 的 OpenAI 兼容端点，无需 Key（Authorization 头会被忽略）。
+const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+
+/// 把 Ollama 的 400（尤其是超上下文）翻译成用户能看懂的中文。
+fn local_ollama_error_message(status: u16, detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("exceed_context_size")
+        || lower.contains("exceeds the available context")
+        || (lower.contains("n_prompt_tokens") && lower.contains("n_ctx"))
+    {
+        // 尽量抠出具体数字
+        let prompt = extract_jsonish_u64(detail, "n_prompt_tokens");
+        let ctx = extract_jsonish_u64(detail, "n_ctx");
+        return match (prompt, ctx) {
+            (Some(p), Some(c)) => format!(
+                "本地模型上下文不够（本次约 {p} tokens，上限 {c}）。请清空一部分聊天后重试，或换更短的回复。"
+            ),
+            _ => "本地模型上下文不够（对话+人设超窗）。请清空一部分聊天后重试。".into(),
+        };
+    }
+    format!("本地模型 错误 {status}")
+}
+
+fn extract_jsonish_u64(hay: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let i = hay.find(&needle)?;
+    let after = &hay[i + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
+}
 
 // 火山引擎（豆包）声音复刻 TTS：HTTP 一次性合成，voice_id 以 S_ 开头。
 // 本地 / CosyVoice 后端则转发到 scripts/local-realtime 的 HTTP /tts（WS 端口 +100）。
@@ -114,9 +149,12 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         // GET 探针：只回传服务端是否已配文字 Key，不触发上游、零费用。
         (Method::Get, "/api/chat") => {
             let cfg = crate::ai_config(app);
+            // 本地 Ollama 无需 Key；仅 DeepSeek 分支需要检查是否已配置。
+            let has_server_key =
+                cfg.text_provider == "local" || !cfg.deepseek_key.is_empty();
             let body = serde_json::json!({
                 "ok": true,
-                "hasServerKey": !cfg.deepseek_key.is_empty()
+                "hasServerKey": has_server_key
             })
             .to_string();
             respond_json(request, 200, body);
@@ -240,6 +278,8 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         .and_then(|v| v.as_bool())
         .unwrap_or(cfg.thinking_default);
 
+    let is_local_text = !use_vision && cfg.text_provider == "local";
+
     let (base_url, model, api_key, provider_name) = if use_vision {
         (
             VL_BASE_URL.to_string(),
@@ -247,6 +287,14 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
             cfg.qwen_vl_key.clone(),
             "通义千问",
         )
+    } else if is_local_text {
+        let model = if !cfg.local_text_model.is_empty() {
+            cfg.local_text_model.clone()
+        } else {
+            crate::local_text::DEFAULT_MODEL.to_string()
+        };
+        // Ollama 忽略 Authorization 头，占位值即可，避免下面的空 Key 检查误判。
+        (OLLAMA_CHAT_BASE_URL.to_string(), model, "ollama".to_string(), "本地模型")
     } else {
         let model = if !cfg.text_model.is_empty() {
             cfg.text_model.clone()
@@ -276,9 +324,13 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         .get("max_tokens")
         .and_then(|v| v.as_i64())
         .unwrap_or(400);
-    // reasoner 的 max_tokens 含思考链，需放大预算。
-    let max_tokens = if is_reasoner {
-        (max_tokens_in * 4).max(2048)
+    // 预算：
+    // - DeepSeek reasoner / 本地开启思考：思考链占用同一 max_tokens，需大幅放大，避免正文被截空。
+    // - 本地关闭思考：保留小幅余量即可（前端 normal≈450）；过大的硬下限会拖慢本地生成。
+    let max_tokens = if is_reasoner || (is_local_text && thinking) {
+        (max_tokens_in * 6).max(4096)
+    } else if is_local_text {
+        max_tokens_in.max(512)
     } else {
         max_tokens_in
     };
@@ -297,6 +349,14 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     // deepseek-reasoner 会忽略 temperature，非 reasoner 时照常下发。
     if !is_reasoner {
         payload["temperature"] = serde_json::json!(temperature);
+    }
+    // 本地 Qwen3 等思考模型：OpenAI 兼容端点用 reasoning_effort 控制开关
+    //（不传时 Ollama 会默认开思考；native `think` 字段在 /v1 上不可靠）。
+    // 注意：`/v1` 会忽略 keep_alive / num_ctx；常驻与上下文扩容由 warmup + touch_keep_alive
+    // 走 native `/api/chat` 完成。
+    if is_local_text {
+        payload["reasoning_effort"] = serde_json::json!(if thinking { "medium" } else { "none" });
+        payload["think"] = serde_json::json!(thinking);
     }
 
     // 传输层重试：`error sending request for url ...` 属于连接被复用到「半损坏」状态或
@@ -346,12 +406,22 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     let status = upstream.status();
     if !status.is_success() {
         let detail = upstream.text().unwrap_or_default();
+        let friendly = if is_local_text {
+            local_ollama_error_message(status.as_u16(), &detail)
+        } else {
+            format!("{provider_name} 错误 {}", status.as_u16())
+        };
         let body = serde_json::json!({
-            "error": format!("{provider_name} 错误 {}", status.as_u16()),
+            "error": friendly,
             "detail": detail.chars().take(500).collect::<String>(),
         })
         .to_string();
         return respond_json(request, status.as_u16(), body);
+    }
+
+    // 本地聊天成功后走 native 续一次 keep_alive（/v1 本身不续命，闲置约 5 分钟就会卸模型）。
+    if is_local_text {
+        crate::local_text::touch_keep_alive(&model);
     }
 
     if !stream {

@@ -146,7 +146,7 @@
       </label>
       <label class="row-inline">
         <input id="showChatDebug" type="checkbox" />
-        <span>显示聊天界面语音调试信息（后端 / 合成进度）</span>
+        <span>显示聊天界面调试信息（语音 / 本地文字生成进度与用量）</span>
       </label>
       <label>
         <span>AI 语音播放音量<small>朗读与通话，100% 为原音量，最高 200%</small></span>
@@ -162,17 +162,50 @@
     <section>
       <h2>模型与人格</h2>
       <label>
-        <span>文字模型</span>
-        <select id="textModel">
-          <option value="">自动（按思考模式）</option>
-          <option value="deepseek-chat">deepseek-chat（快）</option>
-          <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+        <span>文字服务商<small>无网络时可切换本地模型</small></span>
+        <select id="textProvider">
+          <option value="deepseek">DeepSeek（在线）</option>
+          <option value="local">本地模型（Ollama，离线可用）</option>
         </select>
       </label>
+
+      <div id="textFieldsDeepseek" class="text-provider-fields">
+        <label>
+          <span>文字模型</span>
+          <select id="textModel">
+            <option value="">自动（按思考模式）</option>
+            <option value="deepseek-chat">deepseek-chat（快）</option>
+            <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+          </select>
+        </label>
+      </div>
+
+      <div id="textFieldsLocal" class="text-provider-fields" hidden>
+        <label>
+          <span>本地模型<small>Ollama 的模型 tag</small></span>
+          <input id="localTextModel" list="localTextModelPresets" placeholder="qwen3:14b" />
+          <datalist id="localTextModelPresets">
+            <option value="qwen3:14b">qwen3:14b（推荐，均衡）</option>
+            <option value="qwen3:8b">qwen3:8b（更快，低配优先）</option>
+            <option value="qwen3:32b">qwen3:32b（更强，需更大显存/内存）</option>
+          </datalist>
+        </label>
+        <div class="model-actions">
+          <button id="pullLocalModel" type="button" class="ghost">下载 / 更新模型</button>
+          <span id="localTextPullStatus" class="hint"></span>
+        </div>
+        <p id="localTextServiceStatus" class="hint voice-service-status">检测中…</p>
+        <p class="hint">
+          需先安装 <a href="https://ollama.com/download" target="_blank" rel="noreferrer">Ollama</a>（Windows / macOS 均可，5080 / M4 Pro 由其自动调用 CUDA / Metal 加速）。
+          保存后本 App 会自动探测并尝试拉起 Ollama 服务；首次使用可从 <code>hf-mirror</code> / ModelScope 导入 GGUF，或点「下载 / 更新模型」。
+        </p>
+      </div>
+
       <label class="row-inline">
         <input id="thinking" type="checkbox" />
-        <span>开启思考模式（deepseek-reasoner，更慢更贵）</span>
+        <span>开启思考模式<small>DeepSeek→reasoner；本地 Qwen3→思考链（更慢，回复预算会自动加大）</small></span>
       </label>
+
       <label>
         <span>采样温度<small>0~2，越高越发散</small></span>
         <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />

@@ -1,4 +1,5 @@
 mod api;
+mod local_text;
 mod persona_assets;
 mod realtime;
 mod voice_service;
@@ -122,6 +123,12 @@ struct Settings {
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-chat / deepseek-reasoner）。
     #[serde(default)]
     text_model: String,
+    /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
+    #[serde(default = "default_text_provider")]
+    text_provider: String,
+    /// 本地文字模型 tag（Ollama），空则用推荐默认 `qwen3:14b`。
+    #[serde(default)]
+    local_text_model: String,
     /// 思考模式（deepseek-reasoner）。
     #[serde(default)]
     thinking: bool,
@@ -185,6 +192,10 @@ fn default_realtime_backend() -> String {
     "volc".into()
 }
 
+fn default_text_provider() -> String {
+    "deepseek".into()
+}
+
 fn default_voice_volume() -> u32 {
     100
 }
@@ -245,6 +256,8 @@ impl Settings {
             voice_volume: default_voice_volume(),
             show_chat_debug: false,
             text_model: String::new(),
+            text_provider: default_text_provider(),
+            local_text_model: String::new(),
             thinking: false,
             temperature: default_temperature(),
             user_name: String::new(),
@@ -284,6 +297,10 @@ pub(crate) struct AiConfig {
     pub deepseek_key: String,
     pub qwen_vl_key: String,
     pub text_model: String,
+    /// 文字服务商：`deepseek` / `local`（Ollama）。
+    pub text_provider: String,
+    /// 本地文字模型 tag（Ollama），空则由 api.rs 兜底 `local_text::DEFAULT_MODEL`。
+    pub local_text_model: String,
     pub thinking_default: bool,
     /// 语音后端：`volc` / `local` / `cosyvoice` / `cosyvoice3` / `indextts2`。
     pub voice_backend: String,
@@ -307,6 +324,8 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
         deepseek_key: s.deepseek_key,
         qwen_vl_key: s.qwen_vl_key,
         text_model: s.text_model,
+        text_provider: s.text_provider,
+        local_text_model: s.local_text_model,
         thinking_default: s.thinking,
         voice_backend,
         volc_tts_key: s.volc_tts_key,
@@ -1088,6 +1107,10 @@ struct AiSettingsInput {
     #[serde(default = "default_true")]
     show_chat_debug: bool,
     text_model: String,
+    #[serde(default = "default_text_provider")]
+    text_provider: String,
+    #[serde(default)]
+    local_text_model: String,
     thinking: bool,
     temperature: f64,
     user_name: String,
@@ -1162,6 +1185,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.voice_volume = settings.voice_volume.min(200);
         s.show_chat_debug = settings.show_chat_debug;
         s.text_model = settings.text_model.trim().to_string();
+        s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
+            "local" => "local".into(),
+            _ => "deepseek".into(),
+        };
+        s.local_text_model = settings.local_text_model.trim().to_string();
         s.thinking = settings.thinking;
         s.temperature = settings.temperature;
         s.user_name = settings.user_name.trim().to_string();
@@ -1191,6 +1219,41 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         .realtime_backend
         .clone();
     voice_service::ensure(&app, &backend);
+    // 按所选文字服务商自动探测 / 拉起本地 Ollama（非 local 时函数内部直接返回）。
+    let text_provider;
+    let local_text_model;
+    {
+        let state = app.state::<AppState>();
+        let guard = state.settings.lock().unwrap();
+        text_provider = guard.text_provider.clone();
+        local_text_model = guard.local_text_model.clone();
+    }
+    local_text::ensure(&app, &text_provider, &local_text_model);
+}
+
+/// 只读探测本地文字模型（Ollama）状态，不改变系统状态。
+#[tauri::command]
+fn probe_local_text_backend() -> local_text::LocalTextStatus {
+    local_text::probe()
+}
+
+/// 列出本地已装模型（Ollama 未运行时返回空数组）。
+#[tauri::command]
+fn list_local_text_models() -> Vec<local_text::ModelInfo> {
+    local_text::list_models().unwrap_or_default()
+}
+
+/// 触发一次模型下载/更新（Ollama `POST /api/pull`）；立即返回，进度经
+/// `local-text-pull-progress` 事件推送。
+#[tauri::command]
+fn pull_local_text_model(app: AppHandle, model: String) {
+    let model = model.trim().to_string();
+    let model = if model.is_empty() {
+        local_text::DEFAULT_MODEL.to_string()
+    } else {
+        model
+    };
+    local_text::pull_model(app, model);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1272,6 +1335,8 @@ pub fn run() {
             install_tray(app)?;
             // 启动时按已保存的语音后端自动拉起本地服务。
             voice_service::ensure(&handle, &settings.realtime_backend);
+            // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
+            local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
@@ -1322,7 +1387,10 @@ pub fn run() {
             open_settings,
             set_ai_settings,
             get_platform,
-            memory_flushed
+            memory_flushed,
+            probe_local_text_backend,
+            list_local_text_models,
+            pull_local_text_model
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

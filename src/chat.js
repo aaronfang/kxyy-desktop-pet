@@ -12,6 +12,7 @@ import {
   buildMessages,
   splitReply,
   sanitizeReply,
+  normalizeModelNewlines,
   replyMaxTokens,
   buildImageDescribeMessages,
   resolveUserProfile,
@@ -51,7 +52,9 @@ const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
 const emit = window.__TAURI__.event.emit;
 
-const MAX_TURNS = 6; // 送给模型的最近对话轮数
+const MAX_TURNS = 6; // DeepSeek 等在线：送给模型的最近对话轮数
+/** 本地 Ollama：人设已占 ~5k tokens，轮数再多容易顶穿上下文 → 400；比在线收紧一点。 */
+const LOCAL_MAX_TURNS = 4;
 const STICKER_FREQUENCY = "medium"; // 适中：情绪到位时较常配表情
 const IMAGE_DESCRIBE_MAX_TOKENS = 512;
 const PAT_COOLDOWN_MS = 2500;
@@ -266,7 +269,8 @@ function lastRealUserMessage() {
 /** 增量更新较早聊天滚动摘要（fire-and-forget，不阻塞界面）。 */
 async function maybeUpdateRecap() {
   if (recapUpdating) return;
-  const boundary = recapBoundary(history, MAX_TURNS);
+  const historyTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
+  const boundary = recapBoundary(history, historyTurns);
   if (recapCovered > boundary) recapCovered = boundary;
   const pending = history
     .slice(recapCovered, boundary)
@@ -320,14 +324,27 @@ const voiceDebugLabelEl = document.getElementById("voice-debug-label");
 const voiceDebugBarEl = document.getElementById("voice-debug-bar");
 const voiceDebugTtsMetaEl = document.getElementById("voice-debug-tts-meta");
 const apiDebugMetaEl = document.getElementById("api-debug-meta");
+const textDebugGenEl = document.getElementById("text-debug-gen");
+const textDebugBarEl = document.getElementById("text-debug-bar");
+const textDebugMetaEl = document.getElementById("text-debug-meta");
 const callDebugMetaEl = document.getElementById("call-debug-meta");
 
-/** 在线 API 用量 debug 态（单次 usage + DeepSeek 余额；无「剩余 token」接口）。 */
+/** 在线 / 本地文字 API 用量 debug 态（单次 usage + DeepSeek 余额；本地附带耗时）。 */
 const apiDebug = {
   provider: "",
+  model: "",
   last: null, // { prompt, completion, total }
   sessionTotal: 0,
   balanceText: "",
+  lastElapsedMs: 0,
+};
+/** 本地文字生成进度（当前 Windows/mac 代理会缓冲整段 SSE，用计时不定条表示「生成中」）。 */
+const textGenDebug = {
+  active: false,
+  startedAt: 0,
+  timer: null,
+  chars: 0,
+  thinking: false,
 };
 /** TTS 计费字符（CosyVoice / 火山按字计费，非 LLM token）。 */
 const ttsUsageDebug = {
@@ -389,17 +406,112 @@ function formatUsageLine(usage) {
   return `本次 ${formatTokenCount(usage.total)}（入${formatTokenCount(usage.prompt)}/出${formatTokenCount(usage.completion)}）`;
 }
 
+function formatGenSeconds(ms) {
+  const s = Math.max(0, Number(ms) || 0) / 1000;
+  return s < 10 ? s.toFixed(2) : s.toFixed(1);
+}
+
+function localTextModelLabel() {
+  return (settings.localTextModel || "").trim() || "qwen3:14b";
+}
+
+function stopTextGenTimer() {
+  if (textGenDebug.timer) {
+    clearInterval(textGenDebug.timer);
+    textGenDebug.timer = null;
+  }
+}
+
+function setTextGenBarPhase(phase) {
+  if (!textDebugBarEl) return;
+  textDebugBarEl.classList.remove("idle", "gen", "done", "error");
+  textDebugBarEl.classList.add(phase || "idle");
+}
+
+/** 本地文字：显示 / 刷新「生成中」进度行。 */
+function beginLocalTextGen({ thinking = false } = {}) {
+  stopTextGenTimer();
+  textGenDebug.active = true;
+  textGenDebug.startedAt = performance.now();
+  textGenDebug.chars = 0;
+  textGenDebug.thinking = !!thinking;
+  if (!chatDebugEnabled()) return;
+  if (textDebugGenEl) textDebugGenEl.hidden = false;
+  setTextGenBarPhase("gen");
+  const tick = () => {
+    if (!textGenDebug.active || !textDebugMetaEl) return;
+    const ms = performance.now() - textGenDebug.startedAt;
+    const think = textGenDebug.thinking ? " · 思考开" : "";
+    const chars =
+      textGenDebug.chars > 0 ? ` · 已收 ${textGenDebug.chars} 字` : "";
+    textDebugMetaEl.textContent = `生成中 ${formatGenSeconds(ms)}s${think}${chars}`;
+  };
+  tick();
+  textGenDebug.timer = setInterval(tick, 200);
+}
+
+function noteLocalTextGenChars(n) {
+  textGenDebug.chars = Math.max(0, Number(n) || 0);
+}
+
+/** 本地文字生成结束：进度条定稿 + 刷新用量行。 */
+function finishLocalTextGen({ usage = null, error = null } = {}) {
+  const elapsed = textGenDebug.active
+    ? performance.now() - textGenDebug.startedAt
+    : 0;
+  stopTextGenTimer();
+  textGenDebug.active = false;
+  if (!chatDebugEnabled() || !textDebugMetaEl) {
+    if (textDebugGenEl) textDebugGenEl.hidden = true;
+    return elapsed;
+  }
+  if (textDebugGenEl) textDebugGenEl.hidden = false;
+  if (error) {
+    setTextGenBarPhase("error");
+    textDebugMetaEl.textContent = `失败 ${formatGenSeconds(elapsed)}s · ${error}`;
+    return elapsed;
+  }
+  setTextGenBarPhase("done");
+  const parts = [`完成 ${formatGenSeconds(elapsed)}s`];
+  if (usage?.completion) {
+    const tps =
+      elapsed > 0
+        ? ((usage.completion / elapsed) * 1000).toFixed(1)
+        : "—";
+    parts.push(`${formatTokenCount(usage.completion)} tok`);
+    parts.push(`${tps} tok/s`);
+  } else if (textGenDebug.chars > 0) {
+    parts.push(`${textGenDebug.chars} 字`);
+  }
+  textDebugMetaEl.textContent = parts.join(" · ");
+  return elapsed;
+}
+
 function updateApiDebug() {
   if (!apiDebugMetaEl) return;
   if (!chatDebugEnabled()) {
     apiDebugMetaEl.textContent = "";
+    if (textDebugGenEl && !textGenDebug.active) textDebugGenEl.hidden = true;
     updateCallDebug();
     return;
   }
   const parts = ["API"];
   if (apiDebug.provider) parts.push(apiDebug.provider);
+  if (apiDebug.provider === "本地模型" && apiDebug.model) {
+    parts.push(apiDebug.model);
+  }
   if (apiDebug.last) {
     parts.push(formatUsageLine(apiDebug.last));
+    if (apiDebug.lastElapsedMs > 0 && apiDebug.provider === "本地模型") {
+      parts.push(`${formatGenSeconds(apiDebug.lastElapsedMs)}s`);
+      if (apiDebug.last.completion > 0) {
+        const tps = (
+          (apiDebug.last.completion / apiDebug.lastElapsedMs) *
+          1000
+        ).toFixed(1);
+        parts.push(`${tps} tok/s`);
+      }
+    }
     if (apiDebug.sessionTotal > 0) {
       parts.push(`会话 ${formatTokenCount(apiDebug.sessionTotal)}`);
     }
@@ -487,12 +599,20 @@ function noteCallUsage(msg) {
   updateCallDebug();
 }
 
-/** 记录一次在线 API 的 token 用量，并在 DeepSeek 时刷新余额。 */
-function noteApiUsage(provider, usage, { refreshBalance = false } = {}) {
-  if (!usage) return;
-  apiDebug.provider = provider || apiDebug.provider;
-  apiDebug.last = usage;
-  apiDebug.sessionTotal += usage.total || 0;
+/** 记录一次 API 的 token 用量；DeepSeek 可顺带刷新余额，本地可附带耗时。 */
+function noteApiUsage(
+  provider,
+  usage,
+  { refreshBalance = false, model = "", elapsedMs = 0 } = {}
+) {
+  if (!usage && !provider) return;
+  if (provider) apiDebug.provider = provider;
+  if (model) apiDebug.model = model;
+  if (usage) {
+    apiDebug.last = usage;
+    apiDebug.sessionTotal += usage.total || 0;
+  }
+  if (elapsedMs > 0) apiDebug.lastElapsedMs = elapsedMs;
   updateApiDebug();
   if (refreshBalance && provider === "DeepSeek") {
     void fetchDeepSeekBalance();
@@ -598,14 +718,27 @@ function updateVoiceDebug() {
   voiceDebugEl.hidden = !show;
   voiceDebugEl.setAttribute("aria-hidden", show ? "false" : "true");
   if (!show || !voiceDebugLabelEl) {
+    stopTextGenTimer();
+    if (textDebugGenEl) textDebugGenEl.hidden = true;
     updateApiDebug();
     return;
   }
   const vol = Number(settings.voiceVolume);
   const volPct = Number.isFinite(vol) ? Math.max(0, Math.min(200, vol)) : 100;
-  const text = `语音 · ${voiceBackendLabel()} · 音量 ${volPct}%`;
-  voiceDebugLabelEl.textContent = text;
+  const lines = [`语音 · ${voiceBackendLabel()} · 音量 ${volPct}%`];
+  if (settings.textProvider === "local") {
+    lines.push(`文字 · 本地 ${localTextModelLabel()}`);
+  }
+  const text = lines.join("\n");
+  voiceDebugLabelEl.textContent = lines[0];
+  // 第二行挂在 label 上：本地文字后端一眼可见。
+  if (lines[1]) {
+    voiceDebugLabelEl.textContent = `${lines[0]}\n${lines[1]}`;
+  }
   voiceDebugEl.title = text;
+  if (textDebugGenEl && !textGenDebug.active && !textDebugMetaEl?.textContent) {
+    textDebugGenEl.hidden = true;
+  }
   updateApiDebug();
 }
 
@@ -847,7 +980,7 @@ async function loadConfig() {
   } catch (_) {}
   applyAppearance();
   refreshIdentity();
-  if (chatDebugEnabled()) void fetchDeepSeekBalance();
+  if (settings.textProvider !== "local" && chatDebugEnabled()) void fetchDeepSeekBalance();
   // 启动服务状态探测
   scheduleStartupStatusCheck();
 }
@@ -956,11 +1089,12 @@ function buildRequestMessages(opts = {}) {
     memory,
     profile,
   });
+  const maxTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
   return buildMessages({
     systemPrompt,
     fewShot: assets.fewShot,
     history,
-    maxTurns: MAX_TURNS,
+    maxTurns,
     useLive: true,
     lore: assets.lore,
     stickerEmotions: stickerEmotions(),
@@ -1048,6 +1182,8 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
   // 深聊模式：仅普通轮次（非拍一拍 / 非追问等主动开口）按观众用词判定；命中则本轮放开字数与
   // 拆条上限、注入「深聊但保持人设」提示，让元元能展开多聊，但性格口吻不变。
   const deep = !proactiveKind && detectDeepIntent(lastRealUserMessage()?.content || "");
+  const isLocalText = settings.textProvider === "local";
+  let localGenStarted = false;
   try {
     // 防御：apiBase 必须是以 http 开头的绝对地址，否则会变成相对 URL
     // 发到 tauri://localhost/api/chat（返回 HTML 无 data: 行 → "回复为空"）。
@@ -1056,6 +1192,10 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       if (!ok || !apiBase.startsWith("http://")) {
         throw new Error("API 代理未就绪：请先确保本地服务端口可用，或重启应用后重试");
       }
+    }
+    if (isLocalText) {
+      beginLocalTextGen({ thinking: !!settings.thinking });
+      localGenStarted = true;
     }
     const resp = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
@@ -1079,6 +1219,10 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       try {
         const j = await resp.json();
         err = j.error || err;
+        // 本地 400 详情里常有 exceed_context；error 已是可读文案，detail 仅作 debug。
+        if (chatDebugEnabled() && j.detail) {
+          console.warn("[chat] upstream detail", j.detail);
+        }
       } catch (_) {}
       throw new Error(err);
     }
@@ -1108,18 +1252,21 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
           if (chunkUsage) usage = chunkUsage;
           const choice = chunk.choices?.[0];
           if (choice?.finish_reason) finishReason = choice.finish_reason;
-          const rc = choice?.delta?.reasoning_content;
+          const rc = choice?.delta?.reasoning_content ?? choice?.delta?.reasoning;
           if (rc) reasoning += rc;
           const delta = choice?.delta?.content;
           if (delta) {
             full += delta;
+            if (isLocalText) noteLocalTextGenChars(full.length);
             if (!speaking) {
               speaking = true;
               petSignal("speaking");
             }
             // 会朗读时先不显示文字，等对应句音频开始播放再显示（同步出现）。
             if (!willSync) {
-              streamBubble.textContent = stripStickerForDisplay(full);
+              streamBubble.textContent = stripStickerForDisplay(
+                normalizeModelNewlines(full)
+              );
               scrollBottom();
             }
           }
@@ -1128,7 +1275,16 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         }
       }
     }
-    noteApiUsage("DeepSeek", usage, { refreshBalance: true });
+    // 本地模型（Ollama）没有余额概念，仅 DeepSeek 才刷新余额。
+    const elapsedMs = localGenStarted
+      ? finishLocalTextGen({ usage })
+      : 0;
+    noteApiUsage(isLocalText ? "本地模型" : "DeepSeek", usage, {
+      refreshBalance: !isLocalText,
+      model: isLocalText ? localTextModelLabel() : "",
+      elapsedMs,
+    });
+    localGenStarted = false;
 
     const raw = sanitizeReply(full);
     const { text: reply, emotion } = extractSticker(raw);
@@ -1139,9 +1295,19 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       throw new Error(emptyReplyReason({ finishReason, hasReasoning: !!reasoning, sawData }));
     }
 
-    if (proactiveKind === "followup" && isBadFollowupReply(reply)) {
-      streamRow.remove();
-      return { skipped: true };
+    if (proactiveKind === "followup") {
+      // 上一条真实助手回复（主气泡）；history 末尾此时还是「续说」幕后 user 触发。
+      let prevAssistant = "";
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i]?.role === "assistant") {
+          prevAssistant = history[i].content || "";
+          break;
+        }
+      }
+      if (isBadFollowupReply(reply, prevAssistant)) {
+        streamRow.remove();
+        return { skipped: true };
+      }
     }
 
     history.push({
@@ -1179,6 +1345,10 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     void maybeUpdateRecap();
     return { skipped: false, speechDone };
   } catch (e) {
+    if (localGenStarted) {
+      finishLocalTextGen({ error: e.message || String(e) });
+      localGenStarted = false;
+    }
     streamRow.classList.remove("streaming");
     streamRow.classList.add("error");
     streamBubble.textContent = `出错了：${e.message || e}`;
@@ -1854,8 +2024,12 @@ listen("apply-settings", ({ payload }) => {
   settings = { ...settings, ...payload };
   if (identityChanged) refreshIdentity();
   applyAppearance();
-  // 刚打开 debug，或 DeepSeek Key 可能变更时，补拉一次余额。
-  if (chatDebugEnabled() && (!debugWasOn || "deepseekKey" in payload)) {
+  // 刚打开 debug，或 DeepSeek Key 可能变更时，补拉一次余额（本地模型无余额概念，跳过）。
+  if (
+    settings.textProvider !== "local" &&
+    chatDebugEnabled() &&
+    (!debugWasOn || "deepseekKey" in payload)
+  ) {
     void fetchDeepSeekBalance();
   }
 });

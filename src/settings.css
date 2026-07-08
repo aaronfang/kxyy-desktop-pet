@@ -159,6 +159,38 @@ select {
   margin-bottom: 14px;
 }
 
+.text-provider-fields[hidden] {
+  display: none;
+}
+.text-provider-fields > .hint {
+  margin-top: 0;
+  margin-bottom: 14px;
+}
+.model-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 14px;
+}
+.model-actions button.ghost {
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #eef0f3;
+  color: #6b7280;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.model-actions button.ghost:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.model-actions .hint {
+  margin: 0;
+}
+
 /* 文件选择字段：文本输入 + 右侧「浏览…」按钮同一行 */
 .file-field {
   display: flex;

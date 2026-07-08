@@ -24,7 +24,9 @@ const FIELDS = [
   "localRefWav",
   "localRefText",
   "voiceVolume",
+  "textProvider",
   "textModel",
+  "localTextModel",
   "temperature",
   "userName",
   "patText",
@@ -115,6 +117,19 @@ function syncVoiceVolumeLabel() {
   el("voiceVolumeVal").textContent = `${v}%`;
 }
 
+/** 文字服务商：deepseek（在线）/ local（本地 Ollama）。 */
+function currentTextProvider() {
+  const v = (el("textProvider").value || "deepseek").toLowerCase();
+  return v === "local" ? "local" : "deepseek";
+}
+
+/** 按所选文字服务商只展示对应设置项。 */
+function syncTextFields() {
+  const provider = currentTextProvider();
+  el("textFieldsDeepseek").hidden = provider !== "deepseek";
+  el("textFieldsLocal").hidden = provider !== "local";
+}
+
 function fill(s) {
   s = s || {};
   el("deepseekKey").value = s.deepseekKey || "";
@@ -145,7 +160,10 @@ function fill(s) {
   syncVoiceFields();
   el("autoSpeak").checked = !!s.autoSpeak;
   el("showChatDebug").checked = s.showChatDebug === true;
+  el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("textModel").value = s.textModel || "";
+  el("localTextModel").value = s.localTextModel || "";
+  syncTextFields();
   el("thinking").checked = !!s.thinking;
   el("temperature").value = s.temperature ?? 0.8;
   el("userName").value = s.userName || "";
@@ -197,7 +215,9 @@ function collect() {
     ),
     autoSpeak: el("autoSpeak").checked,
     showChatDebug: el("showChatDebug").checked,
+    textProvider: currentTextProvider(),
     textModel: el("textModel").value,
+    localTextModel: el("localTextModel").value.trim(),
     thinking: el("thinking").checked,
     temperature: Number(el("temperature").value) || 0.8,
     userName: el("userName").value.trim(),
@@ -380,11 +400,81 @@ async function probeBackendStatus() {
   }
 }
 
+/** 更新本地文字模型（Ollama）状态提示。 */
+function applyLocalTextStatus(payload) {
+  const node = el("localTextServiceStatus");
+  if (!node || !payload) return;
+  const state = payload.state || "";
+  const msg = (payload.message || "").trim();
+  node.textContent = msg ? `Ollama：${msg}` : "Ollama：状态未知";
+  node.classList.remove("state-running", "state-starting", "state-failed", "state-stopped");
+  if (state) node.classList.add(`state-${state}`);
+}
+
+/** 探测本地文字模型（Ollama）状态（仅当前选中本地服务商时才有意义）。 */
+async function probeLocalTextStatus() {
+  if (currentTextProvider() !== "local") return;
+  try {
+    const status = await invoke("probe_local_text_backend");
+    applyLocalTextStatus(status);
+  } catch (e) {
+    console.error("probe_local_text_backend failed:", e);
+    const node = el("localTextServiceStatus");
+    if (node) {
+      node.textContent = "Ollama：无法探测状态";
+      node.className = "hint voice-service-status state-failed";
+    }
+  }
+}
+
 saveBtn.addEventListener("click", save);
 el("realtimeBackend").addEventListener("change", () => {
   syncVoiceFields();
   probeBackendStatus();
 });
+el("textProvider").addEventListener("change", () => {
+  syncTextFields();
+  probeLocalTextStatus();
+});
+el("pullLocalModel")?.addEventListener("click", async () => {
+  const btn = el("pullLocalModel");
+  const statusEl = el("localTextPullStatus");
+  const model = el("localTextModel").value.trim() || "qwen3:14b";
+  btn.disabled = true;
+  if (statusEl) {
+    statusEl.style.color = "";
+    statusEl.textContent = "准备下载…";
+  }
+  try {
+    await invoke("pull_local_text_model", { model });
+  } catch (e) {
+    btn.disabled = false;
+    if (statusEl) {
+      statusEl.style.color = "#dc2626";
+      statusEl.textContent = `下载失败：${e.message || e}`;
+    }
+  }
+});
+listen("local-text-pull-progress", ({ payload }) => {
+  const statusEl = el("localTextPullStatus");
+  const btn = el("pullLocalModel");
+  if (!statusEl || !payload) return;
+  if (payload.error) {
+    statusEl.style.color = "#dc2626";
+    statusEl.textContent = `失败：${payload.error}`;
+    if (btn) btn.disabled = false;
+    return;
+  }
+  const pct = typeof payload.percent === "number" ? ` ${payload.percent.toFixed(0)}%` : "";
+  statusEl.style.color = "";
+  statusEl.textContent = `${payload.status || "下载中"}${pct}`;
+  if (payload.done) {
+    if (btn) btn.disabled = false;
+    statusEl.style.color = "#16a34a";
+    void probeLocalTextStatus();
+  }
+});
+listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
 
 // ---- 参考音频「浏览…」：调用系统文件对话框，取本地绝对路径写回输入框 ----
@@ -451,6 +541,7 @@ async function init() {
   await load();
   // 页面加载后立即探测当前后端的就绪状态
   probeBackendStatus();
+  probeLocalTextStatus();
 }
 
 init();

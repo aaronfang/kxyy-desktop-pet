@@ -332,6 +332,9 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+#voice-debug-label {
+  white-space: pre-line;
+}
 #api-debug-meta:empty,
 #call-debug-meta:empty {
   display: none;
@@ -341,6 +344,7 @@ body {
   margin-top: 2px;
   color: rgba(255, 255, 255, 0.4);
 }
+#text-debug-gen,
 #voice-debug-tts {
   display: flex;
   align-items: center;
@@ -348,7 +352,11 @@ body {
   margin-top: 3px;
   min-height: 12px;
 }
-#voice-debug-bar {
+#text-debug-gen[hidden] {
+  display: none;
+}
+#voice-debug-bar,
+#text-debug-bar {
   flex: 1 1 auto;
   height: 3px;
   min-width: 48px;
@@ -357,7 +365,8 @@ body {
   overflow: hidden;
   position: relative;
 }
-#voice-debug-bar > i {
+#voice-debug-bar > i,
+#text-debug-bar > i {
   display: block;
   height: 100%;
   width: 0%;
@@ -365,20 +374,27 @@ body {
   background: linear-gradient(90deg, rgba(183, 156, 255, 0.85), rgba(122, 94, 219, 0.9));
   transition: width 0.08s linear;
 }
-#voice-debug-bar.idle > i {
+#text-debug-bar > i {
+  background: linear-gradient(90deg, rgba(125, 211, 252, 0.9), rgba(56, 189, 248, 0.85));
+}
+#voice-debug-bar.idle > i,
+#text-debug-bar.idle > i {
   width: 0%;
   opacity: 0.35;
 }
-#voice-debug-bar.synth > i {
+#voice-debug-bar.synth > i,
+#text-debug-bar.gen > i {
   width: 36%;
   animation: voice-debug-indeterminate 1.1s ease-in-out infinite;
 }
-#voice-debug-bar.done > i {
+#voice-debug-bar.done > i,
+#text-debug-bar.done > i {
   width: 100%;
   animation: none;
   background: linear-gradient(90deg, rgba(110, 231, 183, 0.85), rgba(52, 211, 153, 0.9));
 }
-#voice-debug-bar.error > i {
+#voice-debug-bar.error > i,
+#text-debug-bar.error > i {
   width: 100%;
   animation: none;
   background: rgba(248, 113, 113, 0.85);
@@ -392,7 +408,8 @@ body {
   0% { transform: translateX(-120%); }
   100% { transform: translateX(320%); }
 }
-#voice-debug-tts-meta {
+#voice-debug-tts-meta,
+#text-debug-meta {
   flex: 0 0 auto;
   max-width: 55%;
   white-space: nowrap;
