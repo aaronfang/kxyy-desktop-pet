@@ -27,4 +27,7 @@ dist/
 # 本地 dev 脚本（npm run dev 之类）写出的运行时 PID 文件，纯本地状态
 /dev-pid.txt
 
+# CodeBuddy IDE 项目级数据
+/.codebuddy/
+
 
