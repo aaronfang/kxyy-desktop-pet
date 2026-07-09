@@ -201,7 +201,22 @@ function renderUserBlock(up, overrideName) {
   if (!up && !overrideName) return "";
   const lines = ["", "", "# 当前观众（屏幕对面这个人）"];
   const nickname = overrideName || up?.nickname;
-  if (!isUnset(nickname)) lines.push(`- 昵称：「${nickname}」 — 自然地用这个昵称称呼对方`);
+  if (!isUnset(nickname)) {
+    lines.push(`- 昵称：「${nickname}」 — 只能用「${nickname}」称呼这个人，禁止用别的叫法`);
+    // 若用户有自定义昵称（不是默认"元宝"），明确禁止模型用"元宝"称呼——
+    // system prompt 里大量"元宝们"语料容易让模型习惯性叫错，这里用最强力度纠正。
+    if (nickname !== DEFAULT_FAN_NAME) {
+      lines.push(`- ⚠️ 禁止事项：「元宝」只是粉丝集体统称，跟你对话的这个具体的人叫「${nickname}」——严禁叫「元宝」、禁止说"辛苦了元宝们"、禁止用"元宝们"来指代你面前这一个人。说错了就是认错了人，这是严重错误。`);
+    }
+  }
+
+  // 顶层个人信息（城市、年龄、性别、职业等；real_name_hint 仅用于名字匹配，不暴露给 AI）
+  const infoParts = [];
+  if (!isUnset(up?.location)) infoParts.push(`所在城市：${up.location}`);
+  if (!isUnset(up?.age)) infoParts.push(`年龄：${up.age}`);
+  if (!isUnset(up?.gender)) infoParts.push(`性别：${up.gender}`);
+  if (!isUnset(up?.job)) infoParts.push(`职业：${up.job}`);
+  if (infoParts.length) lines.push("- 个人信息：" + infoParts.join(" / "));
 
   const rel = up?.relationship_with_yuan || {};
   const relKnown = Object.entries(rel).filter(([, v]) => !isUnset(v));
@@ -329,18 +344,25 @@ export function renderCorrectionsBlock(corrections) {
 export function buildSystemPrompt(assets, { name, useUserProfile, memory, profile }) {
   let text = assets.systemPrompt;
   const active = profile || assets.userProfile;
+  const effectiveName = (name || "").trim() || active?.nickname;
   if (useUserProfile) {
     // active.nickname 已在 resolveUserProfile 里定好（本人 ππ / 自填昵称 / 默认元宝），无需再覆盖。
     const block = renderUserBlock(active, null);
     if (block) text += "\n" + block;
   } else {
-    const display = (name || "").trim() || active?.nickname || DEFAULT_FAN_NAME;
+    const display = effectiveName || DEFAULT_FAN_NAME;
     text += `\n\n# 当前观众\n\n- 这条直播弹幕来自一位昵称叫「${display}」的观众，自然地用这个昵称称呼对方。`;
   }
   const memBlock = renderMemoryBlock(memory);
   if (memBlock) text += "\n" + memBlock;
   const corrBlock = renderCorrectionsBlock(assets.corrections);
   if (corrBlock) text += "\n" + corrBlock;
+
+  // 非默认昵称时，在 system prompt 最末尾追加一条简洁提醒，
+  // 利用模型的 recency bias 确保每个回复都用观众名字而非"元宝"。
+  if (effectiveName && effectiveName !== DEFAULT_FAN_NAME) {
+    text += `\n\n# 当前对话对象提醒（最高优先级）\n- 对面这个人是「${effectiveName}」——**不要**叫他「元宝」，元宝只是粉丝集体的统称，不是这个人的名字。\n- 每次回复都要自然地用「${effectiveName}」称呼对方，别用通用称呼糊弄。`;
+  }
   return text;
 }
 
