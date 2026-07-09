@@ -19,7 +19,7 @@
   - **DeepSeek API Key**：文字聊天必填；本地语音对话的 ASR 后文本理解也用（[申请](https://platform.deepseek.com)）。
   - **通义千问 / DashScope Key**：发图看图、CosyVoice（通义云）选填（[申请](https://bailian.console.aliyun.com)）。
   - **火山引擎**（语音后端选「火山」时）：TTS Key、实时语音 App ID / Access Key、音色 `voice_id`。
-  - **本地语音**：需本机 Python 环境；macOS 选 Qwen3-TTS 时应用会自动配置运行时；Windows / Linux 选本地 Qwen3-TTS 走 PyTorch（运行 `scripts/windows/setup-qwen3-tts.cmd` 配置 `.venv-qwen3`）；Windows + NVIDIA 亦可选 IndexTTS-2 / CosyVoice3（安装包可勾选配置，或运行 `scripts/windows/setup-gpu-voice.cmd`）。本地克隆需提供 10–20s 参考音频。
+  - **本地语音**：需本机 Python 环境；macOS 选 Qwen3-TTS 时应用会自动配置运行时；Windows / Linux 选本地 Qwen3-TTS 走 PyTorch（运行 `scripts/windows/setup-qwen3-tts.cmd` 配置 `.venv-qwen3`）。本地克隆需提供 10–20s 参考音频。
   - **本地文字模型（离线可用）**：设置里「文字服务商」切到「本地模型」需先安装 [Ollama](https://ollama.com/download)（Windows / macOS 均可，5080 / M4 Pro 由 Ollama 自动调用 CUDA / Metal 加速），保存后应用会自动探测并尝试拉起 Ollama 服务，再在设置里点「下载 / 更新模型」拉取模型（默认推荐 `qwen3:14b`，也可填 `qwen3:8b` / `qwen3:32b` 等任意 tag）。
   - 首次实时通话需允许麦克风权限。
 
@@ -63,8 +63,6 @@ npm run dev        # 开发模式（tauri dev）
   | **火山引擎（云端）** | 在线 | 云端 TTS + 端到端实时语音；需火山 Key / App ID / Access Key / `voice_id` |
   | **CosyVoice（通义云端）** | 在线 | 本机 Whisper + DeepSeek，TTS 走通义云端；需通义 Key 与 CosyVoice 音色 id |
   | **Qwen3-TTS（本地）** | 本地 | 跨平台：macOS(Apple Silicon) 走 mlx-audio（保存后自动配置）；Windows / Linux 走官方 PyTorch 包 `qwen-tts`（默认 1.7B，运行 `scripts/windows/setup-qwen3-tts.cmd` 配置）。零样本克隆参考音频，不消耗火山 token |
-  | **IndexTTS-2（本地）** | 本地 | Windows + NVIDIA 本地开源模型；安装包可勾选配置，或运行 `scripts/windows/setup-gpu-voice.cmd` |
-  | **CosyVoice3（本地）** | 本地 | Windows + NVIDIA 本地开源模型；安装包可勾选配置，或运行 `scripts/windows/setup-gpu-voice.cmd` |
 - **播放音量**：设置里「AI 语音播放音量」0–200%（100% 为原音量），朗读与通话共用。
 - **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
@@ -81,7 +79,6 @@ npm run dev        # 开发模式（tauri dev）
 - **零样本克隆**：本地模型不训练音色，填入 10–20s 单人清晰参考录音（及可选文案）后，**保存并重启语音服务**（切换后端或重开 App）即按此录音克隆。
 - **macOS**：Qwen3-TTS 运行时落在 `~/Library/Application Support/com.aaronfang.kxyydesktoppet/voice-runtime`，首次选用本地后端会自动配置，也可手动执行 `scripts/macos/setup-qwen3-tts.sh`。
 - **Windows / Linux（本地 Qwen3-TTS）**：走官方 PyTorch 包 `qwen-tts`，默认加载 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`（首次运行自动下载，约数 GB）。Windows 运行 `scripts/windows/setup-qwen3-tts.cmd` 会创建独立环境 `scripts/local-realtime/.venv-qwen3` 并安装 torch + qwen-tts 等依赖（脚本按 GPU 自动选 wheel：RTX 50 系/Blackwell 用 `cu128`，其它 NVIDIA 用 `cu124`，无卡则 CPU，较慢；Python 需 3.10–3.13，3.14 暂无 wheel）。可在 `settings.json` 用 `qwen3ModelDir`（本地权重目录或模型 id）、`qwen3Language`（默认 `Auto`）覆盖。
-- **Windows + NVIDIA（可选大模型）**：IndexTTS-2 / CosyVoice3 模型体积较大（数 GB～十余 GB），需网络与足够磁盘；安装程序 POSTINSTALL 可勾选，或手动运行 `scripts/windows/setup-gpu-voice.cmd`。
 - 设置页底部会显示本地服务状态与日志；开发模式也可直接使用仓库内 `scripts/local-realtime/`。
 
 ## 打包
@@ -143,9 +140,9 @@ scripts/
   sync-ai.mjs         从 web 工程同步 AI 逻辑模块、人设语料与表情素材
   encrypt-assets.mjs  将 persona-assets.js 加密为 src-tauri/assets/persona-assets.enc
   bundle-assets.mjs   打包前 strip / 打包后 restore 明文语料文件
-  local-realtime/     本地语音 Python 服务（Qwen3-TTS / CosyVoice / IndexTTS-2 等）
+  local-realtime/     本地语音 Python 服务（Qwen3-TTS / CosyVoice 等）
   macos/setup-qwen3-tts.sh   macOS Qwen3-TTS 运行时自动配置
-  windows/setup-gpu-voice.*  Windows + NVIDIA 本地模型可选安装
+  windows/setup-qwen3-tts.*  Windows Qwen3-TTS 本地环境配置
 ```
 
 ## 扩展 / 同步新角色

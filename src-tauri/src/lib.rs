@@ -86,8 +86,7 @@ struct Settings {
     #[serde(default)]
     realtime_voice: String,
     /// 语音后端（朗读 + 实时通话共用）：
-    /// `volc` / `local`（Qwen3）/ `cosyvoice`（通义）/
-    /// `cosyvoice3` / `indextts2`（Windows+NVIDIA 本地开源）。
+    /// `volc` / `local`（Qwen3）/ `cosyvoice`（通义）。
     #[serde(default = "default_realtime_backend")]
     realtime_backend: String,
     /// CosyVoice 复刻音色 id（`cosyvoice-…`），仅 `realtimeBackend=cosyvoice` 时用。
@@ -96,19 +95,7 @@ struct Settings {
     /// CosyVoice 模型，默认 `cosyvoice-v3.5-flash`（支持 instruction）。
     #[serde(default)]
     cosyvoice_model: String,
-    /// Fun-CosyVoice3 本地权重目录。
-    #[serde(default)]
-    cosyvoice3_model_dir: String,
-    /// FunAudioLLM/CosyVoice 源码目录（含 cosyvoice 包）。
-    #[serde(default)]
-    cosyvoice3_repo_dir: String,
-    /// IndexTTS-2 本地权重目录（含 config.yaml）。
-    #[serde(default)]
-    index_tts2_model_dir: String,
-    /// index-tts 源码目录。
-    #[serde(default)]
-    index_tts2_repo_dir: String,
-    /// 本地零样本克隆参考音频路径（Qwen3 / CosyVoice3 / IndexTTS-2 共用）。
+    /// 本地零样本克隆参考音频路径（Qwen3 共用）。
     #[serde(default)]
     local_ref_wav: String,
     /// 参考音频对应文案（可留空）。
@@ -129,6 +116,12 @@ struct Settings {
     /// 本地文字模型 tag（Ollama），空则用推荐默认 `qwen3:14b`。
     #[serde(default)]
     local_text_model: String,
+    /// 本地看图 VL 模型 tag（Ollama），空则用推荐默认 `minicpm-v:8b`。
+    #[serde(default)]
+    local_vl_model: String,
+    /// 视觉模型服务商：`qwen`（在线通义千问）/ `local`（本地 Ollama VL）。
+    #[serde(default = "default_vl_provider")]
+    vl_provider: String,
     /// 思考模式（deepseek-reasoner）。
     #[serde(default)]
     thinking: bool,
@@ -196,19 +189,21 @@ fn default_text_provider() -> String {
     "deepseek".into()
 }
 
+fn default_vl_provider() -> String {
+    "qwen".into()
+}
+
 fn default_voice_volume() -> u32 {
     100
 }
 
 /// 本地语音服务端口（scripts/local-realtime/）：WS 通话 + HTTP 朗读（port+100）。
-const LOCAL_REALTIME_PORT: u16 = 9876; // Qwen3-TTS
-const COSYVOICE_REALTIME_PORT: u16 = 9877; // CosyVoice 通义 API
-const COSYVOICE3_REALTIME_PORT: u16 = 9878; // Fun-CosyVoice3 本地开源
-const INDEXTTS2_REALTIME_PORT: u16 = 9879; // IndexTTS-2 本地开源
+/// 端口选择 19876-19877（>15000）以避开 Windows 动态端口范围（1024-15000），
+/// 避免与系统临时客户端端口（如 RabbitMQ）冲突导致 WinError 10013。
+const LOCAL_REALTIME_PORT: u16 = 19876; // Qwen3-TTS
+const COSYVOICE_REALTIME_PORT: u16 = 19877; // CosyVoice 通义 API
 const LOCAL_TTS_HTTP_PORT: u16 = LOCAL_REALTIME_PORT + 100;
 const COSYVOICE_TTS_HTTP_PORT: u16 = COSYVOICE_REALTIME_PORT + 100;
-const COSYVOICE3_TTS_HTTP_PORT: u16 = COSYVOICE3_REALTIME_PORT + 100;
-const INDEXTTS2_TTS_HTTP_PORT: u16 = INDEXTTS2_REALTIME_PORT + 100;
 fn default_true() -> bool {
     true
 }
@@ -247,10 +242,6 @@ impl Settings {
             realtime_backend: default_realtime_backend(),
             cosyvoice_voice: String::new(),
             cosyvoice_model: String::new(),
-            cosyvoice3_model_dir: String::new(),
-            cosyvoice3_repo_dir: String::new(),
-            index_tts2_model_dir: String::new(),
-            index_tts2_repo_dir: String::new(),
             local_ref_wav: String::new(),
             local_ref_text: String::new(),
             voice_volume: default_voice_volume(),
@@ -258,6 +249,8 @@ impl Settings {
             text_model: String::new(),
             text_provider: default_text_provider(),
             local_text_model: String::new(),
+            local_vl_model: String::new(),
+            vl_provider: default_vl_provider(),
             thinking: false,
             temperature: default_temperature(),
             user_name: String::new(),
@@ -301,8 +294,12 @@ pub(crate) struct AiConfig {
     pub text_provider: String,
     /// 本地文字模型 tag（Ollama），空则由 api.rs 兜底 `local_text::DEFAULT_MODEL`。
     pub local_text_model: String,
+    /// 本地看图 VL 模型 tag（Ollama），空则由 api.rs 兜底默认 `minicpm-v:8b`。
+    pub local_vl_model: String,
+    /// 视觉模型服务商：`qwen`（在线）/ `local`（本地 Ollama VL）。
+    pub vl_provider: String,
     pub thinking_default: bool,
-    /// 语音后端：`volc` / `local` / `cosyvoice` / `cosyvoice3` / `indextts2`。
+    /// 语音后端：`volc` / `local` / `cosyvoice`。
     pub voice_backend: String,
     /// 火山 TTS Key（仅 volc）。
     pub volc_tts_key: String,
@@ -316,8 +313,6 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
     let voice_backend = match backend.as_str() {
         "local" => "local".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
-        "cosyvoice3" | "cosyvoice3-local" | "cv3" => "cosyvoice3".into(),
-        "indextts2" | "index-tts2" | "itts2" => "indextts2".into(),
         _ => "volc".into(),
     };
     AiConfig {
@@ -326,6 +321,8 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
         text_model: s.text_model,
         text_provider: s.text_provider,
         local_text_model: s.local_text_model,
+        local_vl_model: s.local_vl_model,
+        vl_provider: s.vl_provider,
         thinking_default: s.thinking,
         voice_backend,
         volc_tts_key: s.volc_tts_key,
@@ -338,8 +335,6 @@ pub(crate) fn local_tts_http_port(backend: &str) -> Option<u16> {
     match backend.trim().to_ascii_lowercase().as_str() {
         "local" => Some(LOCAL_TTS_HTTP_PORT),
         "cosyvoice" | "cosy" => Some(COSYVOICE_TTS_HTTP_PORT),
-        "cosyvoice3" | "cosyvoice3-local" | "cv3" => Some(COSYVOICE3_TTS_HTTP_PORT),
-        "indextts2" | "index-tts2" | "itts2" => Some(INDEXTTS2_TTS_HTTP_PORT),
         _ => None,
     }
 }
@@ -360,11 +355,6 @@ fn load_settings(app: &AppHandle) -> Settings {
                     s.tts_voice = s.realtime_voice.trim().to_string();
                 }
                 s.realtime_voice.clear();
-                // macOS：GPU 本地后端回退到 Qwen3。
-                #[cfg(target_os = "macos")]
-                if matches!(s.realtime_backend.as_str(), "cosyvoice3" | "indextts2") {
-                    s.realtime_backend = "local".into();
-                }
                 return s;
             }
         }
@@ -982,39 +972,6 @@ fn probe_voice_backend(backend: String) -> serde_json::Value {
         });
     }
 
-    // GPU 本地后端：macOS 不可用
-    if backend == "cosyvoice3" || backend == "indextts2" {
-        if !voice_service::gpu_backends_supported() {
-            return serde_json::json!({
-                "backend": backend,
-                "state": "failed",
-                "message": "macOS 不支持此后端；请改用 Qwen3-TTS",
-                "port": port,
-            });
-        }
-        // 跑预检查（源码/权重目录是否存在）
-        if let Some(repo) = voice_service::repo_root() {
-            let result = if backend == "cosyvoice3" {
-                voice_service::preflight_cosyvoice3(&repo)
-            } else {
-                voice_service::preflight_indextts2(&repo)
-            };
-            return match result {
-                Ok(_) => serde_json::json!({
-                    "backend": backend,
-                    "state": "ready",
-                    "message": "就绪，保存后启动",
-                    "port": port,
-                }),
-                Err(msg) => serde_json::json!({
-                    "backend": backend,
-                    "state": "failed",
-                    "message": msg,
-                    "port": port,
-                }),
-            };
-        }
-    }
 
     serde_json::json!({
         "backend": backend,
@@ -1038,12 +995,6 @@ fn get_realtime_base(state: tauri::State<AppState>) -> String {
     match backend.as_str() {
         "local" => format!("ws://127.0.0.1:{LOCAL_REALTIME_PORT}"),
         "cosyvoice" | "cosy" => format!("ws://127.0.0.1:{COSYVOICE_REALTIME_PORT}"),
-        "cosyvoice3" | "cosyvoice3-local" | "cv3" => {
-            format!("ws://127.0.0.1:{COSYVOICE3_REALTIME_PORT}")
-        }
-        "indextts2" | "index-tts2" | "itts2" => {
-            format!("ws://127.0.0.1:{INDEXTTS2_REALTIME_PORT}")
-        }
         _ if state.realtime_port == 0 => String::new(),
         _ => format!("ws://127.0.0.1:{}", state.realtime_port),
     }
@@ -1091,14 +1042,6 @@ struct AiSettingsInput {
     #[serde(default)]
     cosyvoice_model: String,
     #[serde(default)]
-    cosyvoice3_model_dir: String,
-    #[serde(default)]
-    cosyvoice3_repo_dir: String,
-    #[serde(default)]
-    index_tts2_model_dir: String,
-    #[serde(default)]
-    index_tts2_repo_dir: String,
-    #[serde(default)]
     local_ref_wav: String,
     #[serde(default)]
     local_ref_text: String,
@@ -1111,6 +1054,10 @@ struct AiSettingsInput {
     text_provider: String,
     #[serde(default)]
     local_text_model: String,
+    #[serde(default)]
+    local_vl_model: String,
+    #[serde(default = "default_vl_provider")]
+    vl_provider: String,
     thinking: bool,
     temperature: f64,
     user_name: String,
@@ -1165,21 +1112,10 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.realtime_backend = match backend.as_str() {
             "local" => "local".into(),
             "cosyvoice" | "cosy" => "cosyvoice".into(),
-            "cosyvoice3" | "cosyvoice3-local" | "cv3" => "cosyvoice3".into(),
-            "indextts2" | "index-tts2" | "itts2" => "indextts2".into(),
             _ => "volc".into(),
         };
-        // macOS：不允许保存 GPU 本地后端，回退到 Qwen3。
-        #[cfg(target_os = "macos")]
-        if matches!(s.realtime_backend.as_str(), "cosyvoice3" | "indextts2") {
-            s.realtime_backend = "local".into();
-        }
         s.cosyvoice_voice = settings.cosyvoice_voice.trim().to_string();
         s.cosyvoice_model = settings.cosyvoice_model.trim().to_string();
-        s.cosyvoice3_model_dir = settings.cosyvoice3_model_dir.trim().to_string();
-        s.cosyvoice3_repo_dir = settings.cosyvoice3_repo_dir.trim().to_string();
-        s.index_tts2_model_dir = settings.index_tts2_model_dir.trim().to_string();
-        s.index_tts2_repo_dir = settings.index_tts2_repo_dir.trim().to_string();
         s.local_ref_wav = settings.local_ref_wav.trim().to_string();
         s.local_ref_text = settings.local_ref_text.trim().to_string();
         s.voice_volume = settings.voice_volume.min(200);
@@ -1190,6 +1126,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             _ => "deepseek".into(),
         };
         s.local_text_model = settings.local_text_model.trim().to_string();
+        s.local_vl_model = settings.local_vl_model.trim().to_string();
+        s.vl_provider = match settings.vl_provider.trim().to_ascii_lowercase().as_str() {
+            "local" => "local".into(),
+            _ => "qwen".into(),
+        };
         s.thinking = settings.thinking;
         s.temperature = settings.temperature;
         s.user_name = settings.user_name.trim().to_string();

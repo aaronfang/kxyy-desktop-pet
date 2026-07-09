@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """本地实时语音对话：共享协议 / VAD / ASR / LLM / 打断逻辑。
 
-各入口（server.py / server_cosyvoice.py / server_cosyvoice3_local.py / server_indextts2.py）负责加载 TTS，并调用 run(port, name)。
+各入口（server.py / server_cosyvoice.py）负责加载 TTS，并调用 run(port, name)。
 """
 
 from __future__ import annotations

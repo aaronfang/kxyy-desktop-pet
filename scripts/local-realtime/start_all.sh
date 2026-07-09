@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 启动本地实时语音服务（Qwen :9876 + CosyVoice :9877）
+# 启动本地实时语音服务（Qwen :19876 + CosyVoice :19877）
 # 使用 double-fork 守护进程，避免随终端/IDE 会话退出。
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,8 +28,8 @@ stop_port() {
   fi
 }
 
-stop_port 9876
-stop_port 9877
+stop_port 19876
+stop_port 19877
 # 清空旧日志尾部标记
 : >"$LOG_DIR/qwen.log"
 : >"$LOG_DIR/cosy.log"
@@ -41,15 +41,15 @@ echo "等待服务就绪…"
 for i in $(seq 1 40); do
   qwen_ok=0
   cosy_ok=0
-  lsof -iTCP:9876 -sTCP:LISTEN >/dev/null 2>&1 && qwen_ok=1
-  lsof -iTCP:9877 -sTCP:LISTEN >/dev/null 2>&1 && cosy_ok=1
+  lsof -iTCP:19876 -sTCP:LISTEN >/dev/null 2>&1 && qwen_ok=1
+  lsof -iTCP:19877 -sTCP:LISTEN >/dev/null 2>&1 && cosy_ok=1
   if [[ "$qwen_ok" -eq 1 && "$cosy_ok" -eq 1 ]]; then
-    echo "OK  Qwen      ws://127.0.0.1:9876"
-    echo "OK  CosyVoice ws://127.0.0.1:9877"
+    echo "OK  Qwen      ws://127.0.0.1:19876"
+    echo "OK  CosyVoice ws://127.0.0.1:19877"
     echo "日志：$LOG_DIR/qwen.log  $LOG_DIR/cosy.log"
     # 写 pid 方便 stop
-    lsof -tiTCP:9876 -sTCP:LISTEN >"$LOG_DIR/qwen.pid" 2>/dev/null || true
-    lsof -tiTCP:9877 -sTCP:LISTEN >"$LOG_DIR/cosy.pid" 2>/dev/null || true
+    lsof -tiTCP:19876 -sTCP:LISTEN >"$LOG_DIR/qwen.pid" 2>/dev/null || true
+    lsof -tiTCP:19877 -sTCP:LISTEN >"$LOG_DIR/cosy.pid" 2>/dev/null || true
     exit 0
   fi
   sleep 0.5

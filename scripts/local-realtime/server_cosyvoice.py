@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""本地语音 · CosyVoice 情绪/语气（通话 WS :9877，朗读 HTTP :9977）。
+"""本地语音 · CosyVoice 情绪/语气（通话 WS :19877，朗读 HTTP :19977）。
 
 ASR/打断逻辑与 Qwen 入口相同；TTS 走 DashScope CosyVoice（instruction）。
 朗读与通话共用同一后端。
@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 import common
 import tts_cosyvoice
 
-PORT = 9877
+PORT = 19877
 _tts_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cosy-tts")
 
 

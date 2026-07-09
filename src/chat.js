@@ -76,16 +76,6 @@ function canAutoSpeak() {
   if (!settings.autoSpeak) return false;
   const backend = (settings.realtimeBackend || "volc").toLowerCase();
   if (backend === "local") return true;
-  if (
-    backend === "cosyvoice3" ||
-    backend === "cosyvoice3-local" ||
-    backend === "cv3" ||
-    backend === "indextts2" ||
-    backend === "index-tts2" ||
-    backend === "itts2"
-  ) {
-    return true;
-  }
   if (backend === "cosyvoice" || backend === "cosy") {
     return !!(settings.cosyvoiceVoice || "").trim();
   }
@@ -365,15 +355,9 @@ let balanceFetchSeq = 0;
 /** 当前语音后端文案（朗读与通话共用）。 */
 function voiceBackendLabel() {
   const backend = (settings.realtimeBackend || "volc").toLowerCase();
-  if (backend === "local") return "本地 Qwen3-TTS（:9876 / :9976）";
+  if (backend === "local") return "本地 Qwen3-TTS（:19876 / :19976）";
   if (backend === "cosyvoice" || backend === "cosy") {
-    return "CosyVoice 通义（:9877 / :9977）";
-  }
-  if (backend === "cosyvoice3" || backend === "cosyvoice3-local" || backend === "cv3") {
-    return "CosyVoice3 本地开源（:9878 / :9978）";
-  }
-  if (backend === "indextts2" || backend === "index-tts2" || backend === "itts2") {
-    return "IndexTTS-2 本地开源（:9879 / :9979）";
+    return "CosyVoice 通义（:19877 / :19977）";
   }
   const voice = (settings.ttsVoice || "").trim();
   return voice ? `火山引擎 API（${voice}）` : "火山引擎 API";
@@ -1132,7 +1116,8 @@ async function describeImage(imageDataUrl, userText) {
     throw new Error(err);
   }
   const data = await resp.json();
-  noteApiUsage("通义千问", extractUsage(data));
+  const vlProvider = settings.vlProvider === "local" ? "本地看图" : "通义千问";
+  noteApiUsage(vlProvider, extractUsage(data));
   const caption = data.choices?.[0]?.message?.content?.trim();
   if (!caption) throw new Error("识图描述为空");
   return caption;

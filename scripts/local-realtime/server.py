@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""本地语音 · Qwen3-TTS（跨平台，通话 WS :9876，朗读 HTTP :9976）。
+"""本地语音 · Qwen3-TTS（跨平台，通话 WS :19876，朗读 HTTP :19976）。
 
 后端按平台自动选择：
   - macOS(Apple Silicon)：mlx-audio（mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit）。
@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import common
 
-PORT = 9876
+PORT = 19876
 # macOS MLX 量化权重（0.6B）；PyTorch 路径的模型见 tts_qwen3_torch.DEFAULT_MODEL。
 TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
 
