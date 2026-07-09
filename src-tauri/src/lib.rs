@@ -873,12 +873,17 @@ fn popup_tray_menu_centered(app: &AppHandle) {
 }
 
 /// dev 模式 Dock 图标点击：macOS 26+ 上菜单栏托盘常不可见，Dock 作为备用入口。
+/// Reopen 在 AppKit 委托回调里同步执行；若在此栈上立刻 `popUpMenu`（模态跟踪环），
+/// 会与当前事件派发嵌套冲突导致整 app 卡死。须先结束本回调，再在下一轮主线程任务里弹菜单。
 #[cfg(all(target_os = "macos", debug_assertions))]
 fn handle_macos_dock_reopen(app: &AppHandle) {
     let app2 = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
-        let _ = app2.show();
-        popup_tray_menu_centered(&app2);
+    std::thread::spawn(move || {
+        let app3 = app2.clone();
+        let _ = app2.run_on_main_thread(move || {
+            let _ = app3.show();
+            popup_tray_menu_centered(&app3);
+        });
     });
 }
 
@@ -1274,6 +1279,22 @@ pub fn run() {
             });
             // 尽早创建托盘，避免语音服务等后台任务拖慢菜单栏图标出现。
             install_tray(app)?;
+
+            // 兜底清理：托盘「退出」走 app.exit() → tauri::RunEvent::Exit（见 run() 尾部），
+            // 但那套机制依赖事件循环正常收到并处理该事件。若进程被外部信号强杀
+            // （开发时 Ctrl+C / 终止终端，或 Windows 下关闭控制台/注销/关机），事件循环
+            // 会被直接打断，RunEvent::Exit 不一定来得及触发，本地语音子进程（server.py，
+            // 因 process_group(0) 独立于本进程组）就会变成孤儿常驻在后台。这里单独注册
+            // 系统级信号/控制台事件处理器，收到即同步 kill 掉托管子进程再退出，双重兜底。
+            {
+                let sig_handle = handle.clone();
+                let _ = ctrlc::set_handler(move || {
+                    eprintln!("[lib] 收到终止信号，清理本地语音子进程后退出…");
+                    voice_service::stop(&sig_handle);
+                    std::process::exit(0);
+                });
+            }
+
             // 启动时按已保存的语音后端自动拉起本地服务。
             voice_service::ensure(&handle, &settings.realtime_backend);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。

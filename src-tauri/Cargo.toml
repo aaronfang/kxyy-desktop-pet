@@ -30,6 +30,9 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
+# 进程被外部信号强杀时（SIGINT/SIGTERM、Windows Ctrl+C/关闭控制台/注销/关机）的兜底清理，
+# 避免托管的本地语音子进程（server.py）变成孤儿。termination 特性额外覆盖 SIGTERM/SIGHUP。
+ctrlc = { version = "3", features = ["termination"] }
 
 [profile.release]
 panic = "abort"
