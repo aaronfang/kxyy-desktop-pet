@@ -166,6 +166,13 @@ select {
   margin-top: 0;
   margin-bottom: 14px;
 }
+.vl-provider-fields[hidden] {
+  display: none;
+}
+.vl-provider-fields > .hint {
+  margin-top: 0;
+  margin-bottom: 14px;
+}
 .model-actions {
   display: flex;
   align-items: center;

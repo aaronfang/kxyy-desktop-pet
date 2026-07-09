@@ -17,16 +17,14 @@ const FIELDS = [
   "realtimeAccessKey",
   "cosyvoiceVoice",
   "cosyvoiceModel",
-  "cosyvoice3ModelDir",
-  "cosyvoice3RepoDir",
-  "indexTts2ModelDir",
-  "indexTts2RepoDir",
   "localRefWav",
   "localRefText",
   "voiceVolume",
   "textProvider",
   "textModel",
   "localTextModel",
+  "localVlModel",
+  "vlProvider",
   "temperature",
   "userName",
   "patText",
@@ -56,44 +54,15 @@ function renderAvatars() {
   el("userAvatarPreview").src = userAvatar || DEFAULT_USER_AVATAR;
 }
 
-function supportsGpuLocal() {
-  return platform !== "macos";
-}
-
 function normalizeBackend(v) {
   const x = (v || "").toLowerCase();
   if (x === "local") return "local";
   if (x === "cosyvoice" || x === "cosy") return "cosyvoice";
-  if (x === "cosyvoice3" || x === "cosyvoice3-local" || x === "cv3") return "cosyvoice3";
-  if (x === "indextts2" || x === "index-tts2" || x === "itts2") return "indextts2";
   return "volc";
 }
 
 function currentBackend() {
-  let b = normalizeBackend(el("realtimeBackend").value);
-  // macOS：GPU 本地后端不可用，回退 Qwen3
-  if (!supportsGpuLocal() && (b === "cosyvoice3" || b === "indextts2")) {
-    b = "local";
-    el("realtimeBackend").value = "local";
-  }
-  return b;
-}
-
-/** macOS 隐藏 IndexTTS-2 / CosyVoice3 选项。 */
-function applyPlatformOptions() {
-  const sel = el("realtimeBackend");
-  const hint = el("voicePlatformHint");
-  const gpuOk = supportsGpuLocal();
-  for (const opt of sel.options) {
-    if (opt.dataset.gpuLocal === "1") {
-      opt.hidden = !gpuOk;
-      opt.disabled = !gpuOk;
-    }
-  }
-  if (hint) hint.hidden = gpuOk;
-  if (!gpuOk && (sel.value === "cosyvoice3" || sel.value === "indextts2")) {
-    sel.value = "local";
-  }
+  return normalizeBackend(el("realtimeBackend").value);
 }
 
 /** 按所选语音后端只展示对应设置项。 */
@@ -102,13 +71,10 @@ function syncVoiceFields() {
   el("voiceFieldsVolc").hidden = backend !== "volc";
   el("voiceFieldsLocal").hidden = backend !== "local";
   el("voiceFieldsCosyvoice").hidden = backend !== "cosyvoice";
-  el("voiceFieldsCosyvoice3").hidden = backend !== "cosyvoice3";
-  const it2 = el("voiceFieldsIndexTts2");
-  if (it2) it2.hidden = backend !== "indextts2";
-  // 参考音频仅对使用本地零样本克隆的后端可见（本地 Qwen3 / CosyVoice3 / IndexTTS-2）。
+  // 参考音频仅对本地 Qwen3 可见。
   const refBox = el("voiceFieldsRef");
   if (refBox) {
-    refBox.hidden = !["local", "cosyvoice3", "indextts2"].includes(backend);
+    refBox.hidden = backend !== "local";
   }
 }
 
@@ -128,6 +94,23 @@ function syncTextFields() {
   const provider = currentTextProvider();
   el("textFieldsDeepseek").hidden = provider !== "deepseek";
   el("textFieldsLocal").hidden = provider !== "local";
+  // 当切换到 local 时自动探测 Ollama 状态
+  if (provider === "local") {
+    void probeLocalTextStatus();
+  }
+}
+
+/** 视觉模型服务商：qwen（在线）/ local（本地 Ollama VL）。 */
+function currentVlProvider() {
+  const v = (el("vlProvider").value || "qwen").toLowerCase();
+  return v === "local" ? "local" : "qwen";
+}
+
+/** 按所选视觉服务商只展示对应设置项。 */
+function syncVlFields() {
+  const provider = currentVlProvider();
+  el("vlFieldsQwen").hidden = provider !== "qwen";
+  el("vlFieldsLocal").hidden = provider !== "local";
 }
 
 function fill(s) {
@@ -141,17 +124,9 @@ function fill(s) {
   el("realtimeAccessKey").value = s.realtimeAccessKey || "";
   el("cosyvoiceVoice").value = s.cosyvoiceVoice || "";
   el("cosyvoiceModel").value = s.cosyvoiceModel || "";
-  el("cosyvoice3ModelDir").value = s.cosyvoice3ModelDir || "";
-  el("cosyvoice3RepoDir").value = s.cosyvoice3RepoDir || "";
-  el("indexTts2ModelDir").value = s.indexTts2ModelDir || "";
-  el("indexTts2RepoDir").value = s.indexTts2RepoDir || "";
   el("localRefWav").value = s.localRefWav || "";
   el("localRefText").value = s.localRefText || "";
-  applyPlatformOptions();
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
-  if (!supportsGpuLocal() && (el("realtimeBackend").value === "cosyvoice3" || el("realtimeBackend").value === "indextts2")) {
-    el("realtimeBackend").value = "local";
-  }
   const vol = Number(s.voiceVolume);
   el("voiceVolume").value = Number.isFinite(vol)
     ? Math.max(0, Math.min(200, vol))
@@ -163,7 +138,10 @@ function fill(s) {
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
+  el("localVlModel").value = s.localVlModel || "";
+  el("vlProvider").value = s.vlProvider === "local" ? "local" : "qwen";
   syncTextFields();
+  syncVlFields();
   el("thinking").checked = !!s.thinking;
   el("temperature").value = s.temperature ?? 0.8;
   el("userName").value = s.userName || "";
@@ -203,10 +181,6 @@ function collect() {
     realtimeVoice: "",
     cosyvoiceVoice: el("cosyvoiceVoice").value.trim(),
     cosyvoiceModel: el("cosyvoiceModel").value.trim(),
-    cosyvoice3ModelDir: el("cosyvoice3ModelDir").value.trim(),
-    cosyvoice3RepoDir: el("cosyvoice3RepoDir").value.trim(),
-    indexTts2ModelDir: el("indexTts2ModelDir").value.trim(),
-    indexTts2RepoDir: el("indexTts2RepoDir").value.trim(),
     localRefWav: el("localRefWav").value.trim(),
     localRefText: el("localRefText").value.trim(),
     voiceVolume: Math.max(
@@ -218,6 +192,8 @@ function collect() {
     textProvider: currentTextProvider(),
     textModel: el("textModel").value,
     localTextModel: el("localTextModel").value.trim(),
+    localVlModel: el("localVlModel").value.trim(),
+    vlProvider: currentVlProvider(),
     thinking: el("thinking").checked,
     temperature: Number(el("temperature").value) || 0.8,
     userName: el("userName").value.trim(),
@@ -306,8 +282,6 @@ const voiceSetupLogLines = [];
 function backendLabel(backend) {
   if (backend === "local") return "Qwen3-TTS（本地）";
   if (backend === "cosyvoice") return "CosyVoice（通义云端）";
-  if (backend === "cosyvoice3") return "CosyVoice3（本地）";
-  if (backend === "indextts2") return "IndexTTS-2（本地）";
   if (backend === "volc") return "火山引擎（云端）";
   return backend || "本地服务";
 }
@@ -427,19 +401,11 @@ async function probeLocalTextStatus() {
   }
 }
 
-saveBtn.addEventListener("click", save);
-el("realtimeBackend").addEventListener("change", () => {
-  syncVoiceFields();
-  probeBackendStatus();
-});
-el("textProvider").addEventListener("change", () => {
-  syncTextFields();
-  probeLocalTextStatus();
-});
-el("pullLocalModel")?.addEventListener("click", async () => {
-  const btn = el("pullLocalModel");
-  const statusEl = el("localTextPullStatus");
-  const model = el("localTextModel").value.trim() || "qwen3:14b";
+/** 通用模型下载：调用 Rust pull_local_text_model，进度通过 local-text-pull-progress 事件推。 */
+async function pullModel(modelFieldId, statusFieldId, btnId) {
+  const btn = el(btnId);
+  const statusEl = el(statusFieldId);
+  const model = el(modelFieldId).value.trim() || (modelFieldId === "localVlModel" ? "minicpm-v:8b" : "qwen3:14b");
   btn.disabled = true;
   if (statusEl) {
     statusEl.style.color = "";
@@ -454,11 +420,27 @@ el("pullLocalModel")?.addEventListener("click", async () => {
       statusEl.textContent = `下载失败：${e.message || e}`;
     }
   }
-});
+}
+
+// 文字模型下载按钮
+el("pullLocalModel")?.addEventListener("click", () =>
+  pullModel("localTextModel", "localTextPullStatus", "pullLocalModel")
+);
+
+// 看图模型下载按钮
+el("pullLocalVlModel")?.addEventListener("click", () =>
+  pullModel("localVlModel", "localVlPullStatus", "pullLocalVlModel")
+);
+
+// 模型下载进度事件：根据 model 名称区分显示在哪个状态栏
 listen("local-text-pull-progress", ({ payload }) => {
-  const statusEl = el("localTextPullStatus");
-  const btn = el("pullLocalModel");
-  if (!statusEl || !payload) return;
+  if (!payload) return;
+  const model = (payload.model || "").toLowerCase();
+  // 判断是 VL 模型还是文字模型（VL 模型名通常包含 vision/vl/minicpm-v/llava 等）
+  const isVl = /vision|vl\b|minicpm-v|llava|moondream|bakllava|llama.*vision/i.test(model);
+  const statusEl = isVl ? el("localVlPullStatus") : el("localTextPullStatus");
+  const btn = isVl ? el("pullLocalVlModel") : el("pullLocalModel");
+  if (!statusEl) return;
   if (payload.error) {
     statusEl.style.color = "#dc2626";
     statusEl.textContent = `失败：${payload.error}`;
@@ -474,7 +456,17 @@ listen("local-text-pull-progress", ({ payload }) => {
     void probeLocalTextStatus();
   }
 });
-listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));
+
+saveBtn.addEventListener("click", save);
+el("realtimeBackend").addEventListener("change", () => {
+  syncVoiceFields();
+  probeBackendStatus();
+});
+el("textProvider").addEventListener("change", () => {
+  syncTextFields();
+  probeLocalTextStatus();
+});
+el("vlProvider").addEventListener("change", syncVlFields);
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
 
 // ---- 参考音频「浏览…」：调用系统文件对话框，取本地绝对路径写回输入框 ----
@@ -505,6 +497,7 @@ FIELDS.forEach((id) => {
 });
 
 listen("voice-service-status", ({ payload }) => applyVoiceServiceStatus(payload));
+listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));
 
 el("clearMemory").addEventListener("click", async () => {
   const ok = window.confirm(
@@ -537,7 +530,6 @@ async function init() {
   } catch (_) {
     platform = "";
   }
-  applyPlatformOptions();
   await load();
   // 页面加载后立即探测当前后端的就绪状态
   probeBackendStatus();

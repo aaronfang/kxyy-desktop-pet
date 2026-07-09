@@ -73,6 +73,7 @@ pub fn start(app: AppHandle) -> std::io::Result<u16> {
         let client = reqwest::blocking::Client::builder()
             .pool_max_idle_per_host(0)
             .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(600))
             .tcp_nodelay(true)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
@@ -279,8 +280,16 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         .unwrap_or(cfg.thinking_default);
 
     let is_local_text = !use_vision && cfg.text_provider == "local";
+    let is_local_vl = use_vision && cfg.vl_provider == "local";
 
-    let (base_url, model, api_key, provider_name) = if use_vision {
+    let (base_url, model, api_key, provider_name) = if is_local_vl {
+        let model = if !cfg.local_vl_model.is_empty() {
+            cfg.local_vl_model.clone()
+        } else {
+            "minicpm-v:8b".to_string()
+        };
+        (OLLAMA_CHAT_BASE_URL.to_string(), model, "ollama".to_string(), "本地看图")
+    } else if use_vision {
         (
             VL_BASE_URL.to_string(),
             VL_MODEL.to_string(),
@@ -306,7 +315,7 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         (TEXT_BASE_URL.to_string(), model, cfg.deepseek_key.clone(), "DeepSeek")
     };
 
-    if api_key.is_empty() {
+    if api_key.is_empty() && !is_local_vl {
         let msg = if use_vision {
             "未配置通义千问(看图) API Key，请在设置里填写"
         } else {
@@ -354,6 +363,7 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     //（不传时 Ollama 会默认开思考；native `think` 字段在 /v1 上不可靠）。
     // 注意：`/v1` 会忽略 keep_alive / num_ctx；常驻与上下文扩容由 warmup + touch_keep_alive
     // 走 native `/api/chat` 完成。
+    // 注意：local VL 模型（minicpm-v 等）不支持思考模式，仅 local_text 下发 reasoning 控制。
     if is_local_text {
         payload["reasoning_effort"] = serde_json::json!(if thinking { "medium" } else { "none" });
         payload["think"] = serde_json::json!(thinking);
@@ -406,7 +416,7 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     let status = upstream.status();
     if !status.is_success() {
         let detail = upstream.text().unwrap_or_default();
-        let friendly = if is_local_text {
+        let friendly = if is_local_text || is_local_vl {
             local_ollama_error_message(status.as_u16(), &detail)
         } else {
             format!("{provider_name} 错误 {}", status.as_u16())
@@ -423,6 +433,10 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     if is_local_text {
         crate::local_text::touch_keep_alive(&model);
     }
+    // 本地看图后也续命（VL 模型同样不续命）。
+    if is_local_vl {
+        crate::local_text::touch_keep_alive(&model);
+    }
 
     if !stream {
         let text = upstream.text().unwrap_or_default();
@@ -435,10 +449,15 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     // 改为：Rust 侧把整段上游 SSE 读完，带 Content-Length 一次性回给前端——WebView2 对
     // 「有明确长度的响应」读取稳定。代价是失去打字机逐字效果（整条回复一次性出现），
     // 但先保证「能出字」；后续若要恢复流式再针对 WebView2 专门处理。
-    let body = match upstream.text() {
+    let mut body = match upstream.text() {
         Ok(t) => t,
         Err(e) => return error_json(request, 502, &format!("读取{provider_name}响应失败：{e}")),
     };
+    // 本地模型安全网：若模型忽略 think: false 仍把所有内容放入 reasoning_content，
+    // 则把 reasoning_content 复制到 content，避免前端收到空内容 → "回复为空"。
+    if is_local_text && !thinking && !body.is_empty() {
+        body = rewrite_reasoning_to_content(&body);
+    }
     let bytes = body.into_bytes();
     let len = bytes.len();
     let mut headers = cors_headers();
@@ -452,6 +471,64 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         None,
     );
     let _ = request.respond(resp);
+}
+
+/// 本地模型安全网：当 `think: false` 被 qwen3 等模型忽略时，
+/// 它们会把所有输出塞进 `reasoning_content` 而非 `content`。
+/// 此函数遍历 SSE 行，若某 chunk 的 `content` 为空但有 `reasoning_content`，
+/// 则把 reasoning 复制到 content 并删除原 reasoning 字段，
+/// 避免前端解析到空内容 → "回复为空"。
+fn rewrite_reasoning_to_content(sse: &str) -> String {
+    let mut out = String::with_capacity(sse.len());
+    for line in sse.lines() {
+        let payload = match line.strip_prefix("data: ") {
+            Some(p) => p,
+            None => {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+        };
+        if payload == "[DONE]" {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // 尝试解析 JSON 并重写
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(mut v) => {
+                if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                    for choice in choices {
+                        if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                            let content_empty = delta
+                                .get("content")
+                                .map(|v| v.is_null() || v.as_str().map_or(false, |s| s.is_empty()))
+                                .unwrap_or(true);
+                            if content_empty {
+                                if let Some(rc) = delta.remove("reasoning_content") {
+                                    delta.insert("content".to_string(), rc);
+                                }
+                                // 也清理 reasoning 短字段
+                                delta.remove("reasoning");
+                            }
+                        }
+                    }
+                }
+                out.push_str("data: ");
+                if let Ok(json) = serde_json::to_string(&v) {
+                    out.push_str(&json);
+                } else {
+                    out.push_str(payload);
+                }
+                out.push('\n');
+            }
+            Err(_) => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 // ============ 阶段 2·D：火山引擎（豆包）声音复刻 TTS ============
@@ -495,6 +572,18 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// 根据 TTS 文本长度动态计算超时时间。
+/// IndexTTS-2 在本机 GPU 上的实测速度约为 13~15s/汉字；
+/// 最小 5 分钟，按 15s/字估算。
+fn tts_timeout_from_text(body: &str) -> std::time::Duration {
+    let char_count: usize = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.chars().count()))
+        .unwrap_or(0);
+    let seconds = (char_count as u64).saturating_mul(15).max(300);
+    std::time::Duration::from_secs(seconds)
 }
 
 /// 生成一个够用的 reqid（火山只要求本次请求内唯一即可）。
@@ -655,7 +744,7 @@ fn proxy_local_tts(
         // 与本地 TTS 服务约定的共享 secret，避免其它本机进程直接调用刷云端计费。
         .header("X-Tts-Secret", crate::voice_service::tts_secret())
         .body(body_raw.to_string())
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(tts_timeout_from_text(body_raw))
         .send()
     {
         Ok(r) => r,
