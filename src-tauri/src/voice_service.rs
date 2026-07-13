@@ -71,6 +71,8 @@ pub struct VoiceServiceManager {
 struct Inner {
     /// 当前由本进程托管的后端（空 = 未托管）。
     backend: String,
+    /// 本地克隆音色指纹（personaCardId|localRefWav|localRefText）；变化时需重启以换参考音。
+    voice_fingerprint: String,
     child: Option<Child>,
     /// 子进程最近日志（失败时带回设置页）。
     recent_logs: Arc<Mutex<VecDeque<String>>>,
@@ -83,6 +85,7 @@ impl VoiceServiceManager {
         Self {
             inner: Mutex::new(Inner {
                 backend: String::new(),
+                voice_fingerprint: String::new(),
                 child: None,
                 recent_logs: Arc::new(Mutex::new(VecDeque::new())),
                 setup_running: false,
@@ -415,6 +418,37 @@ pub fn repo_root() -> Option<PathBuf> {
     None
 }
 
+/// 内置参考音文件指纹（size+mtime）。替换 assets/<card>/ref.* 后保存设置可触发本地 TTS 重启。
+pub fn builtin_ref_stamp(persona_card_id: &str) -> String {
+    let Some(repo) = repo_root() else {
+        return String::new();
+    };
+    let card = {
+        let t = persona_card_id.trim();
+        if t.is_empty() {
+            "kxyy-yuanyuan"
+        } else {
+            t
+        }
+    };
+    let dir = repo
+        .join("scripts/local-realtime/assets")
+        .join(card);
+    for name in ["ref.wav", "ref.mp3", "ref.m4a", "ref.flac", "ref.ogg"] {
+        let p = dir.join(name);
+        if let Ok(meta) = p.metadata() {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            return format!("{}:{}:{}", name, meta.len(), mtime);
+        }
+    }
+    String::new()
+}
+
 /// 打包后资源可能在 resource_dir；优先仓库/安装根，其次 resource_dir。
 fn scripts_root(app: &AppHandle) -> Option<PathBuf> {
     if let Some(r) = repo_root() {
@@ -569,6 +603,7 @@ fn stop_inner(inner: &mut Inner) {
         eprintln!("[voice-service] 已停止托管进程 pid={pid}");
     }
     inner.backend.clear();
+    inner.voice_fingerprint.clear();
     if let Ok(mut q) = inner.recent_logs.lock() {
         q.clear();
     }
@@ -875,9 +910,11 @@ pub fn stop(app: &AppHandle) {
 }
 
 /// 按当前语音后端确保服务在跑（volc 则停掉托管进程；空=关闭则不启动）。
-pub fn ensure(app: &AppHandle, backend_raw: &str) {
+/// `voice_fingerprint`：人设卡 + 参考音路径/文案指纹；本地后端下变化时强制重启以换克隆音色。
+pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
     let backend = normalize_backend(backend_raw);
     let port = port_for(&backend);
+    let fp = voice_fingerprint.trim().to_string();
 
     // 关闭语音：停服务、不启动
     if backend.is_empty() {
@@ -909,24 +946,67 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
         return;
     };
 
+    // 本地后端：参考音 / 人设卡变化时必须重启，否则 Python 进程仍用旧克隆音色。
+    let prev_fp = app
+        .state::<VoiceServiceManager>()
+        .inner
+        .lock()
+        .ok()
+        .map(|inner| inner.voice_fingerprint.clone())
+        .unwrap_or_default();
+    if backend == "local" && !fp.is_empty() && prev_fp != fp && service_running(port) {
+        eprintln!("[voice-service] 参考音/人设变更，重启本地 TTS（{prev_fp} → {fp}）");
+        stop(app);
+        let _ = clear_stale_voice_listeners(port);
+    }
+
     // 端口已通且健康检查通过：外部或先前实例已在跑，不重复拉起。
     if service_running(port) {
         if let Ok(mut inner) = app.state::<VoiceServiceManager>().inner.lock() {
             // 若托管的是别的后端，先清掉记录（端口被占用说明目标服务已在）
             if inner.backend != backend {
                 stop_inner(&mut inner);
+            } else {
+                // 同后端已在跑：刷新指纹后返回（未发生 need_ref_restart 的情况）
+                if !fp.is_empty() {
+                    inner.voice_fingerprint = fp.clone();
+                }
+                emit(
+                    app,
+                    VoiceServiceStatus {
+                        backend: backend.clone(),
+                        state: "running".into(),
+                        message: format!("已在运行（:{port}）"),
+                        port,
+                    },
+                );
+                return;
             }
+        } else {
+            emit(
+                app,
+                VoiceServiceStatus {
+                    backend: backend.clone(),
+                    state: "running".into(),
+                    message: format!("已在运行（:{port}）"),
+                    port,
+                },
+            );
+            return;
         }
-        emit(
-            app,
-            VoiceServiceStatus {
-                backend: backend.clone(),
-                state: "running".into(),
-                message: format!("已在运行（:{port}）"),
-                port,
-            },
-        );
-        return;
+        // backend mismatch 清掉后若端口仍被旧服务占用，下面会 reclaim / 拉起
+        if service_running(port) {
+            emit(
+                app,
+                VoiceServiceStatus {
+                    backend: backend.clone(),
+                    state: "running".into(),
+                    message: format!("已在运行（:{port}）"),
+                    port,
+                },
+            );
+            return;
+        }
     }
 
     // 端口被占但健康检查失败：优先清理残留（必须在 child_starting 之前，否则永远卡在「正在启动」）。
@@ -1033,6 +1113,7 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
                 let app2 = app.clone();
                 let repo2 = repo.clone();
                 let rt2 = rt.clone();
+                let fp2 = fp.clone();
                 std::thread::spawn(move || {
                     let result = run_macos_qwen3_setup(&app2, &repo2, &rt2);
                     if let Ok(mut inner) = app2.state::<VoiceServiceManager>().inner.lock() {
@@ -1049,7 +1130,7 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
                                     port: 19876,
                                 },
                             );
-                            ensure(&app2, "local");
+                            ensure(&app2, "local", &fp2);
                         }
                         Err(msg) => {
                             emit(
@@ -1201,6 +1282,9 @@ pub fn ensure(app: &AppHandle, backend_raw: &str) {
     let pid = child.id();
     if let Ok(mut inner) = app.state::<VoiceServiceManager>().inner.lock() {
         inner.backend = backend.clone();
+        if !fp.is_empty() {
+            inner.voice_fingerprint = fp.clone();
+        }
         inner.child = Some(child);
     }
 

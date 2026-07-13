@@ -78,8 +78,9 @@
       "../scripts/macos/setup-qwen3-tts.sh": "scripts/macos/setup-qwen3-tts.sh",
       "../scripts/windows/setup-qwen3-tts.cmd": "scripts/windows/setup-qwen3-tts.cmd",
       "../scripts/windows/setup-qwen3-tts.ps1": "scripts/windows/setup-qwen3-tts.ps1",
-      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.wav": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.wav",
-      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt",
+      "../scripts/local-realtime/assets/kxyy-yuanyuan": "scripts/local-realtime/assets/kxyy-yuanyuan",
+      "../scripts/local-realtime/assets/bazi-persona": "scripts/local-realtime/assets/bazi-persona",
+      "../scripts/local-realtime/assets/elon-musk": "scripts/local-realtime/assets/elon-musk",
       "../persona-cards": "persona-cards"
     },
     "windows": {

@@ -14,8 +14,8 @@ settings.json（可选）：
   qwen3ModelDir   本地权重目录，或 HF/ModelScope 模型 id（默认 Qwen/Qwen3-TTS-12Hz-1.7B-Base）
   qwen3Language   合成语言（Auto / Chinese / English …），默认 Auto
 
-参考音：由用户在「设置 → 语音 → 参考音频」填入（settings.localRefWav / localRefText），
-经 common.ensure_ref_wav() 读取；发行版不再内置任何真人录音。
+参考音：优先 settings.localRefWav / localRefText；留空则按 settings.personaCardId
+从 scripts/local-realtime/assets/<cardId>/ref.* 加载（默认卡 kxyy-yuanyuan）。
 """
 
 from __future__ import annotations

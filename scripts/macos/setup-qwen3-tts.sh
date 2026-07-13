@@ -50,15 +50,39 @@ fi
 
 mkdir -p "$RUNTIME/out"
 
-log "STEP 1/5 复制参考音…"
+log "STEP 1/5 复制参考音（按人设卡目录）…"
+mkdir -p "$RUNTIME/out"
+# 新人设布局：assets/<cardId>/ref.{wav,mp3,txt}
+if [[ -d "$LR/assets" ]]; then
+  for card_dir in "$LR/assets"/*/; do
+    [[ -d "$card_dir" ]] || continue
+    card="$(basename "$card_dir")"
+    dest="$RUNTIME/out/$card"
+    mkdir -p "$dest"
+    copied=0
+    for f in "$card_dir"ref.wav "$card_dir"ref.mp3 "$card_dir"ref.txt \
+             "$card_dir"*.wav "$card_dir"*.mp3 "$card_dir"*.txt; do
+      [[ -f "$f" ]] || continue
+      cp -f "$f" "$dest/$(basename "$f")"
+      copied=1
+    done
+    if [[ "$copied" -eq 1 ]]; then
+      log "已复制人设音色 $card → $dest"
+    fi
+  done
+fi
+# 旧扁平文件名兼容
 if [[ -f "$LR/assets/kxyy-wechat-record-cut01_15s.wav" ]]; then
-  cp -f "$LR/assets/kxyy-wechat-record-cut01_15s.wav" "$RUNTIME/out/kxyy-wechat-record-cut01_15s.wav"
-  log "已复制 kxyy-wechat-record-cut01_15s.wav"
-else
-  log "警告：打包内无参考音，稍后若缺失需自行提供"
+  mkdir -p "$RUNTIME/out/kxyy-yuanyuan"
+  cp -f "$LR/assets/kxyy-wechat-record-cut01_15s.wav" "$RUNTIME/out/kxyy-yuanyuan/ref.wav"
+  log "已复制旧版参考音 → kxyy-yuanyuan/ref.wav"
 fi
 if [[ -f "$LR/assets/kxyy-wechat-record-cut01_15s.txt" ]]; then
-  cp -f "$LR/assets/kxyy-wechat-record-cut01_15s.txt" "$RUNTIME/out/kxyy-wechat-record-cut01_15s.txt"
+  mkdir -p "$RUNTIME/out/kxyy-yuanyuan"
+  cp -f "$LR/assets/kxyy-wechat-record-cut01_15s.txt" "$RUNTIME/out/kxyy-yuanyuan/ref.txt"
+fi
+if [[ ! -f "$RUNTIME/out/kxyy-yuanyuan/ref.wav" && ! -f "$RUNTIME/out/kxyy-yuanyuan/ref.mp3" ]]; then
+  log "警告：未找到默认人设参考音，稍后可在设置里自行填入"
 fi
 
 log "检查 ffmpeg（实时通话 ASR 需要）…"
@@ -131,7 +155,9 @@ def heartbeat(label: str, stop: threading.Event) -> None:
         )
 
 runtime = Path(os.environ["KXYY_VOICE_RUNTIME"])
-ref = runtime / "out" / "kxyy-wechat-record-cut01_15s.wav"
+ref = runtime / "out" / "kxyy-yuanyuan" / "ref.wav"
+if not ref.exists():
+    ref = runtime / "out" / "kxyy-wechat-record-cut01_15s.wav"
 print(f"[setup-qwen3] 参考音：{ref} exists={ref.exists()}", flush=True)
 
 stop = threading.Event()

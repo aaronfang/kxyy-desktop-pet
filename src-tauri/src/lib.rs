@@ -912,6 +912,31 @@ fn get_card_display_name(app: AppHandle, card_id: String) -> Result<String, Stri
     crate::persona_assets::get_card_display_name(&card_id, &resource_dir)
 }
 
+/// 写出 UTF-8 文本（人设卡导出等本机文件写入）。
+#[tauri::command]
+fn write_utf8_file(path: String, contents: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if p.as_os_str().is_empty() {
+        return Err("路径为空".into());
+    }
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+    }
+    fs::write(&p, contents).map_err(|e| format!("写入失败: {e}"))
+}
+
+/// 读取 UTF-8 文本（人设卡导入等本机文件读取）。
+#[tauri::command]
+fn read_utf8_file(path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    if p.as_os_str().is_empty() {
+        return Err("路径为空".into());
+    }
+    fs::read_to_string(&p).map_err(|e| format!("读取失败: {e}"))
+}
+
 #[tauri::command]
 fn set_ignore_cursor(window: tauri::WebviewWindow, ignore: bool) -> Result<(), String> {
     window
@@ -1281,14 +1306,21 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
     re_register_hotkey(&app);
     position_chat_window(&app);
     // 按所选语音后端自动拉起 / 切换本地 Python 服务。
-    let backend = app
-        .state::<AppState>()
-        .settings
-        .lock()
-        .unwrap()
-        .realtime_backend
-        .clone();
-    voice_service::ensure(&app, &backend);
+    let backend;
+    let voice_fp;
+    {
+        let state = app.state::<AppState>();
+        let guard = state.settings.lock().unwrap();
+        backend = guard.realtime_backend.clone();
+        voice_fp = format!(
+            "{}|{}|{}|{}",
+            guard.persona_card_id.trim(),
+            guard.local_ref_wav.trim(),
+            guard.local_ref_text.trim(),
+            voice_service::builtin_ref_stamp(&guard.persona_card_id)
+        );
+    }
+    voice_service::ensure(&app, &backend, &voice_fp);
     // 按所选文字服务商自动探测 / 拉起本地 Ollama（非 local 时函数内部直接返回）。
     let text_provider;
     let local_text_model;
@@ -1420,7 +1452,14 @@ pub fn run() {
             }
 
             // 启动时按已保存的语音后端自动拉起本地服务。
-            voice_service::ensure(&handle, &settings.realtime_backend);
+            let voice_fp = format!(
+                "{}|{}|{}|{}",
+                settings.persona_card_id.trim(),
+                settings.local_ref_wav.trim(),
+                settings.local_ref_text.trim(),
+                voice_service::builtin_ref_stamp(&settings.persona_card_id)
+            );
+            voice_service::ensure(&handle, &settings.realtime_backend, &voice_fp);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
             // 启动时按已保存的人格卡 ID 动态加载（为空则用编译期嵌入默认值）。
@@ -1483,6 +1522,8 @@ pub fn run() {
             delete_persona_card,
             export_persona_card,
             import_persona_card,
+            write_utf8_file,
+            read_utf8_file,
             set_ignore_cursor,
             cursor_pos,
             show_menu,
