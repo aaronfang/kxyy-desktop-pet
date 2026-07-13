@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "桌宠主窗口默认能力",
   "windows": ["main", "chat", "settings"],
-  "permissions": ["core:default", "core:event:default", "dialog:allow-open"]
+  "permissions": ["core:default", "core:event:default", "dialog:allow-open", "dialog:allow-save"]
 }

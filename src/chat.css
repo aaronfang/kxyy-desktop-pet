@@ -27,12 +27,37 @@ body {
 }
 
 #chat {
+  position: relative;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
   height: 100%;
   padding: 8px 10px 10px;
   gap: 8px;
+  background: transparent;
+}
+
+/* 接近透明的淡底（10%），四周羽化；不遮挡气泡/输入栏 */
+#chat::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: rgba(18, 14, 28, 0.1);
+  -webkit-mask-image:
+    linear-gradient(to right, transparent 0%, #000 24px, #000 calc(100% - 24px), transparent 100%),
+    linear-gradient(to bottom, transparent 0%, #000 24px, #000 calc(100% - 24px), transparent 100%);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(to right, transparent 0%, #000 24px, #000 calc(100% - 24px), transparent 100%),
+    linear-gradient(to bottom, transparent 0%, #000 24px, #000 calc(100% - 24px), transparent 100%);
+  mask-composite: intersect;
+}
+
+#chat > * {
+  position: relative;
+  z-index: 1;
 }
 
 /* 启动服务就绪状态：各服务启动进度提示，就绪后自动消失。
@@ -441,6 +466,10 @@ body {
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   transition: background 0.18s ease;
+}
+#stickers-btn[hidden],
+#call-btn[hidden] {
+  display: none;
 }
 #stickers-btn:hover,
 #attach:hover,

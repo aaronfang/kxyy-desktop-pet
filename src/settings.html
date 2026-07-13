@@ -100,7 +100,7 @@
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
             <span id="clearMemoryStatus" class="hint"></span>
           </div>
-          <p class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后她不再记得过往，当前聊天气泡不会自动消失。</p>
+          <p id="memoryHint" class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后不再记得过往，当前聊天气泡不会自动消失。</p>
         </section>
 
         <!-- 视觉模型 -->
@@ -181,7 +181,7 @@
               <span>参考音文案<small>与录音内容一致，可留空（留空克隆质量略降）</small></span>
               <input id="localRefText" type="text" placeholder="录音里说的那句话" />
             </label>
-            <p class="hint">本地 Qwen3-TTS 为<strong>零样本克隆，不训练音色</strong>：填入录音后<strong>保存并重启语音服务</strong>（切换后端或重开 App）即按此录音克隆。<strong>留空则使用内置元元参考音色</strong>。</p>
+            <p class="hint">本地 Qwen3-TTS 为<strong>零样本克隆，不训练音色</strong>：填入录音后<strong>保存</strong>即按此录音克隆（会重启语音服务）。<strong>留空则使用当前人设卡的内置参考音色</strong>（随人设切换自动更换）。</p>
           </div>
 
           <div id="voiceFieldsVolc" class="voice-backend-fields" hidden>
@@ -235,7 +235,7 @@
 
           <label class="row-inline">
             <input id="autoSpeak" type="checkbox" />
-            <span>自动朗读元元的回复</span>
+            <span id="autoSpeakLabel">自动朗读元元的回复</span>
           </label>
           <label class="row-inline">
             <input id="showChatDebug" type="checkbox" />
@@ -261,7 +261,7 @@
           <h2>人设卡</h2>
           <div class="persona-card-select-row">
             <select id="personaCardId">
-              <option value="">— 默认（开心元元）—</option>
+              <option value="">开心元元</option>
             </select>
             <div class="persona-card-actions">
               <button id="importPersonaCardBtn" class="btn-sm btn-ghost" title="导入人设卡">导入</button>
@@ -281,7 +281,7 @@
         <section>
           <h2 id="personaUserProfileTitle">观众画像</h2>
           <label>
-            <span>你的昵称<small>AI 如何称呼你，留空=元宝</small></span>
+            <span id="userNameLabel">你的昵称<small>AI 如何称呼你，留空=元宝</small></span>
             <input id="userName" type="text" placeholder="元宝" />
           </label>
           <label>
@@ -293,7 +293,7 @@
             <textarea id="personaFacts" rows="3" placeholder="我在深圳上班&#10;我养了只橘猫叫团子"></textarea>
           </label>
           <label>
-            <span>你俩的暗号 / 梗<small>每行一条</small></span>
+            <span id="personaJokesLabel">你俩的暗号 / 梗<small>每行一条</small></span>
             <textarea id="personaJokes" rows="2" placeholder="每次都催她唱《虫儿飞》"></textarea>
           </label>
           <label>
@@ -349,10 +349,10 @@
           </label>
           <p class="hint">格式如 <code>Ctrl+Shift+Space</code>、<code>Alt+X</code>；修饰键 + 主键，改后立即生效。</p>
           <label>
-            <span>拍一拍文案<small>{name}=你的昵称，{ai}=开心元元</small></span>
+            <span id="patTextLabel">拍一拍文案<small>{name}=你的昵称，{ai}=开心元元</small></span>
             <input id="patText" type="text" placeholder="{name}拍了拍{ai}" />
           </label>
-          <p class="hint">双击聊天里元元的头像即可「拍一拍」，她会主动回你一句。</p>
+          <p id="patHint" class="hint">双击聊天里元元的头像即可「拍一拍」，会主动回你一句。</p>
           <div class="grid3">
             <label>
               <span>气泡宽度 (px)</span>

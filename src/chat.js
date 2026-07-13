@@ -33,6 +33,9 @@ import {
   isBadFollowupReply,
   detectDeepIntent,
   computeLiveContext,
+  parseBilingualReply,
+  stripSpeakBlockForDisplay,
+  needsBilingualTts,
 } from "./ai/persona.js";
 import {
   loadStickers,
@@ -44,7 +47,7 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, onTtsProgress } from "./ai/tts.js";
+import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, onTtsProgress, splitSpeechChunks } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
@@ -110,10 +113,56 @@ function makeBubbleRevealer(parts, firstBubble, firstRow) {
 /** 同步朗读一段（已切分好的）回复：逐句合成音频，并在每句音频「开始播放」的瞬间
  *  才显示该句文字，实现文字与语音同步出现。采用预合成流水线：播放当前句时提前
  *  合成下一句，尽量消除句间空档。gen 变化（清空/通话/收起打断）或合成失败时，
- *  兜底把剩余文字直接补全，避免气泡永远停在闪烁光标。 */
-async function speakPartsSynced(parts, { revealer, voice, gen }) {
-  let nextSynth = synthesizeSpeech(parts[0], { voice }).catch(() => null);
-  for (let i = 0; i < parts.length; i++) {
+ *  兜底把剩余文字直接补全，避免气泡永远停在闪烁光标。
+ *  speakParts 与 parts 条数不一致时（双语）：按英文分段逐段朗读，开播时一次亮出全部中文气泡。 */
+async function speakPartsSynced(parts, { revealer, voice, gen, speakParts } = {}) {
+  const audioParts =
+    Array.isArray(speakParts) && speakParts.length ? speakParts.filter(Boolean) : parts;
+  if (!audioParts.length) {
+    revealer.revealAll();
+    return;
+  }
+  // 显示句与朗读句无法一一对应：按朗读分段逐段合成（勿合并成一段，否则会被 160 字上限截断）。
+  const altAudio = Array.isArray(speakParts) && speakParts.length > 0;
+  if (altAudio && audioParts.length !== parts.length) {
+    let revealed = false;
+    const revealOnce = () => {
+      if (!revealed) {
+        revealed = true;
+        revealer.revealAll();
+      }
+    };
+    let nextSynth = synthesizeSpeech(audioParts[0], { voice }).catch(() => null);
+    for (let i = 0; i < audioParts.length; i++) {
+      if (gen !== ttsQueueGen) {
+        revealer.revealAll();
+        return;
+      }
+      const blob = await nextSynth;
+      nextSynth =
+        i + 1 < audioParts.length
+          ? synthesizeSpeech(audioParts[i + 1], { voice }).catch(() => null)
+          : null;
+      if (!blob) {
+        revealOnce();
+        continue;
+      }
+      await new Promise((resolve) => {
+        playSpeechBlob(blob, {
+          onStart: revealOnce,
+          onError: revealOnce,
+        }).then(() => {
+          revealOnce();
+          resolve();
+        });
+      });
+    }
+    revealer.revealAll();
+    return;
+  }
+
+  let nextSynth = synthesizeSpeech(audioParts[0], { voice }).catch(() => null);
+  for (let i = 0; i < audioParts.length; i++) {
     if (gen !== ttsQueueGen) {
       revealer.revealAll();
       return;
@@ -121,8 +170,8 @@ async function speakPartsSynced(parts, { revealer, voice, gen }) {
     const blob = await nextSynth;
     // 播放本句前先起下一句的合成，藏进本句播放时长里。
     nextSynth =
-      i + 1 < parts.length
-        ? synthesizeSpeech(parts[i + 1], { voice }).catch(() => null)
+      i + 1 < audioParts.length
+        ? synthesizeSpeech(audioParts[i + 1], { voice }).catch(() => null)
         : null;
 
     if (!blob) {
@@ -143,8 +192,9 @@ async function speakPartsSynced(parts, { revealer, voice, gen }) {
 }
 
 /** 把一段回复排进朗读队列，并让文字随语音逐句同步出现（上一条播完再播下一条）。
- *  parts 为已切分好的句子数组；首句复用流式气泡 firstBubble。 */
-function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, stickerMid } = {}) {
+ *  parts 为已切分好的句子数组（气泡显示）；speakParts 可选，与 parts 不同时用于合成（如中文显示 / 英文朗读）。
+ *  首句复用流式气泡 firstBubble。 */
+function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, stickerMid, speakParts } = {}) {
   const gen = ttsQueueGen;
   const backend = (settings.realtimeBackend || "").toLowerCase();
   // 火山才传 voice；本地 / CosyVoice(云/开源) 由后端按设置合成。
@@ -164,7 +214,7 @@ function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, sticker
         finishSticker();
         return;
       }
-      await speakPartsSynced(parts, { revealer, voice: voiceOpt, gen });
+      await speakPartsSynced(parts, { revealer, voice: voiceOpt, gen, speakParts });
       revealer.revealAll();
       finishSticker();
     })
@@ -254,6 +304,34 @@ function aiName() {
   // 优先用人设卡的 displayName（如 "郭德纲"），回退到默认 "开心元元"
   if (assets && assets.displayName) return assets.displayName;
   return AI_DISPLAY_NAME;
+}
+
+/** 口语短称：默认 kxyy 用「元元」，其它卡用完整显示名。 */
+function aiShortName() {
+  const name = aiName();
+  if (isKxyyPersona(settings.personaCardId) && (name === AI_DISPLAY_NAME || name.includes("元元"))) {
+    return "元元";
+  }
+  return name;
+}
+
+function updateInputPlaceholder() {
+  if (!inputEl) return;
+  inputEl.placeholder = callActive
+    ? "通话中…（点电话按钮挂断）"
+    : `和${aiShortName()}说点什么…（Esc 收起）`;
+}
+
+/** 非 kxyy 人设暂不开放实时语音与表情包：隐藏对应按钮并收尾进行中状态。 */
+function updateKxyyOnlyControls() {
+  const kxyy = isKxyyPersona(settings.personaCardId);
+  if (callBtn) callBtn.hidden = !kxyy;
+  if (stickersBtn) stickersBtn.hidden = !kxyy;
+  if (!kxyy) {
+    if (callActive) endCall({ notice: false });
+    clearPendingSticker();
+    closeStickerPanel();
+  }
 }
 
 function lastRealUserMessage() {
@@ -725,11 +803,11 @@ function updatePersonaDebug() {
   if (isKxyyPersona(cardId)) {
     personaDebugMetaEl.textContent = cardId
       ? `人设 · kxyy（${displayName || "开心元元"}）`
-      : "人设 · 默认（开心元元）";
+      : `人设 · ${displayName || "开心元元"}`;
   } else {
     personaDebugMetaEl.textContent = cardId
       ? `人设 · ${cardId}（${displayName || cardId}）`
-      : "人设 · 默认";
+      : "人设 · 开心元元";
   }
 }
 
@@ -847,6 +925,8 @@ function applyAppearance() {
   const vol = Number(settings.voiceVolume);
   setVoiceVolumePercent(Number.isFinite(vol) ? vol : 100);
   updateVoiceDebug();
+  updateInputPlaceholder();
+  updateKxyyOnlyControls();
 }
 
 function scrollBottom() {
@@ -1162,9 +1242,10 @@ function buildRequestMessages(opts = {}) {
     stickerFrequency: stickerFreq,
     proactiveKind: opts.proactiveKind,
     patAction: opts.patAction || "",
-    who: proactiveWhoLabel(name || "元宝"),
+    who: proactiveWhoLabel(name || userDisplayName() || "你"),
     earlierRecap: sessionRecap,
     deep: opts.deep || false,
+    tts: assets.tts,
   });
 }
 
@@ -1327,7 +1408,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
             // 会朗读时先不显示文字，等对应句音频开始播放再显示（同步出现）。
             if (!willSync) {
               streamBubble.textContent = stripStickerForDisplay(
-                normalizeModelNewlines(full)
+                stripSpeakBlockForDisplay(normalizeModelNewlines(full))
               );
               scrollBottom();
             }
@@ -1348,7 +1429,15 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     });
     localGenStarted = false;
 
-    const raw = sanitizeReply(full);
+    const normalized = normalizeModelNewlines(full);
+    const bilingual = parseBilingualReply(normalized);
+    const raw = sanitizeReply(bilingual.display);
+    const speakText = (bilingual.speak || "").trim();
+    const useSpeakAlt =
+      needsBilingualTts(assets?.tts) &&
+      bilingual.bilingual &&
+      speakText &&
+      speakText !== raw;
     const { text: reply, emotion } = extractSticker(raw);
     if (!reply && !emotion) {
       if (chatDebugEnabled()) {
@@ -1387,18 +1476,26 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       willSync && canAutoSpeak() && reply
         ? splitReply(reply).filter(Boolean)
         : null;
+    const speakParts =
+      syncParts && useSpeakAlt
+        ? splitSpeechChunks(speakText)
+        : null;
+    // 双语卡若模型漏了 [[speak]]：只显示中文，别用英文参考音硬读中文。
+    const skipSpeakMissingEn =
+      needsBilingualTts(assets?.tts) && !useSpeakAlt;
 
     // speechDone：本条回复「文字+语音」全部同步出现完成的 promise（不朗读时为 null）。
     let speechDone = null;
-    if (syncParts && syncParts.length) {
+    if (syncParts && syncParts.length && !skipSpeakMissingEn) {
       speechDone = enqueueAutoSpeakSynced(syncParts, {
         firstBubble: streamBubble,
         firstRow: streamRow,
         sticker: replySticker,
         stickerMid: replyId,
+        speakParts,
       });
     } else {
-      // 不朗读（或纯表情回复）：按原有逻辑立即定稿多条气泡。
+      // 不朗读（或纯表情回复 / 双语缺英文稿）：按原有逻辑立即定稿多条气泡。
       streamRow.classList.remove("streaming");
       renderFinalBubbles(streamBubble, reply);
       if (replySticker) addStickerBubble(replySticker, { linkedMid: replyId });
@@ -1587,15 +1684,22 @@ function buildRealtimeSystemRole() {
     "\n\n# 语音通话模式\n\n" +
     "- 现在是**实时语音通话**，你的话会被念出来给对方听。说得像打电话一样自然口语、简短，一次别说太长。\n" +
     "- **不要**输出任何括号里的动作/神态描写、方括号、星号、表情符号或「[表情:xx]」这类标记——这些会被原样念出来，很怪。\n" +
-    "- 想表达情绪就用语气词和说话方式本身，别靠文字符号。\n" +
-    "- 你的名字是**元元**。用户叫的就是「元元」。语音识别经常把「元元」误听成「圆圆」「原原」「源源」「园园」等同音字——" +
-    "你必须一律当作「元元」理解，**绝对不要**纠正用户叫错名字、也不要提「不是圆圆」之类的话。";
+    "- 想表达情绪就用语气词和说话方式本身，别靠文字符号。\n";
+  const bot = aiShortName();
+  if (isKxyyPersona(settings.personaCardId)) {
+    sys +=
+      "- 你的名字是**元元**。用户叫的就是「元元」。语音识别经常把「元元」误听成「圆圆」「原原」「源源」「园园」等同音字——" +
+      "你必须一律当作「元元」理解，**绝对不要**纠正用户叫错名字、也不要提「不是圆圆」之类的话。";
+  } else {
+    sys +=
+      `- 你的名字是**${bot}**。用户叫的就是「${bot}」。语音识别若听错近音字，一律当作「${bot}」理解，不要纠正用户叫错名字。`;
+  }
   return sys;
 }
 
-/** 通话 bot_name：用「元元」而非「开心元元」，便于 ASR 热词与人设对齐。 */
+/** 通话 bot_name：短称便于 ASR 热词与人设对齐。 */
 function callBotName() {
-  return "元元";
+  return aiShortName();
 }
 
 function ensureCallWaveBars() {
@@ -1658,9 +1762,7 @@ function setCallActive(next) {
   sendBtn.disabled = next;
   attachBtn.disabled = next;
   stickersBtn.disabled = next;
-  inputEl.placeholder = next
-    ? "通话中…（点电话按钮挂断）"
-    : "和元元说点什么…（Esc 收起）";
+  updateInputPlaceholder();
   showCallWave(next);
 }
 
@@ -1729,6 +1831,7 @@ function appendCallAsstBubble(delta) {
 }
 
 async function startCall() {
+  if (!isKxyyPersona(settings.personaCardId)) return;
   if (callActive || busy) return;
   if (!assets) return;
   unlockAudio();
@@ -1741,7 +1844,7 @@ async function startCall() {
   callAsstText = "";
 
   setCallActive(true);
-  appendPatNotice("📞 正在接通元元…");
+  appendPatNotice(`📞 正在接通${aiShortName()}…`);
   petSignal("thinking");
 
   callSession = new RealtimeSession({
@@ -1804,6 +1907,7 @@ function endCall({ notice = true } = {}) {
 }
 
 function toggleCall() {
+  if (!isKxyyPersona(settings.personaCardId)) return;
   if (callActive) endCall({ notice: true });
   else startCall();
 }
@@ -1838,6 +1942,7 @@ function buildStickerGrid() {
 }
 
 function openStickerPanel() {
+  if (!isKxyyPersona(settings.personaCardId)) return;
   buildStickerGrid();
   stickerPanel.hidden = false;
   stickersBtn.classList.add("on");
@@ -1846,10 +1951,11 @@ function openStickerPanel() {
 
 function closeStickerPanel() {
   stickerPanel.hidden = true;
-  stickersBtn.classList.remove("on");
+  stickersBtn?.classList.remove("on");
 }
 
 function toggleStickerPanel() {
+  if (!isKxyyPersona(settings.personaCardId)) return;
   if (stickerPanel.hidden) openStickerPanel();
   else closeStickerPanel();
 }
@@ -1991,12 +2097,23 @@ function deleteMessageById(id) {
 function clearChatHistory() {
   if (busy) return;
   if (!confirm("清空当前对话？")) return;
+  resetConversation();
+}
+
+/** 切换人设时静默清空当前会话气泡与上下文（不弹确认）。 */
+function resetConversation() {
+  if (callActive) endCall({ notice: false });
   history.length = 0;
   messagesEl.innerHTML = "";
   lastRememberedLen = 0;
   resetRecap();
+  clearPendingSticker();
+  closeStickerPanel();
+  clearPendingImage();
   stopSpeak();
   resetTtsQueue();
+  busy = false;
+  petSignal("abort");
 }
 
 function setupContextMenu() {
@@ -2087,9 +2204,10 @@ listen("apply-settings", ({ payload }) => {
   const debugWasOn = settings.showChatDebug === true;
   settings = { ...settings, ...payload };
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
-  // 人设卡变更 → 重新从 /api/assets 加载人设语料 + 更新头像
+  // 人设卡变更 → 清空当前会话（避免旧气泡挂在新人设头像下）+ 重载语料
   if (cardIdChanged) {
-    console.log("[chat] 人设卡变更，重新加载 assets...");
+    console.log("[chat] 人设卡变更，清空会话并重新加载 assets...");
+    resetConversation();
     reloadAssets().then((a) => {
       assets = a;
       window.__kxyy_active_card_id = settings.personaCardId || null;

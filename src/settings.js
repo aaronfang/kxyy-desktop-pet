@@ -1,6 +1,6 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
-import { clearAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar } from "./ai/persona.js";
+import { clearAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -203,7 +203,6 @@ async function loadCardList() {
 async function onCardChanged() {
   const sel = el("personaCardId");
   const cardId = sel.value.trim();
-  const opt = sel.selectedOptions?.[0];
 
   _lastCardId = cardId;
   updateCardInfoDisplay();
@@ -225,20 +224,35 @@ async function onCardChanged() {
   el("personaFacts").value = profile.facts || "";
   el("personaJokes").value = profile.jokes || "";
   el("personaTreatAs").value = profile.treatAs || "";
-  const voice = loadCardVoice(cardId);
-  if (voice) {
-    el("realtimeBackend").value = normalizeBackend(voice.backend);
-    el("ttsVoice").value = voice.voice || "";
-    if (voice.backend === "volc") el("volcTtsKey").value = voice.key || "";
-    else if (voice.backend === "cosyvoice") el("cosyvoiceModel").value = voice.model || "";
-    else if (voice.backend === "local") { el("localRefWav").value = voice.refWav || ""; el("localRefText").value = voice.refText || ""; }
-  }
+  applyVoiceForCard(cardId);
   syncVoiceFields();
   probeBackendStatus();
-  const label = opt?.dataset?.name || (cardId || "kxyy-yuanyuan");
-  const titleEl = el("personaUserProfileTitle");
-  if (titleEl) titleEl.textContent = "audience profile (" + label + ")";
-  updateCardLabels(label);
+  updateCardLabels();
+}
+
+/** 有仓库内置参考音的人设（assets/<cardId>/）；空 cardId = 默认开心元元。 */
+const BUILTIN_LOCAL_VOICE_CARDS = new Set(["", "kxyy-yuanyuan", "bazi-persona", "elon-musk"]);
+
+/** 切人设时套用该卡语音：优先卡级覆盖，否则内置卡默认走 local 且参考音留空（后端按 personaCardId 解析）。 */
+function applyVoiceForCard(cardId) {
+  const saved = loadCardVoice(cardId);
+  if (saved && (saved.backend || saved.voice || saved.refWav || saved.refText || saved.model)) {
+    el("realtimeBackend").value = normalizeBackend(saved.backend);
+    el("ttsVoice").value = saved.voice || "";
+    if (saved.backend === "volc" && saved.key) el("volcTtsKey").value = saved.key;
+    if (saved.backend === "cosyvoice") {
+      if (saved.model) el("cosyvoiceModel").value = saved.model;
+      if (saved.cosyvoiceVoice) el("cosyvoiceVoice").value = saved.cosyvoiceVoice;
+    }
+    el("localRefWav").value = saved.refWav || "";
+    el("localRefText").value = saved.refText || "";
+    return;
+  }
+  if (BUILTIN_LOCAL_VOICE_CARDS.has(cardId || "")) {
+    el("realtimeBackend").value = "local";
+    el("localRefWav").value = "";
+    el("localRefText").value = "";
+  }
 }
 
 function updateCardInfoDisplay() {
@@ -259,8 +273,97 @@ function updateCardInfoDisplay() {
   el("deletePersonaCardBtn").style.display = "";
 }
 
-function updateCardLabels(label) {
-  // placeholder
+/** 当前人设显示名：完整名（开心元元）与口语短称（元元）。 */
+function currentPersonaNames() {
+  const cardId = el("personaCardId").value.trim();
+  const opt = el("personaCardId").selectedOptions?.[0];
+  const kxyy = isKxyyPersona(cardId);
+  const full =
+    (cardId && opt?.dataset?.name?.trim()) ||
+    (kxyy ? "开心元元" : cardId || "AI");
+  // 默认 kxyy 系列口语仍用「元元」；其它卡直接用显示名。
+  const short =
+    kxyy && (!cardId || full === "开心元元" || full.includes("元元"))
+      ? "元元"
+      : full;
+  return { full, short, isKxyy: kxyy, cardId };
+}
+
+/** 人设相关 UI 文案跟随当前卡切换（含默认开心元元）。 */
+function updateCardLabels() {
+  const { full, short, isKxyy } = currentPersonaNames();
+
+  const titleEl = el("personaUserProfileTitle");
+  if (titleEl) titleEl.textContent = "观众画像";
+
+  const userNameLabel = el("userNameLabel");
+  const userNameInput = el("userName");
+  if (userNameLabel) {
+    userNameLabel.innerHTML = isKxyy
+      ? "你的昵称<small>AI 如何称呼你，留空=元宝</small>"
+      : "你的昵称<small>AI 如何称呼你，可留空</small>";
+  }
+  if (userNameInput) {
+    userNameInput.placeholder = isKxyy ? "元宝" : "你的昵称";
+  }
+
+  const rel = el("personaRelationshipLabel");
+  if (rel) rel.textContent = `你和${short}的关系`;
+  const relInput = el("personaRelationship");
+  if (relInput) {
+    relInput.placeholder = isKxyy
+      ? "比如：刚关注的萌新"
+      : "比如：咨询者 / 长期提问的朋友";
+  }
+
+  const facts = el("personaFactsLabel");
+  if (facts) facts.innerHTML = `想让${short}记住的事<small>每行一条</small>`;
+  const factsInput = el("personaFacts");
+  if (factsInput) {
+    factsInput.placeholder = isKxyy
+      ? "我在深圳上班\n我养了只橘猫叫团子"
+      : "我的背景信息\n最近关心的问题";
+  }
+
+  const jokes = el("personaJokes");
+  if (jokes) {
+    jokes.placeholder = isKxyy
+      ? "每次都催她唱《虫儿飞》"
+      : "你们之间的专属说法 / 约定用语";
+  }
+
+  const treat = el("personaTreatAsLabel");
+  if (treat) treat.textContent = `希望${short}怎么对待你`;
+  const treatInput = el("personaTreatAs");
+  if (treatInput) {
+    treatInput.placeholder = isKxyy
+      ? "把我当聊得来的朋友，别太客套"
+      : "认真解答、先给结论再讲依据，别卖萌";
+  }
+
+  const hint = el("personaHint");
+  if (hint) {
+    hint.textContent = isKxyy
+      ? `这些资料只在本机保存，会随对话注入，让${short}更懂你。留空就当普通粉丝「元宝」。`
+      : `这些资料只在本机保存，会随对话注入，让${short}更懂你。`;
+  }
+
+  const memory = el("memoryHint");
+  if (memory) {
+    memory.textContent = `${short}会按昵称记住偏好、约定与对话概要（仅存本机）。清空后不再记得过往，当前聊天气泡不会自动消失。`;
+  }
+
+  const autoSpeak = el("autoSpeakLabel");
+  if (autoSpeak) autoSpeak.textContent = `自动朗读${short}的回复`;
+
+  const patLabel = el("patTextLabel");
+  if (patLabel) {
+    patLabel.innerHTML = `拍一拍文案<small>{name}=你的昵称，{ai}=${full}</small>`;
+  }
+  const patHint = el("patHint");
+  if (patHint) {
+    patHint.textContent = `双击聊天里${short}的头像即可「拍一拍」，会主动回你一句。`;
+  }
 }
 
 async function deleteCurrentCard() {
@@ -269,15 +372,17 @@ async function deleteCurrentCard() {
   if (!cardId) return;
   const opt = sel.selectedOptions?.[0];
   const name = opt?.dataset?.name || cardId;
-  if (!window.confirm("delete " + name + "?")) return;
+  if (!window.confirm(`确定删除人设「${name}」？`)) return;
   try {
-    await invoke("delete_local_card", { cardId });
+    await invoke("delete_persona_card", { cardId });
     await loadCardList();
-    sel.value = _lastCardId || "";
-    statusEl.textContent = "deleted " + name;
+    sel.value = "";
+    _lastCardId = "";
+    onCardChanged();
+    statusEl.textContent = `已删除 ${name}`;
     statusEl.style.color = "#16a34a";
   } catch (e) {
-    statusEl.textContent = "delete failed: " + e;
+    statusEl.textContent = `删除失败：${e}`;
     statusEl.style.color = "#dc2626";
   } finally {
     setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
@@ -288,55 +393,91 @@ async function exportCurrentCard() {
   const cardId = el("personaCardId").value.trim();
   if (!cardId) return;
   try {
-    const data = await invoke("export_card", { cardId });
-    const { save } = window.__TAURI__?.dialog || {};
-    const { writeTextFile } = window.__TAURI__?.fs || {};
-    if (save && writeTextFile) {
-      const path = await save({ defaultPath: cardId + ".persona-card.json", filters: [{ name: "persona card JSON", extensions: ["json"] }] });
-      if (path) {
-        await writeTextFile(path, JSON.stringify(data, null, 2));
-        statusEl.textContent = "exported";
-        statusEl.style.color = "#16a34a";
-        setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
-      }
+    const raw = await invoke("export_persona_card", { cardId });
+    const pretty = JSON.stringify(JSON.parse(raw), null, 2);
+    const dialog = window.__TAURI__?.dialog;
+    if (dialog?.save) {
+      const path = await dialog.save({
+        defaultPath: `${cardId}.persona-card.json`,
+        filters: [{ name: "persona card JSON", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await invoke("write_utf8_file", { path, contents: pretty });
+    } else {
+      // 无 dialog.save 时退回浏览器下载
+      const blob = new Blob([pretty], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${cardId}.persona-card.json`;
+      a.click();
+      URL.revokeObjectURL(url);
     }
+    statusEl.textContent = "已导出";
+    statusEl.style.color = "#16a34a";
+    setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
   } catch (e) {
-    statusEl.textContent = "export failed: " + e;
+    statusEl.textContent = `导出失败：${e}`;
     statusEl.style.color = "#dc2626";
     setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
   }
 }
 
+function deriveImportCardId(card) {
+  const fromMeta =
+    (card?.meta?.card_id || card?.meta?.id || card?.meta?.cardId || "").trim();
+  if (fromMeta) return fromMeta;
+  const name = (card?.identity?.name || card?.meta?.name || "").trim();
+  if (name) {
+    return name
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48) || `imported-${Date.now()}`;
+  }
+  return `imported-${Date.now()}`;
+}
+
 async function importPersonaCard() {
   try {
-    const { open } = window.__TAURI__?.dialog || {};
-    const { readTextFile } = window.__TAURI__?.fs || {};
+    const dialog = window.__TAURI__?.dialog;
     let text;
-    if (open && readTextFile) {
-      const selected = await open({ multiple: false, filters: [{ name: "persona card JSON", extensions: ["json"] }] });
+    if (dialog?.open) {
+      const selected = await dialog.open({
+        multiple: false,
+        filters: [{ name: "persona card JSON", extensions: ["json"] }],
+      });
       if (!selected) return;
-      text = await readTextFile(selected);
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      text = await invoke("read_utf8_file", { path });
     } else {
       text = await new Promise((resolve) => {
         const inp = document.createElement("input");
-        inp.type = "file"; inp.accept = ".json";
-        inp.onchange = async () => { const f = inp.files?.[0]; resolve(f ? await f.text() : null); };
+        inp.type = "file";
+        inp.accept = ".json,application/json";
+        inp.onchange = async () => {
+          const f = inp.files?.[0];
+          resolve(f ? await f.text() : null);
+        };
         inp.click();
       });
       if (!text) return;
     }
     const card = JSON.parse(text);
-    const cardId = await invoke("import_card_json", { json: JSON.stringify(card) });
-    const name = card?.meta?.name || card?.identity?.name || cardId;
+    const cardId = deriveImportCardId(card);
+    const name = await invoke("import_persona_card", {
+      cardId,
+      jsonContent: JSON.stringify(card),
+    });
     await loadCardList();
     el("personaCardId").value = cardId;
     _lastCardId = cardId;
-    statusEl.textContent = "imported " + name;
+    statusEl.textContent = `已导入 ${name || cardId}`;
     statusEl.style.color = "#16a34a";
     onCardChanged();
     setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
   } catch (e) {
-    statusEl.textContent = "import failed: " + e;
+    statusEl.textContent = `导入失败：${e}`;
     statusEl.style.color = "#dc2626";
     setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
   }
@@ -390,10 +531,25 @@ function collect() {
 async function save() {
   const cardId = el("personaCardId").value.trim();
   if (cardId) {
-    saveCardProfile(cardId, { userName: el("userName").value.trim(), relationship: el("personaRelationship").value.trim(), facts: el("personaFacts").value.trim(), jokes: el("personaJokes").value.trim(), treatAs: el("personaTreatAs").value.trim() });
-    const bk = currentBackend();
-    if (bk) { saveCardVoice(cardId, { backend: bk, voice: el("ttsVoice").value.trim(), key: bk === "volc" ? el("volcTtsKey").value.trim() : undefined, model: bk === "cosyvoice" ? el("cosyvoiceModel").value.trim() : undefined, refWav: bk === "local" ? el("localRefWav").value.trim() : undefined, refText: bk === "local" ? el("localRefText").value.trim() : undefined }); }
+    saveCardProfile(cardId, {
+      userName: el("userName").value.trim(),
+      relationship: el("personaRelationship").value.trim(),
+      facts: el("personaFacts").value.trim(),
+      jokes: el("personaJokes").value.trim(),
+      treatAs: el("personaTreatAs").value.trim(),
+    });
   }
+  // 人设卡维度语音（含默认「开心元元」空 cardId）：保存后切卡可还原
+  const bk = currentBackend();
+  saveCardVoice(cardId, {
+    backend: bk,
+    voice: el("ttsVoice").value.trim(),
+    key: bk === "volc" ? el("volcTtsKey").value.trim() : undefined,
+    model: bk === "cosyvoice" ? el("cosyvoiceModel").value.trim() : undefined,
+    cosyvoiceVoice: bk === "cosyvoice" ? el("cosyvoiceVoice").value.trim() : undefined,
+    refWav: bk === "local" ? el("localRefWav").value.trim() : undefined,
+    refText: bk === "local" ? el("localRefText").value.trim() : undefined,
+  });
   saveBtn.disabled = true;
   statusEl.textContent = "";
   try {
@@ -734,11 +890,7 @@ async function init() {
   }
   userAvatar = loadCardAvatar(_lastCardId || "", "user") || "";
   renderAvatars();
-  const opt = el("personaCardId").selectedOptions?.[0];
-  const label = opt?.dataset?.name || (_lastCardId || "kxyy-yuanyuan");
-  const titleEl = el("personaUserProfileTitle");
-  if (titleEl) titleEl.textContent = "audience profile (" + label + ")";
-  updateCardLabels(label);
+  updateCardLabels();
   probeBackendStatus();
   probeLocalTextStatus();
 }

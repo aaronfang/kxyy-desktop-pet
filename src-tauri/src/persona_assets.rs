@@ -205,6 +205,7 @@ pub fn load_card_from_file(card_id: &str, resource_dir: &PathBuf) -> Result<(), 
         "_dynamic_card_id": card_id,
         "displayName": display_name,
         "avatar": avatar,
+        "tts": card.get("tts").cloned().unwrap_or(serde_json::Value::Null),
     });
 
     let json = serde_json::to_string(&assets)

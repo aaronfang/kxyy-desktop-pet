@@ -335,7 +335,7 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         .unwrap_or(400);
     // 预算：
     // - DeepSeek reasoner / 本地开启思考：思考链占用同一 max_tokens，需大幅放大，避免正文被截空。
-    // - 本地关闭思考：保留小幅余量即可（前端 normal≈450）；过大的硬下限会拖慢本地生成。
+    // - 本地关闭思考：保留小幅余量即可（前端 normal≈800）；过大的硬下限会拖慢本地生成。
     let max_tokens = if is_reasoner || (is_local_text && thinking) {
         (max_tokens_in * 6).max(4096)
     } else if is_local_text {

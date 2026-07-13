@@ -341,6 +341,53 @@ export function textForSpeech(text) {
   return out;
 }
 
+/** 把长朗读稿切成多段（每段 ≤ MAX_SPEECH_CHARS），避免单次合成被截断听起来「读到一半断掉」。
+ *  双语英文稿常远超 160 字，必须先切再逐段合成。 */
+export function splitSpeechChunks(text, maxChars = MAX_SPEECH_CHARS) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return [];
+  const sentences = raw.match(/[^.!?。！？]+(?:[.!?。！？]+|$)/g) || [raw];
+  const chunks = [];
+  let buf = "";
+  const len = (s) => [...s].length;
+  const flush = () => {
+    const t = buf.trim();
+    if (t) chunks.push(t);
+    buf = "";
+  };
+  for (const sent of sentences) {
+    const s = sent.trim();
+    if (!s) continue;
+    if (!buf) {
+      if (len(s) <= maxChars) {
+        buf = s;
+      } else {
+        const chars = [...s];
+        for (let i = 0; i < chars.length; i += maxChars) {
+          chunks.push(chars.slice(i, i + maxChars).join(""));
+        }
+      }
+      continue;
+    }
+    const merged = `${buf} ${s}`;
+    if (len(merged) <= maxChars) {
+      buf = merged;
+    } else {
+      flush();
+      if (len(s) <= maxChars) {
+        buf = s;
+      } else {
+        const chars = [...s];
+        for (let i = 0; i < chars.length; i += maxChars) {
+          chunks.push(chars.slice(i, i + maxChars).join(""));
+        }
+      }
+    }
+  }
+  flush();
+  return chunks;
+}
+
 /** 朗读情绪 → CosyVoice 的 rate(语速) / pitch(音调) / volume(音量) 预设。
  *  目的：让不同情绪的回复在语速/音调/音量上拉开差距，制造「情绪起伏」，
  *  避免全程一个调读得机械。数值保持温和——拉太猛 CosyVoice 会破音失真。 */

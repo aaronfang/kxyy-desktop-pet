@@ -258,21 +258,36 @@ pub fn ensure(app: &AppHandle, provider: &str, preferred_model: &str) {
     });
 }
 
+/// 预热用 system prompt：优先当前人设卡全文；缺省时用 displayName 拼一句短身份。
+fn warmup_system_prompt() -> String {
+    match crate::persona_assets::decrypted_json() {
+        Ok(raw) => {
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+            if let Some(s) = v
+                .get("systemPrompt")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return s.to_string();
+            }
+            let name = v
+                .get("displayName")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("开心元元");
+            format!("你是{name}。")
+        }
+        Err(_) => "你是开心元元。".into(),
+    }
+}
+
 /// 后台把模型 + 人设 system prompt 预热进 GPU，避免首条聊天卡在 30s+ 冷预填。
 /// 走 native `/api/chat`：才能真正设置 `keep_alive` / `num_ctx`（`/v1` 会忽略）。
 fn spawn_warmup(app: AppHandle, model: String) {
     std::thread::spawn(move || {
-        let system = match crate::persona_assets::decrypted_json() {
-            Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| {
-                    v.get("systemPrompt")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "你是开心元元。".into()),
-            Err(_) => "你是开心元元。".into(),
-        };
+        let system = warmup_system_prompt();
         // 冷加载可要半分钟；单独超时。
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(180))
