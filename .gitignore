@@ -30,4 +30,45 @@ dist/
 # CodeBuddy IDE 项目级数据
 /.codebuddy/
 
+# persona-distill 本地语料与产物（含隐私，勿提交）
+/scripts/persona-distill/sample_wav/
+/scripts/persona-distill/output/
+/scripts/persona-distill/checkpoints/
+/scripts/persona-distill/voiceprint/*
+!/scripts/persona-distill/voiceprint/README.md
+/scripts/persona-distill/.venv*/
+/scripts/persona-distill/__pycache__/
+/scripts/persona-distill/pipeline*.log
+# persona-distill 临时调试脚本与日志（下划线前缀）
+/scripts/persona-distill/_debug_*.py
+/scripts/persona-distill/_debug_*.txt
+/scripts/persona-distill/_diag_*.py
+/scripts/persona-distill/_match_*.py
+/scripts/persona-distill/_match_*.txt
+/scripts/persona-distill/_postprocess_*.py
+/scripts/persona-distill/_postproc_*.txt
+/scripts/persona-distill/_run_tse*.py
+/scripts/persona-distill/_run_tse*.txt
+/scripts/persona-distill/_test_*.py
+/scripts/persona-distill/_tse_*.txt
+
+# 临时调试输出（根目录）
+/check-err.txt
+/dev-output.txt
+/out.txt
+/simple_helper_validate.txt
+/stderr.txt
+/test_out.txt
+/validate_out.txt
+
+# 一次性补丁/验证脚本
+/_patch_settings.cjs
+/_validate.py
+
+# 临时备份文件
+/temp_original_settings.css
+/temp_original_settings.html
+/temp_original_settings.js
+
+
 
