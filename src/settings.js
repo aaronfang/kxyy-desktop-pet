@@ -1,6 +1,6 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
-import { DEFAULT_AI_AVATAR, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
-import { clearAllMemory } from "./ai/persona.js";
+import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
+import { clearAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar } from "./ai/persona.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -26,6 +26,7 @@ const FIELDS = [
   "localVlModel",
   "vlProvider",
   "temperature",
+  "personaCardId",
   "userName",
   "patText",
   "personaRelationship",
@@ -50,7 +51,8 @@ let userAvatar = "";
 let platform = "";
 
 function renderAvatars() {
-  el("aiAvatarPreview").src = aiAvatar || DEFAULT_AI_AVATAR;
+  const isCustomCard = Boolean(el("personaCardId").value.trim());
+  el("aiAvatarPreview").src = aiAvatar || (isCustomCard ? DEFAULT_AI_AVATAR_NEUTRAL : DEFAULT_AI_AVATAR);
   el("userAvatarPreview").src = userAvatar || DEFAULT_USER_AVATAR;
 }
 
@@ -58,7 +60,8 @@ function normalizeBackend(v) {
   const x = (v || "").toLowerCase();
   if (x === "local") return "local";
   if (x === "cosyvoice" || x === "cosy") return "cosyvoice";
-  return "volc";
+  if (x === "volc") return "volc";
+  return ""; // empty = off
 }
 
 function currentBackend() {
@@ -135,6 +138,7 @@ function fill(s) {
   syncVoiceFields();
   el("autoSpeak").checked = !!s.autoSpeak;
   el("showChatDebug").checked = s.showChatDebug === true;
+  el("personaCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
@@ -169,6 +173,175 @@ async function load() {
   }
 }
 
+// ---- persona card management ----
+
+let _lastCardId = null;
+let _cardList = [];
+
+async function loadCardList() {
+  try {
+    _cardList = await invoke("list_all_cards");
+  } catch (e) {
+    console.error("list_all_cards failed:", e);
+    _cardList = [];
+  }
+  const sel = el("personaCardId");
+  if (!sel) return;
+  while (sel.options.length > 1) sel.remove(1);
+  for (const card of _cardList) {
+    if (card.id === "kxyy-yuanyuan") continue;
+    const opt = document.createElement("option");
+    opt.value = card.id;
+    opt.textContent = "📦 " + card.name;
+    opt.dataset.name = card.name;
+    opt.dataset.desc = card.description || "";
+    sel.appendChild(opt);
+  }
+  updateCardInfoDisplay();
+}
+
+async function onCardChanged() {
+  const sel = el("personaCardId");
+  const cardId = sel.value.trim();
+  const opt = sel.selectedOptions?.[0];
+
+  _lastCardId = cardId;
+  updateCardInfoDisplay();
+  if (cardId) {
+    let cardAv = loadCardAvatar(cardId, "ai");
+    if (!cardAv) {
+      try { cardAv = await invoke("get_card_avatar", { cardId }); } catch (e) {}
+    }
+    aiAvatar = cardAv || "";
+    userAvatar = loadCardAvatar(cardId, "user") || "";
+  } else {
+    aiAvatar = "";
+    userAvatar = "";
+  }
+  renderAvatars();
+  const profile = loadCardProfile(cardId) || {};
+  el("userName").value = profile.userName || "";
+  el("personaRelationship").value = profile.relationship || "";
+  el("personaFacts").value = profile.facts || "";
+  el("personaJokes").value = profile.jokes || "";
+  el("personaTreatAs").value = profile.treatAs || "";
+  const voice = loadCardVoice(cardId);
+  if (voice) {
+    el("realtimeBackend").value = normalizeBackend(voice.backend);
+    el("ttsVoice").value = voice.voice || "";
+    if (voice.backend === "volc") el("volcTtsKey").value = voice.key || "";
+    else if (voice.backend === "cosyvoice") el("cosyvoiceModel").value = voice.model || "";
+    else if (voice.backend === "local") { el("localRefWav").value = voice.refWav || ""; el("localRefText").value = voice.refText || ""; }
+  }
+  syncVoiceFields();
+  probeBackendStatus();
+  const label = opt?.dataset?.name || (cardId || "kxyy-yuanyuan");
+  const titleEl = el("personaUserProfileTitle");
+  if (titleEl) titleEl.textContent = "audience profile (" + label + ")";
+  updateCardLabels(label);
+}
+
+function updateCardInfoDisplay() {
+  const sel = el("personaCardId");
+  const opt = sel?.selectedOptions?.[0];
+  const infoDiv = el("personaCardInfo");
+  if (!opt || !opt.value || !opt.dataset.name) {
+    if (infoDiv) infoDiv.hidden = true;
+    el("exportPersonaCardBtn").style.display = "none";
+    el("deletePersonaCardBtn").style.display = "none";
+    return;
+  }
+  if (infoDiv) infoDiv.hidden = false;
+  el("personaCardName").textContent = opt.dataset.name;
+  el("personaCardDesc").textContent = opt.dataset.desc || "";
+  el("personaCardSource").textContent = "📦 local";
+  el("exportPersonaCardBtn").style.display = "";
+  el("deletePersonaCardBtn").style.display = "";
+}
+
+function updateCardLabels(label) {
+  // placeholder
+}
+
+async function deleteCurrentCard() {
+  const sel = el("personaCardId");
+  const cardId = sel.value.trim();
+  if (!cardId) return;
+  const opt = sel.selectedOptions?.[0];
+  const name = opt?.dataset?.name || cardId;
+  if (!window.confirm("delete " + name + "?")) return;
+  try {
+    await invoke("delete_local_card", { cardId });
+    await loadCardList();
+    sel.value = _lastCardId || "";
+    statusEl.textContent = "deleted " + name;
+    statusEl.style.color = "#16a34a";
+  } catch (e) {
+    statusEl.textContent = "delete failed: " + e;
+    statusEl.style.color = "#dc2626";
+  } finally {
+    setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
+  }
+}
+
+async function exportCurrentCard() {
+  const cardId = el("personaCardId").value.trim();
+  if (!cardId) return;
+  try {
+    const data = await invoke("export_card", { cardId });
+    const { save } = window.__TAURI__?.dialog || {};
+    const { writeTextFile } = window.__TAURI__?.fs || {};
+    if (save && writeTextFile) {
+      const path = await save({ defaultPath: cardId + ".persona-card.json", filters: [{ name: "persona card JSON", extensions: ["json"] }] });
+      if (path) {
+        await writeTextFile(path, JSON.stringify(data, null, 2));
+        statusEl.textContent = "exported";
+        statusEl.style.color = "#16a34a";
+        setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
+      }
+    }
+  } catch (e) {
+    statusEl.textContent = "export failed: " + e;
+    statusEl.style.color = "#dc2626";
+    setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
+  }
+}
+
+async function importPersonaCard() {
+  try {
+    const { open } = window.__TAURI__?.dialog || {};
+    const { readTextFile } = window.__TAURI__?.fs || {};
+    let text;
+    if (open && readTextFile) {
+      const selected = await open({ multiple: false, filters: [{ name: "persona card JSON", extensions: ["json"] }] });
+      if (!selected) return;
+      text = await readTextFile(selected);
+    } else {
+      text = await new Promise((resolve) => {
+        const inp = document.createElement("input");
+        inp.type = "file"; inp.accept = ".json";
+        inp.onchange = async () => { const f = inp.files?.[0]; resolve(f ? await f.text() : null); };
+        inp.click();
+      });
+      if (!text) return;
+    }
+    const card = JSON.parse(text);
+    const cardId = await invoke("import_card_json", { json: JSON.stringify(card) });
+    const name = card?.meta?.name || card?.identity?.name || cardId;
+    await loadCardList();
+    el("personaCardId").value = cardId;
+    _lastCardId = cardId;
+    statusEl.textContent = "imported " + name;
+    statusEl.style.color = "#16a34a";
+    onCardChanged();
+    setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
+  } catch (e) {
+    statusEl.textContent = "import failed: " + e;
+    statusEl.style.color = "#dc2626";
+    setTimeout(() => { statusEl.textContent = ""; statusEl.style.color = ""; }, 2500);
+  }
+}
+
 function collect() {
   return {
     deepseekKey: el("deepseekKey").value.trim(),
@@ -196,6 +369,7 @@ function collect() {
     vlProvider: currentVlProvider(),
     thinking: el("thinking").checked,
     temperature: Number(el("temperature").value) || 0.8,
+    personaCardId: el("personaCardId").value.trim(),
     userName: el("userName").value.trim(),
     patText: el("patText").value.trim(),
     personaRelationship: el("personaRelationship").value.trim(),
@@ -214,10 +388,19 @@ function collect() {
 }
 
 async function save() {
+  const cardId = el("personaCardId").value.trim();
+  if (cardId) {
+    saveCardProfile(cardId, { userName: el("userName").value.trim(), relationship: el("personaRelationship").value.trim(), facts: el("personaFacts").value.trim(), jokes: el("personaJokes").value.trim(), treatAs: el("personaTreatAs").value.trim() });
+    const bk = currentBackend();
+    if (bk) { saveCardVoice(cardId, { backend: bk, voice: el("ttsVoice").value.trim(), key: bk === "volc" ? el("volcTtsKey").value.trim() : undefined, model: bk === "cosyvoice" ? el("cosyvoiceModel").value.trim() : undefined, refWav: bk === "local" ? el("localRefWav").value.trim() : undefined, refText: bk === "local" ? el("localRefText").value.trim() : undefined }); }
+  }
   saveBtn.disabled = true;
   statusEl.textContent = "";
   try {
-    await invoke("set_ai_settings", { settings: collect() });
+    const payload = collect();
+    await invoke("set_ai_settings", { settings: payload });
+    // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
+    emit("apply-settings", payload);
     statusEl.style.color = "#16a34a";
     statusEl.textContent = "已保存";
   } catch (e) {
@@ -254,6 +437,8 @@ function bindAvatar(kind) {
     if (!file || !file.type.startsWith("image/")) return;
     try {
       const dataUrl = await readFileAsDataUrl(file);
+      const cid = el("personaCardId").value.trim();
+      if (cid) { saveCardAvatar(cid, kind, dataUrl); }
       if (kind === "ai") aiAvatar = dataUrl;
       else userAvatar = dataUrl;
       renderAvatars();
@@ -458,6 +643,11 @@ listen("local-text-pull-progress", ({ payload }) => {
 });
 
 saveBtn.addEventListener("click", save);
+
+el("personaCardId")?.addEventListener("change", onCardChanged);
+el("deletePersonaCardBtn")?.addEventListener("click", deleteCurrentCard);
+el("exportPersonaCardBtn")?.addEventListener("click", exportCurrentCard);
+el("importPersonaCardBtn")?.addEventListener("click", importPersonaCard);
 el("realtimeBackend").addEventListener("change", () => {
   syncVoiceFields();
   probeBackendStatus();
@@ -501,14 +691,14 @@ listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));
 
 el("clearMemory").addEventListener("click", async () => {
   const ok = window.confirm(
-    "确定清空所有长期记忆？\n\n元元将不再记得你们之前的偏好、约定与对话概要。此操作不可撤销。",
+    "确定清空当前人设卡的长期记忆？\n\n此操作只清当前人设卡下的记忆，不影响其他人设卡的记忆。此操作不可撤销。",
   );
   if (!ok) return;
   const btn = el("clearMemory");
   const st = el("clearMemoryStatus");
   btn.disabled = true;
   try {
-    clearAllMemory();
+    clearAllMemory(el("personaCardId").value.trim());
     await emit("memory-cleared", {});
     st.style.color = "#16a34a";
     st.textContent = "已清空";
@@ -530,8 +720,25 @@ async function init() {
   } catch (_) {
     platform = "";
   }
+  // 必须先加载下拉列表选项，再 fill 表单，否则 fill 设置 personaCardId 时
+  // 目标 option 尚未插入 select，value 赋值会被浏览器静默清空，导致重启后
+  // 人设卡回退到默认 kxyy-yuanyuan。
+  await loadCardList();
   await load();
-  // 页面加载后立即探测当前后端的就绪状态
+  _lastCardId = el("personaCardId").value.trim();
+  updateCardInfoDisplay();
+  if (_lastCardId) {
+    let cardAv = loadCardAvatar(_lastCardId, "ai");
+    if (!cardAv) { try { cardAv = await invoke("get_card_avatar", { cardId: _lastCardId }); } catch (e) {} }
+    if (cardAv) aiAvatar = cardAv;
+  }
+  userAvatar = loadCardAvatar(_lastCardId || "", "user") || "";
+  renderAvatars();
+  const opt = el("personaCardId").selectedOptions?.[0];
+  const label = opt?.dataset?.name || (_lastCardId || "kxyy-yuanyuan");
+  const titleEl = el("personaUserProfileTitle");
+  if (titleEl) titleEl.textContent = "audience profile (" + label + ")";
+  updateCardLabels(label);
   probeBackendStatus();
   probeLocalTextStatus();
 }

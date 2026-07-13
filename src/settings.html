@@ -6,321 +6,412 @@
   <link rel="stylesheet" href="./settings.css" />
 </head>
 <body>
-  <div class="wrap">
-    <h1>聊天设置</h1>
+  <div class="settings-layout">
+    <!-- ====== 左侧导航 ====== -->
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="models">
+        <span class="tab-icon">🧠</span>
+        <span class="tab-label">模型</span>
+      </button>
+      <button class="tab-btn" data-tab="voice">
+        <span class="tab-icon">🎙</span>
+        <span class="tab-label">语音</span>
+      </button>
+      <button class="tab-btn" data-tab="persona">
+        <span class="tab-icon">👤</span>
+        <span class="tab-label">人设</span>
+      </button>
+      <button class="tab-btn" data-tab="appearance">
+        <span class="tab-icon">🎨</span>
+        <span class="tab-label">外观</span>
+      </button>
+    </nav>
 
-    <!-- ====== 第一组：文字模型 ====== -->
-    <section>
-      <h2>文字模型</h2>
-      <label>
-        <span>文字服务商<small>无网络时可切换本地模型</small></span>
-        <select id="textProvider">
-          <option value="deepseek">DeepSeek（在线）</option>
-          <option value="local">本地模型（Ollama，离线可用）</option>
-        </select>
-      </label>
+    <!-- ====== 右侧内容区 ====== -->
+    <div class="tab-content">
 
-      <!-- DeepSeek 相关字段 -->
-      <div id="textFieldsDeepseek" class="text-provider-fields">
-        <label>
-          <span>DeepSeek API Key<small>文字聊天必填；本地语音对话也用</small></span>
-          <div class="pw-field">
-            <input id="deepseekKey" type="password" placeholder="sk-..." />
-            <button type="button" class="pw-toggle" data-target="deepseekKey" aria-label="显示 / 隐藏">👁</button>
+      <!-- ========== 页签 1：模型 ========== -->
+      <div class="tab-panel active" id="tab-models">
+
+        <!-- 文字模型 -->
+        <section>
+          <h2>文字模型</h2>
+          <label>
+            <span>文字服务商<small>无网络时可切换本地模型</small></span>
+            <select id="textProvider">
+              <option value="deepseek">DeepSeek（在线）</option>
+              <option value="local">本地模型（Ollama，离线可用）</option>
+            </select>
+          </label>
+
+          <div id="textFieldsDeepseek" class="text-provider-fields">
+            <label>
+              <span>DeepSeek API Key<small>文字聊天必填；本地语音对话也用</small></span>
+              <div class="pw-field">
+                <input id="deepseekKey" type="password" placeholder="sk-..." />
+                <button type="button" class="pw-toggle" data-target="deepseekKey" aria-label="显示 / 隐藏">👁</button>
+              </div>
+            </label>
+            <label>
+              <span>文字模型</span>
+              <select id="textModel">
+                <option value="">自动（按思考模式）</option>
+                <option value="deepseek-chat">deepseek-chat（快）</option>
+                <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+              </select>
+            </label>
+            <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
           </div>
-        </label>
-        <label>
-          <span>文字模型</span>
-          <select id="textModel">
-            <option value="">自动（按思考模式）</option>
-            <option value="deepseek-chat">deepseek-chat（快）</option>
-            <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
-          </select>
-        </label>
-        <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
-      </div>
 
-      <!-- 本地模型相关字段 -->
-      <div id="textFieldsLocal" class="text-provider-fields" hidden>
-        <label>
-          <span>本地模型<small>Ollama 的模型 tag</small></span>
-          <select id="localTextModel">
-            <option value="">— 请选择模型 —</option>
-            <option value="qwen3:14b">qwen3:14b（推荐，均衡）</option>
-            <option value="qwen3:8b">qwen3:8b（更快，低配优先）</option>
-            <option value="qwen3:4b">qwen3:4b（极速，可能 hold 不住复杂人设）</option>
-            <option value="qwen3:32b">qwen3:32b（更强，需更大显存/内存）</option>
-          </select>
-        </label>
-        <div class="model-actions">
-          <button id="pullLocalModel" type="button" class="ghost">下载 / 更新模型</button>
-          <span id="localTextPullStatus" class="hint"></span>
-        </div>
-        <p id="localTextServiceStatus" class="hint voice-service-status">检测中…</p>
+          <div id="textFieldsLocal" class="text-provider-fields" hidden>
+            <label>
+              <span>本地模型<small>Ollama 的模型 tag</small></span>
+              <select id="localTextModel">
+                <option value="">— 请选择模型 —</option>
+                <option value="qwen3:14b">qwen3:14b（推荐，均衡）</option>
+                <option value="qwen3:8b">qwen3:8b（更快，低配优先）</option>
+                <option value="qwen3:4b">qwen3:4b（极速，可能 hold 不住复杂人设）</option>
+                <option value="qwen3:32b">qwen3:32b（更强，需更大显存/内存）</option>
+              </select>
+            </label>
+            <div class="model-actions">
+              <button id="pullLocalModel" type="button" class="ghost">下载 / 更新模型</button>
+              <span id="localTextPullStatus" class="hint"></span>
+            </div>
+            <p id="localTextServiceStatus" class="hint voice-service-status">检测中…</p>
 
-        <label class="row-inline">
-          <input id="thinking" type="checkbox" />
-          <span>开启思考模式<small>本地 Qwen3→思考链（更慢，回复预算会自动加大）</small></span>
-        </label>
+            <label class="row-inline">
+              <input id="thinking" type="checkbox" />
+              <span>开启思考模式<small>本地 Qwen3→思考链（更慢，回复预算会自动加大）</small></span>
+            </label>
 
-        <label>
-          <span>采样温度<small>0~2，越高越发散</small></span>
-          <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
-        </label>
+            <label>
+              <span>采样温度<small>0~2，越高越发散</small></span>
+              <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
+            </label>
 
-        <p class="hint">
-          需先安装 <a href="https://ollama.com/download" target="_blank" rel="noreferrer">Ollama</a>（Windows / macOS 均可，5080 / M4 Pro 由其自动调用 CUDA / Metal 加速）。
-          保存后本 App 会自动探测并尝试拉起 Ollama 服务；首次使用可从 <code>hf-mirror</code> / ModelScope 导入 GGUF，或点「下载 / 更新模型」。
-        </p>
-      </div>
-
-      <div class="memory-actions">
-        <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
-        <span id="clearMemoryStatus" class="hint"></span>
-      </div>
-      <p class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后她不再记得过往，当前聊天气泡不会自动消失。</p>
-    </section>
-
-    <!-- ====== 第二组：视觉模型 ====== -->
-    <section>
-      <h2>视觉模型</h2>
-      <label>
-        <span>看图服务商<small>发图时用来识别图片内容</small></span>
-        <select id="vlProvider">
-          <option value="qwen">通义千问（在线）</option>
-          <option value="local">本地模型（Ollama，离线可用）</option>
-        </select>
-      </label>
-
-      <!-- 通义千问 VL 字段 -->
-      <div id="vlFieldsQwen" class="vl-provider-fields">
-        <label>
-          <span>通义千问 / DashScope Key<small>看图识别；CosyVoice 语音也用此 Key</small></span>
-          <div class="pw-field">
-            <input id="qwenVlKey" type="password" placeholder="sk-..." />
-            <button type="button" class="pw-toggle" data-target="qwenVlKey" aria-label="显示 / 隐藏">👁</button>
+            <p class="hint">
+              需先安装 <a href="https://ollama.com/download" target="_blank" rel="noreferrer">Ollama</a>（Windows / macOS 均可，5080 / M4 Pro 由其自动调用 CUDA / Metal 加速）。
+              保存后本 App 会自动探测并尝试拉起 Ollama 服务；首次使用可从 <code>hf-mirror</code> / ModelScope 导入 GGUF，或点「下载 / 更新模型」。
+            </p>
           </div>
-        </label>
-        <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
-      </div>
 
-      <!-- 本地 VL 字段 -->
-      <div id="vlFieldsLocal" class="vl-provider-fields" hidden>
-        <label>
-          <span>本地看图模型<small>Ollama 的 VL 模型 tag</small></span>
-          <select id="localVlModel">
-            <option value="">— 请选择模型 —</option>
-            <option value="minicpm-v:8b">minicpm-v:8b（推荐，中英文识图）</option>
-            <option value="llama3.2-vision:11b">llama3.2-vision:11b（Meta，英文更强）</option>
-            <option value="moondream:latest">moondream:latest（极轻，中文弱）</option>
-          </select>
-        </label>
-        <div class="model-actions">
-          <button id="pullLocalVlModel" type="button" class="ghost">下载 / 更新看图模型</button>
-          <span id="localVlPullStatus" class="hint"></span>
-        </div>
-        <p class="hint">
-          需先安装 <a href="https://ollama.com/download" target="_blank" rel="noreferrer">Ollama</a>。
-          推荐 <code>minicpm-v:8b</code>（约 5GB），支持中英文识图；也可用 <code>llama3.2-vision:11b</code>（英文更准）或 <code>moondream:latest</code>（极轻，中文弱）。
-        </p>
-      </div>
-
-      <p class="hint">看图模型与文字模型独立：可分别选择云端 / 本地。例如文字走 DeepSeek 云端、看图走本地 Ollama，或反过来。</p>
-    </section>
-
-    <!-- ====== 第三组：语音服务 ====== -->
-    <section>
-      <h2>语音服务</h2>
-      <label>
-        <span>语音后端<small>文字朗读与实时通话共用</small></span>
-        <select id="realtimeBackend">
-          <optgroup label="在线服务">
-            <option value="volc">火山引擎（云端）</option>
-            <option value="cosyvoice">CosyVoice（通义云端）</option>
-          </optgroup>
-          <optgroup label="本地服务">
-            <option value="local">Qwen3-TTS（本地）</option>
-          </optgroup>
-        </select>
-      </label>
-      <p id="voicePlatformHint" class="hint" hidden>当前为 macOS：本地语音请使用 Qwen3-TTS（该后端也支持 Windows / Linux）。</p>
-
-      <div id="voiceFieldsRef" class="voice-backend-fields" hidden>
-        <label>
-          <span>参考音频<small>本地克隆音色用；10~20s 单人清晰录音，wav/mp3</small></span>
-          <div class="file-field">
-            <input id="localRefWav" type="text" placeholder="/路径/voice.wav（或相对仓库根路径）" />
-            <button id="localRefWavBrowse" type="button" class="ghost">浏览…</button>
+          <div class="memory-actions">
+            <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
+            <span id="clearMemoryStatus" class="hint"></span>
           </div>
-        </label>
-        <label>
-          <span>参考音文案<small>与录音内容一致，可留空（留空克隆质量略降）</small></span>
-          <input id="localRefText" type="text" placeholder="录音里说的那句话" />
-        </label>
-        <p class="hint">本地 Qwen3-TTS 为<strong>零样本克隆，不训练音色</strong>：填入录音后<strong>保存并重启语音服务</strong>（切换后端或重开 App）即按此录音克隆。<strong>留空则使用内置元元参考音色</strong>。</p>
-      </div>
+          <p class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后她不再记得过往，当前聊天气泡不会自动消失。</p>
+        </section>
 
-      <div id="voiceFieldsVolc" class="voice-backend-fields" hidden>
-        <label>
-          <span>火山 TTS Key<small>朗读用</small></span>
-          <div class="pw-field">
-            <input id="volcTtsKey" type="password" placeholder="x-api-key" />
-            <button type="button" class="pw-toggle" data-target="volcTtsKey" aria-label="显示 / 隐藏">👁</button>
+        <!-- 视觉模型 -->
+        <section>
+          <h2>视觉模型</h2>
+          <label>
+            <span>看图服务商<small>发图时用来识别图片内容</small></span>
+            <select id="vlProvider">
+              <option value="qwen">通义千问（在线）</option>
+              <option value="local">本地模型（Ollama，离线可用）</option>
+            </select>
+          </label>
+
+          <div id="vlFieldsQwen" class="vl-provider-fields">
+            <label>
+              <span>通义千问 / DashScope Key<small>看图识别；CosyVoice 语音也用此 Key</small></span>
+              <div class="pw-field">
+                <input id="qwenVlKey" type="password" placeholder="sk-..." />
+                <button type="button" class="pw-toggle" data-target="qwenVlKey" aria-label="显示 / 隐藏">👁</button>
+              </div>
+            </label>
+            <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
           </div>
-        </label>
-        <label>
-          <span>实时语音 App ID<small>通话用</small></span>
-          <input id="realtimeAppId" type="text" placeholder="火山语音技术应用 ID" />
-        </label>
-        <label>
-          <span>实时语音 Access Key<small>通话用</small></span>
-          <div class="pw-field">
-            <input id="realtimeAccessKey" type="password" placeholder="Access Token" />
-            <button type="button" class="pw-toggle" data-target="realtimeAccessKey" aria-label="显示 / 隐藏">👁</button>
+
+          <div id="vlFieldsLocal" class="vl-provider-fields" hidden>
+            <label>
+              <span>本地看图模型<small>Ollama 的 VL 模型 tag</small></span>
+              <select id="localVlModel">
+                <option value="">— 请选择模型 —</option>
+                <option value="minicpm-v:8b">minicpm-v:8b（推荐，中英文识图）</option>
+                <option value="llama3.2-vision:11b">llama3.2-vision:11b（Meta，英文更强）</option>
+                <option value="moondream:latest">moondream:latest（极轻，中文弱）</option>
+              </select>
+            </label>
+            <div class="model-actions">
+              <button id="pullLocalVlModel" type="button" class="ghost">下载 / 更新看图模型</button>
+              <span id="localVlPullStatus" class="hint"></span>
+            </div>
+            <p class="hint">
+              需先安装 <a href="https://ollama.com/download" target="_blank" rel="noreferrer">Ollama</a>。
+              推荐 <code>minicpm-v:8b</code>（约 5GB），支持中英文识图；也可用 <code>llama3.2-vision:11b</code>（英文更准）或 <code>moondream:latest</code>（极轻，中文弱）。
+            </p>
           </div>
-        </label>
-        <label>
-          <span>音色 voice_id<small>朗读与通话共用，S_ 开头</small></span>
-          <input id="ttsVoice" type="text" placeholder="S_..." />
-        </label>
-        <p class="hint">朗读走火山 TTS，通话走火山端到端实时语音；音色共用上方 voice_id。</p>
+
+          <p class="hint">看图模型与文字模型独立：可分别选择云端 / 本地。例如文字走 DeepSeek 云端、看图走本地 Ollama，或反过来。</p>
+        </section>
       </div>
 
-      <div id="voiceFieldsLocal" class="voice-backend-fields" hidden>
-        <p class="hint">
-          macOS(Apple Silicon)：保存后<strong>自动配置</strong> Qwen3-TTS（创建 venv、装依赖、下载 MLX 量化模型到
-          <code>~/Library/Application Support/…/voice-runtime</code>，首次需网络、可能数分钟）。<br/>
-          Windows / Linux：走官方 PyTorch 包 <code>qwen-tts</code>（默认 1.7B 模型），先运行
-          <code>scripts/windows/setup-qwen3-tts.cmd</code> 创建 <code>.venv-qwen3</code> 环境并安装 torch / qwen-tts 等依赖
-         （NVIDIA 显卡自动装 CUDA 版 torch；RTX 50 系需 cu128）。<br/>
-          启动服务（通话 :19876，朗读 :19976），零样本克隆参考音频，不消耗火山 token。
-        </p>
-      </div>
+      <!-- ========== 页签 2：语音 ========== -->
+      <div class="tab-panel" id="tab-voice">
 
-      <div id="voiceFieldsCosyvoice" class="voice-backend-fields" hidden>
-        <label>
-          <span>CosyVoice 音色 id<small>cosyvoice- 开头</small></span>
-          <input id="cosyvoiceVoice" type="text" placeholder="cosyvoice-v3.5-flash-…" />
-        </label>
-        <label>
-          <span>CosyVoice 模型<small>需支持 instruction，默认 v3.5-flash</small></span>
-          <input id="cosyvoiceModel" type="text" placeholder="cosyvoice-v3.5-flash" />
-        </label>
-        <p class="hint">保存后自动启动 <code>server_cosyvoice.py</code>（通话 :19877，朗读 :19977）。本机 Whisper + DeepSeek，TTS 走通义云端（上方通义 Key），不消耗火山 token。</p>
-      </div>
+        <section>
+          <h2>语音服务</h2>
+          <label>
+            <span>语音后端<small>文字朗读与实时通话共用</small></span>
+            <select id="realtimeBackend">
+              <option value="">关闭（纯文字模式）</option>
+              <optgroup label="在线服务">
+                <option value="volc">火山引擎（云端）</option>
+                <option value="cosyvoice">CosyVoice（通义云端）</option>
+              </optgroup>
+              <optgroup label="本地服务">
+                <option value="local">Qwen3-TTS（本地）</option>
+              </optgroup>
+            </select>
+          </label>
+          <p id="voicePlatformHint" class="hint" hidden>当前为 macOS：本地语音请使用 Qwen3-TTS（该后端也支持 Windows / Linux）。</p>
 
-      <label class="row-inline">
-        <input id="autoSpeak" type="checkbox" />
-        <span>自动朗读元元的回复</span>
-      </label>
-      <label class="row-inline">
-        <input id="showChatDebug" type="checkbox" />
-        <span>显示聊天界面调试信息（语音 / 本地文字生成进度与用量）</span>
-      </label>
-      <label>
-        <span>AI 语音播放音量<small>朗读与通话，100% 为原音量，最高 200%</small></span>
-        <div class="range-row">
-          <input id="voiceVolume" type="range" min="0" max="200" step="5" value="100" />
-          <span id="voiceVolumeVal" class="range-val">100%</span>
-        </div>
-      </label>
-      <p id="voiceServiceStatus" class="hint voice-service-status">检测中…</p>
-      <pre id="voiceServiceLog" class="voice-service-log" hidden></pre>
-    </section>
-
-    <!-- ====== 第四组：观众画像 ====== -->
-    <section>
-      <h2>观众画像</h2>
-      <label>
-        <span>你的昵称<small>元元如何称呼你，留空=元宝</small></span>
-        <input id="userName" type="text" placeholder="元宝" />
-      </label>
-      <label>
-        <span>你和元元的关系</span>
-        <input id="personaRelationship" type="text" placeholder="比如：刚关注的萌新" />
-      </label>
-      <label>
-        <span>想让元元记住的事<small>每行一条</small></span>
-        <textarea id="personaFacts" rows="3" placeholder="我在深圳上班&#10;我养了只橘猫叫团子"></textarea>
-      </label>
-      <label>
-        <span>你俩的暗号 / 梗<small>每行一条</small></span>
-        <textarea id="personaJokes" rows="2" placeholder="每次都催她唱《虫儿飞》"></textarea>
-      </label>
-      <label>
-        <span>希望元元怎么对待你</span>
-        <textarea id="personaTreatAs" rows="2" placeholder="把我当聊得来的朋友，别太客套"></textarea>
-      </label>
-      <label class="row-inline">
-        <input id="loadPersona" type="checkbox" />
-        <span>对话时加载观众画像</span>
-      </label>
-      <p class="hint">这些资料只在本机保存，会随对话注入，让元元更懂你。留空就当普通粉丝「元宝」。</p>
-    </section>
-
-    <!-- ====== 第五组：头像与外观 ====== -->
-    <section>
-      <h2>头像与外观</h2>
-      <div class="avatar-grid">
-        <div class="avatar-item">
-          <span class="avatar-label">AI 头像</span>
-          <img id="aiAvatarPreview" class="avatar-preview" alt="AI 头像" />
-          <div class="avatar-btns">
-            <button id="aiAvatarUpload" type="button">上传</button>
-            <button id="aiAvatarReset" type="button" class="ghost">恢复默认</button>
+          <div id="voiceFieldsRef" class="voice-backend-fields" hidden>
+            <label>
+              <span>参考音频<small>本地克隆音色用；10~20s 单人清晰录音，wav/mp3</small></span>
+              <div class="file-field">
+                <input id="localRefWav" type="text" placeholder="/路径/voice.wav（或相对仓库根路径）" />
+                <button id="localRefWavBrowse" type="button" class="ghost">浏览…</button>
+              </div>
+            </label>
+            <label>
+              <span>参考音文案<small>与录音内容一致，可留空（留空克隆质量略降）</small></span>
+              <input id="localRefText" type="text" placeholder="录音里说的那句话" />
+            </label>
+            <p class="hint">本地 Qwen3-TTS 为<strong>零样本克隆，不训练音色</strong>：填入录音后<strong>保存并重启语音服务</strong>（切换后端或重开 App）即按此录音克隆。<strong>留空则使用内置元元参考音色</strong>。</p>
           </div>
-          <input id="aiAvatarFile" type="file" accept="image/*" hidden />
-        </div>
-        <div class="avatar-item">
-          <span class="avatar-label">我的头像</span>
-          <img id="userAvatarPreview" class="avatar-preview" alt="我的头像" />
-          <div class="avatar-btns">
-            <button id="userAvatarUpload" type="button">上传</button>
-            <button id="userAvatarReset" type="button" class="ghost">恢复默认</button>
+
+          <div id="voiceFieldsVolc" class="voice-backend-fields" hidden>
+            <label>
+              <span>火山 TTS Key<small>朗读用</small></span>
+              <div class="pw-field">
+                <input id="volcTtsKey" type="password" placeholder="x-api-key" />
+                <button type="button" class="pw-toggle" data-target="volcTtsKey" aria-label="显示 / 隐藏">👁</button>
+              </div>
+            </label>
+            <label>
+              <span>实时语音 App ID<small>通话用</small></span>
+              <input id="realtimeAppId" type="text" placeholder="火山语音技术应用 ID" />
+            </label>
+            <label>
+              <span>实时语音 Access Key<small>通话用</small></span>
+              <div class="pw-field">
+                <input id="realtimeAccessKey" type="password" placeholder="Access Token" />
+                <button type="button" class="pw-toggle" data-target="realtimeAccessKey" aria-label="显示 / 隐藏">👁</button>
+              </div>
+            </label>
+            <label>
+              <span>音色 voice_id<small>朗读与通话共用，S_ 开头</small></span>
+              <input id="ttsVoice" type="text" placeholder="S_..." />
+            </label>
+            <p class="hint">朗读走火山 TTS，通话走火山端到端实时语音；音色共用上方 voice_id。</p>
           </div>
-          <input id="userAvatarFile" type="file" accept="image/*" hidden />
-        </div>
-      </div>
-      <label>
-        <span>聊天字号 (px)</span>
-        <input id="chatFontSize" type="number" min="12" max="22" step="1" value="14" />
-      </label>
-    </section>
 
-    <!-- ====== 第六组：快捷键与互动 ====== -->
-    <section>
-      <h2>快捷键与互动</h2>
-      <label>
-        <span>切换聊天快捷键</span>
-        <input id="hotkey" type="text" placeholder="Ctrl+Shift+Space" />
-      </label>
-      <p class="hint">格式如 <code>Ctrl+Shift+Space</code>、<code>Alt+X</code>；修饰键 + 主键，改后立即生效。</p>
-      <label>
-        <span>拍一拍文案<small>{name}=你的昵称，{ai}=开心元元</small></span>
-        <input id="patText" type="text" placeholder="{name}拍了拍{ai}" />
-      </label>
-      <p class="hint">双击聊天里元元的头像即可「拍一拍」，她会主动回你一句。</p>
-      <div class="grid3">
-        <label>
-          <span>气泡宽度 (px)</span>
-          <input id="chatWidth" type="number" min="240" max="900" step="10" value="420" />
-        </label>
-        <label>
-          <span>气泡高度 (px)</span>
-          <input id="chatHeight" type="number" min="200" max="900" step="10" value="340" />
-        </label>
-        <label>
-          <span>距底部 (px)</span>
-          <input id="chatBottomOffset" type="number" min="0" max="1200" step="8" value="96" />
-        </label>
-      </div>
-    </section>
+          <div id="voiceFieldsLocal" class="voice-backend-fields" hidden>
+            <p class="hint">
+              macOS(Apple Silicon)：保存后<strong>自动配置</strong> Qwen3-TTS（创建 venv、装依赖、下载 MLX 量化模型到
+              <code>~/Library/Application Support/…/voice-runtime</code>，首次需网络、可能数分钟）。<br/>
+              Windows / Linux：走官方 PyTorch 包 <code>qwen-tts</code>（默认 1.7B 模型），先运行
+              <code>scripts/windows/setup-qwen3-tts.cmd</code> 创建 <code>.venv-qwen3</code> 环境并安装 torch / qwen-tts 等依赖
+             （NVIDIA 显卡自动装 CUDA 版 torch；RTX 50 系需 cu128）。<br/>
+              启动服务（通话 :19876，朗读 :19976），零样本克隆参考音频，不消耗火山 token。
+            </p>
+          </div>
 
-    <div class="actions">
-      <span id="status"></span>
-      <button id="save" type="button">保存</button>
+          <div id="voiceFieldsCosyvoice" class="voice-backend-fields" hidden>
+            <label>
+              <span>CosyVoice 音色 id<small>cosyvoice- 开头</small></span>
+              <input id="cosyvoiceVoice" type="text" placeholder="cosyvoice-v3.5-flash-…" />
+            </label>
+            <label>
+              <span>CosyVoice 模型<small>需支持 instruction，默认 v3.5-flash</small></span>
+              <input id="cosyvoiceModel" type="text" placeholder="cosyvoice-v3.5-flash" />
+            </label>
+            <p class="hint">保存后自动启动 <code>server_cosyvoice.py</code>（通话 :19877，朗读 :19977）。本机 Whisper + DeepSeek，TTS 走通义云端（上方通义 Key），不消耗火山 token。</p>
+          </div>
+
+          <label class="row-inline">
+            <input id="autoSpeak" type="checkbox" />
+            <span>自动朗读元元的回复</span>
+          </label>
+          <label class="row-inline">
+            <input id="showChatDebug" type="checkbox" />
+            <span>显示聊天界面调试信息（语音 / 本地文字生成进度与用量）</span>
+          </label>
+          <label>
+            <span>AI 语音播放音量<small>朗读与通话，100% 为原音量，最高 200%</small></span>
+            <div class="range-row">
+              <input id="voiceVolume" type="range" min="0" max="200" step="5" value="100" />
+              <span id="voiceVolumeVal" class="range-val">100%</span>
+            </div>
+          </label>
+          <p id="voiceServiceStatus" class="hint voice-service-status">检测中…</p>
+          <pre id="voiceServiceLog" class="voice-service-log" hidden></pre>
+        </section>
+      </div>
+
+      <!-- ========== 页签 3：人设 ========== -->
+      <div class="tab-panel" id="tab-persona">
+
+        <!-- 人设卡 -->
+        <section>
+          <h2>人设卡</h2>
+          <div class="persona-card-select-row">
+            <select id="personaCardId">
+              <option value="">— 默认（开心元元）—</option>
+            </select>
+            <div class="persona-card-actions">
+              <button id="importPersonaCardBtn" class="btn-sm btn-ghost" title="导入人设卡">导入</button>
+              <button id="exportPersonaCardBtn" class="btn-sm btn-ghost" title="导出当前人设卡" style="display:none">导出</button>
+              <button id="deletePersonaCardBtn" class="btn-sm btn-ghost btn-danger" title="删除当前人设卡" style="display:none">删除</button>
+            </div>
+          </div>
+          <div id="personaCardInfo" class="persona-card-info" hidden>
+            <span id="personaCardName" class="persona-card-name"></span>
+            <span id="personaCardDesc" class="persona-card-desc"></span>
+            <small id="personaCardSource" class="persona-card-source"></small>
+          </div>
+          <p class="hint">📦 本地已安装 · 🌐 注册表（首次选用自动安装）。支持导入/导出人设卡 JSON 文件。</p>
+        </section>
+
+        <!-- 观众画像 -->
+        <section>
+          <h2 id="personaUserProfileTitle">观众画像</h2>
+          <label>
+            <span>你的昵称<small>AI 如何称呼你，留空=元宝</small></span>
+            <input id="userName" type="text" placeholder="元宝" />
+          </label>
+          <label>
+            <span id="personaRelationshipLabel">你和元元的关系</span>
+            <input id="personaRelationship" type="text" placeholder="比如：刚关注的萌新" />
+          </label>
+          <label>
+            <span id="personaFactsLabel">想让元元记住的事<small>每行一条</small></span>
+            <textarea id="personaFacts" rows="3" placeholder="我在深圳上班&#10;我养了只橘猫叫团子"></textarea>
+          </label>
+          <label>
+            <span>你俩的暗号 / 梗<small>每行一条</small></span>
+            <textarea id="personaJokes" rows="2" placeholder="每次都催她唱《虫儿飞》"></textarea>
+          </label>
+          <label>
+            <span id="personaTreatAsLabel">希望元元怎么对待你</span>
+            <textarea id="personaTreatAs" rows="2" placeholder="把我当聊得来的朋友，别太客套"></textarea>
+          </label>
+          <label class="row-inline">
+            <input id="loadPersona" type="checkbox" />
+            <span>对话时加载观众画像</span>
+          </label>
+          <p id="personaHint" class="hint">这些资料只在本机保存，会随对话注入，让元元更懂你。留空就当普通粉丝「元宝」。</p>
+        </section>
+      </div>
+
+      <!-- ========== 页签 4：外观 ========== -->
+      <div class="tab-panel" id="tab-appearance">
+
+        <!-- 头像与外观 -->
+        <section>
+          <h2>头像与外观</h2>
+          <div class="avatar-grid">
+            <div class="avatar-item">
+              <span class="avatar-label">AI 头像</span>
+              <img id="aiAvatarPreview" class="avatar-preview" alt="AI 头像" />
+              <div class="avatar-btns">
+                <button id="aiAvatarUpload" type="button">上传</button>
+                <button id="aiAvatarReset" type="button" class="ghost">恢复默认</button>
+              </div>
+              <input id="aiAvatarFile" type="file" accept="image/*" hidden />
+            </div>
+            <div class="avatar-item">
+              <span class="avatar-label">我的头像</span>
+              <img id="userAvatarPreview" class="avatar-preview" alt="我的头像" />
+              <div class="avatar-btns">
+                <button id="userAvatarUpload" type="button">上传</button>
+                <button id="userAvatarReset" type="button" class="ghost">恢复默认</button>
+              </div>
+              <input id="userAvatarFile" type="file" accept="image/*" hidden />
+            </div>
+          </div>
+          <label>
+            <span>聊天字号 (px)</span>
+            <input id="chatFontSize" type="number" min="12" max="22" step="1" value="14" />
+          </label>
+        </section>
+
+        <!-- 快捷键与互动 -->
+        <section>
+          <h2>快捷键与互动</h2>
+          <label>
+            <span>切换聊天快捷键</span>
+            <input id="hotkey" type="text" placeholder="Ctrl+Shift+Space" />
+          </label>
+          <p class="hint">格式如 <code>Ctrl+Shift+Space</code>、<code>Alt+X</code>；修饰键 + 主键，改后立即生效。</p>
+          <label>
+            <span>拍一拍文案<small>{name}=你的昵称，{ai}=开心元元</small></span>
+            <input id="patText" type="text" placeholder="{name}拍了拍{ai}" />
+          </label>
+          <p class="hint">双击聊天里元元的头像即可「拍一拍」，她会主动回你一句。</p>
+          <div class="grid3">
+            <label>
+              <span>气泡宽度 (px)</span>
+              <input id="chatWidth" type="number" min="240" max="900" step="10" value="420" />
+            </label>
+            <label>
+              <span>气泡高度 (px)</span>
+              <input id="chatHeight" type="number" min="200" max="900" step="10" value="340" />
+            </label>
+            <label>
+              <span>距底部 (px)</span>
+              <input id="chatBottomOffset" type="number" min="0" max="1200" step="8" value="96" />
+            </label>
+          </div>
+        </section>
+      </div>
+
     </div>
   </div>
+
+  <div class="actions">
+    <span id="status"></span>
+    <button id="save" type="button">保存</button>
+  </div>
   <script type="module" src="./settings.js"></script>
+  <!-- 页签切换：内联非模块脚本，确保不依赖模块加载时机 -->
+  <script>
+    (function () {
+      var nav = document.querySelector('.tab-nav');
+      if (!nav) return;
+      nav.addEventListener('click', function (e) {
+        var btn = e.target.closest('.tab-btn');
+        if (!btn) return;
+        var tab = btn.dataset.tab;
+        if (!tab) return;
+        document.querySelectorAll('.tab-btn').forEach(function (b) { b.classList.remove('active'); });
+        document.querySelectorAll('.tab-panel').forEach(function (p) { p.classList.remove('active'); });
+        btn.classList.add('active');
+        var panel = document.getElementById('tab-' + tab);
+        if (panel) panel.classList.add('active');
+      });
+    })();
+
+    // 等待模块脚本暴露 window.__settingsInit 后调用 init()
+    (function () {
+      var maxWait = 30; // 最多等 30 次 * 100ms = 3s
+      function tryInit() {
+        if (typeof window.__settingsInit === 'function') {
+          window.__settingsInit();
+          return;
+        }
+        if (--maxWait > 0) {
+          setTimeout(tryInit, 100);
+        } else {
+          console.error('[settings] window.__settingsInit 未在 3 秒内就绪');
+        }
+      }
+      tryInit();
+    })();
+  </script>
 </body>
 </html>

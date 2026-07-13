@@ -80,6 +80,9 @@ body {
 #startup-status .svc-dot.failed {
   background: #ef4444;
 }
+#startup-status .svc-dot.stopped {
+  background: rgba(255, 255, 255, 0.28);
+}
 #startup-status .svc-label {
   white-space: nowrap;
   margin-right: 8px;
@@ -190,8 +193,9 @@ body {
   white-space: pre-wrap;
   -webkit-user-select: text;
   user-select: text;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  /* 临时诊断：怀疑 backdrop-filter + box-shadow 在 WebView2 透明窗口产生渲染闪斑 */
+  /* backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px); */
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 .row.assistant .bubble {
@@ -352,7 +356,8 @@ body {
   margin-top: 3px;
   min-height: 12px;
 }
-#text-debug-gen[hidden] {
+#text-debug-gen[hidden],
+#voice-debug-tts[hidden] {
   display: none;
 }
 #voice-debug-bar,

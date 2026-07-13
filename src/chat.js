@@ -16,6 +16,7 @@ import {
   replyMaxTokens,
   buildImageDescribeMessages,
   resolveUserProfile,
+  isKxyyPersona,
   loadMemory,
   getEffectiveName,
   updateMemoryAfterSession,
@@ -24,6 +25,7 @@ import {
   getProactiveUserTrigger,
   proactiveWhoLabel,
   loadAssets,
+  reloadAssets,
   shouldDoFollowup,
   DEFAULT_FOLLOWUP_CHANCE,
   isHiddenUserMessage,
@@ -43,7 +45,7 @@ import {
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
 import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, onTtsProgress } from "./ai/tts.js";
-import { DEFAULT_AI_AVATAR, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
+import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
@@ -74,7 +76,8 @@ function resetTtsQueue() {
 /** 当前语音后端是否已具备自动朗读条件。 */
 function canAutoSpeak() {
   if (!settings.autoSpeak) return false;
-  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  const backend = (settings.realtimeBackend || "").toLowerCase();
+  if (!backend) return false; // 语音关闭
   if (backend === "local") return true;
   if (backend === "cosyvoice" || backend === "cosy") {
     return !!(settings.cosyvoiceVoice || "").trim();
@@ -143,7 +146,7 @@ async function speakPartsSynced(parts, { revealer, voice, gen }) {
  *  parts 为已切分好的句子数组；首句复用流式气泡 firstBubble。 */
 function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, stickerMid } = {}) {
   const gen = ttsQueueGen;
-  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  const backend = (settings.realtimeBackend || "").toLowerCase();
   // 火山才传 voice；本地 / CosyVoice(云/开源) 由后端按设置合成。
   const voiceOpt =
     backend === "volc" || backend === ""
@@ -241,10 +244,15 @@ function genMsgId() {
 }
 
 function userDisplayName() {
-  return (settings.userName || "").trim() || "元宝";
+  const name = (settings.userName || "").trim();
+  if (name) return name;
+  // 非 kxyy 人设（skill 卡）不留默认昵称
+  return isKxyyPersona(settings.personaCardId) ? "元宝" : "";
 }
 
 function aiName() {
+  // 优先用人设卡的 displayName（如 "郭德纲"），回退到默认 "开心元元"
+  if (assets && assets.displayName) return assets.displayName;
   return AI_DISPLAY_NAME;
 }
 
@@ -291,7 +299,12 @@ function formatPatMessage() {
 }
 
 function aiAvatarSrc() {
-  return (settings.aiAvatar || "").trim() || DEFAULT_AI_AVATAR;
+  const custom = (settings.aiAvatar || "").trim();
+  if (custom) return custom;
+  // 优先用人设卡自带的 avatar（data-url），其次由 setting 决定
+  if (assets && assets.avatar) return assets.avatar;
+  // 非 kxyy 人设（skill 卡）未配头像 → 用中性通用头像
+  return isKxyyPersona(settings.personaCardId) ? DEFAULT_AI_AVATAR : DEFAULT_AI_AVATAR_NEUTRAL;
 }
 function userAvatarSrc() {
   return (settings.userAvatar || "").trim() || DEFAULT_USER_AVATAR;
@@ -312,7 +325,9 @@ function createAvatar(role) {
 const voiceDebugEl = document.getElementById("voice-debug");
 const voiceDebugLabelEl = document.getElementById("voice-debug-label");
 const voiceDebugBarEl = document.getElementById("voice-debug-bar");
+const voiceDebugTtsEl = document.getElementById("voice-debug-tts");
 const voiceDebugTtsMetaEl = document.getElementById("voice-debug-tts-meta");
+const personaDebugMetaEl = document.getElementById("persona-debug-meta");
 const apiDebugMetaEl = document.getElementById("api-debug-meta");
 const textDebugGenEl = document.getElementById("text-debug-gen");
 const textDebugBarEl = document.getElementById("text-debug-bar");
@@ -354,7 +369,8 @@ let balanceFetchSeq = 0;
 
 /** 当前语音后端文案（朗读与通话共用）。 */
 function voiceBackendLabel() {
-  const backend = (settings.realtimeBackend || "volc").toLowerCase();
+  const backend = (settings.realtimeBackend || "").toLowerCase();
+  if (!backend) return "已关闭";
   if (backend === "local") return "本地 Qwen3-TTS（:19876 / :19976）";
   if (backend === "cosyvoice" || backend === "cosy") {
     return "CosyVoice 通义（:19877 / :19977）";
@@ -631,7 +647,6 @@ async function fetchDeepSeekBalance() {
 /** 更新启动状态栏：用语音 / AI 两个圆点表示服务就绪情况。 */
 function updateStartupStatus() {
   const bar = document.getElementById("startup-status");
-  console.log("[startup-status] updateStartupStatus", { bar: !!bar, dismissed: bar?.classList.contains("dismissed"), svcState });
   if (!bar || bar.classList.contains("dismissed")) return;
   const dots = bar.querySelectorAll(".svc-dot");
   const labels = bar.querySelectorAll(".svc-label");
@@ -646,11 +661,14 @@ function updateStartupStatus() {
       svcState[key] === "ready" ? "就绪" :
       svcState[key] === "loading" ? "启动中…" :
       svcState[key] === "failed" ? "异常" :
-      svcState[key] === "pending" ? "待检测" : "";
+      svcState[key] === "pending" ? "待检测" :
+      svcState[key] === "stopped" ? "已关闭" : "";
     if (label) label.textContent = `${key === "voice" ? "语音" : "AI"} ${statusText}`;
   }
-  // 全部就绪 → 短暂停留后消失
-  if (svcState.voice === "ready" && svcState.api === "ready") {
+  // 全部就绪/已关闭（视为就绪）→ 短暂停留后消失
+  const voiceDone = svcState.voice === "ready" || svcState.voice === "stopped";
+  const apiDone = svcState.api === "ready";
+  if (voiceDone && apiDone) {
     if (!svcDismissTimer) {
       svcDismissTimer = setTimeout(() => {
         bar.classList.add("dismissed");
@@ -696,11 +714,33 @@ async function checkApiReady() {
   updateStartupStatus();
 }
 
+function updatePersonaDebug() {
+  if (!personaDebugMetaEl) return;
+  if (!chatDebugEnabled()) {
+    personaDebugMetaEl.textContent = "";
+    return;
+  }
+  const cardId = settings?.personaCardId || "";
+  const displayName = assets?.displayName || "";
+  if (isKxyyPersona(cardId)) {
+    personaDebugMetaEl.textContent = cardId
+      ? `人设 · kxyy（${displayName || "开心元元"}）`
+      : "人设 · 默认（开心元元）";
+  } else {
+    personaDebugMetaEl.textContent = cardId
+      ? `人设 · ${cardId}（${displayName || cardId}）`
+      : "人设 · 默认";
+  }
+}
+
 function updateVoiceDebug() {
   if (!voiceDebugEl) return;
   const show = chatDebugEnabled();
   voiceDebugEl.hidden = !show;
+  // 显式后备：防止某些 WebView2 环境下 hidden 属性未能正确联动 CSS display
+  voiceDebugEl.style.display = show ? "" : "none";
   voiceDebugEl.setAttribute("aria-hidden", show ? "false" : "true");
+  updatePersonaDebug();
   if (!show || !voiceDebugLabelEl) {
     stopTextGenTimer();
     if (textDebugGenEl) textDebugGenEl.hidden = true;
@@ -709,7 +749,10 @@ function updateVoiceDebug() {
   }
   const vol = Number(settings.voiceVolume);
   const volPct = Number.isFinite(vol) ? Math.max(0, Math.min(200, vol)) : 100;
+  const voiceOff = !settings.realtimeBackend || !String(settings.realtimeBackend).trim();
   const lines = [`语音 · ${voiceBackendLabel()} · 音量 ${volPct}%`];
+  // 语音关闭时隐藏 TTS 进度条区域（否则会残留上次 synthing/done/idle 的样式）
+  if (voiceDebugTtsEl) voiceDebugTtsEl.hidden = voiceOff;
   if (settings.textProvider === "local") {
     lines.push(`文字 · 本地 ${localTextModelLabel()}`);
   }
@@ -946,7 +989,11 @@ async function loadConfig() {
   // apiBase 已就绪：上面安装的全局 fetch 改写会据此把 tts.js / persona.js 内部的
   // 相对 fetch("/api/...") 转发到本地 Rust 代理（tauri://localhost 没有 /api 路由）。
   try {
-    assets = await loadAssets();
+    settings = (await invoke("get_settings")) || {};
+  } catch (_) {}
+  // 先用 reloadAssets（清缓存 + 重新 fetch），且带重试——启动时 HTTP 服务端可能还未就绪。
+  try {
+    assets = await reloadAssetsWithRetry();
   } catch (_) {
     assets = {
       systemPrompt: "",
@@ -956,9 +1003,13 @@ async function loadConfig() {
       corrections: {},
     };
   }
-  try {
-    settings = (await invoke("get_settings")) || {};
-  } catch (_) {}
+  // 如果 assets 加载成功但缺少人设卡的 displayName，再试一次 reload
+  // （后端可能刚完成 setup 才设置 DYNAMIC_CARD，第一次 fetch 拿到的是默认值）。
+  if (settings.personaCardId && !assets.displayName) {
+    try {
+      assets = await reloadAssets();
+    } catch (_) {}
+  }
   try {
     await loadStickers();
   } catch (_) {}
@@ -969,12 +1020,32 @@ async function loadConfig() {
   scheduleStartupStatusCheck();
 }
 
+/** 带重试的 reloadAssets：启动时 HTTP 服务器可能尚未就绪，等几秒再试。 */
+async function reloadAssetsWithRetry(maxRetries = 4, delayMs = 600) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await reloadAssets();
+    } catch (e) {
+      if (i < maxRetries - 1) {
+        console.log(`[loadConfig] loadAssets 第 ${i + 1} 次失败，${delayMs}ms 后重试...`, e);
+        await new Promise(r => setTimeout(r, delayMs));
+        // 递增延迟：600 → 1200 → 2000 → 3000
+        delayMs = Math.min(delayMs + 600, 3000);
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 /** 聊天窗口首次加载时，探测语音/AI 服务就绪状态。 */
 function scheduleStartupStatusCheck() {
   console.log("[startup-status] scheduleStartupStatusCheck, backend:", settings.realtimeBackend);
   // 语音：volc 无需本地服务 → 直接视为就绪；本地后端等 voice-service-status 事件。
-  const backend = (settings.realtimeBackend || "volc").toLowerCase();
-  if (backend === "volc") {
+  const backend = (settings.realtimeBackend || "").toLowerCase();
+  if (!backend) {
+    svcState.voice = "stopped";
+  } else if (backend === "volc") {
     svcState.voice = "ready";
   } else {
     svcState.voice = "loading";
@@ -1028,9 +1099,10 @@ function refreshIdentity() {
   if (!assets) return;
   const name = (settings.userName || "").trim();
   const stored = buildStoredProfileFromSettings(settings);
-  activeProfile = resolveUserProfile(assets.userProfile, name, stored);
+  activeProfile = resolveUserProfile(assets.userProfile, name, stored, settings.personaCardId);
   activeName = getEffectiveName(name, activeProfile);
-  memory = activeName ? loadMemory(activeName) : {};
+  memory = activeName ? loadMemory(settings.personaCardId || "", activeName) : {};
+
   lastRememberedLen = 0;
 }
 
@@ -1046,7 +1118,7 @@ async function flushMemory() {
     const snapshotLen = history.length;
     try {
       // apiKey 传空：桌面端 DeepSeek Key 在 Rust 代理侧读取，前端无需带 x-api-key。
-      const updated = await updateMemoryAfterSession("", activeName, memory, history, sessionId);
+      const updated = await updateMemoryAfterSession("", settings.personaCardId || "", activeName, memory, history, sessionId);
       if (updated) {
         memory = updated;
         lastRememberedLen = snapshotLen;
@@ -1064,7 +1136,7 @@ function buildRequestMessages(opts = {}) {
   // 画像来源：本人 ππ → 打包个人画像；其它 → 设置里自填的字段（refreshIdentity 已解析好）。
   // 是否把画像注入 system prompt 由「对话时加载观众画像」开关控制（默认开）。
   const profile = activeProfile
-    || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings));
+    || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings), settings.personaCardId);
   const useUserProfile = settings.loadPersona !== false;
   const systemPrompt = buildSystemPrompt(assets, {
     name: name || null,
@@ -1074,6 +1146,10 @@ function buildRequestMessages(opts = {}) {
     profile,
   });
   const maxTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
+  const stickerFreq = isKxyyPersona(settings.personaCardId) ? STICKER_FREQUENCY : "off";
+  const reqDebug = `cardId=${settings.personaCardId} sticker=${stickerFreq} sys=${(systemPrompt || "").substring(0,60)}`;
+  console.log("[buildRequestMessages]", reqDebug);
+  if (apiDebugMetaEl) { apiDebugMetaEl.textContent = "REQ " + reqDebug; apiDebugMetaEl.title = reqDebug; }
   return buildMessages({
     systemPrompt,
     fewShot: assets.fewShot,
@@ -1081,8 +1157,9 @@ function buildRequestMessages(opts = {}) {
     maxTurns,
     useLive: true,
     lore: assets.lore,
+    cardId: settings.personaCardId,
     stickerEmotions: stickerEmotions(),
-    stickerFrequency: STICKER_FREQUENCY,
+    stickerFrequency: stickerFreq,
     proactiveKind: opts.proactiveKind,
     patAction: opts.patAction || "",
     who: proactiveWhoLabel(name || "元宝"),
@@ -1494,7 +1571,7 @@ function buildRealtimeSystemRole() {
   if (!assets) return "";
   const name = (settings.userName || "").trim();
   const profile = activeProfile
-    || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings));
+    || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings), settings.personaCardId);
   const useUserProfile = settings.loadPersona !== false;
   let sys = buildSystemPrompt(assets, {
     name: name || null,
@@ -1503,7 +1580,7 @@ function buildRealtimeSystemRole() {
     profile,
   });
   try {
-    const live = computeLiveContext(new Date(), assets.lore);
+    const live = computeLiveContext(new Date(), assets.lore, settings.personaCardId);
     if (live) sys += "\n\n" + live;
   } catch (_) {}
   sys +=
@@ -1994,6 +2071,7 @@ listen("voice-service-status", ({ payload }) => {
 // 设置页保存后热更新（昵称 / 温度 / 思考模式 / 朗读音色 / 画像 / 头像 / 字号等）；
 // 昵称或画像字段变更时重载画像与记忆。
 listen("apply-settings", ({ payload }) => {
+  console.log("[chat] apply-settings 收到:", JSON.stringify({ showChatDebug: payload?.showChatDebug, hasShowChatDebug: "showChatDebug" in (payload || {}) }));
   if (!payload) return;
   const identityKeys = [
     "userName",
@@ -2005,10 +2083,30 @@ listen("apply-settings", ({ payload }) => {
   const identityChanged = identityKeys.some(
     (k) => k in payload && payload[k] !== settings[k]
   );
+  const cardIdChanged = "personaCardId" in payload && payload.personaCardId !== settings.personaCardId;
   const debugWasOn = settings.showChatDebug === true;
   settings = { ...settings, ...payload };
-  if (identityChanged) refreshIdentity();
+  console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
+  // 人设卡变更 → 重新从 /api/assets 加载人设语料 + 更新头像
+  if (cardIdChanged) {
+    console.log("[chat] 人设卡变更，重新加载 assets...");
+    reloadAssets().then((a) => {
+      assets = a;
+      window.__kxyy_active_card_id = settings.personaCardId || null;
+      // 卡有头像则用它，否则回退默认
+      if (a.avatar) {
+        settings.aiAvatar = a.avatar;
+      } else {
+        settings.aiAvatar = "";
+      }
+      refreshIdentity();
+      applyAppearance();
+    }).catch((e) => console.error("[chat] 重新加载 assets 失败:", e));
+  } else if (identityChanged) {
+    refreshIdentity();
+  }
   applyAppearance();
+  console.log("[chat] voiceDebugEl.hidden =", voiceDebugEl?.hidden);
   // 刚打开 debug，或 DeepSeek Key 可能变更时，补拉一次余额（本地模型无余额概念，跳过）。
   if (
     settings.textProvider !== "local" &&
@@ -2052,10 +2150,15 @@ listen("flush-memory-before-quit", async () => {
 
 loadConfig().then(() => inputEl.focus());
 
-// 聊天窗口 show/hide 时 DOM 不重载，需要在窗口可见时重置启动状态探测
+// 聊天窗口 show/hide 时 DOM 不重载。
+// 注意：不要每次显示都重置启动状态栏——首次 loadConfig 已探测完毕，
+// 反复弹出会让语音关闭 / 已 dismiss 的状态栏一再出现，破坏用户体验。
+let _startupCheckEverDone = false;
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
-  // 重置状态并重新探测
+  // 仅在首次可见时做一次探测，后续 hide/show 不再重查。
+  if (_startupCheckEverDone) return;
+  _startupCheckEverDone = true;
   svcState.voice = "pending";
   svcState.api = "pending";
   svcVoiceEventReceived = false;
