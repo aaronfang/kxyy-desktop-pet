@@ -1,0 +1,437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aaronfang/kxyy-desktop-pet/schemas/persona-card/v1",
+  "title": "人格卡 (Persona Card) v1",
+  "description": "自包含的角色人设卡片。可直灌 LLM system prompt（运营态），也可附带蒸馏分析数据（分析态）。",
+  "type": "object",
+  "required": ["meta", "identity", "system_prompt"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "description": "卡片元数据",
+      "required": ["card_id", "name", "schema_version"],
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "全局唯一标识，推荐格式: author/name 如 kxyy/yuanyuan"
+        },
+        "name": {
+          "type": "string",
+          "description": "人设名称，如「开心元元」"
+        },
+        "version": {
+          "type": "string",
+          "default": "1.0.0",
+          "description": "语义化版本号"
+        },
+        "created": {
+          "type": "string",
+          "format": "date",
+          "description": "创建日期 YYYY-MM-DD"
+        },
+        "updated": {
+          "type": "string",
+          "format": "date",
+          "description": "最后更新日期"
+        },
+        "author": {
+          "type": "string",
+          "description": "作者/维护者"
+        },
+        "source": {
+          "type": "string",
+          "description": "来源说明，如「由 persona-distill 管道从直播回放蒸馏生成」或「手动编写」"
+        },
+        "schema_version": {
+          "type": "string",
+          "const": "1.0",
+          "description": "Schema 版本，用于兼容性判断"
+        },
+        "description": {
+          "type": "string",
+          "description": "人设一句话简介"
+        },
+        "tags": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "标签，如 [\"主播\", \"男扮女装\", \"反串\", \"东北\"]"
+        },
+        "language": {
+          "type": "string",
+          "default": "zh-CN",
+          "description": "主要语言"
+        },
+        "license": {
+          "type": "string",
+          "description": "许可证"
+        }
+      }
+    },
+
+    "identity": {
+      "type": "object",
+      "description": "角色身份信息（事实层，与 persona-assets.js 的 identity facts 对齐）",
+      "required": ["name", "gender"],
+      "properties": {
+        "name": {"type": "string", "description": "角色名"},
+        "aliases": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "别名/曾用名列表"
+        },
+        "real_name": {"type": "string", "description": "真实姓名（如已公开）"},
+        "gender": {
+          "type": "string",
+          "description": "性别认同，如「男」「女」「非二元」"
+        },
+        "age": {"type": "integer", "description": "年龄"},
+        "birthday": {"type": "string", "description": "生日（农历或公历）"},
+        "zodiac": {"type": "string", "description": "星座"},
+        "height_cm": {"type": "number", "description": "身高 cm"},
+        "weight_kg": {"type": "number", "description": "体重 kg"},
+        "origin": {"type": "string", "description": "籍贯/出生地，如「黑龙江绥化兰西」"},
+        "location": {"type": "string", "description": "当前居住地"},
+        "occupation": {"type": "string", "description": "职业/身份"},
+        "persona_type": {
+          "type": "string",
+          "description": "人设类型：streamer(主播) / vtuber / original(原创角色) / historical / fictional",
+          "enum": ["streamer", "vtuber", "original", "historical", "fictional", "other"]
+        },
+        "description": {"type": "string", "description": "角色一句话描述"},
+        "personality_tags": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "性格标签，如 [\"善良\", \"敏感\", \"爱自嘲\"]"
+        }
+      }
+    },
+
+    "system_prompt": {
+      "type": "string",
+      "description": "完整的 system prompt。可直接注入 LLM 的 messages[0].content。包含角色设定、反应规则、表达风格、禁忌等全部运营态内容。"
+    },
+
+    "few_shot": {
+      "type": "array",
+      "description": "Few-shot 对话示例",
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": {"type": "string", "enum": ["user", "assistant"]},
+          "content": {"type": "string"}
+        }
+      }
+    },
+
+    "lore": {
+      "type": "object",
+      "description": "世界观/背景知识（结构化数据）",
+      "properties": {
+        "schedule": {
+          "type": "object",
+          "description": "作息/时间表",
+          "properties": {
+            "open_time": {"type": "string"},
+            "close_time": {"type": "string"},
+            "rest_day": {"type": "string"},
+            "rest_day_note": {"type": "string"}
+          }
+        },
+        "live_show_flow": {
+          "type": "object",
+          "description": "直播流程/环节",
+          "properties": {
+            "description": {"type": "string"},
+            "stages": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "note": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "sunday_special": {
+          "type": "object",
+          "description": "周日特殊活动"
+        },
+        "fans": {
+          "type": "object",
+          "description": "粉丝相关信息",
+          "properties": {
+            "nickname": {"type": "string", "description": "粉丝集体称呼"},
+            "group_count": {"type": "string"},
+            "overseas": {"type": "array", "items": {"type": "string"}},
+            "signature_meme": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "desc": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "known_big_fans": {
+          "type": "array",
+          "description": "已知重要粉丝/老粉名单"
+        },
+        "frequent_co_hosts": {
+          "type": "array",
+          "description": "常连麦主播/朋友名单"
+        },
+        "signature_looks": {
+          "type": "array",
+          "description": "招牌妆造/造型列表"
+        },
+        "key_events": {
+          "type": "array",
+          "description": "关键事件时间线"
+        },
+        "sensitive_topics": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "敏感话题/回避话题列表"
+        },
+        "catchphrases_culture": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "经典梗/文化"
+        }
+      }
+    },
+
+    "corrections": {
+      "type": "object",
+      "description": "事实修正列表，覆盖 AI 常见的认知错误",
+      "properties": {
+        "corrections": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "修正条目，如 '我自称元元，不是圆圆'"
+        }
+      }
+    },
+
+    "personality_dimensions": {
+      "type": "object",
+      "description": "人格维度分析数据（蒸馏管道产出，手动创建时可省略）",
+      "properties": {
+        "catchphrases": {
+          "type": "object",
+          "description": "口头禅/高频用语",
+          "properties": {
+            "phrases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "phrase": {"type": "string"},
+                  "count": {"type": "integer"},
+                  "context": {"type": "string", "description": "使用语境"}
+                }
+              }
+            },
+            "total": {"type": "integer"}
+          }
+        },
+        "sentence_style": {
+          "type": "object",
+          "description": "句式风格",
+          "properties": {
+            "avg_length": {"type": "string", "description": "平均句长描述"},
+            "structure_pref": {"type": "string", "description": "句式结构偏好"},
+            "rhythm": {"type": "string", "description": "节奏特征"},
+            "connectors": {"type": "string", "description": "连接词习惯"},
+            "fillers": {"type": "string", "description": "停顿/填充词"}
+          }
+        },
+        "emotional_pattern": {
+          "type": "object",
+          "description": "情绪表达模式",
+          "properties": {
+            "joy": {"type": "string", "description": "开心/兴奋时的表达"},
+            "anger": {"type": "string", "description": "生气/不满时的表达"},
+            "shy": {"type": "string", "description": "害羞/尴尬时的表达"},
+            "moved": {"type": "string", "description": "感动/走心时的表达"},
+            "tease": {"type": "string", "description": "调侃/吐槽时的表达"},
+            "comfort": {"type": "string", "description": "安慰/温柔时的表达"}
+          }
+        },
+        "interaction_pattern": {
+          "type": "object",
+          "description": "互动模式",
+          "properties": {
+            "praised": {"type": "string", "description": "被夸赞时的回应"},
+            "challenged": {"type": "string", "description": "被质疑/挑刺时的回应"},
+            "privacy": {"type": "string", "description": "被问隐私时的回应"},
+            "cold_start": {"type": "string", "description": "冷场/没弹幕时的自说自话"},
+            "flow": {"type": "string", "description": "接话习惯"},
+            "familiarity": {"type": "string", "description": "对熟客 vs 新观众的区别"}
+          }
+        },
+        "dialect_features": {
+          "type": "object",
+          "description": "方言特征",
+          "properties": {
+            "words": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "word": {"type": "string"},
+                  "meaning": {"type": "string"},
+                  "examples": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                  }
+                }
+              }
+            },
+            "grammar": {"type": "string", "description": "语法特征"},
+            "pronunciation": {"type": "string", "description": "发音特征"},
+            "total": {"type": "integer"}
+          }
+        },
+        "self_reference": {
+          "type": "object",
+          "description": "自我指称方式",
+          "properties": {
+            "terms": {"type": "string", "description": "自称方式"},
+            "variations": {"type": "string", "description": "自称在不同场景的变化"},
+            "self_descriptions": {"type": "string", "description": "自我描述/身份认知"},
+            "self_deprecation": {"type": "string", "description": "自嘲模式"}
+          }
+        },
+        "audience_address": {
+          "type": "object",
+          "description": "对观众/粉丝的称呼模式",
+          "properties": {
+            "collective": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "集体称呼"
+            },
+            "individual": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "个体称呼"
+            },
+            "by_scene": {
+              "type": "object",
+              "description": "不同场景的称呼变化",
+              "properties": {
+                "welcome": {"type": "string"},
+                "thanks": {"type": "string"},
+                "interaction": {"type": "string"},
+                "goodbye": {"type": "string"},
+                "angry_moved": {"type": "string"}
+              }
+            },
+            "intimacy_levels": {
+              "type": "object",
+              "description": "按亲密度分级",
+              "properties": {
+                "close": {"type": "string", "description": "熟客"},
+                "regular": {"type": "string", "description": "普通观众"},
+                "new": {"type": "string", "description": "新观众"}
+              }
+            },
+            "total": {"type": "integer"}
+          }
+        },
+        "stuttering_patterns": {
+          "type": "object",
+          "description": "口吃/重复模式（规则引擎提取）",
+          "properties": {
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "word": {"type": "string"},
+                  "count": {"type": "integer"}
+                }
+              }
+            },
+            "total_patterns": {"type": "integer"},
+            "frequency_per_1k": {"type": "number", "description": "每千字口吃频率"},
+            "imitation_rules": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "AI 模仿建议"
+            }
+          }
+        },
+        "topic_preference": {
+          "type": "object",
+          "description": "话题偏好",
+          "properties": {
+            "top_topics": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "topic": {"type": "string"},
+                  "examples": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                  }
+                }
+              }
+            },
+            "switch_patterns": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "话题切换模式"
+            },
+            "avoidance": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "回避模式"
+            },
+            "verbosity": {"type": "string", "description": "话痨程度描述"}
+          }
+        }
+      }
+    },
+
+    "voiceprint": {
+      "type": "object",
+      "description": "声纹参考信息（供说话人分离使用）",
+      "properties": {
+        "reference_audio_path": {
+          "type": "string",
+          "description": "参考音频路径（相对人格卡目录）"
+        },
+        "embedding_checksum": {
+          "type": "string",
+          "description": "声纹嵌入的校验和"
+        }
+      }
+    },
+
+    "source_materials": {
+      "type": "array",
+      "description": "素材来源列表",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["transcript", "audio", "manual", "other"]
+          },
+          "path": {"type": "string"},
+          "description": {"type": "string"},
+          "duration_hours": {"type": "number"}
+        }
+      }
+    }
+  }
+}

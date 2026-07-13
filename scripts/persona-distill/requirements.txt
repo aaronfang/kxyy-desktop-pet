@@ -1,0 +1,40 @@
+# ============================================================================
+# 元元人设蒸馏管道 - Python 依赖
+# ============================================================================
+# 安装: pip install -r requirements.txt
+# 注意: torch 的 index-url 需要根据 GPU 选择（见 setup.ps1）
+# ============================================================================
+
+# --- 核心：FunASR (SenseVoice + CAM++ + VAD) ---
+funasr>=1.0
+modelscope>=1.16
+
+# --- 背景音乐去除 ---
+demucs>=4.0
+# demucs 需要 torch + torchaudio（由 setup.ps1 处理）
+
+# --- LLM 推理 ---
+# 使用 Ollama API（无需额外 Python 包）
+# 如需 llama-cpp-python 本地推理，取消下行注释（setup.ps1 会自动处理 CUDA 后端）
+# llama-cpp-python>=0.3
+
+# --- 音频处理 ---
+librosa>=0.10
+soundfile>=0.12
+pydub>=0.25
+
+# --- 数据处理 ---
+numpy>=1.26
+scikit-learn>=1.3
+pyyaml>=6.0
+
+# --- 可选: 进度条 ---
+tqdm>=4.66
+
+# --- 可选: HuggingFace (如使用 hf 模型) ---
+# huggingface_hub>=0.20
+
+# 注意:
+# - torch 不在固定依赖中，由 setup.ps1 按 GPU 自动选择 index-url
+# - RTX 5080 (Blackwell, sm_120): 必须用 cu128 index
+# - 用 CPU/MPS: 用默认 PyPI

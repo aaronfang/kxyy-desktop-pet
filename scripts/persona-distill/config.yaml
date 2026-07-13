@@ -1,0 +1,154 @@
+# ============================================================================
+# 元元人设蒸馏管道 - 配置文件
+# ============================================================================
+# 所有 `null` 值会在 pipeline.py 启动时自动推导默认值。
+# 大部分配置可以直接使用默认值，只需配置输入文件路径即可。
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 输入输出路径
+# ---------------------------------------------------------------------------
+paths:
+  # 输入 WAV 文件目录（直播回放，可多个文件）
+  wav_dir: "sample_wav/"
+  # 输出根目录（中间结果和最终产物均在此）
+  output_dir: "output/"
+  # 元元纯净语音参考样本（10-30 秒即可，尽量无BGM、无他人声音）
+  # 如果提供，将使用增强版提取（VAD + CAM++ + MossFormer2 语音分离）
+  # 如果不提供，说话人识别会退化为"最多发言者 = 元元"的聚类策略
+  reference_wav: "sample_wav/kxyy-vocal-sample/kxyy-vocal-sample-12s.wav"
+
+# ---------------------------------------------------------------------------
+# 1. 背景音乐去除 (Demucs)
+# ---------------------------------------------------------------------------
+denoise:
+  enabled: true
+  # demucs 模型: "htdemucs" (默认，质量最好) | "htdemucs_ft" | "htdemucs_6s"
+  model: "htdemucs"
+  # 设备: "cuda" | "cpu" | "mps" (macOS)
+  device: "cuda"
+  # 分片长度(秒)，控制显存占用。htdemucs 上限 7.8，建议 7
+  segment: 7
+  # 重叠(秒)，越大分离质量越好但更慢
+  overlap: 0.25
+
+# ---------------------------------------------------------------------------
+# 2. 说话人分离 (FSMN-VAD + CAM++)
+# ---------------------------------------------------------------------------
+diarize:
+  enabled: true
+  # CAM++ 余弦相似度阈值（0-1），高于此值判定为元元
+  # 建议先用默认值 0.6，查看结果后微调
+  similarity_threshold: 0.6
+  # 最短语音片段(秒)，过滤太短的噪音
+  min_segment: 0.5
+  # 最长单段(毫秒)，超过会切分（直播说话一般不会单次超 30 秒）
+  max_segment_ms: 30000
+  # 如未提供 reference_wav，用此策略：
+  # "largest_cluster" - 选说话最多的聚类作为元元
+  fallback_strategy: "largest_cluster"
+
+# ---------------------------------------------------------------------------
+# 2b. 增强版主播语音提取 (extract_anchor)
+#     当 reference_wav 可用时自动启用，替代 diarize 步骤
+#     流程: VAD + CAM++ sub-chunk → MossFormer2_SS_16K 语音分离 → margin trim
+# ---------------------------------------------------------------------------
+extract_anchor:
+  # 设为 false 可回退到简单的 diarize 模式
+  enabled: true
+  # 推理设备
+  device: "cuda"
+  # CAM++ sub-chunk 匹配阈值（低于 diarize 因为做更细粒度的子段匹配）
+  similarity_threshold: 0.38
+  # 每个处理块的时长（秒），控制 GPU 显存占用
+  chunk_duration_s: 300
+  # 边界裁剪（毫秒），移除 MossFormer2 分离不完美的段首/段尾残留
+  margin_ms: 300
+  # 段间过渡淡化（毫秒）
+  fade_ms: 15
+
+# ---------------------------------------------------------------------------
+# 3. 语音识别 (SenseVoice)
+# ---------------------------------------------------------------------------
+asr:
+  # 模型: "iic/SenseVoiceSmall" (推荐) | "iic/SenseVoiceLarge"
+  model: "iic/SenseVoiceSmall"
+  # 设备
+  device: "cuda"
+  # SenseVoice 自带语言检测，但可指定偏好
+  language: "zh"
+  # 是否启用逆文本正则化（数字、标点规范化）
+  itn: true
+
+# ---------------------------------------------------------------------------
+# 3.5. 转录文本清洗（去除背景歌曲歌词碎片）
+# ---------------------------------------------------------------------------
+transcript_clean:
+  enabled: true
+  # 是否输出详细日志
+  verbose: false
+
+# ---------------------------------------------------------------------------
+# 4. LLM 人设蒸馏提取
+# ---------------------------------------------------------------------------
+distill:
+  # 引擎: "ollama" | "llama.cpp" | "deepseek"
+  engine: "deepseek"
+  
+  # -- llama.cpp 配置 --
+  llama_cpp:
+    # GGUF 模型路径（下载后填写）
+    model_path: null
+    # GPU offload 层数: -1 表示全部 | 0 仅 CPU | N 为指定层数
+    n_gpu_layers: -1
+    # 上下文窗口
+    n_ctx: 32768
+    # 线程数
+    n_threads: 8
+
+  # -- Ollama 配置（备选）--
+  ollama:
+    model: "qwen3:14b"
+    host: "http://127.0.0.1:11434"
+
+  # -- DeepSeek API 配置 --
+  deepseek:
+    # 模型: "deepseek-chat" (V3) 或 "deepseek-reasoner" (R1)
+    model: "deepseek-chat"
+    base_url: "https://api.deepseek.com"
+    # API Key 优先读取环境变量 DEEPSEEK_API_KEY，这里可留空
+    api_key: null
+
+  # -- 通用 LLM 参数 --
+  # 提取任务用低温度，减少幻觉/改写
+  temperature: 0.1
+  top_p: 0.9
+  # 重复惩罚系数，防止 LLM 输出卡死在重复同一行 (0-2, 默认 0.15)
+  frequency_penalty: 0.15
+  # 全文本提取模式（DeepSeek 128K 上下文，不用分块）
+  # 设置一个远大于转录文本的数值即可
+  chunk_chars: 200000
+  # 块间重叠字符数（全文本模式下无意义，保留兼容）
+  chunk_overlap: 0
+  # 提取维度配置（在 prompts/extraction.yaml 中定义具体 prompt）
+  dimensions:
+    - catchphrases      # 口头禅与高频词汇
+    - sentence_style    # 句式特征
+    - stuttering        # 口吃与重复模式（叠字、词语重复、短语重复）
+    - emotional_pattern # 情感表达模式
+    - interaction       # 互动回应模式
+    - dialect           # 方言/口音特征
+    - self_reference    # 自我指称方式
+    - audience_address  # 对粉丝的称呼模式
+    - topic_preference  # 话题偏好
+
+# ---------------------------------------------------------------------------
+# 5. 编译输出
+# ---------------------------------------------------------------------------
+compile:
+  # 输出格式: "json" | "yaml" | "markdown"
+  format: "json"
+  # 是否生成对比报告（蒸馏结果 vs 当前 system prompt）
+  comparison_report: true
+  # 当前 persona-assets 路径（用于对比报告）
+  current_persona_path: "../../src/ai/persona-assets.js"
