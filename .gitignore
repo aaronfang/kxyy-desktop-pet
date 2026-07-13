@@ -37,7 +37,7 @@ dist/
 /scripts/persona-distill/voiceprint/*
 !/scripts/persona-distill/voiceprint/README.md
 /scripts/persona-distill/.venv*/
-/scripts/persona-distill/__pycache__/
+/scripts/persona-distill/**/__pycache__/
 /scripts/persona-distill/pipeline*.log
 # persona-distill 临时调试脚本与日志（下划线前缀）
 /scripts/persona-distill/_debug_*.py
