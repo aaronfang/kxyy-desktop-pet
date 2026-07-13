@@ -198,7 +198,8 @@ pub fn normalize_backend(backend: &str) -> String {
     match backend.trim().to_ascii_lowercase().as_str() {
         "local" => "local".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
-        _ => "volc".into(),
+        "volc" => "volc".into(),
+        _ => String::new(), // 空/其他=关闭
     }
 }
 
@@ -873,10 +874,22 @@ pub fn stop(app: &AppHandle) {
     );
 }
 
-/// 按当前语音后端确保服务在跑（volc 则停掉托管进程）。
+/// 按当前语音后端确保服务在跑（volc 则停掉托管进程；空=关闭则不启动）。
 pub fn ensure(app: &AppHandle, backend_raw: &str) {
     let backend = normalize_backend(backend_raw);
     let port = port_for(&backend);
+
+    // 关闭语音：停服务、不启动
+    if backend.is_empty() {
+        stop(app);
+        emit(app, VoiceServiceStatus {
+            backend: String::new(),
+            state: "stopped".into(),
+            message: "语音已关闭".into(),
+            port: 0,
+        });
+        return;
+    }
 
     if backend == "volc" {
         stop(app);

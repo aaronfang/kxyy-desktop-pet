@@ -45,8 +45,8 @@
         "label": "settings",
         "title": "元元桌宠 · 设置",
         "url": "settings.html",
-        "width": 600,
-        "height": 760,
+        "width": 680,
+        "height": 780,
         "resizable": true,
         "maximizable": false,
         "skipTaskbar": false,
@@ -79,7 +79,8 @@
       "../scripts/windows/setup-qwen3-tts.cmd": "scripts/windows/setup-qwen3-tts.cmd",
       "../scripts/windows/setup-qwen3-tts.ps1": "scripts/windows/setup-qwen3-tts.ps1",
       "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.wav": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.wav",
-      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt"
+      "../scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt": "scripts/local-realtime/assets/kxyy-wechat-record-cut01_15s.txt",
+      "../persona-cards": "persona-cards"
     },
     "windows": {
       "nsis": {

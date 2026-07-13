@@ -2,6 +2,7 @@ mod api;
 mod local_text;
 mod persona_assets;
 mod realtime;
+
 mod voice_service;
 
 use std::fs;
@@ -152,6 +153,12 @@ struct Settings {
     #[serde(default = "default_true")]
     load_persona: bool,
 
+    // ---- 人设卡 ----
+    /// 当前加载的人格卡 ID（对应 persona-cards/<id>/ 目录）。
+    /// 空字符串表示使用编译期嵌入的默认人设。
+    #[serde(default)]
+    persona_card_id: String,
+
     // ---- 头像与外观 ----
     /// AI（元元）头像 data URL；空则用内置默认。
     #[serde(default)]
@@ -260,6 +267,7 @@ impl Settings {
             persona_jokes: String::new(),
             persona_treat_as: String::new(),
             load_persona: true,
+            persona_card_id: String::new(),
             ai_avatar: String::new(),
             user_avatar: String::new(),
             chat_font_size: default_font_size(),
@@ -313,7 +321,8 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
     let voice_backend = match backend.as_str() {
         "local" => "local".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
-        _ => "volc".into(),
+        "volc" => "volc".into(),
+        _ => String::new(),
     };
     AiConfig {
         deepseek_key: s.deepseek_key,
@@ -810,6 +819,99 @@ fn get_settings(state: tauri::State<AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
 
+/// 扫描 persona-cards/ 目录，返回所有可用人格卡的 card_id 列表。
+#[tauri::command]
+fn list_persona_cards(app: AppHandle) -> Result<Vec<String>, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::list_cards(&resource_dir)
+}
+
+/// 列出所有卡片（本地 + 注册表），含元数据（id, name, description, category, source, isLocal）。
+#[tauri::command]
+fn list_all_cards(app: AppHandle) -> Result<Vec<crate::persona_assets::CardMeta>, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::list_all_cards(&resource_dir)
+}
+
+/// 从 persona-cards/<card_id>/persona-card.json 加载人格卡并设为当前活跃。
+/// card_id 为空字符串时恢复编译期嵌入的默认人设。
+/// 如果卡片仅存在于注册表（非本地），则自动生成桩文件后再加载。
+#[tauri::command]
+fn set_persona_card(app: AppHandle, card_id: String) -> Result<(), String> {
+    if card_id.is_empty() {
+        crate::persona_assets::reset_to_default();
+        return Ok(());
+    }
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+
+    crate::persona_assets::load_card_from_file(&card_id, &resource_dir)
+}
+
+/// 删除指定本地人格卡。
+#[tauri::command]
+fn delete_persona_card(app: AppHandle, card_id: String) -> Result<(), String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::delete_card(&card_id, &resource_dir)
+}
+
+/// 导出指定人格卡的 JSON 内容。
+#[tauri::command]
+fn export_persona_card(app: AppHandle, card_id: String) -> Result<String, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::export_card_json(&card_id, &resource_dir)
+}
+
+/// 导入人格卡（card_id + JSON 内容）。
+#[tauri::command]
+fn import_persona_card(app: AppHandle, card_id: String, json_content: String) -> Result<String, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::import_card_json(&card_id, &json_content, &resource_dir)
+}
+
+/// 读取入设卡内置的头像（来自 persona-card.json 的 avatar 字段）。
+#[tauri::command]
+fn get_card_avatar(app: AppHandle, card_id: String) -> Result<String, String> {
+    if card_id.is_empty() {
+        return Ok(String::new());
+    }
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::get_card_avatar(&card_id, &resource_dir)
+}
+
+/// 读取入设卡显示名称。
+#[tauri::command]
+fn get_card_display_name(app: AppHandle, card_id: String) -> Result<String, String> {
+    if card_id.is_empty() {
+        return Ok(String::new());
+    }
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("无法获取资源目录: {e}"))?;
+    crate::persona_assets::get_card_display_name(&card_id, &resource_dir)
+}
+
 #[tauri::command]
 fn set_ignore_cursor(window: tauri::WebviewWindow, ignore: bool) -> Result<(), String> {
     window
@@ -914,6 +1016,13 @@ fn check_voice_service(state: tauri::State<AppState>) -> serde_json::Value {
         .trim()
         .to_ascii_lowercase();
     let normalized = voice_service::normalize_backend(&backend);
+    if normalized.is_empty() {
+        return serde_json::json!({
+            "backend": "",
+            "state": "stopped",
+            "message": "语音已关闭"
+        });
+    }
     if normalized == "volc" {
         return serde_json::json!({
             "backend": "volc",
@@ -1000,8 +1109,8 @@ fn get_realtime_base(state: tauri::State<AppState>) -> String {
     match backend.as_str() {
         "local" => format!("ws://127.0.0.1:{LOCAL_REALTIME_PORT}"),
         "cosyvoice" | "cosy" => format!("ws://127.0.0.1:{COSYVOICE_REALTIME_PORT}"),
-        _ if state.realtime_port == 0 => String::new(),
-        _ => format!("ws://127.0.0.1:{}", state.realtime_port),
+        "volc" if state.realtime_port != 0 => format!("ws://127.0.0.1:{}", state.realtime_port),
+        _ => String::new(), // 关或未初始化
     }
 }
 
@@ -1085,6 +1194,8 @@ struct AiSettingsInput {
     #[serde(default = "default_font_size")]
     chat_font_size: u32,
     hotkey: String,
+    #[serde(default)]
+    persona_card_id: String,
     chat_width: u32,
     chat_height: u32,
     chat_bottom_offset: u32,
@@ -1099,6 +1210,17 @@ fn get_platform() -> String {
 /// 保存 AI / 聊天设置：持久化 + 通知聊天窗口热更新 + 重注册快捷键 + 重定位聊天窗口。
 #[tauri::command]
 fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
+    // 先加载人设卡到 DYNAMIC_CARD（必须在 commit_settings emit apply-settings 之前），
+    // 确保聊天窗口收到事件后 fetch /api/assets 拿到的是新人格而非旧缓存。
+    let card_id = settings.persona_card_id.trim().to_string();
+    {
+        let resource_dir = app.path().resource_dir().unwrap_or_default();
+        if card_id.is_empty() {
+            crate::persona_assets::reset_to_default();
+        } else {
+            let _ = crate::persona_assets::load_card_from_file(&card_id, &resource_dir);
+        }
+    }
     commit_settings(&app, |s| {
         s.deepseek_key = settings.deepseek_key.trim().to_string();
         s.qwen_vl_key = settings.qwen_vl_key.trim().to_string();
@@ -1117,7 +1239,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.realtime_backend = match backend.as_str() {
             "local" => "local".into(),
             "cosyvoice" | "cosy" => "cosyvoice".into(),
-            _ => "volc".into(),
+            "volc" => "volc".into(),
+            _ => String::new(), // 空=关闭语音
         };
         s.cosyvoice_voice = settings.cosyvoice_voice.trim().to_string();
         s.cosyvoice_model = settings.cosyvoice_model.trim().to_string();
@@ -1153,6 +1276,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.chat_width = settings.chat_width.clamp(240, 900);
         s.chat_height = settings.chat_height.clamp(200, 900);
         s.chat_bottom_offset = settings.chat_bottom_offset.min(1200);
+        s.persona_card_id = card_id;
     });
     re_register_hotkey(&app);
     position_chat_window(&app);
@@ -1299,6 +1423,20 @@ pub fn run() {
             voice_service::ensure(&handle, &settings.realtime_backend);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
+            // 启动时按已保存的人格卡 ID 动态加载（为空则用编译期嵌入默认值）。
+            if settings.persona_card_id.is_empty() {
+                eprintln!("[setup] persona_card_id 为空，使用编译期默认人设");
+            } else {
+                eprintln!("[setup] 加载人设卡 '{}'", settings.persona_card_id);
+                let resource_dir = app
+                    .path()
+                    .resource_dir()
+                    .unwrap_or_default();
+                let card_id = settings.persona_card_id.clone();
+                if let Err(e) = crate::persona_assets::load_card_from_file(&card_id, &resource_dir) {
+                    eprintln!("[lib] 加载人格卡 '{}' 失败: {e}", card_id);
+                }
+            }
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
@@ -1337,6 +1475,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            list_persona_cards,
+            list_all_cards,
+            set_persona_card,
+            get_card_avatar,
+            get_card_display_name,
+            delete_persona_card,
+            export_persona_card,
+            import_persona_card,
             set_ignore_cursor,
             cursor_pos,
             show_menu,

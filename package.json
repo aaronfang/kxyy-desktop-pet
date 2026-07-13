@@ -15,7 +15,10 @@
     "build:mac": "npm run build -- --bundles dmg",
     "sync-assets": "node scripts/sync-assets.mjs",
     "sync-ai": "node scripts/sync-ai.mjs",
-    "encrypt-assets": "node scripts/encrypt-assets.mjs"
+    "encrypt-assets": "node scripts/build-persona-enc.mjs",
+    "distill": "cd scripts/persona-distill && python pipeline.py",
+    "validate-card": "python scripts/persona-distill/tools/validate_card.py",
+    "update-persona": "npm run validate-card -- persona-cards/kxyy-yuanyuan/persona-card.json && npm run encrypt-assets"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

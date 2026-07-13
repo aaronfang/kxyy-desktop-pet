@@ -21,15 +21,20 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 人设卡内置头像：图片文件 → data: URL（读取 + MIME 检测 + base64 编码）
+base64 = "0.22"
+mime_guess = "2"
 # 本地 AI 代理：轻量回环 HTTP 服务 + 上游流式转发
 tiny_http = "0.12"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 # 实时语音：本地 WS 桥接前端 ↔ 火山端到端实时语音大模型（自定义鉴权头 + 二进制帧）
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
+# 注册表卡片生成时用当前日期填充 meta.created
+chrono = "0.4"
 # 进程被外部信号强杀时（SIGINT/SIGTERM、Windows Ctrl+C/关闭控制台/注销/关机）的兜底清理，
 # 避免托管的本地语音子进程（server.py）变成孤儿。termination 特性额外覆盖 SIGTERM/SIGHUP。
 ctrlc = { version = "3", features = ["termination"] }
