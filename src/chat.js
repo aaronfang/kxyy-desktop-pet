@@ -1083,12 +1083,16 @@ async function loadConfig() {
       corrections: {},
     };
   }
-  // 如果 assets 加载成功但缺少人设卡的 displayName，再试一次 reload
-  // （后端可能刚完成 setup 才设置 DYNAMIC_CARD，第一次 fetch 拿到的是默认值）。
-  if (settings.personaCardId && !assets.displayName) {
+  // 后端返回资产必须与持久化的人格 ID 一致，避免启动竞态时缓存编译期默认人设。
+  const expectedCardId = (settings.personaCardId || "").trim();
+  const actualCardId = (assets.activeCardId || "").trim();
+  if ((expectedCardId && actualCardId !== expectedCardId) || (!expectedCardId && actualCardId)) {
     try {
-      assets = await reloadAssets();
-    } catch (_) {}
+      assets = await reloadAssetsWithMatchingCard(expectedCardId);
+    } catch (e) {
+      console.error("[loadConfig] 人格资产与设置不一致:", e);
+      throw e;
+    }
   }
   try {
     await loadStickers();
@@ -1116,6 +1120,19 @@ async function reloadAssetsWithRetry(maxRetries = 4, delayMs = 600) {
       }
     }
   }
+}
+
+async function reloadAssetsWithMatchingCard(expectedCardId, maxRetries = 4, delayMs = 250) {
+  let lastAssets = null;
+  for (let i = 0; i < maxRetries; i++) {
+    lastAssets = await reloadAssets();
+    if ((lastAssets.activeCardId || "").trim() === expectedCardId) return lastAssets;
+    if (i < maxRetries - 1) {
+      await new Promise(r => setTimeout(r, delayMs));
+      delayMs = Math.min(delayMs * 2, 1200);
+    }
+  }
+  throw new Error(`人格资产不匹配：期望 ${expectedCardId || "默认"}，实际 ${lastAssets?.activeCardId || "默认"}`);
 }
 
 /** 聊天窗口首次加载时，探测语音/AI 服务就绪状态。 */
@@ -2200,15 +2217,14 @@ listen("apply-settings", ({ payload }) => {
   const identityChanged = identityKeys.some(
     (k) => k in payload && payload[k] !== settings[k]
   );
-  const cardIdChanged = "personaCardId" in payload && payload.personaCardId !== settings.personaCardId;
   const debugWasOn = settings.showChatDebug === true;
   settings = { ...settings, ...payload };
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
-  // 人设卡变更 → 清空当前会话（避免旧气泡挂在新人设头像下）+ 重载语料
-  if (cardIdChanged) {
-    console.log("[chat] 人设卡变更，清空会话并重新加载 assets...");
+  // 人设相关保存都刷新资产，避免同 ID 卡内容更新或启动时缓存漂移。
+  if ("personaCardId" in payload) {
+    console.log("[chat] 人设设置已保存，清空会话并重新加载 assets...");
     resetConversation();
-    reloadAssets().then((a) => {
+    reloadAssetsWithMatchingCard((settings.personaCardId || "").trim()).then((a) => {
       assets = a;
       window.__kxyy_active_card_id = settings.personaCardId || null;
       // 卡有头像则用它，否则回退默认

@@ -815,8 +815,21 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 // ---- IPC 命令 ----
 
 #[tauri::command]
-fn get_settings(state: tauri::State<AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+fn get_settings(app: AppHandle, state: tauri::State<AppState>) -> Settings {
+    let settings = state.settings.lock().unwrap().clone();
+    let resource_dir = app.path().resource_dir().unwrap_or_default();
+    if settings.persona_card_id.trim().is_empty() {
+        crate::persona_assets::reset_to_default();
+    } else if let Err(e) = crate::persona_assets::load_card_from_file(
+        settings.persona_card_id.trim(),
+        &resource_dir,
+    ) {
+        eprintln!(
+            "[get_settings] 加载已保存人格卡 '{}' 失败: {e}",
+            settings.persona_card_id
+        );
+    }
+    settings
 }
 
 /// 扫描 persona-cards/ 目录，返回所有可用人格卡的 card_id 列表。
@@ -1398,6 +1411,20 @@ pub fn run() {
             let handle = app.handle().clone();
             let settings = load_settings(&handle);
 
+            // 必须先激活已保存的人格，再启动本地代理；否则聊天窗口可能先拿到编译期默认人设并缓存。
+            if settings.persona_card_id.is_empty() {
+                eprintln!("[setup] persona_card_id 为空，使用编译期默认人设");
+            } else {
+                eprintln!("[setup] 加载人设卡 '{}'", settings.persona_card_id);
+                let resource_dir = app
+                    .path()
+                    .resource_dir()
+                    .unwrap_or_default();
+                if let Err(e) = crate::persona_assets::load_card_from_file(&settings.persona_card_id, &resource_dir) {
+                    eprintln!("[lib] 加载人格卡 '{}' 失败: {e}", settings.persona_card_id);
+                }
+            }
+
             // 先启动本地 AI 代理，拿到端口后随设置一起纳入全局状态。
             let api_port = api::start(handle.clone()).unwrap_or(0);
             // 启动本地实时语音 WS 桥接：只提供密钥/音色，人设 system_role 由前端 start 消息带入。
@@ -1462,20 +1489,6 @@ pub fn run() {
             voice_service::ensure(&handle, &settings.realtime_backend, &voice_fp);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
-            // 启动时按已保存的人格卡 ID 动态加载（为空则用编译期嵌入默认值）。
-            if settings.persona_card_id.is_empty() {
-                eprintln!("[setup] persona_card_id 为空，使用编译期默认人设");
-            } else {
-                eprintln!("[setup] 加载人设卡 '{}'", settings.persona_card_id);
-                let resource_dir = app
-                    .path()
-                    .resource_dir()
-                    .unwrap_or_default();
-                let card_id = settings.persona_card_id.clone();
-                if let Err(e) = crate::persona_assets::load_card_from_file(&card_id, &resource_dir) {
-                    eprintln!("[lib] 加载人格卡 '{}' 失败: {e}", card_id);
-                }
-            }
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。

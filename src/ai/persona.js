@@ -314,6 +314,7 @@ export async function loadAssets() {
     displayName: data.displayName || null,
     avatar: data.avatar || "",
     tts: data.tts && typeof data.tts === "object" ? data.tts : null,
+    activeCardId: typeof data._dynamic_card_id === "string" ? data._dynamic_card_id : "",
   };
   return _assets;
 }
