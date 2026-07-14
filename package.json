@@ -9,7 +9,7 @@
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
-    "predev": "npm run encrypt-assets",
+    "predev": "node scripts/kill-services.mjs && npm run encrypt-assets",
     "build": "npm run encrypt-assets && node scripts/bundle-assets.mjs strip && tauri build && node scripts/bundle-assets.mjs restore",
     "build:win": "npm run build -- --bundles nsis",
     "build:mac": "npm run build -- --bundles dmg",
