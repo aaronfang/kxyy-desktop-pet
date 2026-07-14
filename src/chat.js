@@ -47,7 +47,7 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, onTtsProgress, splitSpeechChunks } from "./ai/tts.js";
+import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
@@ -722,12 +722,25 @@ async function fetchDeepSeekBalance() {
   }
 }
 
-/** 更新启动状态栏：用语音 / AI 两个圆点表示服务就绪情况。 */
+/** 更新启动状态栏：用语音 / AI 两个圆点表示服务就绪情况。
+ *  人设切换等场景会再次拉起本地语音模型；若栏已 dismiss，需重新亮起。 */
 function updateStartupStatus() {
   const bar = document.getElementById("startup-status");
-  if (!bar || bar.classList.contains("dismissed")) return;
-  const dots = bar.querySelectorAll(".svc-dot");
-  const labels = bar.querySelectorAll(".svc-label");
+  if (!bar) return;
+  const voiceDone = svcState.voice === "ready" || svcState.voice === "stopped";
+  const apiDone = svcState.api === "ready";
+  const allReady = voiceDone && apiDone;
+  // 任一服务离开就绪态（重载 / 失败 / 探测中）→ 取消消失计时并重新显示
+  if (!allReady) {
+    if (svcDismissTimer) {
+      clearTimeout(svcDismissTimer);
+      svcDismissTimer = null;
+    }
+    bar.classList.remove("dismissed");
+  } else if (bar.classList.contains("dismissed")) {
+    // 已消失且仍全部就绪：无需再刷 UI（避免短暂 ready 误闪）
+    return;
+  }
   // 更新圆点 class
   for (const key of Object.keys(svcState)) {
     const dot = bar.querySelector(`.svc-dot.${key}`);
@@ -744,12 +757,11 @@ function updateStartupStatus() {
     if (label) label.textContent = `${key === "voice" ? "语音" : "AI"} ${statusText}`;
   }
   // 全部就绪/已关闭（视为就绪）→ 短暂停留后消失
-  const voiceDone = svcState.voice === "ready" || svcState.voice === "stopped";
-  const apiDone = svcState.api === "ready";
-  if (voiceDone && apiDone) {
+  if (allReady) {
     if (!svcDismissTimer) {
       svcDismissTimer = setTimeout(() => {
         bar.classList.add("dismissed");
+        svcDismissTimer = null;
       }, 4000);
     }
   }
@@ -1500,6 +1512,13 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     // 双语卡若模型漏了 [[speak]]：只显示中文，别用英文参考音硬读中文。
     const skipSpeakMissingEn =
       needsBilingualTts(assets?.tts) && !useSpeakAlt;
+    if (skipSpeakMissingEn && chatDebugEnabled()) {
+      console.warn("[chat] 双语卡缺 [[speak]] 英文稿，跳过朗读", {
+        bilingual: bilingual.bilingual,
+        speakLen: speakText.length,
+        displayLen: raw.length,
+      });
+    }
 
     // speechDone：本条回复「文字+语音」全部同步出现完成的 promise（不朗读时为 null）。
     let speechDone = null;
@@ -2195,9 +2214,17 @@ listen("voice-service-status", ({ payload }) => {
     svcState.voice = "failed";
   } else if (state === "starting") {
     svcState.voice = "loading";
-  } else if (state === "skipped" || state === "stopped") {
-    // volc 标记为 skipped，或无服务 → 对启动栏也视为就绪（无需本地服务）
+  } else if (state === "skipped") {
+    // volc 等无需本地服务 → 视为就绪
     svcState.voice = "ready";
+  } else if (state === "stopped") {
+    // 用户关闭语音 → 就绪（已关闭）；仍选着本地后端时多半是换人设/参考音触发的
+    // 短暂 stop→restart，保持「启动中」以便底部状态栏重新亮起。
+    const backend = (settings.realtimeBackend || "").toLowerCase();
+    svcState.voice =
+      backend === "local" || backend === "cosyvoice" || backend === "cosy"
+        ? "loading"
+        : "stopped";
   }
   updateStartupStatus();
 });
@@ -2218,15 +2245,26 @@ listen("apply-settings", ({ payload }) => {
     (k) => k in payload && payload[k] !== settings[k]
   );
   const debugWasOn = settings.showChatDebug === true;
+  const prevCardId = (settings.personaCardId || "").trim();
+  const prevBackend = (settings.realtimeBackend || "").trim().toLowerCase();
   settings = { ...settings, ...payload };
+  const nextCardId = (settings.personaCardId || "").trim();
+  const nextBackend = (settings.realtimeBackend || "").trim().toLowerCase();
+  const cardChanged = "personaCardId" in payload && prevCardId !== nextCardId;
+  const backendChanged = "realtimeBackend" in payload && prevBackend !== nextBackend;
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
+  // 切人设 / 换语音后端：重建 Web Audio，避免挂起的 AudioContext 导致「合成成功却静音」。
+  if (cardChanged || backendChanged) {
+    console.log("[chat] 重置音频播放管线", { prevCardId, nextCardId, prevBackend, nextBackend });
+    resetPlaybackPipeline();
+  }
   // 人设相关保存都刷新资产，避免同 ID 卡内容更新或启动时缓存漂移。
   if ("personaCardId" in payload) {
     console.log("[chat] 人设设置已保存，清空会话并重新加载 assets...");
     resetConversation();
-    reloadAssetsWithMatchingCard((settings.personaCardId || "").trim()).then((a) => {
+    reloadAssetsWithMatchingCard(nextCardId).then((a) => {
       assets = a;
-      window.__kxyy_active_card_id = settings.personaCardId || null;
+      window.__kxyy_active_card_id = nextCardId || null;
       // 卡有头像则用它，否则回退默认
       if (a.avatar) {
         settings.aiAvatar = a.avatar;

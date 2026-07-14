@@ -111,6 +111,12 @@ function getSharedAudio() {
 /** 初始化 Web Audio 输出链（Gain → destination），与 <audio> 是否接入无关。 */
 function ensureAudioContext() {
   const g = getVoiceGain();
+  // closed 后不可复用：必须重建（切人设 / 长时间挂起后 WKWebView 会出现）。
+  if (outCtx && outCtx.state === "closed") {
+    outCtx = null;
+    outGain = null;
+    outSource = null;
+  }
   if (outCtx && outGain) {
     outGain.gain.value = g;
     if (outCtx.state === "suspended") outCtx.resume().catch(() => {});
@@ -184,16 +190,20 @@ function silentWavUrl() {
 }
 
 /** 在用户手势（点击/发送/按键等）的同步栈内调用，「加持」共享 <audio> 元素，
- *  使后续脱离手势的自动朗读也能成功 play()。多次调用安全：加持成功后即空转返回，
- *  也不会打断正在进行的真实朗读。 */
+ *  使后续脱离手势的自动朗读也能成功 play()。
+ *  每次手势都尝试 resume：WKWebView 在切设置窗 / 失焦后常把 AudioContext 挂起，
+ *  若因 blessed 直接 return，后续自动朗读会「合成成功却静音」直到整应用重启。 */
 export function unlockAudio() {
+  try {
+    ensureAudioContext();
+    if (outCtx?.state === "suspended") outCtx.resume().catch(() => {});
+  } catch { /* ignore */ }
   if (blessed) return;
   const a = getSharedAudio();
   // 已经在放真实音频时不要抢占元素；等下次手势再加持（极少发生）。
   if (playing) return;
   try {
     ensurePlaybackGain();
-    if (outCtx?.state === "suspended") outCtx.resume().catch(() => {});
     if (!silentUrl) silentUrl = silentWavUrl();
     a.src = silentUrl; // 静音 WAV，无需 mute，播放也听不见
     const p = a.play();
@@ -211,6 +221,23 @@ export function unlockAudio() {
       done();
     }
   } catch { /* ignore */ }
+}
+
+/** 切人设 / 语音后端热切换后重置播放管线，等价于「只重开聊天窗的音频侧」。
+ *  避免旧 AudioContext 挂起或 MediaElementSource 绑死导致「有合成无声音」。 */
+export function resetPlaybackPipeline() {
+  stopSpeak();
+  try {
+    if (outCtx && outCtx.state !== "closed") outCtx.close();
+  } catch { /* ignore */ }
+  outCtx = null;
+  outGain = null;
+  outSource = null;
+  activeBufferSource = null;
+  sharedAudio = null;
+  currentUrl = null;
+  blessed = false;
+  audioCache.clear();
 }
 
 // 合成结果缓存：同一「音色|model|文本」只请求上游一次，重复回放直接复用，省额度。
@@ -490,7 +517,17 @@ async function playBlobViaDecode(blob, myGen, { onStart, onError }) {
   source.buffer = audioBuffer;
   source.connect(outGain);
   activeBufferSource = source;
-  if (outCtx.state === "suspended") await outCtx.resume().catch(() => {});
+  if (outCtx.state === "suspended") {
+    try {
+      await outCtx.resume();
+    } catch {
+      /* 手势外 resume 失败时走 media 回退 */
+    }
+  }
+  // 仍挂起则抛错，交给 <audio> 回退——BufferSource 在 suspended 上下文会「看似播了」其实静音。
+  if (outCtx.state === "suspended") {
+    throw new Error("AudioContext 仍挂起");
+  }
 
   return new Promise((resolve) => {
     const finish = (err) => {
