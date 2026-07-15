@@ -1075,14 +1075,17 @@ function readFileAsDataUrl(file) {
 
 async function loadConfig() {
   console.log("[startup-status] loadConfig called");
-  try {
-    apiBase = await invoke("get_api_base");
-  } catch (_) {}
+  // Windows WebView2 有时会在 Rust setup() 完成 app.manage(AppState) 前就执行到这里。
+  // 首次 IPC 此时会报 state 尚未注册；不能静默回退到空 settings，否则本次窗口会一直
+  // 使用默认 kxyy 人设，直到设置页再次保存并通过 apply-settings 把配置推过来。
+  apiBase = await invokeWithStartupRetry("get_api_base");
   // apiBase 已就绪：上面安装的全局 fetch 改写会据此把 tts.js / persona.js 内部的
   // 相对 fetch("/api/...") 转发到本地 Rust 代理（tauri://localhost 没有 /api 路由）。
-  try {
-    settings = (await invoke("get_settings")) || {};
-  } catch (_) {}
+  settings = (await invokeWithStartupRetry("get_settings")) || {};
+  console.log("[loadConfig] 启动配置就绪:", {
+    personaCardId: settings.personaCardId || "",
+    showChatDebug: settings.showChatDebug === true,
+  });
   // 先用 reloadAssets（清缓存 + 重新 fetch），且带重试——启动时 HTTP 服务端可能还未就绪。
   try {
     assets = await reloadAssetsWithRetry();
@@ -1114,6 +1117,26 @@ async function loadConfig() {
   if (settings.textProvider !== "local" && chatDebugEnabled()) void fetchDeepSeekBalance();
   // 启动服务状态探测
   scheduleStartupStatusCheck();
+}
+
+/**
+ * 启动期 IPC 重试：Tauri 的配置窗口会先创建，Windows WebView2 可能早于 Rust
+ * setup() 中的 AppState 注册完成。只用于无参数、依赖 AppState 的只读命令。
+ */
+async function invokeWithStartupRetry(command, maxRetries = 30, delayMs = 100) {
+  let lastError = null;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await invoke(command);
+    } catch (e) {
+      lastError = e;
+      if (i < maxRetries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        delayMs = Math.min(delayMs + 50, 500);
+      }
+    }
+  }
+  throw new Error(`启动 IPC ${command} 在 ${maxRetries} 次重试后仍未就绪：${lastError}`);
 }
 
 /** 带重试的 reloadAssets：启动时 HTTP 服务器可能尚未就绪，等几秒再试。 */

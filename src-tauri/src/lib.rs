@@ -815,21 +815,16 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 // ---- IPC 命令 ----
 
 #[tauri::command]
-fn get_settings(app: AppHandle, state: tauri::State<AppState>) -> Settings {
-    let settings = state.settings.lock().unwrap().clone();
-    let resource_dir = app.path().resource_dir().unwrap_or_default();
-    if settings.persona_card_id.trim().is_empty() {
-        crate::persona_assets::reset_to_default();
-    } else if let Err(e) = crate::persona_assets::load_card_from_file(
-        settings.persona_card_id.trim(),
-        &resource_dir,
-    ) {
-        eprintln!(
-            "[get_settings] 加载已保存人格卡 '{}' 失败: {e}",
-            settings.persona_card_id
-        );
-    }
-    settings
+fn get_settings(state: tauri::State<AppState>) -> Settings {
+    // NOTE: 此处**不**重复加载人设卡（persona card）。
+    // DYNAMIC_CARD 在 setup() 阶段已根据 settings.persona_card_id 加载，
+    // 此后只在 set_ai_settings / set_persona_card 中随用户显式操作更新。
+    // 若 get_settings 也参与加载，一旦 resource_dir() 解析异常（如 Windows
+    // 安装路径含中文时 unwrap_or_default 落入空 PathBuf），会静默失败并导致
+    // 聊天窗口 fetch /api/assets 回退到编译期嵌入的 kxyy 默认人设，
+    // 且 reloadAssetsWithMatchingCard 的重试也无法修复（因为 retry 只是
+    // 重新 fetch /api/assets，不会触发 load_card_from_file）。
+    state.settings.lock().unwrap().clone()
 }
 
 /// 扫描 persona-cards/ 目录，返回所有可用人格卡的 card_id 列表。
@@ -1420,8 +1415,49 @@ pub fn run() {
                     .path()
                     .resource_dir()
                     .unwrap_or_default();
-                if let Err(e) = crate::persona_assets::load_card_from_file(&settings.persona_card_id, &resource_dir) {
-                    eprintln!("[lib] 加载人格卡 '{}' 失败: {e}", settings.persona_card_id);
+                eprintln!("[setup] resource_dir: {:?}", resource_dir);
+                match crate::persona_assets::load_card_from_file(
+                    &settings.persona_card_id,
+                    &resource_dir,
+                ) {
+                    Ok(()) => eprintln!(
+                        "[setup] 人格卡 '{}' 加载成功",
+                        settings.persona_card_id
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "[setup] 人格卡 '{}' 加载失败: {e}（resource_dir={:?}）",
+                            settings.persona_card_id, resource_dir
+                        );
+                        // 兜底：windows 下 resource_dir 解析异常时（如路径含中文），
+                        // 尝试用当前 exe 所在目录作为备选 resource_dir。
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Ok(exe_path) = std::env::current_exe() {
+                                if let Some(exe_dir) = exe_path.parent() {
+                                    let fallback = exe_dir.to_path_buf();
+                                    eprintln!(
+                                        "[setup] Windows 备选 resource_dir 尝试: {:?}",
+                                        fallback
+                                    );
+                                    if let Err(e2) =
+                                        crate::persona_assets::load_card_from_file(
+                                            &settings.persona_card_id,
+                                            &fallback,
+                                        )
+                                    {
+                                        eprintln!(
+                                            "[setup] Windows 备选路径也失败: {e2}"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[setup] Windows 备选路径加载成功"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
