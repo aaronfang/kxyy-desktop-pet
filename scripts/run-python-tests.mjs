@@ -14,7 +14,12 @@ const candidates =
 for (const [command, prefixArgs] of candidates) {
   const result = spawnSync(command, [...prefixArgs, "tests/test_local_realtime_events.py"], {
     stdio: "inherit",
-    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    env: {
+      ...process.env,
+      PYTHONDONTWRITEBYTECODE: "1",
+      PYTHONIOENCODING: "utf-8",
+      PYTHONUTF8: "1",
+    },
   });
   if (result.error?.code === "ENOENT") continue;
   process.exit(result.status ?? 1);
