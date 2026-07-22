@@ -13,6 +13,9 @@ export const TRACE_EVENT = Object.freeze({
   SPEECH_CANDIDATE: "speech_candidate",
   SPEECH_CONFIRMED: "speech_confirmed",
   SPEECH_REJECTED: "speech_rejected",
+  ENDPOINT_SOFT_END: "endpoint_soft_end",
+  ENDPOINT_REOPENED: "endpoint_reopened",
+  ENDPOINT_COMMITTED: "endpoint_committed",
   ASR_PARTIAL: "asr_partial",
   ASR_FINAL: "asr_final",
   LLM_REQUEST: "llm_request",
@@ -46,6 +49,7 @@ const SAFE_METRICS = new Set([
   "droppedSamples",
   "interim",
   "queuedMs",
+  "silenceMs",
   "playedSamples",
   "underruns",
 ]);

@@ -7,6 +7,7 @@
 //     下行 text  = 事件 JSON：
 //       {type:"session",state} / {type:"asr_start"} /
 //       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
+//       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
@@ -228,6 +229,15 @@ export class RealtimeSession {
       case "speech_rejected":
         this._rejectSpeech(msg.reason || "voice_rejected");
         break;
+      case "endpoint_soft_end":
+        this._recordEndpoint(TRACE_EVENT.ENDPOINT_SOFT_END, msg);
+        break;
+      case "endpoint_reopened":
+        this._recordEndpoint(TRACE_EVENT.ENDPOINT_REOPENED, msg);
+        break;
+      case "endpoint_committed":
+        this._recordEndpoint(TRACE_EVENT.ENDPOINT_COMMITTED, msg);
+        break;
       case "asr":
         // asr_end 之后的迟到识别（二遍 ASR 常见）必须忽略，
         // 否则会当成新一轮用户说话，把刚开始的助手语音整段 flush 掉 → 首句静音。
@@ -417,6 +427,12 @@ export class RealtimeSession {
     this._duckPlayback();
     this.cb.onSpeechCandidate?.();
     return true;
+  }
+
+  _recordEndpoint(eventType, msg = {}) {
+    this.trace.record(eventType, {
+      metrics: { silenceMs: Math.max(0, Number(msg.silenceMs) || 0) },
+    });
   }
 
   _confirmSpeech() {

@@ -24,6 +24,32 @@ class FakeWebSocket:
         return [json.loads(message) for message in self.messages if isinstance(message, str)]
 
 
+class SoftEndpointTests(unittest.TestCase):
+    def test_soft_end_reopens_before_deterministic_commit(self):
+        endpoint = common.SoftEndpoint()
+        events = []
+
+        for _ in range(common.SOFT_END_MS // common.FRAME_MS):
+            event = endpoint.observe(False, eligible=True)
+            if event:
+                events.append(event)
+        for _ in range((900 - common.SOFT_END_MS) // common.FRAME_MS):
+            event = endpoint.observe(False, eligible=True)
+            if event:
+                events.append(event)
+        events.append(endpoint.observe(True, eligible=True))
+
+        for _ in range(common.ENDPOINT_COMMIT_MS // common.FRAME_MS):
+            event = endpoint.observe(False, eligible=True)
+            if event:
+                events.append(event)
+
+        self.assertEqual(
+            [event for event in events if event],
+            ["soft_end", "reopened", "soft_end", "committed"],
+        )
+
+
 class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.ws = FakeWebSocket()
@@ -88,6 +114,45 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         messages = self.ws.json_messages()
         self.assertEqual(messages, [{"type": "speech_rejected", "reason": "voice_rejected"}])
         self.assertNotIn("幻觉文本", json.dumps(messages, ensure_ascii=False))
+
+    async def test_soft_endpoint_keeps_reopened_audio_in_one_utterance(self):
+        handled = []
+
+        async def capture_utterance(pcm, *, from_play_barge=False):
+            handled.append((pcm, from_play_barge))
+
+        self.session._handle_utterance = capture_utterance
+        voice = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+
+        for _ in range(20):
+            await self.session._on_frame(voice)
+        for _ in range(900 // common.FRAME_MS):
+            await self.session._on_frame(quiet)
+        await self.session._on_frame(voice)
+
+        self.assertEqual(handled, [])
+        self.assertTrue(self.session.in_speech)
+
+        for _ in range(common.ENDPOINT_COMMIT_MS // common.FRAME_MS):
+            await self.session._on_frame(quiet)
+
+        endpoint_types = [
+            message["type"]
+            for message in self.ws.json_messages()
+            if message["type"].startswith("endpoint_")
+        ]
+        self.assertEqual(
+            endpoint_types,
+            [
+                "endpoint_soft_end",
+                "endpoint_reopened",
+                "endpoint_soft_end",
+                "endpoint_committed",
+            ],
+        )
+        self.assertEqual(len(handled), 1)
+        self.assertFalse(self.session.in_speech)
 
 
 if __name__ == "__main__":
