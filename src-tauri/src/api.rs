@@ -107,7 +107,7 @@ fn cors_headers() -> Vec<Header> {
         // 前端需读 TTS 计费字符头（CosyVoice / 火山）。
         header(
             "Access-Control-Expose-Headers",
-            "X-Tts-Usage-Characters, X-Tts-Usage-Provider",
+            "X-Tts-Usage-Characters, X-Tts-Usage-Provider, X-Kxyy-Text-Provider",
         ),
     ]
 }
@@ -123,6 +123,20 @@ fn respond_json(request: tiny_http::Request, status: u16, body: String) {
     headers.push(header("Content-Type", "application/json; charset=utf-8"));
     headers.push(header("Cache-Control", "no-store"));
     let resp = Response::new(StatusCode(status), headers, body.as_bytes(), Some(body.len()), None);
+    let _ = request.respond(resp);
+}
+
+fn respond_json_with_text_provider(
+    request: tiny_http::Request,
+    body: String,
+    provider: &'static str,
+) {
+    let mut headers = cors_headers();
+    headers.push(header("Content-Type", "application/json; charset=utf-8"));
+    headers.push(header("Cache-Control", "no-store"));
+    headers.push(header("X-Kxyy-Text-Provider", provider));
+    let len = body.len();
+    let resp = Response::new(StatusCode(200), headers, body.as_bytes(), Some(len), None);
     let _ = request.respond(resp);
 }
 
@@ -328,7 +342,8 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     let temperature = body
         .get("temperature")
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.8);
+        .unwrap_or(cfg.temperature_default)
+        .clamp(0.0, 2.0);
     let max_tokens_in = body
         .get("max_tokens")
         .and_then(|v| v.as_i64())
@@ -440,7 +455,8 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
 
     if !stream {
         let text = upstream.text().unwrap_or_default();
-        return respond_json(request, 200, text);
+        let provider = if is_local_text { "Ollama" } else { "DeepSeek" };
+        return respond_json_with_text_provider(request, text, provider);
     }
 
     // 流式：原先把上游 Response 当 Read 直接透传给 tiny_http 走 chunked（无 Content-Length）。

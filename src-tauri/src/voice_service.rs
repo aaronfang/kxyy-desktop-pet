@@ -1217,6 +1217,11 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
         // 强制 USE_MODELSCOPE=true 让其走 ModelScope → hf-mirror 回退链。
         .env("USE_MODELSCOPE", "true")
         .env("PATH", augmented_tool_path());
+    // 本地实时语音的 LLM 统一走桌面 `/api/chat` 代理：provider/model/thinking
+    // 与文字聊天共用当前设置，DeepSeek Key 不进入 Python 子进程环境。
+    if let Some(base) = crate::local_api_base(app) {
+        cmd.env("KXYY_AI_PROXY_BASE", base);
+    }
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);

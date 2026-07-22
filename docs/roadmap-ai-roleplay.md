@@ -79,7 +79,7 @@ graph TD
 | 文字对话 | DeepSeek (`deepseek-chat`/`deepseek-reasoner`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
-| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper+DeepSeek / CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 朗读与通话**共用同一个后端选择**，不可分离 |
+| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper + 当前文字 provider / CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起本地通话复用 `textProvider`（DeepSeek/Ollama）；朗读与通话**共用同一个语音后端选择** |
 | 长期记忆 | — | `localStorage`（按昵称分档） | `persona.js` | 仅浏览器本地，无跨设备同步 |
 | 会话摘要 | 复用文字模型 | 同上 | `persona.js::updateRollingDigest` | 滚动摘要覆盖超窗口旧对话 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |

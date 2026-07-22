@@ -1,10 +1,13 @@
 import asyncio
 import importlib.util
+import io
 import json
+import os
 import struct
 import sys
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 
 
@@ -68,6 +71,110 @@ class GenerationCancelScopeTests(unittest.IsolatedAsyncioTestCase):
         first = session._new_scope("asr")
         second = session._new_scope("asr")
         self.assertEqual(second.generation, first.generation + 1)
+
+
+class TextProviderAdapterTests(unittest.TestCase):
+    def setUp(self):
+        self.original_proxy_base = os.environ.get("KXYY_AI_PROXY_BASE")
+        self.original_load_settings = common.load_settings
+        self.original_urlopen = common.urllib.request.urlopen
+        os.environ["KXYY_AI_PROXY_BASE"] = "http://127.0.0.1:54321"
+
+    def tearDown(self):
+        if self.original_proxy_base is None:
+            os.environ.pop("KXYY_AI_PROXY_BASE", None)
+        else:
+            os.environ["KXYY_AI_PROXY_BASE"] = self.original_proxy_base
+        common.load_settings = self.original_load_settings
+        common.urllib.request.urlopen = self.original_urlopen
+
+    def test_proxy_request_leaves_provider_model_and_keys_to_rust(self):
+        payload = common.build_llm_proxy_payload(
+            "角色设定",
+            [{"role": "assistant", "content": "上一轮"}],
+            "这一轮",
+        )
+
+        self.assertEqual(payload["provider"], "text")
+        self.assertFalse("model" in payload)
+        self.assertFalse("apiKey" in payload)
+        self.assertFalse("thinking" in payload)
+        self.assertFalse("temperature" in payload)
+        self.assertEqual(payload["messages"][-1]["content"], "这一轮")
+
+    def test_chat_llm_uses_loopback_proxy_and_returns_provider_usage(self):
+        captured = {}
+
+        class FakeResponse:
+            headers = {"X-Kxyy-Text-Provider": "Ollama"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "choices": [{"message": {"content": "本地回复"}}],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 4,
+                            "total_tokens": 14,
+                        },
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, *, timeout):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        common.load_settings = lambda: (_ for _ in ()).throw(
+            AssertionError("LLM adapter must not read settings.json")
+        )
+        common.urllib.request.urlopen = fake_urlopen
+
+        text, usage = common.chat_llm("角色设定", [], "用户内容")
+
+        self.assertEqual(text, "本地回复")
+        self.assertEqual(usage["total"], 14)
+        self.assertEqual(usage["_provider"], "Ollama")
+        self.assertEqual(captured["url"], "http://127.0.0.1:54321/api/chat")
+        self.assertEqual(captured["payload"]["provider"], "text")
+        self.assertNotIn("Authorization", captured["headers"])
+        self.assertEqual(captured["timeout"], 120)
+
+    def test_proxy_url_rejects_non_loopback_destination(self):
+        os.environ["KXYY_AI_PROXY_BASE"] = "https://example.com"
+        with self.assertRaisesRegex(RuntimeError, "本地文字代理未就绪"):
+            common._ai_proxy_chat_url()
+
+        os.environ["KXYY_AI_PROXY_BASE"] = "http://127.0.0.1:not-a-port"
+        with self.assertRaisesRegex(RuntimeError, "本地文字代理未就绪"):
+            common._ai_proxy_chat_url()
+
+    def test_proxy_error_uses_safe_message_without_detail(self):
+        body = json.dumps(
+            {"error": "未配置 DeepSeek API Key", "detail": "不得回显的完整请求内容"}
+        ).encode("utf-8")
+
+        def fake_urlopen(request, *, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(body),
+            )
+
+        common.urllib.request.urlopen = fake_urlopen
+        with self.assertRaisesRegex(RuntimeError, "未配置 DeepSeek API Key") as raised:
+            common.chat_llm("角色设定", [], "用户内容")
+        self.assertNotIn("完整请求内容", str(raised.exception))
 
 
 class SoftEndpointTests(unittest.TestCase):
