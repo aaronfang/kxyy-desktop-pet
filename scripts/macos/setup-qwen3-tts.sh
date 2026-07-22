@@ -177,12 +177,8 @@ PY
 
 log "STEP 5/5 下载 Whisper 模型（首次也可能较久）…"
 python - <<'PY'
-import os
-import tempfile
 import threading
 import time
-import wave
-from pathlib import Path
 
 def heartbeat(label: str, stop: threading.Event) -> None:
     t0 = time.time()
@@ -201,24 +197,14 @@ t.start()
 print("[setup-qwen3] 开始加载 mlx-community/whisper-large-v3-turbo …", flush=True)
 try:
     import mlx_whisper
+    import numpy as np
 
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    path = Path(path)
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(16000)
-        w.writeframes(b"\x00\x00" * 16000)
-    try:
-        mlx_whisper.transcribe(
-            str(path),
-            path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
-            language="zh",
-            verbose=False,
-        )
-    finally:
-        path.unlink(missing_ok=True)
+    mlx_whisper.transcribe(
+        np.zeros(16000, dtype=np.float32),
+        path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
+        language="zh",
+        verbose=False,
+    )
 finally:
     stop.set()
 print("[setup-qwen3] Whisper 模型就绪", flush=True)

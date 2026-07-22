@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "sampleRate": 16000,
+  "frameMs": 30,
+  "levels": {
+    "quiet": 0,
+    "voice": 6000,
+    "cough": 12000,
+    "keyboard": 15000,
+    "speakerEcho": 900
+  },
+  "scenarios": [
+    {
+      "id": "normal_turn",
+      "mode": "idle",
+      "segments": [
+        { "level": "voice", "frames": 20 },
+        { "level": "quiet", "frames": 35 }
+      ],
+      "expect": {
+        "candidateCount": 0,
+        "commitCount": 1,
+        "endpointEvents": ["endpoint_soft_end", "endpoint_committed"]
+      }
+    },
+    {
+      "id": "mandarin_pause_900ms",
+      "mode": "idle",
+      "segments": [
+        { "level": "voice", "frames": 20 },
+        { "level": "quiet", "frames": 30 },
+        { "level": "voice", "frames": 10 },
+        { "level": "quiet", "frames": 35 }
+      ],
+      "expect": {
+        "candidateCount": 0,
+        "commitCount": 1,
+        "endpointEvents": [
+          "endpoint_soft_end",
+          "endpoint_reopened",
+          "endpoint_soft_end",
+          "endpoint_committed"
+        ]
+      }
+    },
+    {
+      "id": "short_cough_during_playback",
+      "mode": "playback",
+      "segments": [
+        { "level": "cough", "frames": 4 },
+        { "level": "quiet", "frames": 40 }
+      ],
+      "expect": {
+        "candidateCount": 0,
+        "commitCount": 0,
+        "endpointEvents": []
+      }
+    },
+    {
+      "id": "keyboard_impulses_during_playback",
+      "mode": "playback",
+      "segments": [
+        { "level": "keyboard", "frames": 1 },
+        { "level": "quiet", "frames": 4 },
+        { "level": "keyboard", "frames": 1 },
+        { "level": "quiet", "frames": 4 },
+        { "level": "keyboard", "frames": 1 },
+        { "level": "quiet", "frames": 40 }
+      ],
+      "expect": {
+        "candidateCount": 0,
+        "commitCount": 0,
+        "endpointEvents": []
+      }
+    },
+    {
+      "id": "low_energy_speaker_echo",
+      "mode": "playback",
+      "segments": [
+        { "level": "speakerEcho", "frames": 60 }
+      ],
+      "expect": {
+        "candidateCount": 0,
+        "commitCount": 0,
+        "endpointEvents": []
+      }
+    },
+    {
+      "id": "two_confirmable_barge_ins",
+      "mode": "playback",
+      "segments": [
+        { "level": "voice", "frames": 20 },
+        { "level": "quiet", "frames": 35 },
+        { "level": "voice", "frames": 20 },
+        { "level": "quiet", "frames": 35 }
+      ],
+      "expect": {
+        "candidateCount": 2,
+        "commitCount": 2,
+        "endpointEvents": [
+          "endpoint_soft_end",
+          "endpoint_committed",
+          "endpoint_soft_end",
+          "endpoint_committed"
+        ]
+      }
+    }
+  ]
+}
