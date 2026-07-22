@@ -11,6 +11,7 @@
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
+//     本地级联事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //   挂断发 {type:"hangup"}。
 //
 // 音频采集/播放放前端而非 Rust 的原因：getUserMedia 自带回声消除(AEC)/降噪/AGC，
@@ -98,6 +99,7 @@ export class RealtimeSession {
     this._candidateInterruptsResponse = false;
     this._playbackDrainTimer = 0;
     this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
+    this._backendGeneration = 0;
     this._traceAsrFinalSeen = false;
   }
 
@@ -208,6 +210,7 @@ export class RealtimeSession {
     } catch {
       return;
     }
+    if (!this._acceptBackendGeneration(msg)) return;
     switch (msg.type) {
       case "session":
         if (msg.state === "ended") {
@@ -433,6 +436,15 @@ export class RealtimeSession {
     this.trace.record(eventType, {
       metrics: { silenceMs: Math.max(0, Number(msg.silenceMs) || 0) },
     });
+  }
+
+  _acceptBackendGeneration(msg) {
+    if (this.trace.provider !== "local" || msg.generation === undefined) return true;
+    const generation = msg.generation;
+    if (!Number.isSafeInteger(generation) || generation < 0) return false;
+    if (generation < this._backendGeneration) return false;
+    this._backendGeneration = generation;
+    return true;
   }
 
   _confirmSpeech() {

@@ -294,6 +294,43 @@ test("desktop session ducks candidates, resumes rejection and gates stale audio"
   assert.equal(eventTypes.includes(TRACE_EVENT.RESPONSE_CANCELLED), true);
 });
 
+test("desktop session rejects stale generation control events before reopening audio", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const assistantMessages = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAssistant: (text) => assistantMessages.push(text),
+  });
+  const playbackCommands = [];
+  session.playbackNode = {
+    port: { postMessage: (message) => playbackCommands.push(message) },
+  };
+  session.trace.startSession();
+  session._assistantActive = true;
+
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_confirmed", generation: 2 }),
+  });
+  assert.equal(session._audioGate, true);
+  session._onMessage({
+    data: JSON.stringify({ type: "speaking", generation: 1 }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant", text: "旧回复", generation: 1 }),
+  });
+  session._onMessage({ data: new ArrayBuffer(480) });
+
+  assert.equal(session._audioGate, true);
+  assert.deepEqual(assistantMessages, []);
+  assert.equal(playbackCommands.at(-1).type, "clear");
+
+  session._onMessage({
+    data: JSON.stringify({ type: "speaking", generation: 2 }),
+  });
+  assert.equal(session._audioGate, false);
+});
+
 test("candidate latches the interrupted response and clears its drain timer", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
