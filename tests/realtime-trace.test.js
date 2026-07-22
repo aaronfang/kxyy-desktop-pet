@@ -320,3 +320,36 @@ test("candidate latches the interrupted response and clears its drain timer", as
   assert.equal(playbackCommands.at(-1).type, "clear");
   await new Promise((resolve) => setTimeout(resolve, 20));
 });
+
+test("desktop session records privacy-safe soft endpoint transitions", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  session.trace.startSession();
+
+  for (const message of [
+    { type: "endpoint_soft_end", silenceMs: 480 },
+    { type: "endpoint_reopened", silenceMs: 900 },
+    { type: "endpoint_soft_end", silenceMs: 480 },
+    { type: "endpoint_committed", silenceMs: 1050 },
+  ]) {
+    session._onMessage({ data: JSON.stringify(message) });
+  }
+
+  const endpointEvents = session
+    .getTraceSnapshot()
+    .events.filter((event) => event.eventType.startsWith("endpoint_"));
+  assert.deepEqual(
+    endpointEvents.map((event) => event.eventType),
+    [
+      TRACE_EVENT.ENDPOINT_SOFT_END,
+      TRACE_EVENT.ENDPOINT_REOPENED,
+      TRACE_EVENT.ENDPOINT_SOFT_END,
+      TRACE_EVENT.ENDPOINT_COMMITTED,
+    ],
+  );
+  assert.deepEqual(
+    endpointEvents.map((event) => event.metrics.silenceMs),
+    [480, 900, 480, 1050],
+  );
+});

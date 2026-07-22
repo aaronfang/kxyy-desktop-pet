@@ -330,9 +330,11 @@ FRAME_MS = 30
 FRAME_SAMPLES = INPUT_RATE * FRAME_MS // 1000
 
 SPEECH_RMS = 0.018
-# 句尾静音多久算「说完」：过短会打断思考停顿，过长则回复变慢。
-# 2s 适合边想边说；若仍觉得抢话可再调到 2500。
-SILENCE_END_MS = 2000
+# 测试期 soft endpoint：先标记可能句尾，再保留 reopen 窗口兼容中文思考停顿。
+# 两者均为 30ms 帧的整数倍；约 1.05s 无续说后提交，替代原固定 2s 判停。
+SOFT_END_MS = 480
+SOFT_REOPEN_MS = 570
+ENDPOINT_COMMIT_MS = SOFT_END_MS + SOFT_REOPEN_MS
 MIN_SPEECH_MS = 500
 # 单句最长录音（安全阀，防异常一直录）。日常聊天够用；真要长独白可再加大。
 MAX_SPEECH_MS = 60000
@@ -356,6 +358,49 @@ _FILLER_RE = re.compile(
     r"^(嗯+|啊+|呃+|哦+|噢+|唔+|恩+|嘿+|欸+|唉+|那个|这|啊哈|哈哈+|嘿嘿+)+$"
 )
 _HALLUCINATION_RE = re.compile(r"字幕|订阅|点赞|鸣谢|翻译|thanks for watching", re.I)
+
+
+class SoftEndpoint:
+    """只处理帧级 voiced/quiet 决策的纯状态机，不持有 PCM 或 wall clock。"""
+
+    def __init__(
+        self,
+        *,
+        frame_ms: int = FRAME_MS,
+        soft_end_ms: int = SOFT_END_MS,
+        reopen_ms: int = SOFT_REOPEN_MS,
+    ):
+        if frame_ms <= 0 or soft_end_ms <= 0 or reopen_ms <= 0:
+            raise ValueError("endpoint durations must be positive")
+        self.frame_ms = frame_ms
+        self.soft_end_ms = soft_end_ms
+        self.commit_ms = soft_end_ms + reopen_ms
+        self.silence_ms = 0
+        self.state = "speaking"
+
+    def reset(self) -> None:
+        self.silence_ms = 0
+        self.state = "speaking"
+
+    def observe(self, voiced: bool, *, eligible: bool) -> str | None:
+        if voiced:
+            reopened = self.state == "soft_end"
+            self.reset()
+            return "reopened" if reopened else None
+
+        if self.state == "committed":
+            return None
+        self.silence_ms += self.frame_ms
+        if not eligible:
+            return None
+        if self.state == "speaking" and self.silence_ms >= self.soft_end_ms:
+            self.state = "soft_end"
+            return "soft_end"
+        if self.state == "soft_end" and self.silence_ms >= self.commit_ms:
+            self.state = "committed"
+            return "committed"
+        return None
+
 
 # 各 TTS 后端共用的 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
 SYSTEM_SUFFIX = (
@@ -966,6 +1011,7 @@ class Session:
         self.in_speech = False
         self.silence_ms = 0
         self.speech_ms = 0
+        self.endpoint = SoftEndpoint()
         self.asr_started = False
         self.barge_loud_frames = 0
         self.gen_id = 0
@@ -1073,6 +1119,7 @@ class Session:
                     self.speech_pcm = bytearray(frame)
                     self.speech_ms = FRAME_MS
                     self.silence_ms = 0
+                    self.endpoint.reset()
                     # 忙碌期（合成中或播报中）一律走「旁路采集」：不停播，
                     # 且在 ASR 验证通过前绝不发 asr_start。否则外放余音/杂音
                     # 只要够长就会误触发 asr_start，让前端把「已排队的整段回复」
@@ -1092,6 +1139,7 @@ class Session:
                 self.speech_pcm = bytearray(frame)
                 self.speech_ms = FRAME_MS
                 self.silence_ms = 0
+                self.endpoint.reset()
             return
 
         self.speech_pcm.extend(frame)
@@ -1108,20 +1156,31 @@ class Session:
             thresh = BARGE_IN_RMS * 0.7
         else:
             thresh = SPEECH_RMS
-        if rms < thresh:
-            self.silence_ms += FRAME_MS
-        else:
-            self.silence_ms = 0
+        silence_before = self.endpoint.silence_ms
+        endpoint_event = self.endpoint.observe(
+            rms >= thresh,
+            eligible=self.speech_ms >= min_ms,
+        )
+        self.silence_ms = self.endpoint.silence_ms
+        if endpoint_event:
+            observed_silence = (
+                silence_before if endpoint_event == "reopened" else self.silence_ms
+            )
+            await self.send_json(
+                {
+                    "type": f"endpoint_{endpoint_event}",
+                    "silenceMs": observed_silence,
+                }
+            )
 
-        if self.speech_ms >= MAX_SPEECH_MS or (
-            self.silence_ms >= SILENCE_END_MS and self.speech_ms >= min_ms
-        ):
+        if self.speech_ms >= MAX_SPEECH_MS or endpoint_event == "committed":
             pcm = bytes(self.speech_pcm)
             was_play_barge = self.play_barge_pending
             self.in_speech = False
             self.speech_pcm.clear()
             self.silence_ms = 0
             self.speech_ms = 0
+            self.endpoint.reset()
             self.barge_loud_frames = 0
             self.play_barge_pending = False
             await self._handle_utterance(pcm, from_play_barge=was_play_barge)
