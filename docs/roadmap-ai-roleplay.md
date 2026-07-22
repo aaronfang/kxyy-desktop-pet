@@ -1,6 +1,8 @@
 # 元元桌宠 · AI 角色扮演体验分析报告与改进路线图
 
 > 本文档基于对仓库当前代码（`src/`、`src-tauri/`、`shared/`、`scripts/`）的通读式评审产出，**不包含任何代码改动**，仅供后续立项决策参考。所有诊断与建议均标注了对应的代码位置，避免空泛建议。
+>
+> 实时语音、自然打断、流式管线和情绪语音的深入调研已拆分到 [《实时语音与情绪语音优化路线图》](./roadmap-realtime-voice.md)。本文件只保留角色扮演视角下的摘要，避免两份技术方案漂移。
 
 ---
 
@@ -42,10 +44,10 @@ graph TD
     end
 
     subgraph Python["🐍 本地 Python 服务"]
-        ws_server["<b>WebSocket Server</b><br/>server.py (9876端口)"]
+        ws_server["<b>WebSocket Server</b><br/>server.py (19876端口)"]
         whisper["Whisper ASR<br/>语音识别"]
         qwen_tts["Qwen3-TTS<br/>本地语音合成"]
-        cosy_local["CosyVoice<br/>本地语音合成"]
+        cosy_local["CosyVoice<br/>通义云 TTS 桥接"]
     end
 
     subgraph External["☁️ 外部 API"]
@@ -77,7 +79,7 @@ graph TD
 | 文字对话 | DeepSeek (`deepseek-chat`/`deepseek-reasoner`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
-| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper+DeepSeek / CosyVoice 桥 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 朗读与通话**共用同一个后端选择**，不可分离 |
+| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper+DeepSeek / CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 朗读与通话**共用同一个后端选择**，不可分离 |
 | 长期记忆 | — | `localStorage`（按昵称分档） | `persona.js` | 仅浏览器本地，无跨设备同步 |
 | 会话摘要 | 复用文字模型 | 同上 | `persona.js::updateRollingDigest` | 滚动摘要覆盖超窗口旧对话 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |
@@ -125,11 +127,13 @@ graph TD
 
 | 现状 | 具体缺口 | 影响 |
 |---|---|---|
-| 实时通话打断机制基础但可用 | `src/ai/realtime.js` 有 `_bargeInTurn` 打断标记，ASR 开始即打断播报（`onAsrStart` → `finalizeCallUserBubble` + 打断音频），是合理实现。 | 已是较完整的打断机制，非空白项，但缺少"打断后语气反馈"（比如"喂等下我还没说完"这类符合人设的抗议话术）。 |
-| **本地 ASR 仅支持 Whisper，缺少更优选择** | 当前 `common.py::transcribe()`（第 698 行）仅支持 `mlx-whisper`（macOS，`large-v3-turbo`）与 `openai-whisper`（Windows/Linux，`small`）两种后端。Whisper 是一个通用 ASR 模型，识别精度好但：① **无法感知用户语音中的情感**（愤怒/开心/悲伤的语气），导致语音输入相比文字输入丢失了一个关键信息维度；② 推理延迟较高（`large-v3-turbo` 约 1.3s/utterance）；③ `openai-whisper small` 中文精度偏低。阿里的 **SenseVoice**（与已在用的 CosyVoice 同属 FunAudioLLM 生态）具备原生情感识别（SER）、语种识别（LID）、音频事件检测（AED），Small 模型参数量与 Whisper-small 相当但推理快 7-17 倍（10s 音频仅需 70ms），中文识别精度优于 Whisper，且支持通过 FunASR WebSocket pipeline 做流式实时 ASR。**更重要的是：SenseVoice 的情感识别可以从用户语音中直接获取情绪线索，驱动 AI 回复语气、桌宠动作、TTS 情绪参数——这是 Whisper 完全无法提供的独特能力。** | 当前实时通话中，用户语音的情感维度完全丢失——无论你开心还是生气地说话，ASR 只输出相同的中性文字。SenseVoice 的情感识别能力（SER：speech emotion recognition）可以直接填补这个缺口，让 AI 的回复更有"共情感"。 |
-| 语音语气固定，不随情绪变化 | 实时通话固定用一套 `buildRealtimeSystemRole()` 追加的"语音通话模式"提示，无音色情绪参数（如愤怒/开心时提高语速/音高），三个 TTS 后端（火山/CosyVoice/本地 Qwen3-TTS）均未见调用情绪化参数接口。 | 语音输出情绪扁平，人设的"开心/生气/害羞"文字标记（`[表情:xx]`）没有传导到语音合成层。 |
+| 火山实时通话已有快速打断信号，本地通话确认过晚 | 火山的首字事件会触发前端清空播放；本地后端在播报期间只旁路采集候选，必须等用户说完、固定 2 秒静音并完成 ASR 验证后才真正发出 `asr_start`。 | 火山路径已有基础，本地路径仍会明显抢话；自然打断必须采用“先降音/暂停、确认后取消、误触可恢复”的两阶段状态机。 |
+| **本地 ASR 仅支持 Whisper，缺少用户情绪信号** | SenseVoiceSmall 的已发布 checkpoint 支持普通话、粤语、英语、日语、韩语，并输出 SER/AED 标签；官方基准称同参数量下快于 Whisper-Small 5 倍以上、快于 Whisper-Large 15 倍以上。它不是原生真流式，第三方伪流式方案会牺牲精度。 | 适合作为 final ASR + 用户情绪确认层，不应直接承担快速 VAD 或被描述成无损流式替代。 |
+| 文字 TTS 已部分情绪化，实时链路仍缺统一编排 | 火山文字 TTS 已传 emotion；CosyVoice 已传自然语言 instruction 和 rate；Qwen3-TTS Base 保持复刻音色但官方不支持 instruction。火山端到端路径主要依赖人设和会话级说话风格。 | 需要统一的 provider-neutral `SpeechStyle`，再按后端能力映射；不能继续把所有后端概括成“没有情绪参数”。 |
 | 情绪→动作映射粗粒度 | `app.js::EMOTION_ACTION` 表把 ~15 个情绪词压缩进 6 个既有动作（dance/pet/spin/trip/sit/forcethink），例如"开心""得意""点赞""期待"全部映射为同一个 `dance`。 | 情绪表达的动作区分度低，观感上"AI 情绪很丰富，桌宠动作很单一"。 |
 | 表情包与桌宠动作是两条独立通道 | 聊天气泡里出现的 GIF 表情（`stickers.js`）与主窗口桌宠动作（`pet-engine.js`）分别由 `extractSticker()` 和 `mapEmotionToAction()` 各自解析同一个 `[表情:xx]` 情绪词，**逻辑重复但未真正联动**——桌宠动作只是"看起来像"在配合表情，实际是同源不同步的两次独立映射。 | 两个系统各自维护一份情绪词表，容易出现"聊天窗口发了个'尴尬'表情，桌宠却在跳舞"的不一致（因为两表映射规则不保证一致，`EMOTION_ACTION` 与 `stickers.json` 里的情绪词集合本身就没有强制对齐机制）。 |
+
+完整诊断、目标指标、事件契约和实施顺序见 [《实时语音与情绪语音优化路线图》](./roadmap-realtime-voice.md)。
 
 ### 2.4 生态/可扩展性
 
@@ -187,9 +191,10 @@ graph TD
 | 特性 | 说明 | 价值 | 涉及文件 | 复杂度 |
 |---|---|---|---|---|
 | **统一情绪→动作/语音映射表** | 把 `app.js::EMOTION_ACTION` 与 `stickers.json` 的情绪词集合合并为一份权威映射（可放在 `shared/` 下新建 `emotion-map.json`，Rust 与前端共用，类似 `roster.json` 的模式），扩大动作覆盖粒度（例如给"生气"和"害怕"分开映射而非都用 `trip`）。 | 解决当前"两套独立映射易不一致"的问题，是 2.3 诊断的直接对症方案，且复用了项目已有的"共享 JSON 供 Rust+前端"模式（`roster.json` 先例）。 | 新建 `shared/emotion-map.json`、改 `src/app.js`、`src/ai/stickers.js` | 中 |
-| **打断反馈话术** | 在 `realtime.js` 的 `_bargeInTurn` 触发点上，前端发一个"用户打断了"的隐藏信号，讓下一轮系统提示里带一句"刚才被打断了，可以自然地接上或俏皮抗议一句"，无需改动语音协议本身。 | 用极小的 prompt 层改动提升实时通话的"活人感"。 | `src/ai/realtime.js`、`src/chat.js::buildRealtimeSystemRole` | 小 |
-| **本地 TTS 情绪化参数探索** | 调研 Qwen3-TTS/CosyVoice 是否支持 `instruction`/情绪化参数输入（`cosyvoiceModel` 设置项已提到"需支持 instruction"字样，说明该能力路径已被预留），若支持则把 `[表情:xx]` 解析出的情绪词转成 TTS instruction 参数。 | 让语音音色随情绪变化，是本项目当前语音体验的天花板提升点，但依赖第三方模型能力，需先验证可行性。 | `src-tauri/src/api.rs::/api/tts` 转发逻辑、`src/ai/tts.js` | 大（含调研） |
-| **引入 SenseVoice 替代 Whisper 做本地 ASR（调研+实施）** | **SenseVoice** 是阿里达摩院 FunAudioLLM 项目的开源语音理解模型（与已在用的 CosyVoice 同生态），相比 Whisper 的核心优势：① **内置情感识别（SER）**——直接从用户语音中识别情绪（愤怒/开心/悲伤/中性），这是 Whisper 不具备的独特能力，可驱动 AI 回复的共情度、桌宠动作联动、TTS 情绪参数；② **推理速度快 7-17 倍**（Small 模型 10s 音频仅需 70ms vs Whisper-large-v3-turbo ~1.3s），对实时通话的体感延迟有显著改善；③ **中文识别精度优于 Whisper**（AISHELL 等中文基准测试）；④ **支持 50+ 语种识别（LID）**。实现路径：优先用 `funasr` Python 包的 `SenseVoiceSmall` 模型，在 `common.py` 中新增 `_asr_backend = "sensevoice"` 分支，与现有 Whisper 并存（`transcribe()` 根据后端选择调用），通过 FunASR 的 WebSocket pipeline 支持流式实时识别。调研阶段验证：模型加载速度（首次推理延迟）、显存/内存占用（SenseVoice-Small 约 1GB 以内）、与现有 VAD 打断逻辑的兼容性。 | 填补当前实时通话中"用户语音情感完全丢失"的缺口，是语音体验维度最具差异化的提升。从 Whisper 迁移到 SenseVoice 的代码改动集中在 `common.py` 单文件（`transcribe()` + `load_whisper_on_mlx_thread` 改名/扩展），前端与 Rust 侧无需修改——ASR 输出 text 的接口不变。 | `scripts/local-realtime/common.py`（新增 `sensevoice` ASR 后端）、调研验证脚本 | 中（调研+集成约1周） |
+| **两阶段自然打断** | 先将播放迁移到可暂停/恢复/清空的 AudioWorklet；疑似人声在 150–250ms 内降音，400–700ms 内经神经 VAD 确认后取消全管线，误触则恢复缓冲。 | 同时解决本地抢话和“为了防误触只能延迟数秒”的矛盾，是实时语音最高优先级。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) P1 | 大 |
+| **打断后的自然对话上下文** | 记录 assistant 实际可听文本和中断位置；只在确实播出超过约 1 秒且句中被截断时注入隐藏提示，不默认让角色每次都抗议。 | 避免模型把用户未听到的尾句视为已知，也避免机械化“你打断我”话术。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 4.6 | 中 |
+| **统一 `SpeechStyle` 与情绪后端映射** | 供应商无关地记录 emotion/intensity/pace/source/confidence；火山映射 emotion/角色风格，CosyVoice 映射 instruction/rate，Qwen Base 验证多情绪参考 prompt，CustomVoice 作为可选高表现力模式。 | 保持复刻音色优先，同时允许用户选择更强的情绪表现力。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 第 5 节 | 大 |
+| **SenseVoice final ASR + SER 实验** | 先作为句尾识别、用户情绪和音频事件确认层，与独立神经 VAD 配合；不宣称原生真流式，也不在基准通过前替换 Whisper。 | 以可回退方式补全用户语音情绪，降低直接迁移风险。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 5.4 | 中 |
 | **桌宠"待机闲聊气泡"** | 桌宠长时间无互动时，除了聊天窗口内的 idle 主动性（3.1），可让主窗口的桌宠本体偶尔冒出一个极简小气泡（不打开完整聊天窗口，走独立小 IPC/事件），降低"必须点开聊天才有存在感"的门槛。 | 提升桌宠作为"活物"的持续存在感，与聊天窗口的主动性形成互补而非重复。 | `src/app.js`(新气泡渲染)、`src-tauri/src/lib.rs`(可能需要新增极简 IPC) | 大 |
 
 ### 3.4 生态/可扩展性
@@ -238,9 +243,10 @@ graph TD
 | 扩展记忆层级：事实/承诺/观点/偏好 | 3.1 | 可与情感状态字段合并实施 | 中 | `- [ ]` |
 | 好感度系统（轻量版） | 3.2 | 依赖上一条 | 中 | `- [ ]` |
 | 统一情绪→动作/语音映射表 | 3.3 | 无前置依赖，建议尽早做以避免情绪词表继续分裂 | 低 | `- [ ]` |
-| **引入 SenseVoice 替代/补充 Whisper 做本地 ASR** | 3.3 | 建议先做 1-2 天调研（验证模型加载速度/显存占用/兼容性），确认可行后再排开发 | 低 | `- [ ]` |
+| **两阶段自然打断与播放缓冲** | 3.3 | 依赖 AudioWorklet 可暂停/恢复/清空；先测量再调 VAD | 中 | `- [ ]` |
+| **SenseVoice final ASR + SER 实验** | 3.3 | 先验证中文识别、情绪标签、加载资源和与 VAD 的组合；不直接替换默认 Whisper | 低 | `- [ ]` |
 | 结构化关系画像编辑器 | 3.1 | 无 | 低 | `- [ ]` |
-| 打断反馈话术 | 3.3 | 无 | 低 | `- [ ]` |
+| 打断后的可听上下文与反馈话术 | 3.3 | 依赖 response/generation 标记和实际播放进度 | 低 | `- [ ]` |
 | **与对话内容联动的桌宠动作触发**（`[动作:xxx]` 标记） | 3.2 | 建议在情绪映射表统一后做 | 中 | `- [ ]` |
 | `chat.js` 按职责拆分模块 | 3.5 | 建议在做更多功能前先完成，作为地基 | 无 | `- [ ]` |
 | 表情包自定义目录 | 3.4 | 无 | 低 | `- [ ]` |
@@ -255,7 +261,7 @@ graph TD
 | 多人设配置化（人设包） | 3.1 | **后端已完成**：`persona_assets.rs` 双通道架构、`persona_card_id` 设置项、IPC 命令均已就绪。**剩余工作**：前端设置页人格卡选择/切换 UI、`persona.js` 热切换支持（当前需重启 App） | **高** | `- [~]` 🔧 进行中（2026-07-12 后端就绪） |
 | 人设包导入/导出 | 3.4 | 与上一条共享工作量，建议合并规划 | 高 | `- [ ]` |
 | 桌宠养成系统（轻量版） | 3.2 | 依赖好感度系统（P1）作为数值基础，需新增美术素材、`pet-affinity.js` 模块 | 低 | `- [ ]` |
-| 本地 TTS 情绪化参数探索 | 3.3 | 依赖第三方模型能力调研结果，可能不可行 | 低 | `- [ ]` |
+| Qwen Base 多情绪参考 prompt + CosyVoice 流式情绪 | 3.3 | 依赖统一 `SpeechStyle` 和音频 A/B 基准；复刻音色优先 | 低 | `- [ ]` |
 | 桌宠"待机闲聊气泡" | 3.3 | 需新 IPC/窗口设计，建议在主动性调度（P0）验证用户接受度后再做 | 低 | `- [ ]` |
 | **人格卡系统与一键打包工具** | 新增 | 基于 `scripts/persona-distill/tools/pack.py` 实现素材→蒸馏→校验→打包的完整自动化。`persona-cards/` 目录已就绪，Schema v1 已定义。**App 侧加载机制已完成**（`load_card_from_file` + IPC），未来可独立成仓库 | 低 | `- [~]` 🔧 进行中（2026-07-12 后端加载就绪，前端UI待补） |
 
@@ -528,6 +534,7 @@ graph TD
 | 2026-07-12 | 人格维度注入 system prompt | `persona.js` 新增 `renderPersonalityDimensions()`，将蒸馏管道的 9 维度数据（口头禅/句式/情绪/方言等）自然语言化后注入 system prompt；`loadAssets()` 新增 `personalityDimensions` 字段 | `src/ai/persona.js` |
 | 2026-07-12 | `computeLiveContext` 参数化 | 硬编码 `20:30` → `lore.open_time` 可配置；硬编码阶段流程（PK/打野/唠嗑/跳舞/梳妆/唱歌/回家段）→ `lore.live_stages` 驱动 + `guessStage()` 独立函数；周日特殊活动逻辑保留 | `src/ai/persona.js` |
 | 2026-07-12 | 构建脚本更新 | `encrypt-assets` 改为指向 `scripts/build-persona-enc.mjs`；新增 `distill` / `validate-card` / `update-persona` npm 脚本；`.gitignore` 新增 persona-distill 本地产物忽略规则 | `package.json`、`.gitignore` |
+| 2026-07-21 | 实时语音专项调研 | 新增实时语音与情绪语音专项路线图；修正 CosyVoice/火山 TTS 情绪能力、SenseVoice 已发布范围和本地打断时序结论；补充两阶段打断、流式管线、`SpeechStyle` 与验证指标 | `docs/roadmap-realtime-voice.md`、本文件 |
 | 2026-07-12 | Roadmap 更新 | 同步最近修改到 roadmap：更新 2.1 诊断（人设链路/直播场景）、P0 新增完成项、P2 状态更新、7.2 变更日志 | 同文件 |
 
 ---
@@ -578,7 +585,7 @@ graph LR
 |------|------|----------|----------|
 | 去背景音乐 | **Demucs htdemucs** (4源分离) | UVR, Spleeter, Open-Unmix | 开源 SOTA，人声分离质量最优，Hybrid Transformer 架构，支持 CUDA 加速 |
 | 说话人分离 | **CAM++ 声纹嵌入** + **FSMN-VAD** + **MossFormer2_SS_16K** 语音分离 | pyannote-audio, SpeechBrain, WhisperX | CAM++ 中文说话人识别 SOTA，MossFormer2 提供帧级语音分离精度，组合优于单一 diarization 方案 |
-| ASR | **SenseVoice** (FunASR) | Whisper (openai/whisper), Faster-Whisper | 中文优化更好、速度快 7-17 倍 (170x 实时)、内建情感识别(SER)、音频事件检测(AED)、ITN 逆文本正则化、模型小 10 倍 |
+| ASR | **SenseVoice** (FunASR) | Whisper (openai/whisper), Faster-Whisper | 已发布 Small checkpoint 覆盖中/粤/英/日/韩，内建情感识别(SER)、音频事件检测(AED)、ITN；官方同参数基准快于 Whisper-Small 5 倍以上、Whisper-Large 15 倍以上 |
 | LLM 蒸馏 | **DeepSeek-chat** (API) | Ollama qwen3:14b, llama.cpp GGUF | 性价比最高，支持 9 维度并行提取，中文理解能力强；本地模型可通过 config.yaml 切换 |
 | 口吃提取 | **规则引擎** (正则) | LLM 提取 | LLM 对口吃模式幻觉率高，规则引擎准确且零 API 成本 |
 | 歌词清洗 | **多信号叠加** (口语标记 + 古风词 + 歌词短语 + 句式) | 纯规则/纯 LLM | 直播间背景歌曲歌词碎片是核心噪声，多信号策略平衡了召回率和精度 |
