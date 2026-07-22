@@ -840,44 +840,49 @@ def start_tts_http(port: int) -> None:
     log(f"朗读 HTTP http://127.0.0.1:{http_port}/tts")
 
 
-def transcribe(pcm16: bytes) -> tuple[str, float]:
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        path = Path(f.name)
-    try:
-        write_wav(path, pcm16, INPUT_RATE)
-        if _asr_backend == "mlx":
-            import mlx_whisper
+def pcm16_to_float32(pcm16: bytes):
+    """PCM16LE bytes → Whisper 期望的单声道 float32 [-1, 1) 内存数组。"""
+    import numpy as np
 
-            result = mlx_whisper.transcribe(
-                str(path),
-                path_or_hf_repo=WHISPER_MODEL,
-                language="zh",
-                initial_prompt=WHISPER_PROMPT,
-                verbose=False,
-            )
-            text = (result.get("text") or "").strip()
-            nsp = float(result.get("no_speech_prob") or 0.0)
-            for seg in result.get("segments") or []:
-                nsp = max(nsp, float(seg.get("no_speech_prob") or 0.0))
-            return text, nsp
-        if _asr_backend == "openai" and _openai_whisper_model is not None:
-            result = _openai_whisper_model.transcribe(
-                str(path),
-                language="zh",
-                initial_prompt=WHISPER_PROMPT,
-                verbose=False,
-            )
-            text = (result.get("text") or "").strip()
-            # openai-whisper 无统一 no_speech_prob，用片段平均近似
-            segs = result.get("segments") or []
-            if segs:
-                nsp = sum(float(s.get("no_speech_prob") or 0.0) for s in segs) / len(segs)
-            else:
-                nsp = 0.0
-            return text, nsp
-        raise RuntimeError("ASR 未就绪")
-    finally:
-        path.unlink(missing_ok=True)
+    usable = memoryview(pcm16)[: len(pcm16) - (len(pcm16) % 2)]
+    return np.frombuffer(usable, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def transcribe(pcm16: bytes) -> tuple[str, float]:
+    # mlx-whisper 与 openai-whisper 都原生接受 16k float32 ndarray；
+    # 直接走内存，避免每轮创建、写入、重新读取并删除临时 WAV。
+    audio = pcm16_to_float32(pcm16)
+    if _asr_backend == "mlx":
+        import mlx_whisper
+
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=WHISPER_MODEL,
+            language="zh",
+            initial_prompt=WHISPER_PROMPT,
+            verbose=False,
+        )
+        text = (result.get("text") or "").strip()
+        nsp = float(result.get("no_speech_prob") or 0.0)
+        for seg in result.get("segments") or []:
+            nsp = max(nsp, float(seg.get("no_speech_prob") or 0.0))
+        return text, nsp
+    if _asr_backend == "openai" and _openai_whisper_model is not None:
+        result = _openai_whisper_model.transcribe(
+            audio,
+            language="zh",
+            initial_prompt=WHISPER_PROMPT,
+            verbose=False,
+        )
+        text = (result.get("text") or "").strip()
+        # openai-whisper 无统一 no_speech_prob，用片段平均近似
+        segs = result.get("segments") or []
+        if segs:
+            nsp = sum(float(s.get("no_speech_prob") or 0.0) for s in segs) / len(segs)
+        else:
+            nsp = 0.0
+        return text, nsp
+    raise RuntimeError("ASR 未就绪")
 
 
 def warmup_asr() -> None:

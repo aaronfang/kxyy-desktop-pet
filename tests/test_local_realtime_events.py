@@ -2,11 +2,14 @@ import asyncio
 import importlib.util
 import json
 import struct
+import sys
+import types
 import unittest
 from pathlib import Path
 
 
 COMMON_PATH = Path(__file__).resolve().parents[1] / "scripts" / "local-realtime" / "common.py"
+PCM_REPLAY_PATH = Path(__file__).resolve().parent / "fixtures" / "realtime-pcm-replay.json"
 SPEC = importlib.util.spec_from_file_location("kxyy_local_realtime_common", COMMON_PATH)
 common = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
@@ -48,6 +51,137 @@ class SoftEndpointTests(unittest.TestCase):
             [event for event in events if event],
             ["soft_end", "reopened", "soft_end", "committed"],
         )
+
+
+class InMemoryAsrTests(unittest.TestCase):
+    class FakeArray(list):
+        def astype(self, _dtype):
+            return self
+
+        def __truediv__(self, denominator):
+            return self.__class__(value / denominator for value in self)
+
+    def setUp(self):
+        self.original_numpy = sys.modules.get("numpy")
+        self.original_mlx = sys.modules.get("mlx_whisper")
+        self.original_backend = common._asr_backend
+        self.original_openai_model = common._openai_whisper_model
+
+        fake_numpy = types.SimpleNamespace(
+            float32="float32",
+            frombuffer=lambda data, dtype: self.FakeArray(
+                value[0] for value in struct.iter_unpack("<h", bytes(data))
+            ),
+        )
+        sys.modules["numpy"] = fake_numpy
+
+    def tearDown(self):
+        if self.original_numpy is None:
+            sys.modules.pop("numpy", None)
+        else:
+            sys.modules["numpy"] = self.original_numpy
+        if self.original_mlx is None:
+            sys.modules.pop("mlx_whisper", None)
+        else:
+            sys.modules["mlx_whisper"] = self.original_mlx
+        common._asr_backend = self.original_backend
+        common._openai_whisper_model = self.original_openai_model
+
+    def test_mlx_receives_normalized_memory_audio_without_path(self):
+        captured = {}
+
+        def fake_transcribe(audio, **kwargs):
+            captured["audio"] = audio
+            captured["kwargs"] = kwargs
+            return {
+                "text": " 内存识别 ",
+                "segments": [{"no_speech_prob": 0.2}],
+            }
+
+        sys.modules["mlx_whisper"] = types.SimpleNamespace(transcribe=fake_transcribe)
+        common._asr_backend = "mlx"
+        pcm = struct.pack("<hhh", -32768, 0, 32767) + b"\xff"
+
+        text, no_speech_prob = common.transcribe(pcm)
+
+        self.assertEqual(text, "内存识别")
+        self.assertEqual(no_speech_prob, 0.2)
+        self.assertFalse(isinstance(captured["audio"], (str, Path)))
+        self.assertEqual(len(captured["audio"]), 3)
+        self.assertAlmostEqual(captured["audio"][0], -1.0)
+        self.assertAlmostEqual(captured["audio"][2], 32767 / 32768)
+        self.assertEqual(captured["kwargs"]["language"], "zh")
+
+    def test_openai_receives_the_same_memory_audio_contract(self):
+        captured = {}
+
+        class FakeModel:
+            def transcribe(self, audio, **kwargs):
+                captured["audio"] = audio
+                captured["kwargs"] = kwargs
+                return {
+                    "text": "本地数组",
+                    "segments": [
+                        {"no_speech_prob": 0.1},
+                        {"no_speech_prob": 0.3},
+                    ],
+                }
+
+        common._asr_backend = "openai"
+        common._openai_whisper_model = FakeModel()
+
+        text, no_speech_prob = common.transcribe(struct.pack("<hh", 1000, -1000))
+
+        self.assertEqual(text, "本地数组")
+        self.assertAlmostEqual(no_speech_prob, 0.2)
+        self.assertFalse(isinstance(captured["audio"], (str, Path)))
+        self.assertEqual(captured["kwargs"]["initial_prompt"], common.WHISPER_PROMPT)
+
+
+class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fixed_synthetic_pcm_matrix(self):
+        fixture = json.loads(PCM_REPLAY_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(fixture["schemaVersion"], 1)
+        self.assertEqual(fixture["sampleRate"], common.INPUT_RATE)
+        self.assertEqual(fixture["frameMs"], common.FRAME_MS)
+
+        for scenario in fixture["scenarios"]:
+            with self.subTest(scenario=scenario["id"]):
+                ws = FakeWebSocket()
+                session = common.Session(ws)
+                commits = []
+
+                async def capture_utterance(pcm, *, from_play_barge=False):
+                    commits.append(
+                        {
+                            "bytes": len(pcm),
+                            "fromPlayBarge": from_play_barge,
+                        }
+                    )
+                    await session._emit_speech_rejected()
+
+                session._handle_utterance = capture_utterance
+                if scenario["mode"] == "playback":
+                    session.playing = True
+                    session.play_enabled = True
+
+                for segment in scenario["segments"]:
+                    amplitude = fixture["levels"][segment["level"]]
+                    frame = struct.pack("<h", amplitude) * common.FRAME_SAMPLES
+                    for _ in range(segment["frames"]):
+                        await session._on_frame(frame)
+
+                types = [message["type"] for message in ws.json_messages()]
+                endpoint_types = [
+                    event_type for event_type in types if event_type.startswith("endpoint_")
+                ]
+                expected = scenario["expect"]
+                self.assertEqual(
+                    types.count("speech_candidate"),
+                    expected["candidateCount"],
+                )
+                self.assertEqual(len(commits), expected["commitCount"])
+                self.assertEqual(endpoint_types, expected["endpointEvents"])
 
 
 class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
