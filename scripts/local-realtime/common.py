@@ -402,6 +402,33 @@ class SoftEndpoint:
         return None
 
 
+class GenerationCancelScope:
+    """单调 generation 的显式取消域；阻塞调用返回后必须重新检查 active。"""
+
+    def __init__(self, generation: int, stage: str):
+        self.generation = generation
+        self.stage = stage
+        self.state = "active"
+        self.reason = ""
+
+    @property
+    def active(self) -> bool:
+        return self.state == "active"
+
+    def cancel(self, reason: str) -> None:
+        if self.active:
+            self.state = "cancelled"
+            self.reason = reason
+
+    def complete(self) -> None:
+        if self.active:
+            self.state = "completed"
+
+    def promote(self, stage: str) -> None:
+        if self.active:
+            self.stage = stage
+
+
 # 各 TTS 后端共用的 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
 SYSTEM_SUFFIX = (
     "\n口语化一两句，像真人闲聊；需要停顿时用逗号或……；"
@@ -1020,6 +1047,8 @@ class Session:
         self.asr_started = False
         self.barge_loud_frames = 0
         self.gen_id = 0
+        self.asr_scope: GenerationCancelScope | None = None
+        self.response_scope: GenerationCancelScope | None = None
         self.reply_task: asyncio.Task | None = None
         self.play_enabled = False
         self.playing = False
@@ -1033,21 +1062,43 @@ class Session:
     def _busy(self) -> bool:
         return self.reply_task is not None and not self.reply_task.done()
 
-    async def send_json(self, obj: dict) -> None:
-        if self.closed:
-            return
-        await self.ws.send(json.dumps(obj, ensure_ascii=False))
+    def _new_scope(self, stage: str) -> GenerationCancelScope:
+        self.gen_id += 1
+        return GenerationCancelScope(self.gen_id, stage)
 
-    async def send_pcm(self, pcm: bytes) -> None:
-        if self.closed or not pcm:
-            return
+    async def send_json(
+        self,
+        obj: dict,
+        *,
+        scope: GenerationCancelScope | None = None,
+    ) -> bool:
+        if self.closed or (scope is not None and not scope.active):
+            return False
+        payload = dict(obj)
+        if scope is not None:
+            payload["generation"] = scope.generation
+        await self.ws.send(json.dumps(payload, ensure_ascii=False))
+        return not self.closed and (scope is None or scope.active)
+
+    async def send_pcm(
+        self,
+        pcm: bytes,
+        *,
+        scope: GenerationCancelScope | None = None,
+    ) -> bool:
+        if self.closed or not pcm or (scope is not None and not scope.active):
+            return False
         await self.ws.send(pcm)
+        return not self.closed and (scope is None or scope.active)
 
     def _invalidate_play(self) -> None:
         self.play_enabled = False
 
-    async def cancel_reply(self) -> None:
-        self.gen_id += 1
+    async def cancel_reply(self, reason: str = "superseded") -> None:
+        scope = self.response_scope
+        self.response_scope = None
+        if scope is not None:
+            scope.cancel(reason)
         self.play_enabled = False
         self.playing = False
         t = self.reply_task
@@ -1058,6 +1109,24 @@ class Session:
                 await t
             except asyncio.CancelledError:
                 pass
+
+    async def cancel_asr(self, reason: str = "superseded") -> None:
+        scope = self.asr_scope
+        self.asr_scope = None
+        if scope is not None:
+            scope.cancel(reason)
+        t = self.asr_task
+        self.asr_task = None
+        if t and not t.done():
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    async def cancel_all(self, reason: str) -> None:
+        await self.cancel_asr(reason)
+        await self.cancel_reply(reason)
 
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
@@ -1073,15 +1142,23 @@ class Session:
             del self.pcm_buf[:frame_bytes]
             await self._on_frame(frame)
 
-    async def _emit_asr_start(self) -> None:
+    async def _emit_asr_start(
+        self,
+        scope: GenerationCancelScope | None = None,
+    ) -> None:
         if self.asr_started:
             return
-        self.asr_started = True
-        await self.send_json({"type": "asr_start"})
+        if await self.send_json({"type": "asr_start"}, scope=scope):
+            self.asr_started = True
 
-    async def _emit_asr_end_only(self) -> None:
+    async def _emit_asr_end_only(
+        self,
+        scope: GenerationCancelScope | None = None,
+    ) -> None:
+        if scope is not None and not scope.active:
+            return
         if self.asr_started:
-            await self.send_json({"type": "asr_end"})
+            await self.send_json({"type": "asr_end"}, scope=scope)
         self.asr_started = False
 
     async def _emit_speech_candidate(self) -> None:
@@ -1090,17 +1167,30 @@ class Session:
         self.candidate_emitted = True
         await self.send_json({"type": "speech_candidate"})
 
-    async def _emit_speech_confirmed(self) -> None:
+    async def _emit_speech_confirmed(
+        self,
+        scope: GenerationCancelScope | None = None,
+    ) -> None:
+        if scope is not None and not scope.active:
+            return
         if not self.candidate_emitted:
             return
         self.candidate_emitted = False
-        await self.send_json({"type": "speech_confirmed"})
+        await self.send_json({"type": "speech_confirmed"}, scope=scope)
 
-    async def _emit_speech_rejected(self) -> None:
+    async def _emit_speech_rejected(
+        self,
+        scope: GenerationCancelScope | None = None,
+    ) -> None:
+        if scope is not None and not scope.active:
+            return
         if not self.candidate_emitted:
             return
         self.candidate_emitted = False
-        await self.send_json({"type": "speech_rejected", "reason": "voice_rejected"})
+        await self.send_json(
+            {"type": "speech_rejected", "reason": "voice_rejected"},
+            scope=scope,
+        )
 
     async def _on_frame(self, frame: bytes) -> None:
         rms = pcm16_rms(frame)
@@ -1208,56 +1298,94 @@ class Session:
             await self._resume_play_if_paused()
             return
 
-        if self.asr_task and not self.asr_task.done():
-            await self._emit_speech_rejected()
-            self.asr_task.cancel()
-            try:
-                await self.asr_task
-            except asyncio.CancelledError:
-                pass
+        await self.cancel_asr("superseded")
+        scope = self._new_scope("asr")
+        self.asr_scope = scope
         self.asr_task = asyncio.create_task(
-            self._asr_then_maybe_reply(pcm, from_play_barge=from_play_barge)
+            self._asr_then_maybe_reply(
+                pcm,
+                scope,
+                from_play_barge=from_play_barge,
+            )
         )
 
-    async def _asr_then_maybe_reply(self, pcm: bytes, *, from_play_barge: bool = False) -> None:
+    async def _asr_then_maybe_reply(
+        self,
+        pcm: bytes,
+        scope: GenerationCancelScope,
+        *,
+        from_play_barge: bool = False,
+    ) -> None:
         try:
             t0 = time.perf_counter()
             text, nsp = await self.loop.run_in_executor(_mlx_pool, transcribe, pcm)
+            if not scope.active:
+                log(f"丢弃过期 ASR 结果 gen={scope.generation}")
+                return
             log(f"ASR {time.perf_counter()-t0:.2f}s nsp={nsp:.2f} chars={len(text)}")
             cleaned = is_valid_asr(text, nsp, pcm)
             if not cleaned:
                 log("无效人声，忽略" + ("（播报未中断）" if from_play_barge else ""))
-                await self._emit_asr_end_only()
-                await self._emit_speech_rejected()
+                await self._emit_asr_end_only(scope)
+                await self._emit_speech_rejected(scope)
                 await self._resume_play_if_paused()
+                scope.complete()
                 return
 
             # 此时才真正打断：先停播并通知前端 flush
             if from_play_barge or self.playing:
                 log("确认打断播报")
                 self._invalidate_play()
-            await self._emit_speech_confirmed()
-            await self._emit_asr_start()
-            await self.send_json({"type": "asr", "text": cleaned, "interim": False})
-            await self.send_json({"type": "asr_end"})
+            await self._emit_speech_confirmed(scope)
+            await self._emit_asr_start(scope)
+            await self.send_json(
+                {"type": "asr", "text": cleaned, "interim": False},
+                scope=scope,
+            )
+            await self.send_json({"type": "asr_end"}, scope=scope)
             self.asr_started = False
+            if not scope.active:
+                return
 
-            await self.cancel_reply()
-            my_gen = self.gen_id
-            self.reply_task = asyncio.create_task(self._reply_pipeline(cleaned, my_gen))
+            await self.cancel_reply("turn_detected")
+            if not scope.active:
+                return
+            scope.promote("response")
+            if self.asr_scope is scope:
+                self.asr_scope = None
+            self.response_scope = scope
+            self.reply_task = asyncio.create_task(self._reply_pipeline(cleaned, scope))
         except asyncio.CancelledError:
-            await self._emit_speech_rejected()
+            if scope.active:
+                await self._emit_asr_end_only(scope)
+                await self._emit_speech_rejected(scope)
+                await self._resume_play_if_paused()
+                scope.cancel("task_cancelled")
             raise
         except Exception as e:
-            log(f"ASR 失败: {e}")
-            await self._emit_asr_end_only()
-            await self._emit_speech_rejected()
-            await self._resume_play_if_paused()
-            await self.send_json({"type": "error", "message": str(e)})
+            if scope.active:
+                log(f"ASR 失败: {e}")
+                await self._emit_asr_end_only(scope)
+                await self._emit_speech_rejected(scope)
+                await self._resume_play_if_paused()
+                await self.send_json(
+                    {"type": "error", "message": str(e)},
+                    scope=scope,
+                )
+                scope.cancel("asr_error")
+        finally:
+            if self.asr_task is asyncio.current_task():
+                self.asr_task = None
+            if self.asr_scope is scope and scope.stage == "asr":
+                self.asr_scope = None
 
-    async def _reply_pipeline(self, text: str, my_gen: int) -> None:
-        assert _synth_tts is not None
+    async def _reply_pipeline(
+        self,
+        text: str,
+        scope: GenerationCancelScope,
+    ) -> None:
         try:
+            assert _synth_tts is not None
             t1 = time.perf_counter()
             reply, llm_usage = await self.loop.run_in_executor(
                 None, chat_llm, self.system_role, list(self.history), text
@@ -1266,8 +1394,8 @@ class Session:
                 f"LLM {time.perf_counter()-t1:.2f}s "
                 f"tok={llm_usage.get('total', 0)} chars={len(reply or '')}"
             )
-            if my_gen != self.gen_id:
-                log(f"丢弃过期 LLM 结果 gen={my_gen}/{self.gen_id}")
+            if not scope.active:
+                log(f"丢弃过期 LLM 结果 gen={scope.generation}")
                 return
             if not reply:
                 return
@@ -1277,8 +1405,13 @@ class Session:
             if len(self.history) > MAX_HISTORY_MESSAGES:
                 del self.history[:-MAX_HISTORY_MESSAGES]
 
-            await self.send_json({"type": "assistant", "text": reply})
-            await self.send_json({"type": "assistant_end"})
+            await self.send_json(
+                {"type": "assistant", "text": reply},
+                scope=scope,
+            )
+            await self.send_json({"type": "assistant_end"}, scope=scope)
+            if not scope.active:
+                return
 
             t2 = time.perf_counter()
             pool = _tts_pool if _tts_pool is not None else _mlx_pool
@@ -1299,8 +1432,8 @@ class Session:
                 f"TTS {time.perf_counter()-t2:.2f}s "
                 f"({len(audio)} bytes, billed={tts_chars or '-'})"
             )
-            if my_gen != self.gen_id:
-                log(f"丢弃过期 TTS gen={my_gen}/{self.gen_id}")
+            if not scope.active:
+                log(f"丢弃过期 TTS gen={scope.generation}")
                 return
 
             # 本轮用量：DeepSeek token +（若有）云端 TTS 计费字符。
@@ -1315,45 +1448,50 @@ class Session:
                     "llm": llm_usage,
                     "ttsCharacters": tts_chars,
                     "total": int(llm_usage.get("total") or 0),
-                }
+                },
+                scope=scope,
             )
 
-            if not audio:
+            if not audio or not scope.active:
                 return
 
             self.playing = True
             self.play_enabled = not self.in_speech
             if not self.play_enabled:
                 log("用户仍在说话，暂缓播报")
-            await self.send_json({"type": "speaking"})
+            await self.send_json({"type": "speaking"}, scope=scope)
 
             for chunk in chunk_pcm(audio, 80):
-                if my_gen != self.gen_id:
+                if not scope.active:
                     log("播报被新话术取代")
                     break
-                while not self.play_enabled and my_gen == self.gen_id:
+                while not self.play_enabled and scope.active:
                     await asyncio.sleep(0.02)
-                if my_gen != self.gen_id:
+                if not scope.active:
                     break
-                await self.send_pcm(chunk)
+                if not await self.send_pcm(chunk, scope=scope):
+                    break
                 # 每片 80ms 音频。发送节奏贴近实时（0.06s，留 ~20ms 提前量抗抖动），
                 # 不再把整段回复瞬间灌满前端队列——万一真被打断/flush，也只损失一小段，
                 # 而不是「说一半后半句全没」。
                 await asyncio.sleep(0.06)
-
-            if my_gen == self.gen_id:
-                self.playing = False
-                self.play_enabled = False
         except asyncio.CancelledError:
-            self.playing = False
-            self.play_enabled = False
             raise
         except Exception as e:
-            self.playing = False
-            self.play_enabled = False
-            log(f"回复失败: {e}")
-            if my_gen == self.gen_id:
-                await self.send_json({"type": "error", "message": str(e)})
+            if scope.active:
+                log(f"回复失败: {e}")
+                await self.send_json(
+                    {"type": "error", "message": str(e)},
+                    scope=scope,
+                )
+        finally:
+            if self.reply_task is asyncio.current_task():
+                self.reply_task = None
+            if self.response_scope is scope:
+                self.playing = False
+                self.play_enabled = False
+                self.response_scope = None
+                scope.complete()
 
 
 async def _handler(ws):
@@ -1372,16 +1510,14 @@ async def _handler(ws):
             if typ == "start":
                 await session.on_start(msg)
             elif typ == "hangup":
-                await session.cancel_reply()
-                if session.asr_task and not session.asr_task.done():
-                    session.asr_task.cancel()
+                await session.cancel_all("hangup")
                 await session.send_json({"type": "session", "state": "ended"})
                 break
     except Exception as e:
         log(f"连接结束: {e}")
     finally:
         session.closed = True
-        await session.cancel_reply()
+        await session.cancel_all("disconnect")
         log("客户端断开")
 
 

@@ -27,6 +27,49 @@ class FakeWebSocket:
         return [json.loads(message) for message in self.messages if isinstance(message, str)]
 
 
+class ControlledLoop:
+    def __init__(self, futures):
+        self.futures = iter(futures)
+
+    def run_in_executor(self, *_args):
+        return next(self.futures)
+
+
+class BlockingPcmWebSocket(FakeWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.pcm_entered = asyncio.Event()
+        self.pcm_release = asyncio.Event()
+        self.pcm_attempts = 0
+
+    async def send(self, message):
+        if isinstance(message, bytes):
+            self.pcm_attempts += 1
+            self.pcm_entered.set()
+            await self.pcm_release.wait()
+        self.messages.append(message)
+
+
+class GenerationCancelScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scope_lifecycle_and_monotonic_session_generations(self):
+        scope = common.GenerationCancelScope(7, "asr")
+        self.assertTrue(scope.active)
+        scope.promote("response")
+        self.assertEqual(scope.stage, "response")
+        scope.cancel("turn_detected")
+        scope.complete()
+        scope.promote("pcm")
+        self.assertFalse(scope.active)
+        self.assertEqual(scope.state, "cancelled")
+        self.assertEqual(scope.reason, "turn_detected")
+        self.assertEqual(scope.stage, "response")
+
+        session = common.Session(FakeWebSocket())
+        first = session._new_scope("asr")
+        second = session._new_scope("asr")
+        self.assertEqual(second.generation, first.generation + 1)
+
+
 class SoftEndpointTests(unittest.TestCase):
     def test_soft_end_reopens_before_deterministic_commit(self):
         endpoint = common.SoftEndpoint()
@@ -188,10 +231,12 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.ws = FakeWebSocket()
         self.session = common.Session(self.ws)
+        self.original_synth_tts = common._synth_tts
 
     async def asyncTearDown(self):
         if self.session.reply_task:
             await self.session.reply_task
+        common._synth_tts = self.original_synth_tts
 
     async def test_playback_voice_threshold_emits_one_candidate(self):
         self.session.playing = True
@@ -218,8 +263,14 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.session.candidate_emitted = True
         self.session.playing = True
         self.session.play_enabled = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
         try:
-            await self.session._asr_then_maybe_reply(b"\x01\x00" * 1000, from_play_barge=True)
+            await self.session._asr_then_maybe_reply(
+                b"\x01\x00" * 1000,
+                scope,
+                from_play_barge=True,
+            )
             await asyncio.sleep(0)
         finally:
             common.transcribe = original_transcribe
@@ -239,15 +290,141 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         common.transcribe = lambda _pcm: ("幻觉文本", 0.9)
         common.is_valid_asr = lambda _text, _nsp, _pcm: None
         self.session.candidate_emitted = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
         try:
-            await self.session._asr_then_maybe_reply(b"\x01\x00" * 1000, from_play_barge=True)
+            await self.session._asr_then_maybe_reply(
+                b"\x01\x00" * 1000,
+                scope,
+                from_play_barge=True,
+            )
         finally:
             common.transcribe = original_transcribe
             common.is_valid_asr = original_validate
 
         messages = self.ws.json_messages()
-        self.assertEqual(messages, [{"type": "speech_rejected", "reason": "voice_rejected"}])
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "type": "speech_rejected",
+                    "reason": "voice_rejected",
+                    "generation": scope.generation,
+                }
+            ],
+        )
         self.assertNotIn("幻觉文本", json.dumps(messages, ensure_ascii=False))
+
+    async def test_cancelled_asr_scope_drops_late_result(self):
+        future = asyncio.get_running_loop().create_future()
+        self.session.loop = ControlledLoop([future])
+        self.session.candidate_emitted = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        task = asyncio.create_task(
+            self.session._asr_then_maybe_reply(b"\x01\x00" * 1000, scope)
+        )
+        self.session.asr_task = task
+
+        await asyncio.sleep(0)
+        scope.cancel("superseded")
+        future.set_result(("迟到识别", 0.01))
+        await task
+
+        self.assertEqual(self.ws.messages, [])
+        self.assertIsNone(self.session.reply_task)
+        self.assertIsNone(self.session.asr_scope)
+
+    async def test_cancelled_llm_scope_drops_late_text_and_history(self):
+        common._synth_tts = lambda _text: b"unused"
+        future = asyncio.get_running_loop().create_future()
+        self.session.loop = ControlledLoop([future])
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+        self.session.reply_task = task
+
+        await asyncio.sleep(0)
+        scope.cancel("turn_detected")
+        future.set_result(("迟到回复", {"total": 3}))
+        await task
+
+        self.assertEqual(self.session.history, [])
+        self.assertEqual(self.ws.messages, [])
+        self.assertIsNone(self.session.response_scope)
+
+    async def test_cancelled_tts_scope_drops_late_audio_and_usage(self):
+        common._synth_tts = lambda _text: b"unused"
+        loop = asyncio.get_running_loop()
+        llm_future = loop.create_future()
+        tts_future = loop.create_future()
+        llm_future.set_result(("先完成的回复", {"total": 4}))
+        self.session.loop = ControlledLoop([llm_future, tts_future])
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+        self.session.reply_task = task
+
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        scope.cancel("turn_detected")
+        tts_future.set_result(b"\x01\x00" * common.OUTPUT_RATE)
+        await task
+
+        types = [message["type"] for message in self.ws.json_messages()]
+        self.assertEqual(types, ["assistant", "assistant_end"])
+        self.assertFalse(any(isinstance(message, bytes) for message in self.ws.messages))
+        self.assertNotIn("usage", types)
+        self.assertNotIn("speaking", types)
+
+    async def test_old_pipeline_cleanup_cannot_clear_new_response_state(self):
+        common._synth_tts = lambda _text: b"unused"
+        future = asyncio.get_running_loop().create_future()
+        self.session.loop = ControlledLoop([future])
+        old_scope = self.session._new_scope("response")
+        self.session.response_scope = old_scope
+        old_task = asyncio.create_task(self.session._reply_pipeline("旧输入", old_scope))
+        self.session.reply_task = old_task
+
+        await asyncio.sleep(0)
+        old_scope.cancel("turn_detected")
+        new_scope = self.session._new_scope("response")
+        self.session.response_scope = new_scope
+        self.session.playing = True
+        self.session.play_enabled = True
+        future.set_result(("迟到回复", {"total": 3}))
+        await old_task
+
+        self.assertIs(self.session.response_scope, new_scope)
+        self.assertTrue(self.session.playing)
+        self.assertTrue(self.session.play_enabled)
+        self.assertTrue(new_scope.active)
+
+    async def test_cancelled_scope_allows_only_in_flight_pcm_chunk(self):
+        ws = BlockingPcmWebSocket()
+        session = common.Session(ws)
+        common._synth_tts = lambda _text: b"unused"
+        loop = asyncio.get_running_loop()
+        llm_future = loop.create_future()
+        tts_future = loop.create_future()
+        llm_future.set_result(("回复", {"total": 2}))
+        audio = b"\x01\x00" * (common.OUTPUT_RATE // 5)
+        tts_future.set_result(audio)
+        session.loop = ControlledLoop([llm_future, tts_future])
+        scope = session._new_scope("response")
+        session.response_scope = scope
+        task = asyncio.create_task(session._reply_pipeline("用户输入", scope))
+        session.reply_task = task
+
+        await ws.pcm_entered.wait()
+        scope.cancel("turn_detected")
+        ws.pcm_release.set()
+        await task
+
+        binary_messages = [message for message in ws.messages if isinstance(message, bytes)]
+        self.assertEqual(ws.pcm_attempts, 1)
+        self.assertEqual(len(binary_messages), 1)
+        self.assertIsNone(session.response_scope)
 
     async def test_soft_endpoint_keeps_reopened_audio_in_one_utterance(self):
         handled = []
