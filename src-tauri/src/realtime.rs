@@ -750,8 +750,11 @@ fn server_event_to_frontend(event: i32, payload: &[u8]) -> Option<String> {
         // 只在 SessionStarted 通知前端「已接通」，避免 ConnectionStarted 再弹一次。
         protocol::EV_SESSION_STARTED => Some(to_frontend_session("started").to_string()),
         protocol::EV_CONNECTION_STARTED => None,
-        // 首字：仅用于打断播报，不带文本。
-        protocol::EV_ASR_INFO => Some(serde_json::json!({ "type": "asr_start" }).to_string()),
+        // 服务端首字边界只作为候选：前端先 duck/暂停；首个非空 ASR 文本再安全确认。
+        // 不新增或猜测火山协议常量，只重新映射已有且已验证的 EV_ASR_INFO。
+        protocol::EV_ASR_INFO => {
+            Some(serde_json::json!({ "type": "speech_candidate" }).to_string())
+        }
         protocol::EV_ASR_RESPONSE => {
             let (text, interim) = extract_asr(&json);
             let text = correct_yuan_name(&text);
@@ -853,4 +856,38 @@ fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     dec.read_to_end(&mut out).ok()?;
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asr_info_maps_to_speech_candidate_without_text() {
+        let message = server_event_to_frontend(protocol::EV_ASR_INFO, b"{}").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("speech_candidate")
+        );
+        assert!(json.get("text").is_none());
+    }
+
+    #[test]
+    fn non_empty_asr_response_remains_available_for_safe_confirmation() {
+        let payload = serde_json::json!({
+            "results": [{ "text": "你好", "is_interim": true }]
+        });
+        let payload = serde_json::to_vec(&payload).unwrap();
+        let message = server_event_to_frontend(protocol::EV_ASR_RESPONSE, &payload).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("asr")
+        );
+        assert_eq!(
+            json.get("interim").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
 }

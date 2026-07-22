@@ -17,6 +17,7 @@ dist/
 /scripts/local-realtime/out/
 /scripts/local-realtime/.venv*/
 /scripts/local-realtime/__pycache__/
+/tests/__pycache__/
 
 # Rust / Tauri 构建产物
 /src-tauri/target/
@@ -69,6 +70,5 @@ dist/
 /temp_original_settings.css
 /temp_original_settings.html
 /temp_original_settings.js
-
 
 

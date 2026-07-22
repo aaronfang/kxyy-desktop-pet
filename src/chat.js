@@ -1785,7 +1785,7 @@ function showCallWave(show) {
   } else {
     callWaveEl.hidden = true;
     callWaveEl.setAttribute("aria-hidden", "true");
-    callWaveEl.classList.remove("speaking");
+    callWaveEl.classList.remove("speaking", "candidate");
     callWaveSpeaking = false;
     for (const bar of callWaveBars) {
       const base = Number(bar.dataset.base) || 0.2;
@@ -1918,6 +1918,7 @@ async function startCall() {
     },
     onAsrStart: () => {
       // 新一轮用户说话：定稿上一轮用户气泡（若有），并打断助手。
+      callWaveEl?.classList.remove("candidate", "speaking");
       finalizeCallUserBubble();
       finalizeCallAsstBubble();
       petSignal("user");
@@ -1927,7 +1928,14 @@ async function startCall() {
     onAsrEnd: () => finalizeCallUserBubble(),
     onAssistant: (text) => appendCallAsstBubble(text),
     onAssistantEnd: () => finalizeCallAsstBubble(),
+    onSpeechCandidate: () => {
+      callWaveEl?.classList.add("candidate");
+    },
+    onSpeechRejected: () => {
+      callWaveEl?.classList.remove("candidate");
+    },
     onSpeaking: () => {
+      callWaveEl?.classList.remove("candidate");
       callWaveSpeaking = true;
       callWaveEl?.classList.add("speaking");
       petSignal("speaking");

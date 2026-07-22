@@ -22,6 +22,7 @@ export const TRACE_EVENT = Object.freeze({
   TTS_FIRST_AUDIO: "tts_first_audio",
   PLAYBACK_QUEUED: "playback_queued",
   PLAYBACK_STARTED: "playback_started",
+  PLAYBACK_STATS: "playback_stats",
   PLAYBACK_STOPPED: "playback_stopped",
   RESPONSE_STARTED: "response_started",
   RESPONSE_COMPLETED: "response_completed",
@@ -42,8 +43,11 @@ const SAFE_METRICS = new Set([
   "audioBytes",
   "chunkCount",
   "confidence",
+  "droppedSamples",
   "interim",
   "queuedMs",
+  "playedSamples",
+  "underruns",
 ]);
 
 let fallbackId = 0;
