@@ -80,6 +80,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Test realtime voice state replay
+        run: npm test
+
       - name: Encrypt persona assets
         run: npm run encrypt-assets
 
