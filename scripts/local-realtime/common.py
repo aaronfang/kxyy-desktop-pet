@@ -342,6 +342,7 @@ BARGE_IN_FRAMES = 6
 # AI 播报中：更高更久才采信（防外放漏音/杂音）；确认前不停播、不发 asr_start
 BARGE_IN_RMS_PLAY = 0.04
 BARGE_IN_FRAMES_PLAY = 12  # ~360ms
+MAX_HISTORY_MESSAGES = 24
 MIN_SPEECH_MS_PLAY = 800
 NO_SPEECH_PROB_MAX = 0.55
 MIN_CJK_CHARS = 2
@@ -864,17 +865,17 @@ def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
     if not text:
         return None
     if _HALLUCINATION_RE.search(text):
-        log(f"过滤: 幻觉文本 {text!r}")
+        log(f"过滤: 幻觉文本 ({len(text)} chars)")
         return None
     cjk = _CJK_RE.findall(text)
     if len(cjk) < MIN_CJK_CHARS:
-        log(f"过滤: 汉字过少 {text!r}")
+        log(f"过滤: 汉字过少 ({len(text)} chars)")
         return None
     bare = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
     if len(bare) < MIN_CJK_CHARS:
         return None
     if _FILLER_RE.match(bare):
-        log(f"过滤: 填充词 {text!r}")
+        log(f"过滤: 填充词 ({len(text)} chars)")
         return None
     if pcm16_rms(pcm) < SPEECH_RMS * 0.55:
         log("过滤: 整段能量过低")
@@ -971,8 +972,9 @@ class Session:
         self.reply_task: asyncio.Task | None = None
         self.play_enabled = False
         self.playing = False
-        # 播报中正在旁路采集候选打断（尚未停播、未通知前端）
+        # 播报中正在旁路采集候选打断（后端不停播；前端会 duck 并暂停消费）
         self.play_barge_pending = False
+        self.candidate_emitted = False
         self.closed = False
         self.loop = asyncio.get_event_loop()
         self.asr_task: asyncio.Task | None = None
@@ -1031,6 +1033,24 @@ class Session:
             await self.send_json({"type": "asr_end"})
         self.asr_started = False
 
+    async def _emit_speech_candidate(self) -> None:
+        if self.candidate_emitted:
+            return
+        self.candidate_emitted = True
+        await self.send_json({"type": "speech_candidate"})
+
+    async def _emit_speech_confirmed(self) -> None:
+        if not self.candidate_emitted:
+            return
+        self.candidate_emitted = False
+        await self.send_json({"type": "speech_confirmed"})
+
+    async def _emit_speech_rejected(self) -> None:
+        if not self.candidate_emitted:
+            return
+        self.candidate_emitted = False
+        await self.send_json({"type": "speech_rejected", "reason": "voice_rejected"})
+
     async def _on_frame(self, frame: bytes) -> None:
         rms = pcm16_rms(frame)
         busy = self._busy() or self.playing
@@ -1058,6 +1078,7 @@ class Session:
                     # 只要够长就会误触发 asr_start，让前端把「已排队的整段回复」
                     # flush 掉——因为后端是超速灌音频，一 flush 就是后半句全没。
                     self.play_barge_pending = True
+                    await self._emit_speech_candidate()
                     log(
                         "播报中检测到疑似人声（旁路采集，待确认）"
                         if while_playing
@@ -1119,10 +1140,12 @@ class Session:
             # 无条件恢复：旁路采集期若回复开始时 in_speech 为真，play_enabled
             # 会被置 False；此处必须放开，否则发送循环永久卡住（幂等，安全）。
             await self._emit_asr_end_only()
+            await self._emit_speech_rejected()
             await self._resume_play_if_paused()
             return
 
         if self.asr_task and not self.asr_task.done():
+            await self._emit_speech_rejected()
             self.asr_task.cancel()
             try:
                 await self.asr_task
@@ -1136,11 +1159,12 @@ class Session:
         try:
             t0 = time.perf_counter()
             text, nsp = await self.loop.run_in_executor(_mlx_pool, transcribe, pcm)
-            log(f"ASR {time.perf_counter()-t0:.2f}s nsp={nsp:.2f} → {text!r}")
+            log(f"ASR {time.perf_counter()-t0:.2f}s nsp={nsp:.2f} chars={len(text)}")
             cleaned = is_valid_asr(text, nsp, pcm)
             if not cleaned:
                 log("无效人声，忽略" + ("（播报未中断）" if from_play_barge else ""))
                 await self._emit_asr_end_only()
+                await self._emit_speech_rejected()
                 await self._resume_play_if_paused()
                 return
 
@@ -1148,6 +1172,7 @@ class Session:
             if from_play_barge or self.playing:
                 log("确认打断播报")
                 self._invalidate_play()
+            await self._emit_speech_confirmed()
             await self._emit_asr_start()
             await self.send_json({"type": "asr", "text": cleaned, "interim": False})
             await self.send_json({"type": "asr_end"})
@@ -1157,10 +1182,12 @@ class Session:
             my_gen = self.gen_id
             self.reply_task = asyncio.create_task(self._reply_pipeline(cleaned, my_gen))
         except asyncio.CancelledError:
+            await self._emit_speech_rejected()
             raise
         except Exception as e:
             log(f"ASR 失败: {e}")
             await self._emit_asr_end_only()
+            await self._emit_speech_rejected()
             await self._resume_play_if_paused()
             await self.send_json({"type": "error", "message": str(e)})
 
@@ -1173,7 +1200,7 @@ class Session:
             )
             log(
                 f"LLM {time.perf_counter()-t1:.2f}s "
-                f"tok={llm_usage.get('total', 0)} → {reply!r}"
+                f"tok={llm_usage.get('total', 0)} chars={len(reply or '')}"
             )
             if my_gen != self.gen_id:
                 log(f"丢弃过期 LLM 结果 gen={my_gen}/{self.gen_id}")
@@ -1183,6 +1210,8 @@ class Session:
 
             self.history.append({"role": "user", "content": text})
             self.history.append({"role": "assistant", "content": reply})
+            if len(self.history) > MAX_HISTORY_MESSAGES:
+                del self.history[:-MAX_HISTORY_MESSAGES]
 
             await self.send_json({"type": "assistant", "text": reply})
             await self.send_json({"type": "assistant_end"})

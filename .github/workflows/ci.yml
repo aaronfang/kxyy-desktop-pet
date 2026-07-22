@@ -83,6 +83,9 @@ jobs:
       - name: Test realtime voice state replay
         run: npm test
 
+      - name: Test local realtime event transitions
+        run: npm run test:python
+
       - name: Encrypt persona assets
         run: npm run encrypt-assets
 

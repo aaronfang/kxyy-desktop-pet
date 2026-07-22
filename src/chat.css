@@ -589,6 +589,14 @@ body {
   );
   box-shadow: 0 0 6px rgba(229, 72, 77, 0.35);
 }
+#call-wave.candidate .call-wave-bars span {
+  background: linear-gradient(
+    180deg,
+    rgba(255, 224, 130, 0.98) 0%,
+    rgba(232, 157, 45, 0.78) 100%
+  );
+  box-shadow: 0 0 8px rgba(232, 157, 45, 0.45);
+}
 
 /* 表情库面板：底部弹出的半透明深色网格 */
 #sticker-panel {

@@ -258,3 +258,65 @@ test("desktop session maps local cascade events without retaining transcript tex
   assert.equal(JSON.stringify(snapshot).includes("完整用户文本"), false);
   assert.equal(JSON.stringify(snapshot).includes("完整助手文本"), false);
 });
+
+test("desktop session ducks candidates, resumes rejection and gates stale audio", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  const playbackCommands = [];
+  session.playbackNode = {
+    port: { postMessage: (message) => playbackCommands.push(message) },
+  };
+  session.trace.startSession();
+  session.trace.startResponse();
+  session._assistantActive = true;
+  session._playbackQueuedMs = 200;
+
+  session._onMessage({ data: JSON.stringify({ type: "speech_candidate" }) });
+  assert.equal(playbackCommands.at(-1).type, "duck");
+  session._onMessage({ data: JSON.stringify({ type: "speech_rejected" }) });
+  assert.equal(playbackCommands.at(-1).type, "resume");
+
+  session._onMessage({ data: JSON.stringify({ type: "speech_candidate" }) });
+  session._onMessage({
+    data: JSON.stringify({ type: "asr", text: "确认插话", interim: true }),
+  });
+  assert.equal(session._audioGate, true);
+  assert.equal(playbackCommands.at(-1).type, "clear");
+  const commandsBeforeStaleAudio = playbackCommands.length;
+  session._onMessage({ data: new ArrayBuffer(480) });
+  assert.equal(playbackCommands.length, commandsBeforeStaleAudio);
+
+  const eventTypes = session.getTraceSnapshot().events.map((event) => event.eventType);
+  assert.equal(eventTypes.filter((type) => type === TRACE_EVENT.SPEECH_CANDIDATE).length, 2);
+  assert.equal(eventTypes.includes(TRACE_EVENT.SPEECH_REJECTED), true);
+  assert.equal(eventTypes.includes(TRACE_EVENT.SPEECH_CONFIRMED), true);
+  assert.equal(eventTypes.includes(TRACE_EVENT.RESPONSE_CANCELLED), true);
+});
+
+test("candidate latches the interrupted response and clears its drain timer", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  const playbackCommands = [];
+  session.playbackNode = {
+    port: { postMessage: (message) => playbackCommands.push(message) },
+  };
+  session.trace.startSession();
+  session.trace.startResponse();
+  session._assistantActive = true;
+
+  session._onMessage({ data: JSON.stringify({ type: "speech_candidate" }) });
+  session._assistantActive = false;
+  session._playbackQueuedMs = 0;
+  session._playbackDrainTimer = setTimeout(() => {
+    throw new Error("confirmed interruption must cancel the stale drain timer");
+  }, 10);
+
+  session._onMessage({ data: JSON.stringify({ type: "speech_confirmed" }) });
+
+  assert.equal(session._audioGate, true);
+  assert.equal(session._playbackDrainTimer, 0);
+  assert.equal(playbackCommands.at(-1).type, "clear");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+});

@@ -6,6 +6,7 @@
 //     下行 binary = 播放 PCM16 mono 24k；
 //     下行 text  = 事件 JSON：
 //       {type:"session",state} / {type:"asr_start"} /
+//       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
@@ -21,8 +22,19 @@ const invoke = window.__TAURI__.core.invoke;
 
 const OUTPUT_RATE = 24000; // 与 realtime.rs protocol::OUTPUT_SAMPLE_RATE 一致
 const TARGET_RATE = 16000; // 上行目标采样率
+const MAX_PENDING_PCM_CHUNKS = 64;
+const PLAYBACK_MAX_QUEUE_MS = 3000;
+const PLAYBACK_DRAIN_GRACE_MS = 300;
 
-/** 通话会话：封装 WS、麦克风采集、下行播放与打断。 */
+function recoverablePlaybackEnabled() {
+  try {
+    return globalThis.localStorage?.getItem("kxyy.realtime.playback") !== "legacy";
+  } catch {
+    return true;
+  }
+}
+
+/** 通话会话：封装 WS、麦克风采集、可恢复 Worklet 播放与两阶段打断。 */
 export class RealtimeSession {
   constructor({
     onState,
@@ -34,6 +46,9 @@ export class RealtimeSession {
     onSpeaking,
     onUsage,
     onLevel,
+    onSpeechCandidate,
+    onSpeechRejected,
+    onPlaybackStats,
     onError,
     provider = "unknown",
     maxTraceEvents = 256,
@@ -49,6 +64,9 @@ export class RealtimeSession {
       onSpeaking,
       onUsage,
       onLevel,
+      onSpeechCandidate,
+      onSpeechRejected,
+      onPlaybackStats,
       onError,
     };
     this.ws = null;
@@ -71,6 +89,13 @@ export class RealtimeSession {
     this._outGain = null; // 下行播放主音量
     this._unsubVol = null;
     this._micPrepare = null; // 在用户手势栈内发起的 getUserMedia Promise
+    this.playbackNode = null;
+    this._playbackMode = "legacy";
+    this._playbackQueuedMs = 0;
+    this._audioGate = false;
+    this._speechCandidate = false;
+    this._candidateInterruptsResponse = false;
+    this._playbackDrainTimer = 0;
     this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
     this._traceAsrFinalSeen = false;
   }
@@ -114,6 +139,8 @@ export class RealtimeSession {
     await this._openSocket(base, { systemRole, botName });
     if (this.stopped) return;
     await this._resumeAudioCtx();
+    if (this.stopped) return;
+    await this._startPlayback();
     if (this.stopped) return;
     await this._startMic();
     if (this.stopped) return;
@@ -162,6 +189,7 @@ export class RealtimeSession {
   _onMessage(ev) {
     if (typeof ev.data !== "string") {
       // 下行音频 PCM16 24k
+      if (this._audioGate) return;
       this.trace.startResponse();
       this.trace.recordOnce("tts_first_audio", TRACE_EVENT.TTS_FIRST_AUDIO, {
         metrics: { audioBytes: ev.data?.byteLength || 0 },
@@ -189,15 +217,27 @@ export class RealtimeSession {
         this.cb.onState?.(msg.state);
         break;
       case "asr_start":
-        this._beginUserTurn();
-        this.cb.onAsrStart?.();
+        if (this._confirmSpeech()) this.cb.onAsrStart?.();
+        break;
+      case "speech_candidate":
+        this._beginSpeechCandidate(msg);
+        break;
+      case "speech_confirmed":
+        if (this._confirmSpeech()) this.cb.onAsrStart?.();
+        break;
+      case "speech_rejected":
+        this._rejectSpeech(msg.reason || "voice_rejected");
         break;
       case "asr":
         // asr_end 之后的迟到识别（二遍 ASR 常见）必须忽略，
         // 否则会当成新一轮用户说话，把刚开始的助手语音整段 flush 掉 → 首句静音。
         if (!this._userTurnOpen) {
-          if (this._assistantActive || this._hasPlayback()) return;
-          this._beginUserTurn();
+          if (this._speechCandidate) {
+            if (this._confirmSpeech()) this.cb.onAsrStart?.();
+          } else {
+            if (this._assistantActive || this._hasPlayback()) return;
+            if (this._confirmSpeech()) this.cb.onAsrStart?.();
+          }
         }
         this.trace.record(
           msg.interim === false ? TRACE_EVENT.ASR_FINAL : TRACE_EVENT.ASR_PARTIAL,
@@ -206,17 +246,24 @@ export class RealtimeSession {
         if (msg.interim === false) this._traceAsrFinalSeen = true;
         this.cb.onAsr?.(msg.text || "", { interim: msg.interim !== false });
         break;
-      case "asr_end":
-        if (!this._traceAsrFinalSeen) {
+      case "asr_end": {
+        const hadUserTurn = this._userTurnOpen;
+        if (this._speechCandidate && !this._userTurnOpen) {
+          this._rejectSpeech("voice_rejected");
+        }
+        if (hadUserTurn && !this._traceAsrFinalSeen) {
           this.trace.recordOnce("asr_final", TRACE_EVENT.ASR_FINAL, {
             metrics: { interim: false },
           });
         }
         this._userTurnOpen = false;
-        this.cb.onAsrEnd?.();
-        this.trace.startResponse();
-        this.trace.recordOnce("llm_request", TRACE_EVENT.LLM_REQUEST);
+        if (hadUserTurn) {
+          this.cb.onAsrEnd?.();
+          this.trace.startResponse();
+          this.trace.recordOnce("llm_request", TRACE_EVENT.LLM_REQUEST);
+        }
         break;
+      }
       case "assistant":
         this._assistantActive = true;
         this.trace.startResponse();
@@ -236,6 +283,7 @@ export class RealtimeSession {
         break;
       case "speaking":
         this._assistantActive = true;
+        this._audioGate = false;
         this.trace.startResponse();
         this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
         this.cb.onSpeaking?.();
@@ -359,23 +407,141 @@ export class RealtimeSession {
     this._flushPendingPcm();
   }
 
-  _beginUserTurn() {
+  _beginSpeechCandidate(msg = {}) {
+    if (this._speechCandidate || this._userTurnOpen) return false;
+    this._speechCandidate = true;
+    this._candidateInterruptsResponse = this._assistantActive || this._hasPlayback();
+    this.trace.record(TRACE_EVENT.SPEECH_CANDIDATE, {
+      metrics: { confidence: Number(msg.confidence) || 0 },
+    });
+    this._duckPlayback();
+    this.cb.onSpeechCandidate?.();
+    return true;
+  }
+
+  _confirmSpeech() {
+    if (this._userTurnOpen) return false;
+    const interruptsResponse = this._candidateInterruptsResponse;
+    this._speechCandidate = false;
+    this._candidateInterruptsResponse = false;
+    return this._beginUserTurn(interruptsResponse);
+  }
+
+  _rejectSpeech(reason = "voice_rejected") {
+    if (!this._speechCandidate) return false;
+    this._speechCandidate = false;
+    this._candidateInterruptsResponse = false;
+    this.trace.record(TRACE_EVENT.SPEECH_REJECTED, { reason });
+    this._resumePlayback();
+    this.cb.onSpeechRejected?.();
+    return true;
+  }
+
+  _beginUserTurn(candidateInterruptedResponse = false) {
     // 仅在「新开一轮」时打断播报；同一轮内的重复 asr_start/asr 不再 flush。
     const alreadyOpen = this._userTurnOpen;
+    const assistantWasActive = this._assistantActive;
     this._userTurnOpen = true;
     this._assistantActive = false;
-    if (alreadyOpen) return;
-    if (this.trace.responseId) {
+    if (alreadyOpen) return false;
+    const interruptsResponse =
+      candidateInterruptedResponse || assistantWasActive || this._hasPlayback();
+    if (interruptsResponse && this.trace.responseId) {
       this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "turn_detected" });
     }
     this.trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
     this._traceAsrFinalSeen = false;
     this._bargeInTurn = true;
+    if (interruptsResponse) this._audioGate = true;
     this._flushPlayback("turn_detected");
+    return true;
   }
 
   _hasPlayback() {
-    return (this._sources && this._sources.size > 0) || this._pendingPcm.length > 0;
+    return (
+      this._playbackQueuedMs > 0 ||
+      (this._sources && this._sources.size > 0) ||
+      this._pendingPcm.length > 0
+    );
+  }
+
+  async _startPlayback() {
+    const ctx = this.audioCtx;
+    if (!ctx || this.playbackNode || this.stopped) return;
+    if (!recoverablePlaybackEnabled()) {
+      this._playbackMode = "legacy";
+      return;
+    }
+    try {
+      await ctx.audioWorklet.addModule("./ai/playback-worklet.js");
+      if (this.stopped || !this.audioCtx) return;
+      const node = new AudioWorkletNode(ctx, "pcm-playback", {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: { sourceRate: OUTPUT_RATE, maxQueueMs: PLAYBACK_MAX_QUEUE_MS },
+      });
+      node.connect(this._outGain || ctx.destination);
+      node.port.onmessage = (event) => this._onPlaybackMessage(event.data || {});
+      this.playbackNode = node;
+      this._playbackMode = "worklet";
+      this._flushPendingPcm();
+    } catch (error) {
+      // Unsupported/failed worklet keeps the established source-node path available.
+      console.warn("[realtime] playback worklet unavailable; using legacy scheduler", error);
+      this._playbackMode = "legacy";
+    }
+  }
+
+  _onPlaybackMessage(message) {
+    if (Number.isFinite(message.queuedMs)) this._playbackQueuedMs = message.queuedMs;
+    if (message.type === "queued" && this._playbackDrainTimer) {
+      clearTimeout(this._playbackDrainTimer);
+      this._playbackDrainTimer = 0;
+    }
+    if (message.type === "started") {
+      this.trace.recordOnce("playback_started", TRACE_EVENT.PLAYBACK_STARTED, {
+        metrics: { queuedMs: this._playbackQueuedMs },
+      });
+    } else if (message.type === "drained") {
+      this._playbackQueuedMs = 0;
+      this._schedulePlaybackCompletion();
+    }
+    if (message.type === "stats") {
+      const stats = {
+        queuedMs: Number(message.queuedMs) || 0,
+        underruns: Number(message.underruns) || 0,
+        droppedSamples: Number(message.droppedSamples) || 0,
+        playedSamples: Number(message.playedSamples) || 0,
+      };
+      this.trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: stats });
+      this.cb.onPlaybackStats?.(stats);
+    }
+  }
+
+  _duckPlayback() {
+    this.playbackNode?.port.postMessage({ type: "duck" });
+  }
+
+  _resumePlayback() {
+    this.playbackNode?.port.postMessage({ type: "resume" });
+  }
+
+  _schedulePlaybackCompletion() {
+    if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
+    this._playbackDrainTimer = setTimeout(() => {
+      this._playbackDrainTimer = 0;
+      if (this.stopped || this._playbackQueuedMs > 0 || this._sources?.size) return;
+      this._assistantActive = false;
+      this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, {
+        reason: "completed",
+      });
+      if (this.trace.state.response === "active") {
+        this.trace.recordOnce("response_completed", TRACE_EVENT.RESPONSE_COMPLETED, {
+          reason: "completed",
+        });
+      }
+    }, PLAYBACK_DRAIN_GRACE_MS);
   }
 
   _enqueuePcm(arrayBuffer) {
@@ -383,6 +549,7 @@ export class RealtimeSession {
     this._assistantActive = true;
     // context 尚未 running：先入队，resume 后再播，避免 start(过去时间) 整段静音。
     if (this.audioCtx.state !== "running") {
+      if (this._pendingPcm.length >= MAX_PENDING_PCM_CHUNKS) this._pendingPcm.shift();
       this._pendingPcm.push(arrayBuffer.slice ? arrayBuffer.slice(0) : arrayBuffer);
       this._kickResumeOut();
       return;
@@ -415,6 +582,15 @@ export class RealtimeSession {
   }
 
   _enqueuePcmNow(arrayBuffer) {
+    if (this._playbackDrainTimer) {
+      clearTimeout(this._playbackDrainTimer);
+      this._playbackDrainTimer = 0;
+    }
+    if (this.playbackNode) {
+      const pcm = arrayBuffer.slice ? arrayBuffer.slice(0) : arrayBuffer;
+      this.playbackNode.port.postMessage({ type: "audio", pcm }, [pcm]);
+      return;
+    }
     const i16 = new Int16Array(arrayBuffer);
     if (!i16.length) return;
     const f32 = new Float32Array(i16.length);
@@ -433,15 +609,22 @@ export class RealtimeSession {
     });
     this.playHead += buf.duration;
     (this._sources ||= new Set()).add(src);
-    src.onended = () => this._sources?.delete(src);
+    src.onended = () => {
+      this._sources?.delete(src);
+      if (!this._sources?.size) this._schedulePlaybackCompletion();
+    };
   }
 
   /** 打断：停掉所有排队中的播放源，重置游标。 */
   _flushPlayback(reason = "session_ended") {
+    if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
+    this._playbackDrainTimer = 0;
     if (this._hasPlayback()) {
       this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, { reason });
     }
     this._pendingPcm = [];
+    this._playbackQueuedMs = 0;
+    this.playbackNode?.port.postMessage({ type: "clear" });
     if (this._sources) {
       for (const s of this._sources) {
         try {
@@ -508,6 +691,8 @@ export class RealtimeSession {
     this.stopped = true;
     if (this._levelRaf) cancelAnimationFrame(this._levelRaf);
     this._levelRaf = 0;
+    if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
+    this._playbackDrainTimer = 0;
     this.cb.onLevel?.(0);
     try {
       this._unsubVol?.();
@@ -537,6 +722,7 @@ export class RealtimeSession {
     this._outGain = null;
     try {
       this.workletNode?.disconnect();
+      this.playbackNode?.disconnect();
       this.micSource?.disconnect();
     } catch {
       /* ignore */
@@ -561,6 +747,7 @@ export class RealtimeSession {
     this.micStream = null;
     this.audioCtx = null;
     this.workletNode = null;
+    this.playbackNode = null;
     this.micSource = null;
   }
 
