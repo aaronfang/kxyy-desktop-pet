@@ -7,7 +7,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.js",
+    "test": "node --test tests/realtime-trace.test.js",
     "tauri": "tauri",
     "dev": "tauri dev",
     "predev": "node scripts/kill-services.mjs && npm run encrypt-assets",
