@@ -1907,6 +1907,7 @@ async function startCall() {
   petSignal("thinking");
 
   callSession = new RealtimeSession({
+    provider: settings.realtimeBackend,
     onState: (state) => {
       if (state === "started") {
         appendPatNotice("📞 通话已接通");

@@ -15,6 +15,7 @@
 // 桌宠是外放场景，没有 AEC 会自己听到自己造成啸叫与误打断。
 
 import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
+import { RealtimeTrace, TRACE_EVENT } from "./realtime-trace.js";
 
 const invoke = window.__TAURI__.core.invoke;
 
@@ -34,6 +35,9 @@ export class RealtimeSession {
     onUsage,
     onLevel,
     onError,
+    provider = "unknown",
+    maxTraceEvents = 256,
+    onTrace,
   } = {}) {
     this.cb = {
       onState,
@@ -67,6 +71,8 @@ export class RealtimeSession {
     this._outGain = null; // 下行播放主音量
     this._unsubVol = null;
     this._micPrepare = null; // 在用户手势栈内发起的 getUserMedia Promise
+    this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
+    this._traceAsrFinalSeen = false;
   }
 
   /**
@@ -96,6 +102,7 @@ export class RealtimeSession {
 
   /** 开始通话：连桥接 → 发 start → 起麦克风与播放。 */
   async start({ systemRole, botName }) {
+    this.trace.startSession();
     // 若 chat.js 已在点击栈调用 prepareAudio，这里是幂等补齐。
     this._initAudioCtx();
     if (!this._micPrepare) this._micPrepare = this._acquireMicStream();
@@ -144,6 +151,9 @@ export class RealtimeSession {
         if (!opened) reject(new Error("连接实时语音服务失败"));
       };
       ws.onclose = () => {
+        this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
+          reason: this.stopped ? "hangup" : "session_ended",
+        });
         if (!this.stopped) this.cb.onState?.("ended");
       };
     });
@@ -152,6 +162,13 @@ export class RealtimeSession {
   _onMessage(ev) {
     if (typeof ev.data !== "string") {
       // 下行音频 PCM16 24k
+      this.trace.startResponse();
+      this.trace.recordOnce("tts_first_audio", TRACE_EVENT.TTS_FIRST_AUDIO, {
+        metrics: { audioBytes: ev.data?.byteLength || 0 },
+      });
+      this.trace.recordOnce("playback_queued", TRACE_EVENT.PLAYBACK_QUEUED, {
+        metrics: { audioBytes: ev.data?.byteLength || 0 },
+      });
       this._notePlayLevel(ev.data);
       this._enqueuePcm(ev.data);
       return;
@@ -164,6 +181,11 @@ export class RealtimeSession {
     }
     switch (msg.type) {
       case "session":
+        if (msg.state === "ended") {
+          this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
+            reason: "session_ended",
+          });
+        }
         this.cb.onState?.(msg.state);
         break;
       case "asr_start":
@@ -177,28 +199,54 @@ export class RealtimeSession {
           if (this._assistantActive || this._hasPlayback()) return;
           this._beginUserTurn();
         }
+        this.trace.record(
+          msg.interim === false ? TRACE_EVENT.ASR_FINAL : TRACE_EVENT.ASR_PARTIAL,
+          { metrics: { interim: msg.interim !== false } },
+        );
+        if (msg.interim === false) this._traceAsrFinalSeen = true;
         this.cb.onAsr?.(msg.text || "", { interim: msg.interim !== false });
         break;
       case "asr_end":
+        if (!this._traceAsrFinalSeen) {
+          this.trace.recordOnce("asr_final", TRACE_EVENT.ASR_FINAL, {
+            metrics: { interim: false },
+          });
+        }
         this._userTurnOpen = false;
         this.cb.onAsrEnd?.();
+        this.trace.startResponse();
+        this.trace.recordOnce("llm_request", TRACE_EVENT.LLM_REQUEST);
         break;
       case "assistant":
         this._assistantActive = true;
+        this.trace.startResponse();
+        if (this.trace.mode === "end_to_end") {
+          this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
+        } else {
+          // 本地级联后端当前整段返回，不能把整段首包冒充流式 first token。
+          this.trace.recordOnce("llm_response", TRACE_EVENT.LLM_RESPONSE);
+        }
         this.cb.onAssistant?.(msg.text || "");
         break;
       case "assistant_end":
         this._assistantActive = false;
+        this.trace.recordOnce("llm_response", TRACE_EVENT.LLM_RESPONSE);
+        this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
         this.cb.onAssistantEnd?.();
         break;
       case "speaking":
         this._assistantActive = true;
+        this.trace.startResponse();
+        this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
         this.cb.onSpeaking?.();
         break;
       case "usage":
         this.cb.onUsage?.(msg);
         break;
       case "error":
+        if (this.trace.responseId && this.trace.state.response === "active") {
+          this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "error" });
+        }
         this.cb.onError?.(new Error(msg.message || "实时语音出错"));
         break;
       default:
@@ -317,8 +365,13 @@ export class RealtimeSession {
     this._userTurnOpen = true;
     this._assistantActive = false;
     if (alreadyOpen) return;
+    if (this.trace.responseId) {
+      this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "turn_detected" });
+    }
+    this.trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
+    this._traceAsrFinalSeen = false;
     this._bargeInTurn = true;
-    this._flushPlayback();
+    this._flushPlayback("turn_detected");
   }
 
   _hasPlayback() {
@@ -375,13 +428,19 @@ export class RealtimeSession {
     const now = this.audioCtx.currentTime + 0.02;
     if (this.playHead < now) this.playHead = now;
     src.start(this.playHead);
+    this.trace.recordOnce("playback_started", TRACE_EVENT.PLAYBACK_STARTED, {
+      metrics: { audioBytes: arrayBuffer.byteLength || 0 },
+    });
     this.playHead += buf.duration;
     (this._sources ||= new Set()).add(src);
     src.onended = () => this._sources?.delete(src);
   }
 
   /** 打断：停掉所有排队中的播放源，重置游标。 */
-  _flushPlayback() {
+  _flushPlayback(reason = "session_ended") {
+    if (this._hasPlayback()) {
+      this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, { reason });
+    }
     this._pendingPcm = [];
     if (this._sources) {
       for (const s of this._sources) {
@@ -431,6 +490,9 @@ export class RealtimeSession {
     });
     this.workletNode.port.onmessage = (e) => {
       // e.data 是 Int16 PCM 的 ArrayBuffer，直接上行。
+      this.trace.recordOnce("mic_audio_input", TRACE_EVENT.MIC_AUDIO_INPUT, {
+        metrics: { audioBytes: e.data?.byteLength || 0 },
+      });
       this._noteMicLevel(e.data);
       if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.stopped) {
         this.ws.send(e.data);
@@ -460,7 +522,11 @@ export class RealtimeSession {
     } catch {
       /* ignore */
     }
-    this._flushPlayback();
+    if (this.trace.responseId && this.trace.state.response === "active") {
+      this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "hangup" });
+    }
+    this._flushPlayback("hangup");
+    this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, { reason: "hangup" });
     try {
       this._keepAliveOsc?.stop();
     } catch {
@@ -496,5 +562,10 @@ export class RealtimeSession {
     this.audioCtx = null;
     this.workletNode = null;
     this.micSource = null;
+  }
+
+  /** 返回隐私安全、固定上限的 trace 快照，供诊断或导出测试夹具。 */
+  getTraceSnapshot() {
+    return this.trace.snapshot();
   }
 }
