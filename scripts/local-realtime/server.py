@@ -96,6 +96,8 @@ def _run_mlx() -> None:
         synth_tts=_synth_mlx,
         prepare=_prepare_mlx,
         tts_pool=common._mlx_pool,
+        tts_parallelism=1,
+        tts_prefetch_while_playing=False,
     )
 
 
@@ -121,6 +123,8 @@ def _run_torch() -> None:
         synth_tts_http=qwen3.synth_tts_http,
         prepare=prepare,
         tts_pool=tts_pool,
+        tts_parallelism=1,
+        tts_prefetch_while_playing=True,
     )
 
 
