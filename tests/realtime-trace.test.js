@@ -332,6 +332,186 @@ test("desktop session rejects stale generation control events before reopening a
   assert.equal(session._audioGate, false);
 });
 
+test("desktop session returns text-free receipts only for current completed segments", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const audible = [];
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAudibleAssistant: (text, meta) => audible.push({ text, ...meta }),
+  });
+  session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+  session.playbackNode = { port: { postMessage: () => {} } };
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 3,
+      segmentId: 1,
+      text: "已经播完的第一句。",
+      samples: 2400,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 3, segmentId: 1 }),
+  });
+  session._onPlaybackMessage({
+    type: "segment_completed",
+    generation: 3,
+    segmentId: 1,
+  });
+  session._onPlaybackMessage({
+    type: "segment_completed",
+    generation: 2,
+    segmentId: 1,
+  });
+
+  assert.deepEqual(audible, [
+    { text: "已经播完的第一句。", generation: 3, segmentId: 1 },
+  ]);
+  assert.deepEqual(sent, [
+    { type: "playback_segment", generation: 3, segmentId: 1, state: "completed" },
+  ]);
+  assert.equal(JSON.stringify(sent).includes("已经播完"), false);
+});
+
+test("candidate defers a completed segment until rejection and discards it on confirmation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "cosyvoice" });
+  session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+  session.playbackNode = { port: { postMessage: () => {} } };
+  session.trace.startSession();
+
+  const start = (generation, segmentId) => {
+    session._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_start",
+        generation,
+        segmentId,
+        text: `句段${segmentId}。`,
+      }),
+    });
+  };
+  start(1, 1);
+  session._speechCandidate = true;
+  session._onPlaybackMessage({ type: "segment_completed", generation: 1, segmentId: 1 });
+  assert.deepEqual(sent, []);
+  session._rejectSpeech("voice_rejected");
+  assert.equal(sent.length, 1);
+
+  start(2, 1);
+  session._speechCandidate = true;
+  session._candidateInterruptsResponse = true;
+  session._onPlaybackMessage({ type: "segment_completed", generation: 2, segmentId: 1 });
+  session._confirmSpeech();
+  assert.equal(sent.length, 1, "confirmed interruption must not commit the faded tail");
+});
+
+test("suspended audio keeps PCM before its segment end marker", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const commands = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.audioCtx = {
+    state: "suspended",
+    resume: () => new Promise(() => {}),
+  };
+  session.playbackNode = {
+    port: { postMessage: (message) => commands.push(message) },
+  };
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "挂起时暂存。",
+    }),
+  });
+  session._onMessage({ data: new Int16Array(240).buffer });
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 1, segmentId: 1 }),
+  });
+
+  assert.deepEqual(commands.map((message) => message.type), ["segment_start"]);
+  assert.deepEqual(session._pendingPcm.map((item) => item.type), ["audio", "segment_end"]);
+  session.audioCtx.state = "running";
+  session._flushPendingPcm();
+  assert.deepEqual(commands.map((message) => message.type), [
+    "segment_start",
+    "audio",
+    "segment_end",
+  ]);
+});
+
+test("legacy playback receipts require natural source completion and remain bounded", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const sources = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+  session.audioCtx = {
+    state: "running",
+    currentTime: 0,
+    destination: {},
+    createBuffer: (_channels, length, rate) => ({
+      duration: length / rate,
+      getChannelData: () => new Float32Array(length),
+    }),
+    createBufferSource: () => {
+      const source = {
+        connect: () => {},
+        start: () => {},
+        stop() {
+          this.onended?.();
+        },
+        onended: null,
+      };
+      sources.push(source);
+      return source;
+    },
+  };
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "自然播完。",
+    }),
+  });
+  session._onMessage({ data: new Int16Array(240).buffer });
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 1, segmentId: 1 }),
+  });
+  assert.equal(sent.length, 0);
+  sources[0].onended();
+  assert.equal(sent.length, 1);
+  if (session._playbackDrainTimer) clearTimeout(session._playbackDrainTimer);
+  session._playbackDrainTimer = 0;
+
+  for (let generation = 2; generation < 70; generation++) {
+    session._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_start",
+        generation,
+        segmentId: 1,
+        text: "有界句段。",
+      }),
+    });
+  }
+  assert.ok(session._legacySegments.size <= 64);
+  session._flushPlayback("turn_detected");
+  assert.equal(sent.length, 1, "cleared legacy sources must not add receipts");
+  if (session._playbackDrainTimer) clearTimeout(session._playbackDrainTimer);
+});
+
 test("candidate latches the interrupted response and clears its drain timer", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");

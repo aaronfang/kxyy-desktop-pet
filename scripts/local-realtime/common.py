@@ -349,6 +349,8 @@ BARGE_IN_FRAMES = 6
 BARGE_IN_RMS_PLAY = 0.04
 BARGE_IN_FRAMES_PLAY = 12  # ~360ms
 MAX_HISTORY_MESSAGES = 24
+MAX_PENDING_HISTORY_TURNS = 4
+MAX_AUDIO_SEGMENTS_PER_TURN = 64
 LLM_STREAM_QUEUE_MAX = 32
 LLM_STREAM_MAX_PRODUCERS = 2
 TTS_STREAM_MAX_TASKS = 2
@@ -513,6 +515,110 @@ class StableSentenceBuffer:
             if self._buffer[index] in self.WEAK:
                 return index + 1
         return None
+
+
+class AudibleHistory:
+    """只把前端确认播完的句段写入下一轮上下文。
+
+    ``generated`` 文本只在当前回复管线中短暂存在；这里保存的 assistant
+    内容全部来自不含文本的 ``generation + segmentId`` 播放回执。turn/segment
+    ledger 都有固定上限，迟到或未知回执会被忽略。
+    """
+
+    def __init__(
+        self,
+        *,
+        max_messages: int = MAX_HISTORY_MESSAGES,
+        max_pending_turns: int = MAX_PENDING_HISTORY_TURNS,
+    ):
+        if max_messages < 2 or max_pending_turns < 1:
+            raise ValueError("history limits must be positive")
+        self.max_messages = max_messages
+        self.max_pending_turns = max_pending_turns
+        self.messages: list[dict] = []
+        self._turns: dict[int, dict] = {}
+        self._order: list[int] = []
+
+    def begin_turn(self, generation: int, user_text: str) -> list[dict]:
+        """返回当前轮之前的快照，再登记当前用户输入。"""
+        snapshot = [dict(message) for message in self.messages]
+        user_message = {"role": "user", "content": user_text}
+        self.messages.append(user_message)
+        self._turns[generation] = {
+            "user": user_message,
+            "assistant": None,
+            "segments": [],
+            "segmentIds": set(),
+            "completed": set(),
+            "cancelled": False,
+        }
+        self._order.append(generation)
+        while len(self._order) > self.max_pending_turns:
+            expired = self._order.pop(0)
+            self._turns.pop(expired, None)
+        self._trim()
+        return snapshot
+
+    def add_segment(self, generation: int, segment_id: int, text: str) -> bool:
+        turn = self._turns.get(generation)
+        clean = str(text or "").strip()
+        if turn is None or not clean or segment_id in turn["segmentIds"]:
+            return False
+        if len(turn["segments"]) >= MAX_AUDIO_SEGMENTS_PER_TURN:
+            return False
+        turn["segmentIds"].add(segment_id)
+        turn["segments"].append({"id": segment_id, "text": clean})
+        return True
+
+    def acknowledge(self, generation: int, segment_id: int, state: str) -> bool:
+        turn = self._turns.get(generation)
+        if (
+            turn is None
+            or turn["cancelled"]
+            or state != "completed"
+            or segment_id not in turn["segmentIds"]
+        ):
+            return False
+        turn["completed"].add(segment_id)
+        audible_parts: list[str] = []
+        for segment in turn["segments"]:
+            if segment["id"] not in turn["completed"]:
+                break
+            audible_parts.append(segment["text"])
+        audible = "".join(audible_parts).strip()
+        if not audible:
+            return False
+        assistant = turn["assistant"]
+        if assistant is None:
+            assistant = {"role": "assistant", "content": audible}
+            turn["assistant"] = assistant
+            try:
+                user_index = next(
+                    index
+                    for index, message in enumerate(self.messages)
+                    if message is turn["user"]
+                )
+            except StopIteration:
+                return False
+            self.messages.insert(user_index + 1, assistant)
+        else:
+            assistant["content"] = audible
+        self._trim()
+        return True
+
+    def cancel_turn(self, generation: int) -> None:
+        turn = self._turns.get(generation)
+        if turn is not None:
+            turn["cancelled"] = True
+
+    def _trim(self) -> None:
+        overflow = len(self.messages) - self.max_messages
+        if overflow > 0:
+            del self.messages[:overflow]
+        # 不能让 OpenAI-compatible history 以孤立 assistant 开头；满容量时
+        # 宁可再丢一条最旧回复，也要保持剩余上下文的角色顺序可解释。
+        while self.messages and self.messages[0].get("role") == "assistant":
+            del self.messages[0]
 
 
 class SafeRealtimeError(RuntimeError):
@@ -1295,7 +1401,9 @@ class Session:
         self.ws = ws
         self.system_role = "你是元元，口语化简短回复，一两句即可。"
         self.bot_name = "元元"
-        self.history: list[dict] = []
+        self._audible_history = AudibleHistory()
+        # 兼容现有诊断/测试读取；其中 assistant 永远只含前端确认播完的句段。
+        self.history = self._audible_history.messages
         self.pcm_buf = bytearray()
         self.speech_pcm = bytearray()
         self.in_speech = False
@@ -1356,6 +1464,7 @@ class Session:
         scope = self.response_scope
         self.response_scope = None
         if scope is not None:
+            self._audible_history.cancel_turn(scope.generation)
             scope.cancel(reason)
         self.play_enabled = False
         self.playing = False
@@ -1391,6 +1500,23 @@ class Session:
         self.bot_name = (msg.get("botName") or "元元").strip() or "元元"
         await self.send_json({"type": "session", "state": "started"})
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
+
+    def on_playback_segment(self, msg: dict) -> None:
+        """接收前端实际播放回执；只接受有界 ledger 中已知的句段。"""
+        generation = msg.get("generation")
+        segment_id = msg.get("segmentId")
+        state = msg.get("state")
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or not isinstance(segment_id, int)
+            or isinstance(segment_id, bool)
+            or segment_id < 1
+            or state != "completed"
+        ):
+            return
+        self._audible_history.acknowledge(generation, segment_id, state)
 
     async def on_pcm(self, data: bytes) -> None:
         self.pcm_buf.extend(data)
@@ -1646,10 +1772,11 @@ class Session:
         try:
             assert _synth_tts is not None
             t1 = time.perf_counter()
+            history_snapshot = self._audible_history.begin_turn(scope.generation, text)
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
             start_llm_stream_producer(
                 self.system_role,
-                list(self.history),
+                history_snapshot,
                 text,
                 scope,
                 events,
@@ -1662,9 +1789,10 @@ class Session:
             tts_provider = ""
             tts_started = False
             speaking_sent = False
+            segment_seq = 0
 
             async def speak_sentence(sentence: str) -> None:
-                nonlocal tts_chars, tts_provider, tts_started, speaking_sent
+                nonlocal tts_chars, tts_provider, tts_started, speaking_sent, segment_seq
                 if not sentence or not scope.active:
                     return
                 if not tts_started:
@@ -1721,6 +1849,29 @@ class Session:
                     tts_provider = provider
                 if not audio:
                     return
+                spoken_sentence = clip_speech_text(
+                    text_for_speech(sentence) or sentence.strip()
+                )
+                if not spoken_sentence:
+                    return
+                segment_seq += 1
+                segment_id = segment_seq
+                if not self._audible_history.add_segment(
+                    scope.generation,
+                    segment_id,
+                    spoken_sentence,
+                ):
+                    raise SafeRealtimeError("本轮语音句段过多，已停止播报")
+                if not await self.send_json(
+                    {
+                        "type": "audio_segment_start",
+                        "segmentId": segment_id,
+                        "text": spoken_sentence,
+                        "samples": len(audio) // 2,
+                    },
+                    scope=scope,
+                ):
+                    return
                 self.playing = True
                 if not speaking_sent:
                     self.play_enabled = not self.in_speech
@@ -1738,6 +1889,10 @@ class Session:
                     if not scope.active or not await self.send_pcm(chunk, scope=scope):
                         return
                     await asyncio.sleep(0.06)
+                await self.send_json(
+                    {"type": "audio_segment_end", "segmentId": segment_id},
+                    scope=scope,
+                )
 
             stream_done = False
             while scope.active and not stream_done:
@@ -1789,10 +1944,6 @@ class Session:
 
             if not await self.send_json({"type": "assistant_end"}, scope=scope):
                 return
-            self.history.append({"role": "user", "content": text})
-            self.history.append({"role": "assistant", "content": reply})
-            if len(self.history) > MAX_HISTORY_MESSAGES:
-                del self.history[:-MAX_HISTORY_MESSAGES]
 
             for sentence in sentences.flush():
                 await speak_sentence(sentence)
@@ -1860,6 +2011,8 @@ async def _handler(ws):
                 await session.cancel_all("hangup")
                 await session.send_json({"type": "session", "state": "ended"})
                 break
+            elif typ == "playback_segment":
+                session.on_playback_segment(msg)
     except Exception as e:
         log(f"连接结束: {e}")
     finally:

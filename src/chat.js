@@ -1714,7 +1714,15 @@ let callUserBubble = null;
 let callUserText = "";
 let callAsstBubble = null;
 let callAsstText = "";
+let callLastUserMessageId = "";
+let callAudibleTurns = new Map();
 let callWaveSpeaking = false;
+const MAX_CALL_AUDIBLE_TURNS = 4;
+let callAudibleReceiptsActive = false;
+
+function callUsesAudibleReceipts() {
+  return callAudibleReceiptsActive;
+}
 
 const callWaveEl = document.getElementById("call-wave");
 const callWaveBarsEl = callWaveEl?.querySelector(".call-wave-bars");
@@ -1826,7 +1834,7 @@ function setCallActive(next) {
 }
 
 function finalizeCallUserBubble() {
-  if (!callUserBubble) return;
+  if (!callUserBubble) return null;
   const text = (callUserText || "").trim();
   const mid = callUserBubble.dataset.mid || genMsgId();
   const row = callUserBubble.closest(".row");
@@ -1834,7 +1842,13 @@ function finalizeCallUserBubble() {
   callUserBubble = null;
   callUserText = "";
   // 语音轮次写入 history，收起/退出时才能进长期记忆，也与文字聊天共用上下文窗口。
-  if (text) history.push({ role: "user", content: text, id: mid, call: true });
+  if (text) {
+    const message = { role: "user", content: text, id: mid, call: true };
+    history.push(message);
+    callLastUserMessageId = mid;
+    return message;
+  }
+  return null;
 }
 
 function finalizeCallAsstBubble() {
@@ -1847,10 +1861,12 @@ function finalizeCallAsstBubble() {
   callAsstText = "";
   callWaveSpeaking = false;
   callWaveEl?.classList.remove("speaking");
-  if (text) {
+  // 气泡展示 generatedText；对话/长期记忆只由实际播完的句段回执写入。
+  if (text && !callUsesAudibleReceipts()) {
     history.push({ role: "assistant", content: text, id: mid, call: true });
     void maybeUpdateRecap();
   }
+  return text ? { text, mid } : null;
 }
 
 /** 用户一轮：中间态只更新同一气泡，asr_end / 终态后定稿。 */
@@ -1873,20 +1889,67 @@ function upsertCallUserBubble(text, { interim }) {
 }
 
 /** 助手一轮：token 追加到同一气泡，assistant_end 定稿。 */
-function appendCallAsstBubble(delta) {
+function appendCallAsstBubble(delta, { generation } = {}) {
   const d = delta || "";
   if (!d) return;
   // 助手开始回复时，定稿用户气泡（若 asr_end 尚未到）。
   finalizeCallUserBubble();
+  if (
+    callUsesAudibleReceipts() &&
+    Number.isSafeInteger(generation) &&
+    !callAudibleTurns.has(generation)
+  ) {
+    while (callAudibleTurns.size >= MAX_CALL_AUDIBLE_TURNS) {
+      callAudibleTurns.delete(callAudibleTurns.keys().next().value);
+    }
+    callAudibleTurns.set(generation, {
+      anchorId: callLastUserMessageId,
+      assistantId: "",
+      entry: null,
+      audibleText: "",
+      segmentIds: new Set(),
+    });
+  }
   callAsstText += d;
   if (!callAsstBubble) {
     callAsstBubble = addBubble("assistant", callAsstText, { mid: genMsgId() });
+    const turn = callAudibleTurns.get(generation);
+    if (turn) turn.assistantId = callAsstBubble.dataset.mid || genMsgId();
     callAsstBubble.closest(".row")?.classList.add("streaming");
     petSignal("reply");
   } else {
     callAsstBubble.textContent = callAsstText;
     scrollBottom();
   }
+}
+
+function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
+  const sentence = (text || "").trim();
+  if (
+    !sentence ||
+    !Number.isSafeInteger(generation) ||
+    !Number.isSafeInteger(segmentId)
+  )
+    return;
+  const turn = callAudibleTurns.get(generation);
+  if (!turn || turn.segmentIds.has(segmentId)) return;
+  turn.segmentIds.add(segmentId);
+  turn.audibleText += sentence;
+  if (!turn.entry) {
+    turn.entry = {
+      role: "assistant",
+      content: turn.audibleText,
+      id: turn.assistantId || genMsgId(),
+      call: true,
+      audible: true,
+    };
+    const anchorIndex = history.findIndex((message) => message.id === turn.anchorId);
+    if (anchorIndex >= 0) history.splice(anchorIndex + 1, 0, turn.entry);
+    else history.push(turn.entry);
+  } else {
+    turn.entry.content = turn.audibleText;
+  }
+  void maybeUpdateRecap();
 }
 
 async function startCall() {
@@ -1897,10 +1960,14 @@ async function startCall() {
   // 通话与朗读互斥：先停掉正在放的朗读。
   stopSpeak();
   resetTtsQueue();
+  const callBackend = (settings.realtimeBackend || "").toLowerCase();
+  callAudibleReceiptsActive = callBackend === "local" || callBackend === "cosyvoice";
   callUserBubble = null;
   callUserText = "";
   callAsstBubble = null;
   callAsstText = "";
+  callLastUserMessageId = "";
+  callAudibleTurns = new Map();
 
   setCallActive(true);
   appendPatNotice(`📞 正在接通${aiShortName()}…`);
@@ -1926,8 +1993,9 @@ async function startCall() {
     // ASR 全文是覆盖式更新；只在 asr_end 定稿，避免中间态被标成 final 时切成多条。
     onAsr: (text) => upsertCallUserBubble(text, { interim: true }),
     onAsrEnd: () => finalizeCallUserBubble(),
-    onAssistant: (text) => appendCallAsstBubble(text),
+    onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
     onAssistantEnd: () => finalizeCallAsstBubble(),
+    onAudibleAssistant: (text, meta) => commitCallAudibleSegment(text, meta),
     onSpeechCandidate: () => {
       callWaveEl?.classList.add("candidate");
     },
@@ -1968,6 +2036,7 @@ function endCall({ notice = true } = {}) {
   callSession = null;
   finalizeCallUserBubble();
   finalizeCallAsstBubble();
+  callAudibleReceiptsActive = false;
   setCallActive(false);
   petSignal("abort");
   if (notice) appendPatNotice("📞 通话已结束");
@@ -2287,6 +2356,7 @@ listen("apply-settings", ({ payload }) => {
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
   // 切人设 / 换语音后端：重建 Web Audio，避免挂起的 AudioContext 导致「合成成功却静音」。
   if (cardChanged || backendChanged) {
+    if (callActive) endCall({ notice: false });
     console.log("[chat] 重置音频播放管线", { prevCardId, nextCardId, prevBackend, nextBackend });
     resetPlaybackPipeline();
   }

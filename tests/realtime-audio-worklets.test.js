@@ -93,6 +93,80 @@ test("playback worklet resamples 24k PCM into a 48k output", async () => {
   assert.equal(player.size, 0);
 });
 
+test("playback worklet acknowledges only fully consumed sentence segments", async () => {
+  const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
+  const player = new Playback({
+    processorOptions: { sourceRate: 24000, maxQueueMs: 250 },
+  });
+  const pcm = new Int16Array(240).fill(8000);
+  player.port.dispatch({ type: "segment_start", generation: 7, segmentId: 1 });
+  player.port.dispatch({
+    type: "audio",
+    pcm: pcm.buffer,
+    generation: 7,
+    segmentId: 1,
+  });
+  player.port.dispatch({ type: "segment_end", generation: 7, segmentId: 1 });
+  player.process([], outputBlock(480));
+
+  const completed = player.port.messages.filter(
+    (message) => message.type === "segment_completed",
+  );
+  assert.deepEqual(completed.map(({ generation, segmentId }) => [generation, segmentId]), [
+    [7, 1],
+  ]);
+
+  player.port.dispatch({ type: "segment_start", generation: 7, segmentId: 2 });
+  player.port.dispatch({
+    type: "audio",
+    pcm: pcm.buffer,
+    generation: 7,
+    segmentId: 2,
+  });
+  player.port.dispatch({ type: "segment_end", generation: 7, segmentId: 2 });
+  player.port.dispatch({ type: "clear" });
+  player.process([], outputBlock(480));
+  assert.equal(
+    player.port.messages.filter((message) => message.type === "segment_completed").length,
+    1,
+    "cleared audio must not become audible history",
+  );
+});
+
+test("playback worklet suppresses segment receipts after ring overflow", async () => {
+  const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
+  const player = new Playback({
+    processorOptions: { sourceRate: 24000, maxQueueMs: 250 },
+  });
+  const pcm = new Int16Array(7000).fill(8000);
+  player.port.dispatch({ type: "segment_start", generation: 8, segmentId: 1 });
+  player.port.dispatch({
+    type: "audio",
+    pcm: pcm.buffer,
+    generation: 8,
+    segmentId: 1,
+  });
+  player.port.dispatch({ type: "segment_end", generation: 8, segmentId: 1 });
+  for (let i = 0; i < 50 && player.size > 0; i++) player.process([], outputBlock(512));
+  assert.equal(
+    player.port.messages.some((message) => message.type === "segment_completed"),
+    false,
+  );
+});
+
+test("playback worklet coalesces untagged spans without dropping valid ring audio", async () => {
+  const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
+  const player = new Playback({
+    processorOptions: { sourceRate: 24000, maxQueueMs: 3000 },
+  });
+  for (let i = 0; i < 129; i++) {
+    player.port.dispatch({ type: "audio", pcm: new Int16Array([i]).buffer });
+  }
+  assert.equal(player.size, 129);
+  assert.equal(player.droppedSamples, 0);
+  assert.equal(player.spans.length, 1);
+});
+
 test("capture worklet keeps fractional 44.1k to 16k resampling state across blocks", async () => {
   const Capture = await loadProcessor("pcm-worklet.js", "pcm-capture", 44100);
   const capture = new Capture({ processorOptions: { targetRate: 16000 } });

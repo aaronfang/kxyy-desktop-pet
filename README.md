@@ -64,7 +64,7 @@ npm run dev        # 开发模式（tauri dev）
   | **CosyVoice（通义云端）** | 在线 | 本机 Whisper + 当前文字服务（DeepSeek/Ollama），TTS 走通义云端；需通义 Key 与 CosyVoice 音色 id |
   | **Qwen3-TTS（本地）** | 本地 | 跨平台：macOS(Apple Silicon) 走 mlx-audio（保存后自动配置）；Windows / Linux 走官方 PyTorch 包 `qwen-tts`（默认 1.7B，运行 `scripts/windows/setup-qwen3-tts.cmd` 配置）。零样本克隆参考音频，不消耗火山 token |
 - **播放音量**：设置里「AI 语音播放音量」0–200%（100% 为原音量），朗读与通话共用。
-- **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话会按 LLM 稳定句提前合成，但每句音频仍是整段生成，并非真正音频流式。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
+- **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话会按 LLM 稳定句提前合成，但每句音频仍是整段生成，并非真正音频流式；下一轮上下文只采用完整播完的稳定句，不会把确认打断后未播的尾句当成用户已经听过。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
 - **实时语音优化路线**：自然打断、流式管线、Qwen3-TTS/CosyVoice/火山情绪能力和 SenseVoice 评估见 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md)；其中尚未实现的目标不会作为当前功能承诺。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。

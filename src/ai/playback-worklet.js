@@ -1,7 +1,8 @@
 // Realtime PCM playback worklet.
 //
 // Input messages:
-//   {type:"audio", pcm:ArrayBuffer} - PCM16 mono @ sourceRate
+//   {type:"audio", pcm:ArrayBuffer, generation?, segmentId?} - PCM16 mono @ sourceRate
+//   {type:"segment_start|segment_end", generation, segmentId}
 //   {type:"duck"}                   - 30ms fade-out, then pause consumption
 //   {type:"resume"}                 - resume consumption with 60ms fade-in
 //   {type:"clear"}                  - discard queued audio immediately
@@ -31,6 +32,10 @@ class PcmPlayback extends AudioWorkletProcessor {
     this.playedSamples = 0;
     this.outputFramesSinceStats = 0;
     this.wasAudible = false;
+    this.spans = [];
+    this.segments = new Map();
+    this.maxSpans = 128;
+    this.maxSegments = 64;
 
     this.port.onmessage = (event) => this._onMessage(event.data || {});
   }
@@ -39,7 +44,7 @@ class PcmPlayback extends AudioWorkletProcessor {
     return (this.size * 1000) / this.sourceRate;
   }
 
-  _post(type) {
+  _post(type, extra = {}) {
     this.port.postMessage({
       type,
       queuedMs: this._queuedMs(),
@@ -47,14 +52,76 @@ class PcmPlayback extends AudioWorkletProcessor {
       droppedSamples: this.droppedSamples,
       playedSamples: this.playedSamples,
       state: this.state,
+      ...extra,
     });
+  }
+
+  _segmentKey(generation, segmentId) {
+    return `${generation}:${segmentId}`;
+  }
+
+  _segmentMeta(message) {
+    const generation = message.generation;
+    const segmentId = message.segmentId;
+    if (
+      !Number.isSafeInteger(generation) ||
+      generation < 0 ||
+      !Number.isSafeInteger(segmentId) ||
+      segmentId < 1
+    )
+      return null;
+    return { generation, segmentId, key: this._segmentKey(generation, segmentId) };
+  }
+
+  _ensureSegment(meta) {
+    if (!meta) return null;
+    let segment = this.segments.get(meta.key);
+    if (segment) return segment;
+    if (this.segments.size >= this.maxSegments) return null;
+    segment = {
+      generation: meta.generation,
+      segmentId: meta.segmentId,
+      pending: 0,
+      played: 0,
+      started: false,
+      ended: false,
+      dropped: false,
+    };
+    this.segments.set(meta.key, segment);
+    return segment;
+  }
+
+  _completeSegment(meta, segment) {
+    if (!segment || !segment.ended || segment.pending > 0) return;
+    this.segments.delete(meta.key);
+    if (!segment.dropped && segment.played > 0) {
+      this._post("segment_completed", {
+        generation: segment.generation,
+        segmentId: segment.segmentId,
+        playedSamples: segment.played,
+      });
+    }
   }
 
   _onMessage(message) {
     switch (message.type) {
       case "audio":
-        this._appendPcm(message.pcm);
+        this._appendPcm(message);
         break;
+      case "segment_start": {
+        const meta = this._segmentMeta(message);
+        this._ensureSegment(meta);
+        break;
+      }
+      case "segment_end": {
+        const meta = this._segmentMeta(message);
+        const segment = meta ? this.segments.get(meta.key) : null;
+        if (segment) {
+          segment.ended = true;
+          this._completeSegment(meta, segment);
+        }
+        break;
+      }
       case "duck":
         if (this.state !== "paused") this.state = "ducking";
         break;
@@ -67,6 +134,8 @@ class PcmPlayback extends AudioWorkletProcessor {
         this.writeIndex = 0;
         this.size = 0;
         this.phase = 0;
+        this.spans = [];
+        this.segments.clear();
         this.state = "playing";
         this.gain = 1;
         this.wasAudible = false;
@@ -77,13 +146,26 @@ class PcmPlayback extends AudioWorkletProcessor {
     }
   }
 
-  _appendPcm(buffer) {
+  _appendPcm(message) {
+    const buffer = message.pcm;
     if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 2) return;
     const input = new Int16Array(buffer);
+    const meta = this._segmentMeta(message);
+    const segment = this._ensureSegment(meta);
+    const spanKey = meta?.key || null;
+    const lastSpan = this.spans[this.spans.length - 1];
+    const canMergeSpan = Boolean(lastSpan && lastSpan.key === spanKey);
     let accepted = 0;
+    if (!canMergeSpan && this.spans.length >= this.maxSpans) {
+      this.droppedSamples += input.length;
+      if (segment) segment.dropped = true;
+      this._post("queued");
+      return;
+    }
     for (let i = 0; i < input.length; i++) {
       if (this.size >= this.capacity) {
         this.droppedSamples += input.length - i;
+        if (segment) segment.dropped = true;
         break;
       }
       this.ring[this.writeIndex] = input[i] / 0x8000;
@@ -91,7 +173,41 @@ class PcmPlayback extends AudioWorkletProcessor {
       this.size += 1;
       accepted += 1;
     }
+    if (accepted > 0) {
+      if (canMergeSpan) lastSpan.remaining += accepted;
+      else this.spans.push({ key: spanKey, remaining: accepted });
+      if (segment) segment.pending += accepted;
+    }
     if (accepted > 0) this._post("queued");
+  }
+
+  _consumeSpanSample() {
+    while (this.spans.length && this.spans[0].remaining <= 0) this.spans.shift();
+    const span = this.spans[0];
+    if (!span) return;
+    span.remaining -= 1;
+    if (!span.key) return;
+    const segment = this.segments.get(span.key);
+    if (!segment) return;
+    segment.pending = Math.max(0, segment.pending - 1);
+    segment.played += 1;
+    if (!segment.started) {
+      segment.started = true;
+      this._post("segment_started", {
+        generation: segment.generation,
+        segmentId: segment.segmentId,
+      });
+    }
+    if (segment.pending === 0 && segment.ended) {
+      this._completeSegment(
+        {
+          generation: segment.generation,
+          segmentId: segment.segmentId,
+          key: span.key,
+        },
+        segment,
+      );
+    }
   }
 
   _readSample() {
@@ -105,6 +221,7 @@ class PcmPlayback extends AudioWorkletProcessor {
       this.readIndex = (this.readIndex + 1) % this.capacity;
       this.size -= 1;
       this.playedSamples += 1;
+      this._consumeSpanSample();
     }
     return value;
   }

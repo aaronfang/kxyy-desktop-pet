@@ -60,9 +60,13 @@ def _prepare_mlx() -> None:
 def _synth_mlx(text: str) -> bytes:
     import numpy as np
 
+    spoken = common.text_for_speech(text) or (text or "").strip()
+    spoken = common.clip_speech_text(spoken)
+    if not spoken:
+        return b""
     results = list(
         _tts_model.generate(
-            text=text,
+            text=spoken,
             ref_audio=str(_ref_wav),
             ref_text=_ref_text,
         )
