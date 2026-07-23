@@ -1,6 +1,6 @@
 {
   "name": "kxyy-desktop-pet",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "description": "元元桌宠 · 基于 webmeji 动画的 macOS / Windows 跨平台桌面宠物（Tauri）",
   "author": "aaronfang",
   "license": "MIT",

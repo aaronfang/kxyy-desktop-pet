@@ -15,6 +15,8 @@ import struct
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -350,7 +352,6 @@ NO_SPEECH_PROB_MAX = 0.55
 MIN_CJK_CHARS = 2
 
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 WHISPER_PROMPT = "以下是一段中文对话，角色名叫元元。"
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
@@ -514,8 +515,6 @@ _synth_tts: Callable[[str], bytes | tuple] | None = None
 # 朗读专用：返回 (audio_bytes, mime)。CosyVoice 直接回 MP3，避免 ffmpeg+24k WAV 失真。
 # 返回 (audio, mime) 或 (audio, mime, usage_dict)；usage 含 characters / provider。
 _synth_tts_http: Callable[[str], tuple] | None = None
-_deepseek_key = ""
-_temperature = 0.8
 _system_suffix = ""
 
 
@@ -635,13 +634,52 @@ def ensure_ref_wav() -> tuple[Path, str]:
     )
 
 
+def _ai_proxy_chat_url() -> str:
+    """只允许受托管语音服务调用本机桌面代理，避免把人设/文本发往任意地址。"""
+    base = (os.environ.get("KXYY_AI_PROXY_BASE") or "").strip().rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or port is None
+        or parsed.path not in {"", "/"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+    ):
+        raise RuntimeError("本地文字代理未就绪，请从元元桌宠启动语音服务")
+    return f"{base}/api/chat"
+
+
+def build_llm_proxy_payload(
+    system_role: str,
+    history: list[dict],
+    user_text: str,
+) -> dict:
+    """构造桌面 `/api/chat` 请求；provider/model 由 Rust 当前设置统一选择。"""
+    role = system_role or "你是元元，口语化简短回复。"
+    if _system_suffix:
+        role = role + _system_suffix
+    messages = [{"role": "system", "content": role}]
+    messages.extend(history[-12:])
+    messages.append({"role": "user", "content": user_text})
+    return {
+        "provider": "text",
+        "messages": messages,
+        "max_tokens": 200,
+        "stream": False,
+    }
+
+
 def load_llm_settings() -> None:
-    global _deepseek_key, _temperature
-    s = load_settings()
-    _deepseek_key = (s.get("deepseekKey") or "").strip()
-    if not _deepseek_key:
-        raise SystemExit("settings.json 未配置 deepseekKey（本地对话的 LLM）")
-    _temperature = float(s.get("temperature") or 0.8)
+    """启动前验证桌面代理；provider 设置与 Key 只由 Rust 读取。"""
+    _ai_proxy_chat_url()
+    log("文字 LLM 使用桌面统一代理")
 
 
 _asr_backend = "none"  # mlx | openai | none
@@ -961,39 +999,43 @@ def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
 
 
 def chat_llm(system_role: str, history: list[dict], user_text: str) -> tuple[str, dict]:
-    """返回 (reply_text, usage)；usage 含 prompt/completion/total（DeepSeek）。"""
-    role = system_role or "你是元元，口语化简短回复。"
-    if _system_suffix:
-        role = role + _system_suffix
-    messages = [{"role": "system", "content": role}]
-    messages.extend(history[-12:])
-    messages.append({"role": "user", "content": user_text})
-    payload = {
-        "model": "deepseek-chat",
-        "messages": messages,
-        "temperature": _temperature,
-        "max_tokens": 200,
-        "stream": False,
-    }
+    """经桌面统一代理返回 (reply_text, usage)，不在 Python 内持有 provider Key。"""
+    payload = build_llm_proxy_payload(system_role, history, user_text)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        DEEPSEEK_URL,
+        _ai_proxy_chat_url(),
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {_deepseek_key}",
-        },
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
-    ctx = https_context()
-    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    text = (data["choices"][0]["message"]["content"] or "").strip()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            provider_header = str(resp.headers.get("X-Kxyy-Text-Provider") or "")
+            provider = provider_header if provider_header in {"DeepSeek", "Ollama"} else "文字模型"
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            error_data = json.loads(e.read().decode("utf-8"))
+            message = str(error_data.get("error") or "").strip()
+        except Exception:
+            message = ""
+        raise RuntimeError(message or f"文字模型请求失败（HTTP {e.code}）") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError("本地文字代理连接失败，请稍后重试") from e
+    try:
+        text = str(data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"{provider} 返回格式无效") from e
     u = data.get("usage") or {}
     prompt = int(u.get("prompt_tokens") or 0)
     completion = int(u.get("completion_tokens") or 0)
     total = int(u.get("total_tokens") or (prompt + completion))
-    return text, {"prompt": prompt, "completion": completion, "total": total}
+    return text, {
+        "prompt": prompt,
+        "completion": completion,
+        "total": total,
+        "_provider": provider,
+    }
 
 
 def chunk_pcm(pcm: bytes, ms: int = 80):
@@ -1390,6 +1432,8 @@ class Session:
             reply, llm_usage = await self.loop.run_in_executor(
                 None, chat_llm, self.system_role, list(self.history), text
             )
+            llm_usage = dict(llm_usage or {})
+            llm_provider = str(llm_usage.pop("_provider", "DeepSeek"))
             log(
                 f"LLM {time.perf_counter()-t1:.2f}s "
                 f"tok={llm_usage.get('total', 0)} chars={len(reply or '')}"
@@ -1436,10 +1480,10 @@ class Session:
                 log(f"丢弃过期 TTS gen={scope.generation}")
                 return
 
-            # 本轮用量：DeepSeek token +（若有）云端 TTS 计费字符。
-            provider = "DeepSeek"
+            # 本轮用量：当前文字 provider token +（若有）云端 TTS 计费字符。
+            provider = llm_provider
             if tts_chars > 0:
-                provider = f"DeepSeek+{tts_provider or _log_prefix or 'TTS'}"
+                provider = f"{llm_provider}+{tts_provider or _log_prefix or 'TTS'}"
             await self.send_json(
                 {
                     "type": "usage",

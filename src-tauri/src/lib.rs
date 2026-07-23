@@ -307,6 +307,7 @@ pub(crate) struct AiConfig {
     /// 视觉模型服务商：`qwen`（在线）/ `local`（本地 Ollama VL）。
     pub vl_provider: String,
     pub thinking_default: bool,
+    pub temperature_default: f64,
     /// 语音后端：`volc` / `local` / `cosyvoice`。
     pub voice_backend: String,
     /// 火山 TTS Key（仅 volc）。
@@ -333,6 +334,7 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
         local_vl_model: s.local_vl_model,
         vl_provider: s.vl_provider,
         thinking_default: s.thinking,
+        temperature_default: s.temperature,
         voice_backend,
         volc_tts_key: s.volc_tts_key,
         tts_voice: s.tts_voice,
@@ -1035,6 +1037,13 @@ fn show_menu(app: AppHandle) {
 #[tauri::command]
 fn get_api_base(state: tauri::State<AppState>) -> String {
     format!("http://127.0.0.1:{}", state.api_port)
+}
+
+/// 供受托管的本地 Python 语音服务复用桌面文字代理。
+/// 只暴露随机 loopback 地址，不把任何 provider key 注入子进程。
+pub(crate) fn local_api_base(app: &AppHandle) -> Option<String> {
+    let port = app.state::<AppState>().api_port;
+    (port != 0).then(|| format!("http://127.0.0.1:{port}"))
 }
 
 /// 查询当前语音后端服务就绪状态，供前端在聊天窗口打开时主动探测
