@@ -243,6 +243,7 @@ test("desktop session maps local cascade events without retaining transcript tex
     { type: "asr", text: "完整用户文本不应进入 trace", interim: false },
     { type: "asr_end" },
     { type: "assistant", text: "完整助手文本也不应进入 trace" },
+    { type: "tts_start" },
     { type: "assistant_end" },
   ]) {
     session._onMessage({ data: JSON.stringify(message) });
@@ -253,7 +254,7 @@ test("desktop session maps local cascade events without retaining transcript tex
   assert.equal(eventTypes.includes(TRACE_EVENT.SPEECH_CONFIRMED), true);
   assert.equal(eventTypes.includes(TRACE_EVENT.LLM_REQUEST), true);
   assert.equal(eventTypes.includes(TRACE_EVENT.LLM_RESPONSE), true);
-  assert.equal(eventTypes.includes(TRACE_EVENT.LLM_FIRST_TOKEN), false);
+  assert.equal(eventTypes.includes(TRACE_EVENT.LLM_FIRST_TOKEN), true);
   assert.equal(eventTypes.includes(TRACE_EVENT.TTS_REQUEST), true);
   assert.equal(JSON.stringify(snapshot).includes("完整用户文本"), false);
   assert.equal(JSON.stringify(snapshot).includes("完整助手文本"), false);
@@ -356,6 +357,29 @@ test("candidate latches the interrupted response and clears its drain timer", as
   assert.equal(session._playbackDrainTimer, 0);
   assert.equal(playbackCommands.at(-1).type, "clear");
   await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
+test("local response stays active across stable-sentence TTS gaps", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  session.trace.startSession();
+  session.trace.startResponse();
+
+  session._onMessage({ data: JSON.stringify({ type: "tts_start", generation: 1 }) });
+  session._onPlaybackMessage({ type: "drained", queuedMs: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(session.trace.state.response, "active");
+  assert.equal(
+    session.getTraceSnapshot().events.some(
+      (event) => event.eventType === TRACE_EVENT.RESPONSE_COMPLETED,
+    ),
+    false,
+  );
+
+  session._onMessage({ data: JSON.stringify({ type: "tts_end", generation: 1 }) });
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(session.trace.state.response, "completed");
 });
 
 test("desktop session records privacy-safe soft endpoint transitions", async () => {
