@@ -423,6 +423,217 @@ class BoundedLlmProducerTests(unittest.TestCase):
             common.iter_llm_stream = original_iter
 
 
+class BoundedOrderedTtsPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_out_of_order_synthesis_still_plays_in_submit_order(self):
+        gates = {
+            1: asyncio.get_running_loop().create_future(),
+            2: asyncio.get_running_loop().create_future(),
+        }
+        synth_started = []
+        played = []
+        active_play = 0
+        max_active_play = 0
+
+        async def synthesize(sequence, sentence):
+            synth_started.append(sequence)
+            return await gates[sequence]
+
+        async def play(sequence, sentence, result):
+            nonlocal active_play, max_active_play
+            active_play += 1
+            max_active_play = max(max_active_play, active_play)
+            played.append((sequence, sentence, result))
+            await asyncio.sleep(0)
+            active_play -= 1
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=2,
+        )
+        await pipeline.submit("第一句。")
+        await pipeline.submit("第二句。")
+        finish = asyncio.create_task(pipeline.finish())
+        for _ in range(10):
+            if synth_started == [1, 2]:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(synth_started, [1, 2])
+
+        gates[2].set_result("audio-2")
+        await asyncio.sleep(0)
+        self.assertEqual(played, [])
+        gates[1].set_result("audio-1")
+        await finish
+
+        self.assertEqual(
+            played,
+            [(1, "第一句。", "audio-1"), (2, "第二句。", "audio-2")],
+        )
+        self.assertEqual(max_active_play, 1)
+
+    async def test_playback_overlaps_next_synthesis_and_queue_backpressures(self):
+        first_synth = asyncio.Event()
+        release_first_synth = asyncio.Event()
+        first_play = asyncio.Event()
+        release_first_play = asyncio.Event()
+        second_synth = asyncio.Event()
+
+        async def synthesize(sequence, _sentence):
+            if sequence == 1:
+                first_synth.set()
+                await release_first_synth.wait()
+            elif sequence == 2:
+                second_synth.set()
+            return sequence
+
+        async def play(sequence, _sentence, _result):
+            if sequence == 1:
+                first_play.set()
+                await release_first_play.wait()
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=1,
+            queue_max=2,
+        )
+        await pipeline.submit("一")
+        await first_synth.wait()
+        await pipeline.submit("二")
+        await pipeline.submit("三")
+        blocked = asyncio.create_task(pipeline.submit("四"))
+        await asyncio.sleep(0)
+        self.assertFalse(blocked.done())
+        self.assertLessEqual(pipeline.queue.qsize(), 2)
+
+        release_first_synth.set()
+        await first_play.wait()
+        await asyncio.wait_for(second_synth.wait(), timeout=1)
+        await asyncio.wait_for(blocked, timeout=1)
+        release_first_play.set()
+        await pipeline.finish()
+
+    async def test_shared_asr_executor_backend_does_not_prefetch_during_playback(self):
+        release_first_synth = asyncio.Event()
+        first_play = asyncio.Event()
+        release_first_play = asyncio.Event()
+        second_synth = asyncio.Event()
+
+        async def synthesize(sequence, _sentence):
+            if sequence == 1:
+                await release_first_synth.wait()
+            else:
+                second_synth.set()
+            return sequence
+
+        async def play(sequence, _sentence, _result):
+            if sequence == 1:
+                first_play.set()
+                await release_first_play.wait()
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=1,
+            prefetch_while_playing=False,
+        )
+        await pipeline.submit("一")
+        await pipeline.submit("二")
+        finish = asyncio.create_task(pipeline.finish())
+        release_first_synth.set()
+        await first_play.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(second_synth.is_set())
+
+        release_first_play.set()
+        await asyncio.wait_for(second_synth.wait(), timeout=1)
+        await finish
+
+    async def test_cancel_stops_pending_playback_and_unblocks_submit(self):
+        synth_gate = asyncio.Event()
+        played = []
+
+        async def synthesize(sequence, _sentence):
+            await synth_gate.wait()
+            return sequence
+
+        async def play(sequence, _sentence, _result):
+            played.append(sequence)
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=1,
+            queue_max=1,
+        )
+        await pipeline.submit("一")
+        await asyncio.sleep(0)
+        await pipeline.submit("二")
+        blocked = asyncio.create_task(pipeline.submit("三"))
+        await asyncio.sleep(0)
+        self.assertFalse(blocked.done())
+
+        await pipeline.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await blocked
+        synth_gate.set()
+        await asyncio.sleep(0)
+        self.assertEqual(played, [])
+        self.assertTrue(pipeline.runner.done())
+
+    async def test_synthesis_failure_propagates_and_cancels_remaining_work(self):
+        second_started = asyncio.Event()
+        second_cancelled = asyncio.Event()
+
+        async def synthesize(sequence, _sentence):
+            if sequence == 1:
+                await second_started.wait()
+                raise common.SafeRealtimeError("fixed safe error")
+            try:
+                second_started.set()
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                second_cancelled.set()
+                raise
+
+        async def play(_sequence, _sentence, _result):
+            self.fail("failed synthesis must not play")
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=2,
+        )
+        await pipeline.submit("一")
+        await pipeline.submit("二")
+        with self.assertRaisesRegex(common.SafeRealtimeError, "fixed safe error"):
+            await pipeline.finish()
+        self.assertTrue(second_cancelled.is_set())
+
+    async def test_segment_limit_rejects_without_growing_the_queue(self):
+        played = []
+
+        async def synthesize(sequence, _sentence):
+            return sequence
+
+        async def play(sequence, _sentence, _result):
+            played.append(sequence)
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            max_segments=2,
+        )
+        await pipeline.submit("一")
+        await pipeline.submit("二")
+        with self.assertRaisesRegex(common.SafeRealtimeError, "句段过多"):
+            await pipeline.submit("三")
+        self.assertLessEqual(pipeline.queue.qsize(), 2)
+        await pipeline.finish()
+        self.assertEqual(played, [1, 2])
+
+
 class SoftEndpointTests(unittest.TestCase):
     def test_soft_end_reopens_before_deterministic_commit(self):
         endpoint = common.SoftEndpoint()
@@ -856,6 +1067,24 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(binary_messages), 1)
         self.assertIsNone(session.response_scope)
 
+    async def test_send_lock_rechecks_generation_before_queued_control_event(self):
+        ws = BlockingPcmWebSocket()
+        session = common.Session(ws)
+        scope = session._new_scope("response")
+
+        pcm_send = asyncio.create_task(session.send_pcm(b"\x01\x00", scope=scope))
+        await ws.pcm_entered.wait()
+        queued_json = asyncio.create_task(
+            session.send_json({"type": "assistant", "text": "late"}, scope=scope)
+        )
+        await asyncio.sleep(0)
+        scope.cancel("turn_detected")
+        ws.pcm_release.set()
+
+        self.assertFalse(await pcm_send)
+        self.assertFalse(await queued_json)
+        self.assertEqual(ws.messages, [b"\x01\x00"])
+
     async def test_streaming_pipeline_emits_deltas_and_synthesizes_stable_sentences(self):
         synthesized = []
 
@@ -912,6 +1141,100 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["provider"], "Ollama+CosyVoice")
         self.assertEqual(usage["llm"]["total"], 16)
         self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
+
+    async def test_parallel_synthesis_keeps_wire_and_history_ordered(self):
+        common._synth_tts = lambda _text: b"unused"
+        loop = asyncio.get_running_loop()
+        first = loop.create_future()
+        second = loop.create_future()
+        self.session.loop = ControlledLoop([first, second])
+        self.session.tts_parallelism = 2
+        self.stream_events = [
+            {"type": "delta", "text": "第一句已经完成。"},
+            {"type": "delta", "text": "第二句也完成了。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+
+        for _ in range(20):
+            types = [message["type"] for message in self.ws.json_messages()]
+            if "assistant_end" in types:
+                break
+            await asyncio.sleep(0)
+        self.assertIn("assistant_end", types)
+        self.assertFalse(first.done())
+        self.assertFalse(second.done())
+
+        second.set_result(b"\x02\x00" * 40)
+        await asyncio.sleep(0)
+        self.assertFalse(
+            any(m["type"] == "audio_segment_start" for m in self.ws.json_messages())
+        )
+        first.set_result(b"\x01\x00" * 40)
+        await task
+
+        starts = [
+            (m["segmentId"], m["text"])
+            for m in self.ws.json_messages()
+            if m["type"] == "audio_segment_start"
+        ]
+        self.assertEqual(
+            starts,
+            [(1, "第一句已经完成。"), (2, "第二句也完成了。")],
+        )
+        self.session.on_playback_segment(
+            {"generation": scope.generation, "segmentId": 2, "state": "completed"}
+        )
+        self.assertEqual(
+            self.session.history,
+            [{"role": "user", "content": "用户输入"}],
+        )
+        self.session.on_playback_segment(
+            {"generation": scope.generation, "segmentId": 1, "state": "completed"}
+        )
+        self.assertEqual(
+            self.session.history[-1]["content"],
+            "第一句已经完成。第二句也完成了。",
+        )
+
+    async def test_invalid_sentence_pcm_is_rejected_before_segment_registration(self):
+        common._synth_tts = lambda _text: b"unused"
+        invalid_audio = [
+            (b"\x01", "无效音频"),
+            ("not-pcm", "无效音频"),
+            (
+                b"\x00\x00" * (common.TTS_SENTENCE_MAX_SAMPLES + 1),
+                "单句语音过长",
+            ),
+        ]
+        for index, (audio, expected_error) in enumerate(invalid_audio, start=1):
+            with self.subTest(index=index):
+                common._tts_stream_slots = threading.BoundedSemaphore(
+                    common.TTS_STREAM_MAX_TASKS
+                )
+                ws = FakeWebSocket()
+                session = common.Session(ws)
+                tts_future = asyncio.get_running_loop().create_future()
+                tts_future.set_result(audio)
+                session.loop = ControlledLoop([tts_future])
+                self.stream_events = [
+                    {"type": "delta", "text": "需要校验的完整句子。"},
+                    {"type": "done"},
+                ]
+                scope = session._new_scope("response")
+                session.response_scope = scope
+                await session._reply_pipeline("用户输入", scope)
+
+                messages = ws.json_messages()
+                self.assertFalse(
+                    any(m["type"] == "audio_segment_start" for m in messages)
+                )
+                self.assertFalse(any(isinstance(m, bytes) for m in ws.messages))
+                self.assertEqual(messages[-1]["type"], "error")
+                self.assertIn(expected_error, messages[-1]["message"])
+                self.assertNotIn("not-pcm", messages[-1]["message"])
 
     async def test_soft_endpoint_keeps_reopened_audio_in_one_utterance(self):
         handled = []

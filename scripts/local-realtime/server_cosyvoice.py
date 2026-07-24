@@ -35,5 +35,7 @@ if __name__ == "__main__":
         synth_tts_http=tts_cosyvoice.synth_tts_http,
         prepare=prepare,
         tts_pool=_tts_pool,
+        tts_parallelism=2,
+        tts_prefetch_while_playing=True,
         system_suffix=tts_cosyvoice.SYSTEM_SUFFIX,
     )

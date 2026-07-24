@@ -354,6 +354,10 @@ MAX_AUDIO_SEGMENTS_PER_TURN = 64
 LLM_STREAM_QUEUE_MAX = 32
 LLM_STREAM_MAX_PRODUCERS = 2
 TTS_STREAM_MAX_TASKS = 2
+TTS_SENTENCE_QUEUE_MAX = 4
+TTS_PARALLELISM_MAX = 2
+# 单个稳定句最多保留 60 秒 24kHz mono s16le；数量有界之外也限制 PCM 字节。
+TTS_SENTENCE_MAX_SAMPLES = OUTPUT_RATE * 60
 LLM_REPLY_MAX_CHARS = 4096
 STABLE_SENTENCE_MIN_CHARS = 6
 STABLE_SENTENCE_SOFT_CHARS = 40
@@ -711,6 +715,8 @@ _synth_tts: Callable[[str], bytes | tuple] | None = None
 # 返回 (audio, mime) 或 (audio, mime, usage_dict)；usage 含 characters / provider。
 _synth_tts_http: Callable[[str], tuple] | None = None
 _system_suffix = ""
+_tts_parallelism = 1
+_tts_prefetch_while_playing = False
 
 
 def log(msg: str) -> None:
@@ -1360,6 +1366,154 @@ def _drain_background_future(done) -> None:
         pass
 
 
+class BoundedOrderedTtsPipeline:
+    """有界句队列 + 有界并行合成 + 单路有序播放。
+
+    ``synthesize`` 可并行，``play`` 永远按 submit 顺序一次执行一个。pending
+    只保留 ``parallelism`` 个合成 task，输入队列另有固定上限，因此即使后句
+    先完成也不会形成无界音频结果缓存。生命周期只允许一个 producer 顺序调用
+    submit/finish；callback 不得反向调用本 pipeline 的生命周期方法。共享 ASR
+    executor 的后端可关闭 playback 期间预取，避免插话识别排在下一句 TTS 之后。
+    """
+
+    def __init__(
+        self,
+        synthesize,
+        play,
+        *,
+        parallelism: int = 1,
+        prefetch_while_playing: bool = True,
+        queue_max: int = TTS_SENTENCE_QUEUE_MAX,
+        max_segments: int = MAX_AUDIO_SEGMENTS_PER_TURN,
+    ):
+        self.synthesize = synthesize
+        self.play = play
+        self.parallelism = max(1, min(TTS_PARALLELISM_MAX, int(parallelism)))
+        self.prefetch_while_playing = bool(prefetch_while_playing)
+        self.queue = asyncio.Queue(maxsize=max(1, int(queue_max)))
+        self.max_segments = max(1, int(max_segments))
+        self.submitted = 0
+        self.closed = False
+        self.runner = asyncio.create_task(self._run())
+
+    async def _put(self, item) -> None:
+        if self.runner.done():
+            self.runner.result()
+        put_task = asyncio.create_task(self.queue.put(item))
+        try:
+            done, _pending = await asyncio.wait(
+                {put_task, self.runner},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self.runner in done and not put_task.done():
+                put_task.cancel()
+                await asyncio.gather(put_task, return_exceptions=True)
+                self.runner.result()
+            await put_task
+            if self.runner.done():
+                self.runner.result()
+        except BaseException:
+            if not put_task.done():
+                put_task.cancel()
+                await asyncio.gather(put_task, return_exceptions=True)
+            raise
+
+    async def submit(self, sentence: str) -> int:
+        if self.closed:
+            raise RuntimeError("TTS pipeline is closed")
+        if self.submitted >= self.max_segments:
+            raise SafeRealtimeError("本轮语音句段过多，已停止播报")
+        self.submitted += 1
+        sequence = self.submitted
+        await self._put((sequence, sentence))
+        return sequence
+
+    async def finish(self) -> None:
+        if not self.closed:
+            self.closed = True
+            await self._put(None)
+        await self.runner
+
+    async def cancel(self) -> None:
+        self.closed = True
+        if not self.runner.done():
+            self.runner.cancel()
+        await asyncio.gather(self.runner, return_exceptions=True)
+
+    async def _run(self) -> None:
+        pending: list[tuple[int, str, asyncio.Task]] = []
+        input_task: asyncio.Task | None = None
+        playback_task: asyncio.Task | None = None
+        input_closed = False
+        try:
+            while True:
+                if (
+                    not input_closed
+                    and input_task is None
+                    and len(pending) < self.parallelism
+                    and (playback_task is None or self.prefetch_while_playing)
+                ):
+                    input_task = asyncio.create_task(self.queue.get())
+
+                if playback_task is None and pending and pending[0][2].done():
+                    sequence, sentence, synth_task = pending.pop(0)
+                    result = synth_task.result()
+                    playback_task = asyncio.create_task(
+                        self.play(sequence, sentence, result)
+                    )
+                    continue
+
+                if input_closed and not pending and playback_task is None:
+                    return
+
+                waits: set[asyncio.Task] = set()
+                if input_task is not None:
+                    waits.add(input_task)
+                if playback_task is not None:
+                    waits.add(playback_task)
+                elif pending:
+                    waits.add(pending[0][2])
+                if not waits:
+                    raise RuntimeError("TTS pipeline lost its wake source")
+
+                done, _pending = await asyncio.wait(
+                    waits,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if input_task is not None and input_task in done:
+                    item = input_task.result()
+                    input_task = None
+                    if item is None:
+                        input_closed = True
+                    else:
+                        sequence, sentence = item
+                        pending.append(
+                            (
+                                sequence,
+                                sentence,
+                                asyncio.create_task(
+                                    self.synthesize(sequence, sentence)
+                                ),
+                            )
+                        )
+                if playback_task is not None and playback_task in done:
+                    playback_task.result()
+                    playback_task = None
+        finally:
+            cleanup: list[asyncio.Task] = []
+            if input_task is not None:
+                input_task.cancel()
+                cleanup.append(input_task)
+            if playback_task is not None:
+                playback_task.cancel()
+                cleanup.append(playback_task)
+            for _sequence, _sentence, synth_task in pending:
+                synth_task.cancel()
+                cleanup.append(synth_task)
+            if cleanup:
+                await asyncio.gather(*cleanup, return_exceptions=True)
+
+
 def chunk_pcm(pcm: bytes, ms: int = 80):
     bytes_per = OUTPUT_RATE * 2 * ms // 1000
     for i in range(0, len(pcm), bytes_per):
@@ -1423,7 +1577,11 @@ class Session:
         self.candidate_emitted = False
         self.closed = False
         self.loop = asyncio.get_event_loop()
+        # LLM delta 与有序音频 sender 可并行推进，但同一 WebSocket 只允许一个 send 在途。
+        self._send_lock = asyncio.Lock()
         self.asr_task: asyncio.Task | None = None
+        self.tts_parallelism = _tts_parallelism
+        self.tts_prefetch_while_playing = _tts_prefetch_while_playing
 
     def _busy(self) -> bool:
         return self.reply_task is not None and not self.reply_task.done()
@@ -1443,7 +1601,10 @@ class Session:
         payload = dict(obj)
         if scope is not None:
             payload["generation"] = scope.generation
-        await self.ws.send(json.dumps(payload, ensure_ascii=False))
+        async with self._send_lock:
+            if self.closed or (scope is not None and not scope.active):
+                return False
+            await self.ws.send(json.dumps(payload, ensure_ascii=False))
         return not self.closed and (scope is None or scope.active)
 
     async def send_pcm(
@@ -1454,7 +1615,10 @@ class Session:
     ) -> bool:
         if self.closed or not pcm or (scope is not None and not scope.active):
             return False
-        await self.ws.send(pcm)
+        async with self._send_lock:
+            if self.closed or (scope is not None and not scope.active):
+                return False
+            await self.ws.send(pcm)
         return not self.closed and (scope is None or scope.active)
 
     def _invalidate_play(self) -> None:
@@ -1769,6 +1933,7 @@ class Session:
         scope: GenerationCancelScope,
     ) -> None:
         sentences = StableSentenceBuffer()
+        tts_pipeline: BoundedOrderedTtsPipeline | None = None
         try:
             assert _synth_tts is not None
             t1 = time.perf_counter()
@@ -1791,14 +1956,9 @@ class Session:
             speaking_sent = False
             segment_seq = 0
 
-            async def speak_sentence(sentence: str) -> None:
-                nonlocal tts_chars, tts_provider, tts_started, speaking_sent, segment_seq
+            async def synthesize_sentence(_sequence: int, sentence: str) -> dict:
                 if not sentence or not scope.active:
-                    return
-                if not tts_started:
-                    if not await self.send_json({"type": "tts_start"}, scope=scope):
-                        return
-                    tts_started = True
+                    return {"audio": b"", "billed": 0, "provider": "", "spoken": ""}
                 tts_slots = _tts_stream_slots
                 if not tts_slots.acquire(blocking=False):
                     raise SafeRealtimeError("语音合成仍在结束上一轮请求，请稍后再试")
@@ -1837,22 +1997,53 @@ class Session:
                         billed = int(extra)
                 else:
                     audio = tts_result
+                audio_bytes = (
+                    len(audio)
+                    if isinstance(audio, (bytes, bytearray, memoryview))
+                    else 0
+                )
                 log(
                     f"TTS sentence {time.perf_counter()-t2:.2f}s "
-                    f"({len(audio or b'')} bytes, billed={billed or '-'})"
+                    f"({audio_bytes} bytes, billed={billed or '-'})"
                 )
                 if not scope.active:
                     log(f"丢弃过期 TTS gen={scope.generation}")
-                    return
-                tts_chars += billed
-                if provider:
-                    tts_provider = provider
+                    return {"audio": b"", "billed": 0, "provider": "", "spoken": ""}
                 if not audio:
-                    return
+                    return {
+                        "audio": b"",
+                        "billed": billed,
+                        "provider": provider,
+                        "spoken": "",
+                    }
+                if not isinstance(audio, (bytes, bytearray, memoryview)):
+                    raise SafeRealtimeError("语音合成返回了无效音频，请稍后重试")
+                if audio_bytes % 2 != 0:
+                    raise SafeRealtimeError("语音合成返回了无效音频，请稍后重试")
+                if audio_bytes // 2 > TTS_SENTENCE_MAX_SAMPLES:
+                    raise SafeRealtimeError("单句语音过长，已停止播报")
                 spoken_sentence = clip_speech_text(
                     text_for_speech(sentence) or sentence.strip()
                 )
-                if not spoken_sentence:
+                return {
+                    "audio": bytes(audio),
+                    "billed": billed,
+                    "provider": provider,
+                    "spoken": spoken_sentence,
+                }
+
+            async def play_sentence(_sequence: int, _sentence: str, result: dict) -> None:
+                nonlocal tts_chars, tts_provider, speaking_sent, segment_seq
+                if not scope.active:
+                    return
+                audio = result["audio"]
+                billed = int(result["billed"] or 0)
+                provider = str(result["provider"] or "").strip()
+                spoken_sentence = str(result["spoken"] or "")
+                tts_chars += billed
+                if provider:
+                    tts_provider = provider
+                if not audio or not spoken_sentence:
                     return
                 segment_seq += 1
                 segment_id = segment_seq
@@ -1894,6 +2085,24 @@ class Session:
                     scope=scope,
                 )
 
+            async def enqueue_sentence(sentence: str) -> None:
+                nonlocal tts_started
+                if not sentence or not scope.active:
+                    return
+                if not tts_started:
+                    if not await self.send_json({"type": "tts_start"}, scope=scope):
+                        return
+                    tts_started = True
+                assert tts_pipeline is not None
+                await tts_pipeline.submit(sentence)
+
+            tts_pipeline = BoundedOrderedTtsPipeline(
+                synthesize_sentence,
+                play_sentence,
+                parallelism=self.tts_parallelism,
+                prefetch_while_playing=self.tts_prefetch_while_playing,
+            )
+
             stream_done = False
             while scope.active and not stream_done:
                 try:
@@ -1924,7 +2133,7 @@ class Session:
                     ):
                         return
                     for sentence in sentences.feed(delta):
-                        await speak_sentence(sentence)
+                        await enqueue_sentence(sentence)
                 elif event_type == "error":
                     raise SafeRealtimeError(
                         str(event.get("message") or "文字模型请求失败")
@@ -1946,7 +2155,9 @@ class Session:
                 return
 
             for sentence in sentences.flush():
-                await speak_sentence(sentence)
+                await enqueue_sentence(sentence)
+
+            await tts_pipeline.finish()
 
             if tts_started:
                 await self.send_json({"type": "tts_end"}, scope=scope)
@@ -1983,6 +2194,8 @@ class Session:
                 )
                 scope.cancel("response_error")
         finally:
+            if tts_pipeline is not None:
+                await tts_pipeline.cancel()
             if self.reply_task is asyncio.current_task():
                 self.reply_task = None
             if self.response_scope is scope:
@@ -2028,15 +2241,20 @@ def run(
     synth_tts: Callable[[str], bytes],
     prepare,
     tts_pool: Executor | None = None,
+    tts_parallelism: int = 1,
+    tts_prefetch_while_playing: bool = False,
     system_suffix: str = "",
     synth_tts_http: Callable[[str], tuple] | None = None,
 ) -> None:
     """prepare() 在监听前调用（加载模型等）。"""
-    global _log_prefix, _synth_tts, _synth_tts_http, _tts_pool, _system_suffix
+    global _log_prefix, _synth_tts, _synth_tts_http, _tts_pool
+    global _tts_parallelism, _tts_prefetch_while_playing, _system_suffix
     _log_prefix = name
     _synth_tts = synth_tts
     _synth_tts_http = synth_tts_http
     _tts_pool = tts_pool
+    _tts_parallelism = max(1, min(TTS_PARALLELISM_MAX, int(tts_parallelism)))
+    _tts_prefetch_while_playing = bool(tts_prefetch_while_playing)
     _system_suffix = system_suffix
 
     try:
