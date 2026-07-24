@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "kxyy-desktop-pet"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "base64 0.22.1",
  "chrono",

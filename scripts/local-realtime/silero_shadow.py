@@ -22,7 +22,11 @@ import struct
 import sys
 import sysconfig
 
-from vad_adapter import NeuralVadPipeline, ProbabilityVadState
+from vad_adapter import (
+    NeuralVadPipeline,
+    ProbabilityVadState,
+    SILERO_VAD_CONFIG_REVISION,
+)
 
 
 MODEL_ID = "silero-vad-v6.2.1-16k-op15"
@@ -93,6 +97,14 @@ class SileroCapability:
     ort_version: str | None = None
     runtime_path: Path | None = None
     model_path: Path | None = None
+
+    @property
+    def config_revision(self):
+        return (
+            SILERO_VAD_CONFIG_REVISION
+            if self.status == STATUS_READY and self.mode == SHADOW_MODE
+            else "none"
+        )
 
     @property
     def ready(self):

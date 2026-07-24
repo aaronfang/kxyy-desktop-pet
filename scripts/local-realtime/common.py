@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import queue
 import re
@@ -30,10 +31,175 @@ REPO = ROOT.parent.parent
 VOICE_AB = REPO / "scripts" / "voice-ab"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from vad_adapter import VAD_SHADOW_ADMISSION, VadShadowWorker
+from vad_adapter import (
+    SHADOW_COUNTER_MAX,
+    SHADOW_LATENCY_SAMPLES,
+    SHADOW_MODES,
+    SHADOW_QUEUE_CAPACITY,
+    VAD_SHADOW_ADMISSION,
+    VAD_SHADOW_CONFIG_REVISIONS,
+    VadShadowWorker,
+)
 
 VAD_SHADOW_READY_TIMEOUT_SECONDS = 0.05
 VAD_SHADOW_READY_POLL_SECONDS = 0.005
+VAD_SHADOW_SUMMARY_SCHEMA_VERSION = 1
+VAD_SHADOW_SUMMARY_MODES = frozenset((*SHADOW_MODES, "disabled", "unavailable"))
+VAD_SHADOW_SUMMARY_STATUSES = frozenset(
+    (
+        "starting",
+        "active",
+        "overloaded",
+        "faulted",
+        "closed",
+        "disabled",
+        "warming",
+        "busy",
+        "unavailable",
+        "not-reported",
+    )
+)
+VAD_SHADOW_SUMMARY_COUNTERS = (
+    "offered",
+    "accepted",
+    "dropped",
+    "processedJobs",
+    "processedFrames",
+    "staleResults",
+    "fallbacks",
+    "faults",
+    "candidateEvents",
+    "confirmedEvents",
+    "rejectedEvents",
+    "candidateTimeoutEvents",
+    "endedEvents",
+)
+
+
+def _empty_vad_shadow_summary(
+    *,
+    mode="disabled",
+    status="not-reported",
+    config_revision="none",
+):
+    safe_mode = mode if mode in VAD_SHADOW_SUMMARY_MODES else "disabled"
+    safe_status = (
+        status if status in VAD_SHADOW_SUMMARY_STATUSES else "not-reported"
+    )
+    safe_revision = (
+        config_revision
+        if config_revision in VAD_SHADOW_CONFIG_REVISIONS
+        else "none"
+    )
+    return {
+        "schemaVersion": VAD_SHADOW_SUMMARY_SCHEMA_VERSION,
+        "configRevision": safe_revision,
+        "mode": safe_mode,
+        "status": safe_status,
+        "complete": False,
+        "outstanding": 0,
+        "queueCapacity": SHADOW_QUEUE_CAPACITY,
+        "maxQueueDepth": 0,
+        **{name: 0 for name in VAD_SHADOW_SUMMARY_COUNTERS},
+        "latencySamples": 0,
+        "inferenceP50Ms": None,
+        "inferenceP95Ms": None,
+    }
+
+
+def sanitize_vad_shadow_summary(
+    raw,
+    *,
+    fallback_mode="disabled",
+    fallback_status="not-reported",
+    fallback_config_revision="none",
+):
+    """Return the only bounded aggregate shape allowed onto the private wire."""
+
+    fallback = _empty_vad_shadow_summary(
+        mode=fallback_mode,
+        status=fallback_status,
+        config_revision=fallback_config_revision,
+    )
+    if not isinstance(raw, dict):
+        return fallback
+
+    def safe_counter(name, maximum=SHADOW_COUNTER_MAX):
+        value = raw.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > maximum
+        ):
+            return 0
+        return value
+
+    try:
+        mode = raw.get("mode")
+        status = raw.get("status")
+        revision = raw.get("configRevision")
+        summary = _empty_vad_shadow_summary(
+            mode=mode if mode in VAD_SHADOW_SUMMARY_MODES else fallback["mode"],
+            status=(
+                status
+                if status in VAD_SHADOW_SUMMARY_STATUSES
+                else fallback["status"]
+            ),
+            config_revision=(
+                revision
+                if revision in VAD_SHADOW_CONFIG_REVISIONS
+                else fallback["configRevision"]
+            ),
+        )
+        raw_outstanding = raw.get("outstanding")
+        outstanding_valid = (
+            not isinstance(raw_outstanding, bool)
+            and isinstance(raw_outstanding, int)
+            and 0 <= raw_outstanding <= SHADOW_QUEUE_CAPACITY + 1
+        )
+        summary["outstanding"] = raw_outstanding if outstanding_valid else 0
+        summary["maxQueueDepth"] = safe_counter(
+            "maxQueueDepth", SHADOW_QUEUE_CAPACITY
+        )
+        for name in VAD_SHADOW_SUMMARY_COUNTERS:
+            summary[name] = safe_counter(name)
+        summary["latencySamples"] = safe_counter(
+            "latencySamples", SHADOW_LATENCY_SAMPLES
+        )
+
+        def safe_latency(name):
+            value = raw.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or value > 1_000_000
+            ):
+                return None
+            return round(float(value), 3)
+
+        p50 = safe_latency("inferenceP50Ms")
+        p95 = safe_latency("inferenceP95Ms")
+        if (
+            summary["latencySamples"] == 0
+            or p50 is None
+            or p95 is None
+            or p50 > p95
+        ):
+            p50 = None
+            p95 = None
+        summary["inferenceP50Ms"] = p50
+        summary["inferenceP95Ms"] = p95
+        summary["complete"] = (
+            raw.get("complete") is True
+            and outstanding_valid
+            and summary["outstanding"] == 0
+        )
+        return summary
+    except Exception:
+        return fallback
 
 # 打包后由桌宠注入：可写运行时（venv / 参考音副本）
 _RUNTIME = Path(os.environ["KXYY_VOICE_RUNTIME"]).expanduser() if os.environ.get("KXYY_VOICE_RUNTIME") else None
@@ -752,6 +918,7 @@ _vad_shadow_admission = VAD_SHADOW_ADMISSION
 _vad_shadow_service = None
 _vad_shadow_start_status = "disabled"
 _vad_shadow_mode = "shadow-v1"
+_vad_shadow_config_revision = "none"
 _system_suffix = ""
 _tts_parallelism = 1
 _tts_prefetch_while_playing = False
@@ -1667,27 +1834,36 @@ class VadShadowLease:
 class VadShadowService:
     """Process-wide prepared shadow worker leased to at most one Session."""
 
-    def __init__(self, worker, mode, start_status):
+    def __init__(self, worker, mode, start_status, config_revision):
         self._worker = worker
         self.mode = mode
         self.start_status = start_status
+        self.config_revision = config_revision
         self._lock = threading.Lock()
         self._leased = False
         self._lease_id = 0
         self._closed = False
 
     @classmethod
-    def prepare(cls, pipeline_factory, *, mode="shadow-v1", admission=None):
+    def prepare(
+        cls,
+        pipeline_factory,
+        *,
+        mode="shadow-v1",
+        config_revision="unversioned",
+        admission=None,
+    ):
         if pipeline_factory is None:
-            return cls(None, mode, "unavailable")
+            return cls(None, mode, "unavailable", config_revision)
         worker = VadShadowWorker.try_start(
             pipeline_factory,
             admission=admission or _vad_shadow_admission,
             mode=mode,
+            config_revision=config_revision,
         )
         if worker is None:
-            return cls(None, mode, "unavailable")
-        return cls(worker, mode, "warming")
+            return cls(None, mode, "unavailable", config_revision)
+        return cls(worker, mode, "warming", config_revision)
 
     def current_status(self):
         with self._lock:
@@ -1762,6 +1938,7 @@ class VadShadowService:
             if worker is None:
                 return {
                     "mode": self.mode,
+                    "configRevision": self.config_revision,
                     "status": "unavailable",
                     "queueCapacity": 1,
                 }
@@ -1770,15 +1947,25 @@ class VadShadowService:
     def release(self, lease):
         with self._lock:
             if not isinstance(lease, VadShadowLease) or lease._service is not self:
-                return
+                return None
             worker = self._owned_worker(lease._lease_id)
             if worker is None:
-                return
+                return None
             try:
                 worker.begin_epoch()
             except Exception:
                 pass
+            try:
+                snapshot = worker.snapshot()
+            except Exception:
+                snapshot = {
+                    "mode": self.mode,
+                    "configRevision": self.config_revision,
+                    "status": "unavailable",
+                    "queueCapacity": SHADOW_QUEUE_CAPACITY,
+                }
             self._leased = False
+            return snapshot
 
     def close(self):
         with self._lock:
@@ -1803,6 +1990,7 @@ class Session:
         vad_shadow_service=None,
         vad_shadow_start_status=None,
         vad_shadow_mode="shadow-v1",
+        vad_shadow_config_revision="none",
     ):
         self.ws = ws
         self.system_role = "你是元元，口语化简短回复，一两句即可。"
@@ -1846,15 +2034,29 @@ class Session:
         self._vad_shadow_admission = vad_shadow_admission or _vad_shadow_admission
         self._vad_shadow_service = vad_shadow_service
         self._vad_shadow_mode = vad_shadow_mode
+        self._vad_shadow_config_revision = (
+            vad_shadow_config_revision
+            if vad_shadow_config_revision in VAD_SHADOW_CONFIG_REVISIONS
+            else ("unversioned" if vad_shadow_pipeline_factory is not None else "none")
+        )
         self._vad_shadow = None
         self._vad_shadow_start_status = vad_shadow_start_status or (
             "disabled"
             if vad_shadow_pipeline_factory is None and vad_shadow_service is None
             else "pending"
         )
+        self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+            mode=self._vad_shadow_mode,
+            status=self._vad_shadow_start_status,
+            config_revision=self._vad_shadow_config_revision,
+        )
 
     async def _start_or_reset_vad_shadow(self) -> str:
         if self._vad_shadow_service is not None:
+            self._vad_shadow_mode = self._vad_shadow_service.mode
+            self._vad_shadow_config_revision = (
+                self._vad_shadow_service.config_revision
+            )
             if self._vad_shadow is None:
                 self._vad_shadow, status = self._vad_shadow_service.acquire()
             else:
@@ -1866,11 +2068,20 @@ class Session:
                     self._vad_shadow_service.release(self._vad_shadow)
                     self._vad_shadow = None
                     self._vad_shadow_start_status = "unavailable"
+                    self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+                        mode=self._vad_shadow_mode,
+                        status="unavailable",
+                        config_revision=self._vad_shadow_config_revision,
+                    )
                     return self._vad_shadow_start_status
             if self._vad_shadow is None:
                 self._vad_shadow_start_status = status
+                self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+                    mode=self._vad_shadow_mode,
+                    status=status,
+                    config_revision=self._vad_shadow_config_revision,
+                )
                 return self._vad_shadow_start_status
-            self._vad_shadow_mode = self._vad_shadow_service.mode
             self._vad_shadow_start_status = self._vad_shadow_mode
             return self._vad_shadow_start_status
         if self._vad_shadow_pipeline_factory is None:
@@ -1880,11 +2091,18 @@ class Session:
                 self._vad_shadow = VadShadowWorker.try_start(
                     self._vad_shadow_pipeline_factory,
                     admission=self._vad_shadow_admission,
+                    mode=self._vad_shadow_mode,
+                    config_revision=self._vad_shadow_config_revision,
                 )
             except Exception:
                 self._vad_shadow = None
             if self._vad_shadow is None:
                 self._vad_shadow_start_status = "unavailable"
+                self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+                    mode=self._vad_shadow_mode,
+                    status="unavailable",
+                    config_revision=self._vad_shadow_config_revision,
+                )
                 return self._vad_shadow_start_status
 
         shadow = self._vad_shadow
@@ -1895,6 +2113,11 @@ class Session:
                     shadow.close()
                     self._vad_shadow = None
                     self._vad_shadow_start_status = "unavailable"
+                    self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+                        mode=self._vad_shadow_mode,
+                        status="unavailable",
+                        config_revision=self._vad_shadow_config_revision,
+                    )
                     return self._vad_shadow_start_status
                 await asyncio.sleep(VAD_SHADOW_READY_POLL_SECONDS)
 
@@ -1902,6 +2125,11 @@ class Session:
                 shadow.close()
                 self._vad_shadow = None
                 self._vad_shadow_start_status = "unavailable"
+                self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+                    mode=self._vad_shadow_mode,
+                    status="unavailable",
+                    config_revision=self._vad_shadow_config_revision,
+                )
                 return self._vad_shadow_start_status
 
             shadow.begin_epoch()
@@ -1918,6 +2146,11 @@ class Session:
                 pass
             self._vad_shadow = None
             self._vad_shadow_start_status = "unavailable"
+            self._last_vad_shadow_summary = _empty_vad_shadow_summary(
+                mode=self._vad_shadow_mode,
+                status="unavailable",
+                config_revision=self._vad_shadow_config_revision,
+            )
         return self._vad_shadow_start_status
 
     def _close_vad_shadow(self) -> None:
@@ -1925,19 +2158,37 @@ class Session:
         if shadow is None:
             return
         if self._vad_shadow_service is not None:
-            self._vad_shadow_service.release(shadow)
+            raw = self._vad_shadow_service.release(shadow)
+            self._last_vad_shadow_summary = sanitize_vad_shadow_summary(
+                raw,
+                fallback_mode=self._vad_shadow_mode,
+                fallback_status="unavailable",
+                fallback_config_revision=self._vad_shadow_config_revision,
+            )
             self._vad_shadow = None
             return
         try:
             shadow.close()
         except Exception:
             pass
+        try:
+            raw = shadow.snapshot()
+        except Exception:
+            raw = None
+        self._last_vad_shadow_summary = sanitize_vad_shadow_summary(
+            raw,
+            fallback_mode=self._vad_shadow_mode,
+            fallback_status="unavailable",
+            fallback_config_revision=self._vad_shadow_config_revision,
+        )
+        self._vad_shadow = None
 
     def vad_shadow_snapshot(self) -> dict:
         shadow = self._vad_shadow
         if shadow is None:
             return {
                 "mode": self._vad_shadow_mode,
+                "configRevision": self._vad_shadow_config_revision,
                 "status": self._vad_shadow_start_status,
                 "queueCapacity": 1,
             }
@@ -1946,9 +2197,27 @@ class Session:
         except Exception:
             return {
                 "mode": self._vad_shadow_mode,
+                "configRevision": self._vad_shadow_config_revision,
                 "status": "unavailable",
                 "queueCapacity": 1,
             }
+
+    def vad_shadow_summary(self) -> dict:
+        shadow = self._vad_shadow
+        if shadow is None:
+            return dict(self._last_vad_shadow_summary)
+        try:
+            raw = shadow.snapshot()
+        except Exception:
+            raw = None
+        summary = sanitize_vad_shadow_summary(
+            raw,
+            fallback_mode=self._vad_shadow_mode,
+            fallback_status="unavailable",
+            fallback_config_revision=self._vad_shadow_config_revision,
+        )
+        self._last_vad_shadow_summary = summary
+        return dict(summary)
 
     def _busy(self) -> bool:
         return self.reply_task is not None and not self.reply_task.done()
@@ -2086,9 +2355,21 @@ class Session:
                 "ttsStream": self.tts_streaming,
                 "interruptionHint": self.interruption_hint,
                 "vadShadow": vad_shadow,
+                "vadShadowSummary": self.vad_shadow_summary(),
             }
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
+
+    async def send_vad_shadow_summary(self, *, final: bool) -> bool:
+        """Send one bounded, text-free aggregate outside the per-frame path."""
+
+        return await self.send_json(
+            {
+                "type": "vad_shadow_summary",
+                "final": bool(final),
+                "summary": self.vad_shadow_summary(),
+            }
+        )
 
     def on_playback_segment(self, msg: dict) -> None:
         """接收前端实际播放回执；只接受有界 ledger 中已知的句段。"""
@@ -2197,6 +2478,12 @@ class Session:
         if await self.send_json({"type": "asr_start"}, scope=scope):
             self.asr_started = True
 
+    def _asr_end_payload(self) -> dict:
+        return {
+            "type": "asr_end",
+            "vadShadowSummary": self.vad_shadow_summary(),
+        }
+
     async def _emit_asr_end_only(
         self,
         scope: GenerationCancelScope | None = None,
@@ -2204,7 +2491,7 @@ class Session:
         if scope is not None and not scope.active:
             return
         if self.asr_started:
-            await self.send_json({"type": "asr_end"}, scope=scope)
+            await self.send_json(self._asr_end_payload(), scope=scope)
         self.asr_started = False
 
     async def _emit_speech_candidate(self) -> None:
@@ -2414,7 +2701,7 @@ class Session:
                 {"type": "asr", "text": cleaned, "interim": False},
                 scope=scope,
             )
-            await self.send_json({"type": "asr_end"}, scope=scope)
+            await self.send_json(self._asr_end_payload(), scope=scope)
             self.asr_started = False
             if not scope.active:
                 return
@@ -2906,6 +3193,7 @@ async def _handler(ws):
         vad_shadow_service=_vad_shadow_service,
         vad_shadow_start_status=_vad_shadow_start_status,
         vad_shadow_mode=_vad_shadow_mode,
+        vad_shadow_config_revision=_vad_shadow_config_revision,
     )
     log("客户端已连接")
     try:
@@ -2922,6 +3210,7 @@ async def _handler(ws):
                 await session.on_start(msg)
             elif typ == "hangup":
                 await session.cancel_all("hangup")
+                await session.send_vad_shadow_summary(final=True)
                 await session.send_json({"type": "session", "state": "ended"})
                 break
             elif typ == "playback_segment":
@@ -2951,12 +3240,13 @@ def run(
     vad_shadow_pipeline_factory=None,
     vad_shadow_start_status="disabled",
     vad_shadow_mode="shadow-v1",
+    vad_shadow_config_revision="none",
 ) -> None:
     """prepare() 在监听前调用（加载模型等）。"""
     global _log_prefix, _synth_tts, _synth_tts_http, _synth_tts_stream, _tts_pool
     global _tts_parallelism, _tts_prefetch_while_playing, _system_suffix
     global _vad_shadow_pipeline_factory, _vad_shadow_service
-    global _vad_shadow_start_status, _vad_shadow_mode
+    global _vad_shadow_start_status, _vad_shadow_mode, _vad_shadow_config_revision
     _log_prefix = name
     _synth_tts = synth_tts
     _synth_tts_http = synth_tts_http
@@ -2968,6 +3258,11 @@ def run(
     _vad_shadow_pipeline_factory = vad_shadow_pipeline_factory
     _vad_shadow_start_status = vad_shadow_start_status
     _vad_shadow_mode = vad_shadow_mode
+    _vad_shadow_config_revision = (
+        vad_shadow_config_revision
+        if vad_shadow_config_revision in VAD_SHADOW_CONFIG_REVISIONS
+        else "none"
+    )
 
     try:
         import websockets
@@ -2982,6 +3277,7 @@ def run(
         _vad_shadow_service = VadShadowService.prepare(
             vad_shadow_pipeline_factory,
             mode=vad_shadow_mode,
+            config_revision=_vad_shadow_config_revision,
             admission=_vad_shadow_admission,
         )
         _vad_shadow_start_status = _vad_shadow_service.start_status

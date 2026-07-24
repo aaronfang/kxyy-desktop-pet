@@ -55,6 +55,42 @@ class FakeWebSocket:
         return [json.loads(message) for message in self.messages if isinstance(message, str)]
 
 
+def last_json_of_type(ws, message_type):
+    return next(
+        message
+        for message in reversed(ws.json_messages())
+        if message.get("type") == message_type
+    )
+
+
+VAD_SHADOW_SUMMARY_KEYS = {
+    "schemaVersion",
+    "configRevision",
+    "mode",
+    "status",
+    "complete",
+    "outstanding",
+    "queueCapacity",
+    "maxQueueDepth",
+    "offered",
+    "accepted",
+    "dropped",
+    "processedJobs",
+    "processedFrames",
+    "staleResults",
+    "fallbacks",
+    "faults",
+    "candidateEvents",
+    "confirmedEvents",
+    "rejectedEvents",
+    "candidateTimeoutEvents",
+    "endedEvents",
+    "latencySamples",
+    "inferenceP50Ms",
+    "inferenceP95Ms",
+}
+
+
 class ControlledLoop:
     def __init__(self, futures):
         self.futures = iter(futures)
@@ -1071,6 +1107,354 @@ class InMemoryAsrTests(unittest.TestCase):
 
 
 class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
+    def test_vad_shadow_summary_schema_bounds_and_privacy_are_fixed(self):
+        raw = {
+            "mode": "silero-onnx-shadow-v1",
+            "configRevision": vad.SILERO_VAD_CONFIG_REVISION,
+            "status": "active",
+            "complete": True,
+            "outstanding": 0,
+            "queueCapacity": 999,
+            "maxQueueDepth": 1,
+            **{
+                name: vad.SHADOW_COUNTER_MAX
+                for name in common.VAD_SHADOW_SUMMARY_COUNTERS
+            },
+            "latencySamples": vad.SHADOW_LATENCY_SAMPLES,
+            "inferenceP50Ms": 12.34567,
+            "inferenceP95Ms": 45.67891,
+            "epoch": 99,
+            "rawPcm": "secret-key persona /Users/private transcript",
+        }
+        summary = common.sanitize_vad_shadow_summary(raw)
+        self.assertEqual(set(summary), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(summary["schemaVersion"], 1)
+        self.assertEqual(
+            summary["configRevision"], vad.SILERO_VAD_CONFIG_REVISION
+        )
+        self.assertEqual(summary["mode"], "silero-onnx-shadow-v1")
+        self.assertEqual(summary["status"], "active")
+        self.assertIs(summary["complete"], True)
+        self.assertEqual(summary["outstanding"], 0)
+        self.assertEqual(summary["queueCapacity"], 1)
+        self.assertEqual(summary["maxQueueDepth"], 1)
+        self.assertEqual(summary["latencySamples"], vad.SHADOW_LATENCY_SAMPLES)
+        self.assertEqual(summary["inferenceP50Ms"], 12.346)
+        self.assertEqual(summary["inferenceP95Ms"], 45.679)
+        serialized = json.dumps(summary, sort_keys=True)
+        for forbidden in (
+            "secret-key",
+            "persona",
+            "/Users",
+            "transcript",
+            "rawPcm",
+            "epoch",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertLess(len(serialized), 2048)
+
+        poisoned = dict(raw)
+        poisoned.update(
+            {
+                "mode": "future-mode",
+                "configRevision": "private-revision",
+                "status": "future-status",
+                "complete": True,
+                "outstanding": True,
+                "maxQueueDepth": 2,
+                "offered": -1,
+                "accepted": vad.SHADOW_COUNTER_MAX + 1,
+                "latencySamples": vad.SHADOW_LATENCY_SAMPLES + 1,
+                "inferenceP50Ms": float("nan"),
+                "inferenceP95Ms": float("inf"),
+            }
+        )
+        fallback = common.sanitize_vad_shadow_summary(
+            poisoned,
+            fallback_mode="unavailable",
+            fallback_status="not-reported",
+            fallback_config_revision="none",
+        )
+        self.assertEqual(set(fallback), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(fallback["mode"], "unavailable")
+        self.assertEqual(fallback["configRevision"], "none")
+        self.assertEqual(fallback["status"], "not-reported")
+        self.assertIs(fallback["complete"], False)
+        self.assertEqual(fallback["outstanding"], 0)
+        self.assertEqual(fallback["maxQueueDepth"], 0)
+        self.assertEqual(fallback["offered"], 0)
+        self.assertEqual(fallback["accepted"], 0)
+        self.assertEqual(fallback["latencySamples"], 0)
+        self.assertIsNone(fallback["inferenceP50Ms"])
+        self.assertIsNone(fallback["inferenceP95Ms"])
+
+    def test_service_release_captures_before_unlock_and_isolates_next_lease(self):
+        calls = []
+
+        class DeterministicWorker:
+            def __init__(self):
+                self.service = None
+                self.owner = 0
+                self.counters = 0
+
+            def wait_ready(self, _timeout):
+                return True
+
+            def begin_lease(self):
+                calls.append(("begin_lease", self.service._leased))
+                self.owner += 1
+                self.counters = 0
+                return True
+
+            def begin_epoch(self):
+                calls.append(("begin_epoch", self.service._leased))
+                return self.owner
+
+            def snapshot(self):
+                calls.append(("snapshot", self.service._leased))
+                return {
+                    "mode": "silero-onnx-shadow-v1",
+                    "configRevision": vad.SILERO_VAD_CONFIG_REVISION,
+                    "status": "active",
+                    "complete": True,
+                    "outstanding": 0,
+                    "queueCapacity": 1,
+                    "offered": self.counters,
+                }
+
+            def offer(self, _pcm):
+                self.counters += 1
+                return True
+
+            def close(self):
+                pass
+
+        worker = DeterministicWorker()
+        service = common.VadShadowService(
+            worker,
+            "silero-onnx-shadow-v1",
+            "warming",
+            vad.SILERO_VAD_CONFIG_REVISION,
+        )
+        worker.service = service
+
+        first, first_status = service.acquire()
+        self.assertEqual(first_status, "silero-onnx-shadow-v1")
+        self.assertIsNotNone(first)
+        self.assertTrue(first.offer(bytes(1024)))
+        captured = service.release(first)
+        self.assertEqual(captured["offered"], 1)
+        self.assertEqual(calls[-2:], [("begin_epoch", True), ("snapshot", True)])
+        self.assertFalse(service._leased)
+        self.assertFalse(first.offer(bytes(1024)))
+        self.assertFalse(first.begin_epoch())
+
+        second, second_status = service.acquire()
+        self.assertEqual(second_status, "silero-onnx-shadow-v1")
+        self.assertIsNotNone(second)
+        self.assertEqual(second.snapshot()["offered"], 0)
+        service.release(first)
+        self.assertTrue(second.offer(bytes(1024)))
+        self.assertEqual(second.snapshot()["offered"], 1)
+        service.release(second)
+
+    async def test_shadow_summary_wire_is_fixed_for_disabled_and_old_services(self):
+        disabled_ws = FakeWebSocket()
+        disabled = common.Session(disabled_ws)
+        await disabled.on_start({})
+        disabled_messages = disabled_ws.json_messages()
+        self.assertEqual(
+            [message["type"] for message in disabled_messages],
+            ["session"],
+        )
+        disabled_summary = disabled_messages[-1]["vadShadowSummary"]
+        self.assertEqual(set(disabled_summary), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(disabled_summary["configRevision"], "none")
+        self.assertEqual(disabled_summary["status"], "disabled")
+        self.assertIs(disabled_summary["complete"], False)
+
+        class OldLease:
+            def snapshot(self):
+                raise RuntimeError("secret-key persona /Users/private transcript")
+
+            def begin_epoch(self):
+                return True
+
+            def offer(self, _pcm):
+                return True
+
+        class OldService:
+            mode = "silero-onnx-shadow-v1"
+            config_revision = vad.SILERO_VAD_CONFIG_REVISION
+
+            def __init__(self):
+                self.lease = OldLease()
+                self.release_count = 0
+
+            def acquire(self):
+                return self.lease, self.mode
+
+            def release(self, lease):
+                self.release_count += 1
+                self.asserted_lease = lease
+                return None
+
+        old_service = OldService()
+        old_ws = FakeWebSocket()
+        old = common.Session(
+            old_ws,
+            vad_shadow_service=old_service,
+            vad_shadow_start_status="warming",
+            vad_shadow_mode="silero-onnx-shadow-v1",
+            vad_shadow_config_revision=vad.SILERO_VAD_CONFIG_REVISION,
+        )
+        await old.on_start({})
+        old_start = last_json_of_type(old_ws, "session")["vadShadowSummary"]
+        self.assertEqual(set(old_start), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(old_start["status"], "unavailable")
+        self.assertEqual(
+            old_start["configRevision"],
+            vad.SILERO_VAD_CONFIG_REVISION,
+        )
+
+        await old.cancel_all("hangup")
+        await old.send_vad_shadow_summary(final=True)
+        final = last_json_of_type(old_ws, "vad_shadow_summary")
+        self.assertIs(final["final"], True)
+        self.assertEqual(set(final["summary"]), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(final["summary"]["status"], "unavailable")
+        self.assertEqual(old_service.release_count, 1)
+        serialized = json.dumps(old_ws.json_messages(), sort_keys=True)
+        for forbidden in (
+            "secret-key",
+            "persona",
+            "/Users",
+            "transcript",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertLess(len(json.dumps(final, sort_keys=True)), 2048)
+
+    async def test_shadow_summary_piggybacks_without_an_observer_send(self):
+        ws = FakeWebSocket()
+        session = common.Session(ws)
+        committed = []
+
+        async def capture_utterance(pcm, *, from_play_barge=False):
+            committed.append((bytes(pcm), from_play_barge))
+
+        session._handle_utterance = capture_utterance
+        await session.on_start({})
+        start = last_json_of_type(ws, "session")
+        self.assertEqual(
+            set(start["vadShadowSummary"]), VAD_SHADOW_SUMMARY_KEYS
+        )
+
+        voice = struct.pack("<h", 6000) * common.FRAME_SAMPLES
+        quiet = bytes(common.FRAME_SAMPLES * 2)
+        for _ in range(20):
+            await session._on_frame(voice)
+        for _ in range(34):
+            await session._on_frame(quiet)
+        self.assertEqual(
+            sum(
+                message.get("type") == "vad_shadow_summary"
+                for message in ws.json_messages()
+            ),
+            0,
+        )
+
+        await session._on_frame(quiet)
+        self.assertEqual(len(committed), 1)
+        session.asr_started = True
+        await session._emit_asr_end_only()
+        asr_end = last_json_of_type(ws, "asr_end")
+        self.assertEqual(set(asr_end["vadShadowSummary"]), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(asr_end["vadShadowSummary"]["status"], "disabled")
+
+    async def test_rms_commit_never_sends_a_standalone_observer_message(self):
+        ws = FakeWebSocket()
+        session = common.Session(ws)
+        committed = []
+
+        async def capture_utterance(pcm, *, from_play_barge=False):
+            committed.append((bytes(pcm), from_play_barge))
+
+        session._handle_utterance = capture_utterance
+        await session.on_start({})
+
+        voice = struct.pack("<h", 6000) * common.FRAME_SAMPLES
+        quiet = bytes(common.FRAME_SAMPLES * 2)
+        for _ in range(20):
+            await session._on_frame(voice)
+        for _ in range(35):
+            await session._on_frame(quiet)
+
+        self.assertEqual(len(committed), 1)
+        self.assertEqual(
+            sum(
+                message.get("type") == "vad_shadow_summary"
+                for message in ws.json_messages()
+            ),
+            0,
+        )
+
+    async def test_blocked_shadow_final_summary_is_nonblocking_and_incomplete(self):
+        entered = threading.Event()
+        scorer_release = threading.Event()
+
+        class BlockingPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                entered.set()
+                scorer_release.wait(2)
+                return (vad.VadObservation(generation, 512, 0.9, ()),)
+
+            def close(self):
+                pass
+
+        service = common.VadShadowService.prepare(
+            BlockingPipeline,
+            mode="silero-onnx-shadow-v1",
+            config_revision=vad.SILERO_VAD_CONFIG_REVISION,
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertTrue(service._worker.wait_ready(1))
+        ws = FakeWebSocket()
+        session = common.Session(
+            ws,
+            vad_shadow_service=service,
+            vad_shadow_start_status="warming",
+            vad_shadow_mode="silero-onnx-shadow-v1",
+            vad_shadow_config_revision=vad.SILERO_VAD_CONFIG_REVISION,
+        )
+        await session.on_start({})
+        self.assertTrue(session._vad_shadow.offer(bytes(1024)))
+        self.assertTrue(entered.wait(1))
+
+        async def finish_without_waiting_for_scorer():
+            await session.cancel_all("hangup")
+            await session.send_vad_shadow_summary(final=True)
+
+        # The timeout is only a deadlock guard. The scorer barrier remains closed
+        # until both release and fixed-summary capture have completed.
+        await asyncio.wait_for(finish_without_waiting_for_scorer(), timeout=1)
+        final = last_json_of_type(ws, "vad_shadow_summary")
+        self.assertIs(final["final"], True)
+        self.assertEqual(set(final["summary"]), VAD_SHADOW_SUMMARY_KEYS)
+        self.assertEqual(final["summary"]["outstanding"], 1)
+        self.assertIs(final["summary"]["complete"], False)
+        self.assertEqual(final["summary"]["processedJobs"], 0)
+        self.assertEqual(final["summary"]["latencySamples"], 0)
+
+        contender, contender_status = service.acquire()
+        self.assertIsNone(contender)
+        self.assertEqual(contender_status, "busy")
+        scorer_release.set()
+        service.close()
+        self.assertTrue(service._worker.wait_closed(1))
+
     async def test_fixed_synthetic_pcm_matrix(self):
         fixture = json.loads(PCM_REPLAY_PATH.read_text(encoding="utf-8"))
         self.assertEqual(fixture["schemaVersion"], 1)
@@ -1181,17 +1565,28 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
             tuple(getattr(baseline, field) for field in state_fields),
         )
         shadow_events = [
-            {key: value for key, value in message.items() if key != "vadShadow"}
+            {
+                key: value
+                for key, value in message.items()
+                if key not in ("vadShadow", "vadShadowSummary")
+            }
             for message in shadow_ws.json_messages()
+            if message.get("type") != "vad_shadow_summary"
         ]
         baseline_events = [
-            {key: value for key, value in message.items() if key != "vadShadow"}
+            {
+                key: value
+                for key, value in message.items()
+                if key not in ("vadShadow", "vadShadowSummary")
+            }
             for message in baseline_ws.json_messages()
+            if message.get("type") != "vad_shadow_summary"
         ]
         self.assertEqual(shadow_events, baseline_events)
+        shadow_worker = shadow._vad_shadow
         await shadow.cancel_all("hangup")
         await shadow.cancel_all("disconnect")
-        self.assertTrue(shadow._vad_shadow.wait_closed(1))
+        self.assertTrue(shadow_worker.wait_closed(1))
 
     async def test_shadow_high_probability_never_changes_synthetic_rms_replay(self):
         fixture = json.loads(PCM_REPLAY_PATH.read_text(encoding="utf-8"))
@@ -1266,8 +1661,13 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
 
                 def controls(ws):
                     return [
-                        {key: value for key, value in message.items() if key != "vadShadow"}
+                        {
+                            key: value
+                            for key, value in message.items()
+                            if key not in ("vadShadow", "vadShadowSummary")
+                        }
                         for message in ws.json_messages()
+                        if message.get("type") != "vad_shadow_summary"
                     ]
 
                 self.assertEqual(controls(shadow_ws), controls(baseline_ws))
@@ -1277,8 +1677,9 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreater(
                     shadow.vad_shadow_snapshot().get("processedFrames", 0), 0
                 )
+                shadow_worker = shadow._vad_shadow
                 await shadow.cancel_all("hangup")
-                self.assertTrue(shadow._vad_shadow.wait_closed(1))
+                self.assertTrue(shadow_worker.wait_closed(1))
 
     async def test_shadow_factory_failure_reports_unavailable_without_leaking_details(self):
         def fail_factory():
@@ -1292,7 +1693,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await session.on_start({})
-        self.assertEqual(ws.json_messages()[-1]["vadShadow"], "unavailable")
+        self.assertEqual(last_json_of_type(ws, "session")["vadShadow"], "unavailable")
         self.assertIsNone(session._vad_shadow)
 
         loud_frame = struct.pack("<h", 10000) * common.FRAME_SAMPLES
@@ -1300,7 +1701,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.in_speech)
 
         await session.on_start({})
-        self.assertEqual(ws.json_messages()[-1]["vadShadow"], "unavailable")
+        self.assertEqual(last_json_of_type(ws, "session")["vadShadow"], "unavailable")
         serialized = json.dumps(ws.json_messages())
         self.assertNotIn("secret-key", serialized)
         self.assertNotIn("persona", serialized)
@@ -1388,7 +1789,9 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
         started = asyncio.get_running_loop().time()
         await warming.on_start({})
         self.assertLess(asyncio.get_running_loop().time() - started, 0.05)
-        self.assertEqual(warming.ws.json_messages()[-1]["vadShadow"], "warming")
+        self.assertEqual(
+            last_json_of_type(warming.ws, "session")["vadShadow"], "warming"
+        )
 
         factory_release.set()
         self.assertTrue(service._worker.wait_ready(1))
@@ -1400,7 +1803,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
         )
         await active.on_start({})
         self.assertEqual(
-            active.ws.json_messages()[-1]["vadShadow"],
+            last_json_of_type(active.ws, "session")["vadShadow"],
             "silero-onnx-shadow-v1",
         )
         await active.cancel_all("hangup")
@@ -1634,16 +2037,16 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             common.INTERRUPTION_HINT_CAPABILITY,
         )
         self.assertEqual(
-            self.ws.json_messages()[-1]["downlinkAudio"],
+            last_json_of_type(self.ws, "session")["downlinkAudio"],
             common.MANAGED_AUDIO_CAPABILITY,
         )
         self.assertEqual(self.session.tts_streaming, common.TTS_STREAMING_CAPABILITY)
         self.assertEqual(
-            self.ws.json_messages()[-1]["ttsStream"],
+            last_json_of_type(self.ws, "session")["ttsStream"],
             common.TTS_STREAMING_CAPABILITY,
         )
         self.assertEqual(
-            self.ws.json_messages()[-1]["interruptionHint"],
+            last_json_of_type(self.ws, "session")["interruptionHint"],
             common.INTERRUPTION_HINT_CAPABILITY,
         )
 
@@ -1653,9 +2056,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_session.downlink_audio, "raw")
         self.assertEqual(old_session.tts_streaming, "none")
         self.assertEqual(old_session.interruption_hint, "none")
-        self.assertEqual(old_ws.json_messages()[-1]["downlinkAudio"], "raw")
-        self.assertEqual(old_ws.json_messages()[-1]["ttsStream"], "none")
-        self.assertEqual(old_ws.json_messages()[-1]["interruptionHint"], "none")
+        old_started = last_json_of_type(old_ws, "session")
+        self.assertEqual(old_started["downlinkAudio"], "raw")
+        self.assertEqual(old_started["ttsStream"], "none")
+        self.assertEqual(old_started["interruptionHint"], "none")
         old_scope = old_session._new_scope("response")
         self.assertTrue(
             await old_session.send_downlink_pcm(

@@ -5,10 +5,52 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 3;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 4;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
+const VAD_SHADOW_SUMMARY_SCHEMA_VERSION = 1;
+const VAD_SHADOW_COUNTER_MAX = Number.MAX_SAFE_INTEGER;
+const VAD_SHADOW_LATENCY_SAMPLES_MAX = 64;
+const VAD_SHADOW_INFERENCE_MS_MAX = 1_000_000;
+const VAD_SHADOW_MODES = new Set([
+  "shadow-v1",
+  "silero-onnx-shadow-v1",
+  "disabled",
+  "unavailable",
+]);
+const VAD_SHADOW_STATUSES = new Set([
+  "starting",
+  "active",
+  "overloaded",
+  "faulted",
+  "closed",
+  "disabled",
+  "warming",
+  "busy",
+  "unavailable",
+  "not-reported",
+]);
+const VAD_SHADOW_CONFIG_REVISIONS = new Set([
+  "none",
+  "unversioned",
+  "silero-v6.2.1-p0700-r0350-c3-r3-e8-m96",
+]);
+const VAD_SHADOW_COUNTERS = [
+  "offered",
+  "accepted",
+  "dropped",
+  "processedJobs",
+  "processedFrames",
+  "staleResults",
+  "fallbacks",
+  "faults",
+  "candidateEvents",
+  "confirmedEvents",
+  "rejectedEvents",
+  "candidateTimeoutEvents",
+  "endedEvents",
+];
 
 export const TRACE_EVENT = Object.freeze({
   SESSION_STARTED: "session_started",
@@ -473,6 +515,90 @@ function sanitizeAppVersion(value) {
   return /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version) ? version : null;
 }
 
+function emptyVadShadowSummary() {
+  return {
+    schemaVersion: VAD_SHADOW_SUMMARY_SCHEMA_VERSION,
+    configRevision: "none",
+    mode: "disabled",
+    status: "not-reported",
+    complete: false,
+    outstanding: 0,
+    queueCapacity: 1,
+    maxQueueDepth: 0,
+    ...Object.fromEntries(VAD_SHADOW_COUNTERS.map((name) => [name, 0])),
+    latencySamples: 0,
+    inferenceP50Ms: null,
+    inferenceP95Ms: null,
+  };
+}
+
+/**
+ * Copy one private-wire VAD shadow summary into its complete fixed whitelist.
+ * Unknown/legacy services become an explicit not-reported summary; arbitrary
+ * backend fields are never retained in the desktop session or exported report.
+ */
+export function sanitizeVadShadowSummary(raw) {
+  const fallback = emptyVadShadowSummary();
+  if (
+    !raw ||
+    typeof raw !== "object" ||
+    Array.isArray(raw) ||
+    raw.schemaVersion !== VAD_SHADOW_SUMMARY_SCHEMA_VERSION
+  ) {
+    return Object.freeze(fallback);
+  }
+
+  const safeCounter = (name, maximum = VAD_SHADOW_COUNTER_MAX) => {
+    const value = raw[name];
+    return Number.isSafeInteger(value) && value >= 0 && value <= maximum ? value : 0;
+  };
+  const summary = {
+    ...fallback,
+    configRevision: VAD_SHADOW_CONFIG_REVISIONS.has(raw.configRevision)
+      ? raw.configRevision
+      : "none",
+    mode: VAD_SHADOW_MODES.has(raw.mode) ? raw.mode : "disabled",
+    status: VAD_SHADOW_STATUSES.has(raw.status) ? raw.status : "not-reported",
+    outstanding: safeCounter("outstanding", 2),
+    maxQueueDepth: safeCounter("maxQueueDepth", 1),
+  };
+  for (const name of VAD_SHADOW_COUNTERS) summary[name] = safeCounter(name);
+  summary.latencySamples = safeCounter(
+    "latencySamples",
+    VAD_SHADOW_LATENCY_SAMPLES_MAX,
+  );
+
+  const safeLatency = (name) => {
+    const value = raw[name];
+    return typeof value === "number" &&
+      Number.isFinite(value) &&
+      value >= 0 &&
+      value <= VAD_SHADOW_INFERENCE_MS_MAX
+      ? Math.round(value * 1000) / 1000
+      : null;
+  };
+  let p50 = safeLatency("inferenceP50Ms");
+  let p95 = safeLatency("inferenceP95Ms");
+  if (
+    summary.latencySamples === 0 ||
+    p50 === null ||
+    p95 === null ||
+    p50 > p95
+  ) {
+    p50 = null;
+    p95 = null;
+  }
+  summary.inferenceP50Ms = p50;
+  summary.inferenceP95Ms = p95;
+  summary.complete =
+    raw.complete === true &&
+    Number.isSafeInteger(raw.outstanding) &&
+    raw.outstanding >= 0 &&
+    raw.outstanding <= 2 &&
+    summary.outstanding === 0;
+  return Object.freeze(summary);
+}
+
 function sanitizeRuntimeSummary(runtime) {
   const value = runtime && typeof runtime === "object" ? runtime : {};
   return {
@@ -590,6 +716,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
     aggregate: {
       latency,
       interruptions: summarizeCandidateOutcomes(events),
+      vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),
       playback: {
         maxSampledQueuedMs:
           maxMetric(events, "maxQueuedMs") ?? maxMetric(events, "queuedMs"),

@@ -24,6 +24,10 @@ VAD_EVENTS = frozenset(
 )
 MAX_CANDIDATE_FRAMES = 4096
 SHADOW_MODES = frozenset(("shadow-v1", "silero-onnx-shadow-v1"))
+SILERO_VAD_CONFIG_REVISION = "silero-v6.2.1-p0700-r0350-c3-r3-e8-m96"
+VAD_SHADOW_CONFIG_REVISIONS = frozenset(
+    ("none", "unversioned", SILERO_VAD_CONFIG_REVISION)
+)
 SHADOW_QUEUE_CAPACITY = 1
 SHADOW_LATENCY_SAMPLES = 64
 SHADOW_COUNTER_MAX = (1 << 53) - 1
@@ -457,11 +461,19 @@ class VadShadowWorker:
     the waiting job so discontinuous PCM can never share recurrent/model state.
     """
 
-    def __init__(self, pipeline_factory, admission, monotonic, mode):
+    def __init__(
+        self,
+        pipeline_factory,
+        admission,
+        monotonic,
+        mode,
+        config_revision,
+    ):
         self._pipeline_factory = pipeline_factory
         self._admission = admission
         self._monotonic = monotonic
         self._mode = mode
+        self._config_revision = config_revision
         self._queue = queue.Queue(maxsize=SHADOW_QUEUE_CAPACITY)
         self._lock = threading.Lock()
         self._closed = False
@@ -495,10 +507,13 @@ class VadShadowWorker:
         admission=None,
         monotonic=time.perf_counter,
         mode="shadow-v1",
+        config_revision="unversioned",
     ):
         if pipeline_factory is None or not callable(pipeline_factory):
             return None
         if mode not in SHADOW_MODES:
+            return None
+        if config_revision not in VAD_SHADOW_CONFIG_REVISIONS:
             return None
         admission = admission or VAD_SHADOW_ADMISSION
         try:
@@ -507,7 +522,13 @@ class VadShadowWorker:
             return None
         if not acquired:
             return None
-        worker = cls(pipeline_factory, admission, monotonic, mode)
+        worker = cls(
+            pipeline_factory,
+            admission,
+            monotonic,
+            mode,
+            config_revision,
+        )
         try:
             worker._thread.start()
         except Exception:
@@ -633,6 +654,7 @@ class VadShadowWorker:
             latencies = tuple(self._latencies_ms)
             return {
                 "mode": self._mode,
+                "configRevision": self._config_revision,
                 "status": self._status,
                 "epoch": self._epoch,
                 "queueCapacity": SHADOW_QUEUE_CAPACITY,
@@ -655,6 +677,8 @@ class VadShadowWorker:
                 "latencySamples": len(latencies),
                 "inferenceP50Ms": _percentile(latencies, 50),
                 "inferenceP95Ms": _percentile(latencies, 95),
+                "outstanding": self._outstanding,
+                "complete": self._outstanding == 0,
             }
 
     def _mark_fault(self, epoch):
