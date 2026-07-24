@@ -165,6 +165,7 @@ export class RealtimeSession {
     this._downlinkAudioMode = "raw";
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
+    this._vadShadowMode = "disabled";
     this._candidateId = null;
     this._candidateSnapshot = null;
     this._candidateSegmentKeys = null;
@@ -319,6 +320,12 @@ export class RealtimeSession {
             msg.interruptionHint === INTERRUPTION_HINT_CAPABILITY
               ? INTERRUPTION_HINT_CAPABILITY
               : "none";
+          this._vadShadowMode =
+            msg.vadShadow === undefined
+              ? "disabled"
+              : ["shadow-v1", "disabled", "unavailable"].includes(msg.vadShadow)
+                ? msg.vadShadow
+                : "unavailable";
         }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
@@ -1291,6 +1298,7 @@ export class RealtimeSession {
         downlinkAudio: this._downlinkAudioMode,
         ttsStream: this._ttsStreamingMode,
         interruptionHint: this._interruptionHintMode,
+        vadShadow: this._vadShadowMode,
       },
     };
   }

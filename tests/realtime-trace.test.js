@@ -330,6 +330,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
+      vadShadow: "shadow-v1",
       url: "forbidden-url",
     },
     events,
@@ -337,12 +338,15 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
+  assert.equal(report.diagnosticSchemaVersion, 2);
+
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
     playbackMode: "worklet",
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    vadShadow: "shadow-v1",
   });
   assert.deepEqual(report.exportStats, {
     sourceDroppedEvents: 17,
@@ -384,6 +388,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
       downlinkAudio: "future-envelope",
       ttsStream: "future-stream",
       interruptionHint: "future-hint",
+      vadShadow: "future-shadow",
     },
   });
   assert.deepEqual(report.runtime, {
@@ -392,6 +397,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     downlinkAudio: "raw",
     ttsStream: "none",
     interruptionHint: "none",
+    vadShadow: "disabled",
   });
 });
 
@@ -596,6 +602,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    vadShadow: "disabled",
   });
 
   const cosy = new RealtimeSession({ provider: "cosyvoice" });

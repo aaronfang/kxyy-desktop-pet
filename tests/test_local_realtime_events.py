@@ -26,6 +26,7 @@ SPEC = importlib.util.spec_from_file_location("kxyy_local_realtime_common", COMM
 common = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(common)
+import vad_adapter as vad
 
 TTS_COSYVOICE_SPEC = importlib.util.spec_from_file_location(
     "kxyy_local_realtime_tts_cosyvoice", TTS_COSYVOICE_PATH
@@ -1113,6 +1114,243 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(len(commits), expected["commitCount"])
                 self.assertEqual(endpoint_types, expected["endpointEvents"])
+
+    async def test_shadow_reassembles_frontend_chunks_without_changing_rms_path(self):
+        class RecordingScorer:
+            def __init__(self):
+                self.frames = []
+
+            def __call__(self, frame):
+                self.frames.append(frame)
+                return 0.9
+
+            def reset(self):
+                pass
+
+        scorer = RecordingScorer()
+
+        def pipeline_factory():
+            return vad.NeuralVadPipeline(
+                scorer,
+                vad.ProbabilityVadState(
+                    speech_threshold=0.7,
+                    release_threshold=0.3,
+                    confirm_frames=3,
+                    reject_frames=2,
+                    end_frames=3,
+                ),
+            )
+
+        shadow_ws = FakeWebSocket()
+        baseline_ws = FakeWebSocket()
+        shadow = common.Session(
+            shadow_ws,
+            vad_shadow_pipeline_factory=pipeline_factory,
+            vad_shadow_admission=threading.BoundedSemaphore(1),
+        )
+        baseline = common.Session(baseline_ws)
+        await shadow.on_start({"systemRole": "角色", "botName": "元元"})
+        await baseline.on_start({"systemRole": "角色", "botName": "元元"})
+        self.assertEqual(shadow_ws.json_messages()[0]["vadShadow"], "shadow-v1")
+        self.assertEqual(baseline_ws.json_messages()[0]["vadShadow"], "disabled")
+
+        source = b"".join(struct.pack("<h", index % 20) for index in range(2560))
+        for chunk_index, offset in enumerate(range(0, len(source), 640), 1):
+            chunk = source[offset : offset + 640]
+            await shadow.on_pcm(chunk)
+            await baseline.on_pcm(chunk)
+            deadline = asyncio.get_running_loop().time() + 1
+            while shadow.vad_shadow_snapshot().get("processedJobs", 0) < chunk_index:
+                self.assertLess(asyncio.get_running_loop().time(), deadline)
+                await asyncio.sleep(0.001)
+
+        self.assertEqual(len(scorer.frames), 5)
+        self.assertEqual(b"".join(scorer.frames), source)
+        self.assertEqual(bytes(shadow.pcm_buf), bytes(baseline.pcm_buf))
+        state_fields = (
+            "in_speech",
+            "silence_ms",
+            "speech_ms",
+            "barge_loud_frames",
+            "play_barge_pending",
+            "candidate_emitted",
+        )
+        self.assertEqual(
+            tuple(getattr(shadow, field) for field in state_fields),
+            tuple(getattr(baseline, field) for field in state_fields),
+        )
+        shadow_events = [
+            {key: value for key, value in message.items() if key != "vadShadow"}
+            for message in shadow_ws.json_messages()
+        ]
+        baseline_events = [
+            {key: value for key, value in message.items() if key != "vadShadow"}
+            for message in baseline_ws.json_messages()
+        ]
+        self.assertEqual(shadow_events, baseline_events)
+        await shadow.cancel_all("hangup")
+        await shadow.cancel_all("disconnect")
+        self.assertTrue(shadow._vad_shadow.wait_closed(1))
+
+    async def test_shadow_high_probability_never_changes_synthetic_rms_replay(self):
+        fixture = json.loads(PCM_REPLAY_PATH.read_text(encoding="utf-8"))
+
+        class ConstantScorer:
+            def __call__(self, _frame):
+                return 1.0
+
+            def reset(self):
+                pass
+
+        def pipeline_factory():
+            return vad.NeuralVadPipeline(
+                ConstantScorer(),
+                vad.ProbabilityVadState(
+                    speech_threshold=0.7,
+                    release_threshold=0.3,
+                    confirm_frames=3,
+                    reject_frames=2,
+                    end_frames=3,
+                ),
+            )
+
+        for scenario in fixture["scenarios"]:
+            with self.subTest(scenario=scenario["id"]):
+                baseline_ws = FakeWebSocket()
+                shadow_ws = FakeWebSocket()
+                baseline = common.Session(baseline_ws)
+                shadow = common.Session(
+                    shadow_ws,
+                    vad_shadow_pipeline_factory=pipeline_factory,
+                    vad_shadow_admission=threading.BoundedSemaphore(1),
+                )
+                baseline_commits = []
+                shadow_commits = []
+
+                async def capture_baseline(pcm, *, from_play_barge=False):
+                    baseline_commits.append((bytes(pcm), from_play_barge))
+                    await baseline._emit_speech_rejected()
+
+                async def capture_shadow(pcm, *, from_play_barge=False):
+                    shadow_commits.append((bytes(pcm), from_play_barge))
+                    await shadow._emit_speech_rejected()
+
+                baseline._handle_utterance = capture_baseline
+                shadow._handle_utterance = capture_shadow
+                if scenario["mode"] == "playback":
+                    baseline.playing = baseline.play_enabled = True
+                    shadow.playing = shadow.play_enabled = True
+                await baseline.on_start({})
+                await shadow.on_start({})
+
+                offered_frames = 0
+                for segment in scenario["segments"]:
+                    amplitude = fixture["levels"][segment["level"]]
+                    frame = struct.pack("<h", amplitude) * common.FRAME_SAMPLES
+                    for _ in range(segment["frames"]):
+                        await baseline.on_pcm(frame)
+                        await shadow.on_pcm(frame)
+                        offered_frames += 1
+                        if offered_frames <= 2:
+                            deadline = asyncio.get_running_loop().time() + 1
+                            expected_key = (
+                                "processedJobs" if offered_frames == 1 else "processedFrames"
+                            )
+                            while shadow.vad_shadow_snapshot().get(expected_key, 0) < 1:
+                                self.assertLess(
+                                    asyncio.get_running_loop().time(), deadline
+                                )
+                                await asyncio.sleep(0.001)
+
+                def controls(ws):
+                    return [
+                        {key: value for key, value in message.items() if key != "vadShadow"}
+                        for message in ws.json_messages()
+                    ]
+
+                self.assertEqual(controls(shadow_ws), controls(baseline_ws))
+                self.assertEqual(shadow_commits, baseline_commits)
+                self.assertEqual(shadow.endpoint.state, baseline.endpoint.state)
+                self.assertEqual(shadow.in_speech, baseline.in_speech)
+                self.assertGreater(
+                    shadow.vad_shadow_snapshot().get("processedFrames", 0), 0
+                )
+                await shadow.cancel_all("hangup")
+                self.assertTrue(shadow._vad_shadow.wait_closed(1))
+
+    async def test_shadow_factory_failure_reports_unavailable_without_leaking_details(self):
+        def fail_factory():
+            raise RuntimeError("secret-key persona /Users/private/path")
+
+        ws = FakeWebSocket()
+        session = common.Session(
+            ws,
+            vad_shadow_pipeline_factory=fail_factory,
+            vad_shadow_admission=threading.BoundedSemaphore(1),
+        )
+
+        await session.on_start({})
+        self.assertEqual(ws.json_messages()[-1]["vadShadow"], "unavailable")
+        self.assertIsNone(session._vad_shadow)
+
+        loud_frame = struct.pack("<h", 10000) * common.FRAME_SAMPLES
+        await session.on_pcm(loud_frame)
+        self.assertTrue(session.in_speech)
+
+        await session.on_start({})
+        self.assertEqual(ws.json_messages()[-1]["vadShadow"], "unavailable")
+        serialized = json.dumps(ws.json_messages())
+        self.assertNotIn("secret-key", serialized)
+        self.assertNotIn("persona", serialized)
+        self.assertNotIn("/Users", serialized)
+
+    async def test_terminal_cleanup_closes_shadow_when_cancellation_raises(self):
+        class QuietPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                return ()
+
+            def close(self):
+                pass
+
+        for failing_method in ("cancel_asr", "cancel_reply"):
+            with self.subTest(failing_method=failing_method):
+                admission = threading.BoundedSemaphore(1)
+                session = common.Session(
+                    FakeWebSocket(),
+                    vad_shadow_pipeline_factory=QuietPipeline,
+                    vad_shadow_admission=admission,
+                )
+                await session.on_start({})
+                self.assertEqual(
+                    session.vad_shadow_snapshot()["status"], "active"
+                )
+                worker = session._vad_shadow
+                completed = []
+
+                async def succeed(reason):
+                    completed.append(reason)
+
+                async def fail(_reason):
+                    raise RuntimeError("synthetic cancellation failure")
+
+                session.cancel_asr = fail if failing_method == "cancel_asr" else succeed
+                session.cancel_reply = fail if failing_method == "cancel_reply" else succeed
+
+                with self.assertRaisesRegex(RuntimeError, "synthetic cancellation"):
+                    await session.cancel_all("hangup")
+                self.assertEqual(completed, ["hangup"])
+                self.assertTrue(worker.wait_closed(1))
+
+                replacement = vad.VadShadowWorker.try_start(
+                    QuietPipeline,
+                    admission=admission,
+                )
+                self.assertIsNotNone(replacement)
+                replacement.close()
+                self.assertTrue(replacement.wait_closed(1))
 
 
 class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):

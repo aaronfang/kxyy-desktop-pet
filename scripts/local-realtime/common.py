@@ -28,6 +28,13 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
 VOICE_AB = REPO / "scripts" / "voice-ab"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from vad_adapter import VAD_SHADOW_ADMISSION, VadShadowWorker
+
+VAD_SHADOW_READY_TIMEOUT_SECONDS = 0.05
+VAD_SHADOW_READY_POLL_SECONDS = 0.005
+
 # 打包后由桌宠注入：可写运行时（venv / 参考音副本）
 _RUNTIME = Path(os.environ["KXYY_VOICE_RUNTIME"]).expanduser() if os.environ.get("KXYY_VOICE_RUNTIME") else None
 
@@ -740,6 +747,8 @@ _synth_tts_stream = None
 # 朗读专用：返回 (audio_bytes, mime)。CosyVoice 直接回 MP3，避免 ffmpeg+24k WAV 失真。
 # 返回 (audio, mime) 或 (audio, mime, usage_dict)；usage 含 characters / provider。
 _synth_tts_http: Callable[[str], tuple] | None = None
+_vad_shadow_pipeline_factory = None
+_vad_shadow_admission = VAD_SHADOW_ADMISSION
 _system_suffix = ""
 _tts_parallelism = 1
 _tts_prefetch_while_playing = False
@@ -1638,7 +1647,13 @@ def mp3_to_pcm24k(mp3: bytes) -> bytes:
 
 
 class Session:
-    def __init__(self, ws):
+    def __init__(
+        self,
+        ws,
+        *,
+        vad_shadow_pipeline_factory=None,
+        vad_shadow_admission=None,
+    ):
         self.ws = ws
         self.system_role = "你是元元，口语化简短回复，一两句即可。"
         self.bot_name = "元元"
@@ -1677,6 +1692,87 @@ class Session:
         self._candidate_confirmed = False
         self._candidate_receipt_qualified = False
         self._candidate_receipt_event = asyncio.Event()
+        self._vad_shadow_pipeline_factory = vad_shadow_pipeline_factory
+        self._vad_shadow_admission = vad_shadow_admission or _vad_shadow_admission
+        self._vad_shadow = None
+        self._vad_shadow_start_status = (
+            "disabled" if vad_shadow_pipeline_factory is None else "pending"
+        )
+
+    async def _start_or_reset_vad_shadow(self) -> str:
+        if self._vad_shadow_pipeline_factory is None:
+            self._vad_shadow_start_status = "disabled"
+            return self._vad_shadow_start_status
+        if self._vad_shadow is None:
+            try:
+                self._vad_shadow = VadShadowWorker.try_start(
+                    self._vad_shadow_pipeline_factory,
+                    admission=self._vad_shadow_admission,
+                )
+            except Exception:
+                self._vad_shadow = None
+            if self._vad_shadow is None:
+                self._vad_shadow_start_status = "unavailable"
+                return self._vad_shadow_start_status
+
+        shadow = self._vad_shadow
+        try:
+            deadline = self.loop.time() + VAD_SHADOW_READY_TIMEOUT_SECONDS
+            while not shadow.wait_ready(0):
+                if self.loop.time() >= deadline:
+                    shadow.close()
+                    self._vad_shadow = None
+                    self._vad_shadow_start_status = "unavailable"
+                    return self._vad_shadow_start_status
+                await asyncio.sleep(VAD_SHADOW_READY_POLL_SECONDS)
+
+            if shadow.snapshot().get("status") != "active":
+                shadow.close()
+                self._vad_shadow = None
+                self._vad_shadow_start_status = "unavailable"
+                return self._vad_shadow_start_status
+
+            shadow.begin_epoch()
+            if shadow.snapshot().get("status") == "active":
+                self._vad_shadow_start_status = "shadow-v1"
+            else:
+                shadow.close()
+                self._vad_shadow = None
+                self._vad_shadow_start_status = "unavailable"
+        except Exception:
+            try:
+                shadow.close()
+            except Exception:
+                pass
+            self._vad_shadow = None
+            self._vad_shadow_start_status = "unavailable"
+        return self._vad_shadow_start_status
+
+    def _close_vad_shadow(self) -> None:
+        shadow = self._vad_shadow
+        if shadow is None:
+            return
+        try:
+            shadow.close()
+        except Exception:
+            pass
+
+    def vad_shadow_snapshot(self) -> dict:
+        shadow = self._vad_shadow
+        if shadow is None:
+            return {
+                "mode": "shadow-v1",
+                "status": self._vad_shadow_start_status,
+                "queueCapacity": 1,
+            }
+        try:
+            return shadow.snapshot()
+        except Exception:
+            return {
+                "mode": "shadow-v1",
+                "status": "unavailable",
+                "queueCapacity": 1,
+            }
 
     def _busy(self) -> bool:
         return self.reply_task is not None and not self.reply_task.done()
@@ -1769,9 +1865,15 @@ class Session:
                 pass
 
     async def cancel_all(self, reason: str) -> None:
-        await self.cancel_asr(reason)
-        await self.cancel_reply(reason)
-        self._clear_interruption_candidate()
+        try:
+            await self.cancel_asr(reason)
+        finally:
+            try:
+                await self.cancel_reply(reason)
+            finally:
+                self._clear_interruption_candidate()
+                if reason in ("hangup", "disconnect"):
+                    self._close_vad_shadow()
 
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
@@ -1799,6 +1901,7 @@ class Session:
             else "none"
         )
         self._clear_interruption_candidate()
+        vad_shadow = await self._start_or_reset_vad_shadow()
         await self.send_json(
             {
                 "type": "session",
@@ -1806,6 +1909,7 @@ class Session:
                 "downlinkAudio": self.downlink_audio,
                 "ttsStream": self.tts_streaming,
                 "interruptionHint": self.interruption_hint,
+                "vadShadow": vad_shadow,
             }
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
@@ -1896,6 +2000,11 @@ class Session:
         return qualified
 
     async def on_pcm(self, data: bytes) -> None:
+        if self._vad_shadow is not None:
+            try:
+                self._vad_shadow.offer(data)
+            except Exception:
+                self._close_vad_shadow()
         self.pcm_buf.extend(data)
         frame_bytes = FRAME_SAMPLES * 2
         while len(self.pcm_buf) >= frame_bytes:
@@ -2060,6 +2169,11 @@ class Session:
             self.endpoint.reset()
             self.barge_loud_frames = 0
             self.play_barge_pending = False
+            if self._vad_shadow is not None:
+                try:
+                    self._vad_shadow.begin_epoch()
+                except Exception:
+                    self._close_vad_shadow()
             await self._handle_utterance(pcm, from_play_barge=was_play_barge)
 
     async def _resume_play_if_paused(self) -> None:
@@ -2609,7 +2723,11 @@ class Session:
 
 
 async def _handler(ws):
-    session = Session(ws)
+    session = Session(
+        ws,
+        vad_shadow_pipeline_factory=_vad_shadow_pipeline_factory,
+        vad_shadow_admission=_vad_shadow_admission,
+    )
     log("客户端已连接")
     try:
         async for message in ws:
@@ -2651,10 +2769,12 @@ def run(
     system_suffix: str = "",
     synth_tts_http: Callable[[str], tuple] | None = None,
     synth_tts_stream=None,
+    vad_shadow_pipeline_factory=None,
 ) -> None:
     """prepare() 在监听前调用（加载模型等）。"""
     global _log_prefix, _synth_tts, _synth_tts_http, _synth_tts_stream, _tts_pool
     global _tts_parallelism, _tts_prefetch_while_playing, _system_suffix
+    global _vad_shadow_pipeline_factory
     _log_prefix = name
     _synth_tts = synth_tts
     _synth_tts_http = synth_tts_http
@@ -2663,6 +2783,7 @@ def run(
     _tts_parallelism = max(1, min(TTS_PARALLELISM_MAX, int(tts_parallelism)))
     _tts_prefetch_while_playing = bool(tts_prefetch_while_playing)
     _system_suffix = system_suffix
+    _vad_shadow_pipeline_factory = vad_shadow_pipeline_factory
 
     try:
         import websockets
