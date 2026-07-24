@@ -84,6 +84,7 @@ npm run dev        # 开发模式（tauri dev）
 - **Qwen MLX 0.2.22 实测重点**：在 Apple Silicon 选择本地 Qwen3-TTS，要求一段较长回复，观察首句是否在整句生成完前开始播放、chunk 接缝是否自然，并在首句中途插话确认旧生成在下一个 provider chunk 边界后释放、ASR 能继续运行。旧 `mlx-audio` API、非 24k 模型、Windows/Linux PyTorch、legacy 播放会自动回退整句；没有真实设备 trace 前不宣称 TTFA 或打断 p95 改善。
 - **0.2.23 通话诊断**：在设置中勾选“显示聊天界面调试信息”，接通并完成测试轮次后，可在聊天底部点击“复制通话诊断 JSON”（通话中或挂断后均可）。JSON 只含固定协商枚举、重新编号的会话 ID、单调相对时间和有界数值指标，不含 Key、persona、文本、路径或 PCM。先检查 `runtime` 是否为预期的 `worklet + managed-v1 + provider-pcm-v1`，再按 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md) 2.17 的 runbook 记录 TTFA、接缝与取消恢复；`maxSampledQueuedMs` 是 500ms 采样最高值，`drainInclusiveUnderruns` 包含自然播放结束，二者都不能解释成 provider 内部指标。
 - **0.2.24 VAD 回放基础**：仓库新增不依赖账户、麦克风、模型、Torch 或 ONNX Runtime 的 512-sample 组帧、概率迟滞、generation/fallback 和 synthetic-only provenance 测试。它尚未接入本地通话 `Session`，App 仍使用原有 RMS candidate/soft endpoint；此版不能用于比较神经 VAD 听感或准确率。开发验证运行 `npm run test:python`，实现/待实验边界见路线图 2.18。
+- **0.2.25 bounded VAD shadow**：本地/CosyVoice `Session` 已具备可注入的 dedicated worker、全进程单 admission 和 queue=1 旁路；溢出会换 epoch，迟到结果不参与状态。发布版尚未带 Silero/ORT，默认诊断 `runtime.vadShadow=disabled`，因此通话仍完全由 RMS 决策、没有神经 VAD 体验变化。诊断报告 schema 升为 v2；下一版才会对支持的运行时启用真实 shadow。
 - 设置页底部会显示本地服务状态与日志；开发模式也可直接使用仓库内 `scripts/local-realtime/`。
 
 ## 打包

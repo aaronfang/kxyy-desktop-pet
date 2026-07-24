@@ -7,7 +7,11 @@ PCM frames.
 """
 
 from dataclasses import dataclass
+from collections import deque
 import math
+import queue
+import threading
+import time
 from typing import Callable, Optional, Tuple, Union
 
 
@@ -17,6 +21,14 @@ DEFAULT_MAX_INPUT_FRAMES = 64
 MAX_FRAME_SAMPLES = 16000
 MAX_INPUT_FRAMES = 64
 VAD_EVENTS = frozenset(("candidate", "confirmed", "rejected", "ended"))
+SHADOW_QUEUE_CAPACITY = 1
+SHADOW_LATENCY_SAMPLES = 64
+SHADOW_COUNTER_MAX = (1 << 53) - 1
+SHADOW_MAX_INPUT_BYTES = (
+    DEFAULT_FRAME_SAMPLES * PCM16_BYTES_PER_SAMPLE * DEFAULT_MAX_INPUT_FRAMES
+)
+VAD_SHADOW_ADMISSION = threading.BoundedSemaphore(1)
+_SHADOW_STOP = object()
 
 
 def _positive_int(value, name):
@@ -372,3 +384,292 @@ class NeuralVadPipeline:
             return tuple(observations)
         finally:
             self._feeding = False
+
+
+def _saturating_add(value, amount=1):
+    return min(SHADOW_COUNTER_MAX, value + max(0, int(amount)))
+
+
+def _percentile(values, percentile):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil((percentile / 100.0) * len(ordered)) - 1)
+    return round(ordered[index], 3)
+
+
+class VadShadowWorker:
+    """Single-lane, queue=1 shadow runner that never owns live VAD decisions.
+
+    The factory, scorer, pipeline state, and PCM assembly are touched only by the
+    daemon worker.  Producers never wait.  Overflow advances an epoch and replaces
+    the waiting job so discontinuous PCM can never share recurrent/model state.
+    """
+
+    def __init__(self, pipeline_factory, admission, monotonic):
+        self._pipeline_factory = pipeline_factory
+        self._admission = admission
+        self._monotonic = monotonic
+        self._queue = queue.Queue(maxsize=SHADOW_QUEUE_CAPACITY)
+        self._lock = threading.Lock()
+        self._closed = False
+        self._epoch = 0
+        self._status = "starting"
+        self._offered = 0
+        self._accepted = 0
+        self._dropped = 0
+        self._processed_jobs = 0
+        self._processed_frames = 0
+        self._stale_results = 0
+        self._fallbacks = 0
+        self._faults = 0
+        self._max_queue_depth = 0
+        self._event_counts = {event: 0 for event in VAD_EVENTS}
+        self._latencies_ms = deque(maxlen=SHADOW_LATENCY_SAMPLES)
+        self._ready = threading.Event()
+        self._terminated = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="kxyy-vad-shadow",
+            daemon=True,
+        )
+
+    @classmethod
+    def try_start(
+        cls,
+        pipeline_factory,
+        *,
+        admission=None,
+        monotonic=time.perf_counter,
+    ):
+        if pipeline_factory is None or not callable(pipeline_factory):
+            return None
+        admission = admission or VAD_SHADOW_ADMISSION
+        try:
+            acquired = admission.acquire(blocking=False)
+        except Exception:
+            return None
+        if not acquired:
+            return None
+        worker = cls(pipeline_factory, admission, monotonic)
+        try:
+            worker._thread.start()
+        except Exception:
+            admission.release()
+            return None
+        return worker
+
+    def _increment(self, name, amount=1):
+        setattr(self, name, _saturating_add(getattr(self, name), amount))
+
+    def _drain_waiting_locked(self):
+        removed = 0
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not _SHADOW_STOP:
+                removed += 1
+        if removed:
+            self._increment("_dropped", removed)
+        return removed
+
+    def begin_epoch(self):
+        with self._lock:
+            if self._closed or self._terminated.is_set():
+                return self._epoch
+            self._epoch += 1
+            self._drain_waiting_locked()
+            if self._status not in ("starting", "unavailable"):
+                self._status = "active"
+            return self._epoch
+
+    def offer(self, pcm):
+        if not isinstance(pcm, (bytes, bytearray, memoryview)):
+            input_size = -1
+        else:
+            input_size = memoryview(pcm).nbytes
+
+        if input_size == 0:
+            return False
+        valid = 0 < input_size <= SHADOW_MAX_INPUT_BYTES
+        data = bytes(pcm) if valid else None
+        with self._lock:
+            if self._closed or self._terminated.is_set():
+                return False
+            self._increment("_offered")
+            if not valid:
+                self._epoch += 1
+                self._drain_waiting_locked()
+                self._increment("_dropped")
+                self._status = "overloaded"
+                return False
+            job = (self._epoch, data)
+            try:
+                self._queue.put_nowait(job)
+            except queue.Full:
+                self._epoch += 1
+                self._drain_waiting_locked()
+                self._status = "overloaded"
+                job = (self._epoch, data)
+                try:
+                    self._queue.put_nowait(job)
+                except queue.Full:
+                    self._increment("_dropped")
+                    return False
+            self._increment("_accepted")
+            self._max_queue_depth = max(
+                self._max_queue_depth,
+                min(SHADOW_QUEUE_CAPACITY, self._queue.qsize()),
+            )
+            return True
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._epoch += 1
+            self._drain_waiting_locked()
+            self._status = "closed"
+            try:
+                self._queue.put_nowait(_SHADOW_STOP)
+            except queue.Full:
+                # The queue was drained while holding the same producer lock.
+                pass
+
+    def wait_ready(self, timeout=None):
+        return self._ready.wait(timeout)
+
+    def wait_closed(self, timeout=None):
+        return self._terminated.wait(timeout)
+
+    def snapshot(self):
+        with self._lock:
+            latencies = tuple(self._latencies_ms)
+            return {
+                "mode": "shadow-v1",
+                "status": self._status,
+                "epoch": self._epoch,
+                "queueCapacity": SHADOW_QUEUE_CAPACITY,
+                "maxQueueDepth": self._max_queue_depth,
+                "offered": self._offered,
+                "accepted": self._accepted,
+                "dropped": self._dropped,
+                "processedJobs": self._processed_jobs,
+                "processedFrames": self._processed_frames,
+                "staleResults": self._stale_results,
+                "fallbacks": self._fallbacks,
+                "faults": self._faults,
+                "candidateEvents": self._event_counts["candidate"],
+                "confirmedEvents": self._event_counts["confirmed"],
+                "rejectedEvents": self._event_counts["rejected"],
+                "endedEvents": self._event_counts["ended"],
+                "latencySamples": len(latencies),
+                "inferenceP50Ms": _percentile(latencies, 50),
+                "inferenceP95Ms": _percentile(latencies, 95),
+            }
+
+    def _mark_fault(self, epoch):
+        with self._lock:
+            if self._closed or epoch != self._epoch:
+                self._increment("_stale_results")
+                return
+            self._increment("_faults")
+            self._increment("_fallbacks")
+            self._status = "faulted"
+
+    def _run(self):
+        pipeline = None
+        pipeline_epoch = None
+        fault_epoch = None
+        try:
+            try:
+                pipeline = self._pipeline_factory()
+            except Exception:
+                with self._lock:
+                    if not self._closed:
+                        self._status = "unavailable"
+                    self._drain_waiting_locked()
+                self._ready.set()
+                return
+
+            with self._lock:
+                if not self._closed:
+                    self._status = "active"
+            self._ready.set()
+
+            while True:
+                job = self._queue.get()
+                if job is _SHADOW_STOP:
+                    break
+                epoch, pcm = job
+                with self._lock:
+                    if self._closed or epoch != self._epoch:
+                        self._increment("_stale_results")
+                        continue
+                if fault_epoch == epoch:
+                    with self._lock:
+                        self._increment("_dropped")
+                    continue
+                if pipeline_epoch != epoch:
+                    try:
+                        pipeline.reset(epoch)
+                    except Exception:
+                        fault_epoch = epoch
+                        self._mark_fault(epoch)
+                        continue
+                    pipeline_epoch = epoch
+                    fault_epoch = None
+
+                try:
+                    started = self._monotonic()
+                    results = pipeline.feed(pcm, generation=epoch)
+                    finished = self._monotonic()
+                except Exception:
+                    fault_epoch = epoch
+                    self._mark_fault(epoch)
+                    continue
+
+                with self._lock:
+                    if self._closed or epoch != self._epoch:
+                        self._increment("_stale_results")
+                        continue
+                    self._increment("_processed_jobs")
+                    elapsed_ms = (finished - started) * 1000.0
+                    if math.isfinite(elapsed_ms) and elapsed_ms >= 0:
+                        self._latencies_ms.append(elapsed_ms)
+                    observations = 0
+                    fallback_seen = False
+                    for result in results:
+                        if isinstance(result, VadObservation):
+                            observations += 1
+                            for event in result.events:
+                                if event in self._event_counts:
+                                    self._event_counts[event] = _saturating_add(
+                                        self._event_counts[event]
+                                    )
+                        elif isinstance(result, VadFallback):
+                            fallback_seen = True
+                        else:
+                            fallback_seen = True
+                    self._increment("_processed_frames", observations)
+                    if fallback_seen:
+                        self._increment("_fallbacks")
+                        self._increment("_faults")
+                        self._status = "faulted"
+                        fault_epoch = epoch
+                    else:
+                        self._status = "active"
+        finally:
+            if pipeline is not None:
+                try:
+                    pipeline.close()
+                except Exception:
+                    pass
+            try:
+                self._admission.release()
+            except Exception:
+                pass
+            self._terminated.set()

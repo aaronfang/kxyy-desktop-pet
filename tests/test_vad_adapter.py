@@ -6,6 +6,8 @@ import math
 import random
 import struct
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -436,6 +438,235 @@ class NeuralVadPipelineTests(unittest.TestCase):
         for invalid in (1, 2):
             with self.assertRaises(ValueError):
                 pipeline.reset(invalid)
+
+
+def wait_for_snapshot(worker, predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshot = worker.snapshot()
+        if predicate(snapshot):
+            return snapshot
+        threading.Event().wait(0.002)
+    raise AssertionError(f"shadow worker condition not reached: {worker.snapshot()}")
+
+
+class VadShadowWorkerTests(unittest.TestCase):
+    def test_ready_is_published_only_after_start_status_is_final(self):
+        factory_entered = threading.Event()
+        factory_release = threading.Event()
+        ready_set_entered = threading.Event()
+        ready_set_release = threading.Event()
+
+        class ReadyGate(threading.Event):
+            def set(self):
+                super().set()
+                ready_set_entered.set()
+                ready_set_release.wait(2)
+
+        class QuietPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                return ()
+
+            def close(self):
+                pass
+
+        def factory():
+            factory_entered.set()
+            factory_release.wait(2)
+            return QuietPipeline()
+
+        worker = vad.VadShadowWorker.try_start(
+            factory,
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertTrue(factory_entered.wait(1))
+        worker._ready = ReadyGate()
+        factory_release.set()
+        self.assertTrue(ready_set_entered.wait(1))
+        try:
+            self.assertTrue(worker.wait_ready(0))
+            self.assertEqual(worker.snapshot()["status"], "active")
+        finally:
+            ready_set_release.set()
+        worker.close()
+        self.assertTrue(worker.wait_closed(1))
+
+    def test_worker_processes_frames_and_exposes_only_bounded_aggregates(self):
+        scorer = FakeScorer([0.9, 0.9, 0.9])
+        state = new_state()
+        pipeline = vad.NeuralVadPipeline(scorer, state)
+        clock_values = iter((10.0, 10.004))
+        worker = vad.VadShadowWorker.try_start(
+            lambda: pipeline,
+            admission=threading.BoundedSemaphore(1),
+            monotonic=lambda: next(clock_values),
+        )
+        self.assertIsNotNone(worker)
+        self.assertTrue(worker.wait_ready(1))
+        self.assertEqual(worker.begin_epoch(), 1)
+        self.assertTrue(worker.offer(b"\x44" * 3072))
+
+        snapshot = wait_for_snapshot(
+            worker, lambda value: value["processedFrames"] == 3
+        )
+        self.assertEqual(snapshot["queueCapacity"], 1)
+        self.assertLessEqual(snapshot["maxQueueDepth"], 1)
+        self.assertEqual(snapshot["candidateEvents"], 1)
+        self.assertEqual(snapshot["confirmedEvents"], 1)
+        self.assertEqual(snapshot["latencySamples"], 1)
+        self.assertEqual(snapshot["inferenceP50Ms"], 4.0)
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("4444", serialized)
+        self.assertNotIn("probability", serialized.lower())
+        worker.close()
+        self.assertTrue(worker.wait_closed(1))
+
+    def test_overflow_invalidates_inflight_and_replaces_waiting_epoch(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_scored = threading.Event()
+
+        class BlockingScorer:
+            def __init__(self):
+                self.frames = []
+
+            def __call__(self, frame):
+                self.frames.append(frame)
+                if len(self.frames) == 1:
+                    entered.set()
+                    release.wait(2)
+                else:
+                    second_scored.set()
+                return 0.9
+
+            def reset(self):
+                pass
+
+        scorer = BlockingScorer()
+        worker = vad.VadShadowWorker.try_start(
+            lambda: vad.NeuralVadPipeline(scorer, new_state()),
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertIsNotNone(worker)
+        worker.begin_epoch()
+        first = b"\x11" * 1024
+        waiting = b"\x22" * 1024
+        latest = b"\x33" * 1024
+        self.assertTrue(worker.offer(first))
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(worker.offer(waiting))
+        self.assertTrue(worker.offer(latest))
+        release.set()
+        self.assertTrue(second_scored.wait(1))
+
+        snapshot = wait_for_snapshot(
+            worker, lambda value: value["processedFrames"] == 1
+        )
+        self.assertEqual(scorer.frames, [first, latest])
+        self.assertEqual(snapshot["dropped"], 1)
+        self.assertEqual(snapshot["staleResults"], 1)
+        self.assertEqual(snapshot["candidateEvents"], 1)
+        worker.close()
+        self.assertTrue(worker.wait_closed(1))
+
+    def test_close_is_nonblocking_and_holds_admission_until_worker_exits(self):
+        entered = threading.Event()
+        release = threading.Event()
+        scored = []
+
+        class BlockingPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                scored.append(bytes(_pcm))
+                entered.set()
+                release.wait(2)
+                return (vad.VadObservation(generation, 512, 0.9, ()),)
+
+            def close(self):
+                pass
+
+        admission = threading.BoundedSemaphore(1)
+        worker = vad.VadShadowWorker.try_start(
+            BlockingPipeline,
+            admission=admission,
+        )
+        worker.begin_epoch()
+        worker.offer(bytes(1024))
+        self.assertTrue(entered.wait(1))
+        worker.offer(b"\x01" * 1024)
+        worker.close()
+        worker.close()
+        self.assertFalse(worker.wait_closed(0))
+        self.assertIsNone(
+            vad.VadShadowWorker.try_start(BlockingPipeline, admission=admission)
+        )
+        release.set()
+        self.assertTrue(worker.wait_closed(1))
+        snapshot = worker.snapshot()
+        self.assertEqual(snapshot["status"], "closed")
+        self.assertEqual(snapshot["processedJobs"], 0)
+        self.assertEqual(snapshot["processedFrames"], 0)
+        self.assertEqual(snapshot["candidateEvents"], 0)
+        self.assertEqual(snapshot["confirmedEvents"], 0)
+        self.assertEqual(snapshot["rejectedEvents"], 0)
+        self.assertEqual(snapshot["endedEvents"], 0)
+        self.assertEqual(snapshot["latencySamples"], 0)
+        self.assertEqual(snapshot["staleResults"], 1)
+        self.assertEqual(scored, [bytes(1024)])
+
+        replacement = vad.VadShadowWorker.try_start(
+            BlockingPipeline,
+            admission=admission,
+        )
+        self.assertIsNotNone(replacement)
+        replacement.close()
+        self.assertTrue(replacement.wait_closed(1))
+
+    def test_factory_failure_is_fixed_unavailable_without_error_details(self):
+        def fail_factory():
+            raise RuntimeError("secret-key persona /Users/private/path")
+
+        admission = threading.BoundedSemaphore(1)
+        worker = vad.VadShadowWorker.try_start(
+            fail_factory,
+            admission=admission,
+        )
+        self.assertTrue(worker.wait_ready(1))
+        self.assertTrue(worker.wait_closed(1))
+        snapshot = worker.snapshot()
+        self.assertEqual(snapshot["status"], "unavailable")
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("secret-key", serialized)
+        self.assertNotIn("persona", serialized)
+        self.assertNotIn("/Users", serialized)
+
+        recovered = vad.VadShadowWorker.try_start(
+            lambda: vad.NeuralVadPipeline(FakeScorer([0.9]), new_state()),
+            admission=admission,
+        )
+        self.assertIsNotNone(recovered)
+        recovered.close()
+        self.assertTrue(recovered.wait_closed(1))
+
+    def test_invalid_input_advances_epoch_without_copy_or_worker_failure(self):
+        worker = vad.VadShadowWorker.try_start(
+            lambda: vad.NeuralVadPipeline(FakeScorer([0.9]), new_state()),
+            admission=threading.BoundedSemaphore(1),
+        )
+        worker.begin_epoch()
+        before = worker.snapshot()["epoch"]
+        self.assertFalse(worker.offer(memoryview(bytearray(70000))))
+        snapshot = worker.snapshot()
+        self.assertEqual(snapshot["epoch"], before + 1)
+        self.assertEqual(snapshot["dropped"], 1)
+        self.assertEqual(snapshot["status"], "overloaded")
+        worker.close()
+        self.assertTrue(worker.wait_closed(1))
 
 
 class AcousticManifestTests(unittest.TestCase):
