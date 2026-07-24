@@ -133,6 +133,57 @@ test("playback worklet acknowledges only fully consumed sentence segments", asyn
   );
 });
 
+test("playback worklet snapshots exact active-segment source progress", async () => {
+  const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
+  const player = new Playback({
+    processorOptions: { sourceRate: 24000, maxQueueMs: 3000 },
+  });
+  const pcm = new Int16Array(48000).fill(8000);
+  player.port.dispatch({ type: "segment_start", generation: 9, segmentId: 2 });
+  player.port.dispatch({
+    type: "audio",
+    pcm: pcm.buffer,
+    generation: 9,
+    segmentId: 2,
+  });
+  player.port.dispatch({ type: "segment_end", generation: 9, segmentId: 2 });
+
+  player.process([], outputBlock(48000));
+  player.port.dispatch({ type: "candidate_snapshot", candidateId: 17 });
+  const firstSnapshot = player.port.messages.at(-1);
+  assert.deepEqual(
+    {
+      type: firstSnapshot.type,
+      candidateId: firstSnapshot.candidateId,
+      generation: firstSnapshot.generation,
+      segmentId: firstSnapshot.segmentId,
+      playedSamples: firstSnapshot.playedSamples,
+      inProgress: firstSnapshot.inProgress,
+    },
+    {
+    type: "candidate_snapshot",
+    candidateId: 17,
+    generation: 9,
+    segmentId: 2,
+    playedSamples: 24000,
+    inProgress: true,
+    },
+  );
+
+  player.process([], outputBlock(48000));
+  player.port.dispatch({ type: "candidate_snapshot", candidateId: 18 });
+  assert.equal(player.port.messages.at(-1).candidateId, 18);
+  assert.equal(player.port.messages.at(-1).playedSamples, 0);
+  assert.equal(player.port.messages.at(-1).inProgress, false);
+
+  player.port.dispatch({ type: "clear" });
+  player.port.dispatch({ type: "candidate_snapshot", candidateId: 19 });
+  assert.equal(player.port.messages.at(-1).inProgress, false);
+  const messageCount = player.port.messages.length;
+  player.port.dispatch({ type: "candidate_snapshot", candidateId: 0 });
+  assert.equal(player.port.messages.length, messageCount);
+});
+
 test("playback worklet suppresses segment receipts after ring overflow", async () => {
   const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
   const player = new Playback({

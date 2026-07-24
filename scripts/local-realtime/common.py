@@ -365,6 +365,13 @@ MANAGED_AUDIO_HEADER = struct.Struct(">4sBBHIIII")
 MANAGED_AUDIO_HEADER_BYTES = MANAGED_AUDIO_HEADER.size
 MANAGED_AUDIO_CHUNK_MAX_SAMPLES = OUTPUT_RATE * 80 // 1000
 MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750
+INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1"
+INTERRUPTION_HINT_MIN_SAMPLES = OUTPUT_RATE
+INTERRUPTION_RECEIPT_WAIT_SECONDS = 0.05
+INTERRUPTION_HINT_TEXT = (
+    "上一轮语音在句中被用户打断。不要假设未播完的尾句已被用户听到；"
+    "按当前人设自然承接即可，不要机械道歉、抱怨或复述未播内容。"
+)
 LLM_REPLY_MAX_CHARS = 4096
 STABLE_SENTENCE_MIN_CHARS = 6
 STABLE_SENTENCE_SOFT_CHARS = 40
@@ -621,6 +628,15 @@ class AudibleHistory:
         turn = self._turns.get(generation)
         if turn is not None:
             turn["cancelled"] = True
+
+    def has_incomplete_segment(self, generation: int, segment_id: int) -> bool:
+        turn = self._turns.get(generation)
+        return bool(
+            turn is not None
+            and not turn["cancelled"]
+            and segment_id in turn["segmentIds"]
+            and segment_id not in turn["completed"]
+        )
 
     def _trim(self) -> None:
         overflow = len(self.messages) - self.max_messages
@@ -1623,6 +1639,12 @@ class Session:
         self.tts_parallelism = _tts_parallelism
         self.tts_prefetch_while_playing = _tts_prefetch_while_playing
         self.downlink_audio = "raw"
+        self.interruption_hint = "none"
+        self._candidate_sequence = 0
+        self._candidate_id: int | None = None
+        self._candidate_confirmed = False
+        self._candidate_receipt_qualified = False
+        self._candidate_receipt_event = asyncio.Event()
 
     def _busy(self) -> bool:
         return self.reply_task is not None and not self.reply_task.done()
@@ -1717,6 +1739,7 @@ class Session:
     async def cancel_all(self, reason: str) -> None:
         await self.cancel_asr(reason)
         await self.cancel_reply(reason)
+        self._clear_interruption_candidate()
 
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
@@ -1727,11 +1750,20 @@ class Session:
             if isinstance(offered, list) and MANAGED_AUDIO_CAPABILITY in offered
             else "raw"
         )
+        offered_interruption = msg.get("interruptionHint")
+        self.interruption_hint = (
+            INTERRUPTION_HINT_CAPABILITY
+            if isinstance(offered_interruption, list)
+            and INTERRUPTION_HINT_CAPABILITY in offered_interruption
+            else "none"
+        )
+        self._clear_interruption_candidate()
         await self.send_json(
             {
                 "type": "session",
                 "state": "started",
                 "downlinkAudio": self.downlink_audio,
+                "interruptionHint": self.interruption_hint,
             }
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
@@ -1752,6 +1784,74 @@ class Session:
         ):
             return
         self._audible_history.acknowledge(generation, segment_id, state)
+
+    def on_playback_interruption(self, msg: dict) -> None:
+        """接收 text-free candidate 播放快照；单候选、单回执、固定上限。"""
+        if self.interruption_hint != INTERRUPTION_HINT_CAPABILITY:
+            return
+        candidate_id = msg.get("candidateId")
+        generation = msg.get("generation")
+        segment_id = msg.get("segmentId")
+        played_samples = msg.get("playedSamples")
+        if (
+            msg.get("state") != "confirmed"
+            or not isinstance(candidate_id, int)
+            or isinstance(candidate_id, bool)
+            or candidate_id < 1
+            or candidate_id > 0xFFFFFFFF
+            or candidate_id != self._candidate_id
+            or not self._candidate_confirmed
+            or self._candidate_receipt_event.is_set()
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or not isinstance(segment_id, int)
+            or isinstance(segment_id, bool)
+            or segment_id < 1
+            or segment_id > MAX_AUDIO_SEGMENTS_PER_TURN
+            or not isinstance(played_samples, int)
+            or isinstance(played_samples, bool)
+            or played_samples < 0
+            or played_samples > TTS_SENTENCE_MAX_SAMPLES
+            or not self._audible_history.has_incomplete_segment(
+                generation, segment_id
+            )
+        ):
+            return
+        self._candidate_receipt_qualified = (
+            played_samples >= INTERRUPTION_HINT_MIN_SAMPLES
+        )
+        self._candidate_receipt_event.set()
+
+    def _clear_interruption_candidate(self) -> None:
+        self._candidate_id = None
+        self._candidate_confirmed = False
+        self._candidate_receipt_qualified = False
+        self._candidate_receipt_event = asyncio.Event()
+
+    async def _consume_interruption_hint(self, candidate_id: int | None) -> bool:
+        if (
+            self.interruption_hint != INTERRUPTION_HINT_CAPABILITY
+            or candidate_id is None
+            or candidate_id != self._candidate_id
+        ):
+            self._clear_interruption_candidate()
+            return False
+        event = self._candidate_receipt_event
+        try:
+            if not event.is_set():
+                await asyncio.wait_for(
+                    event.wait(), timeout=INTERRUPTION_RECEIPT_WAIT_SECONDS
+                )
+        except asyncio.TimeoutError:
+            pass
+        qualified = bool(
+            candidate_id == self._candidate_id
+            and event.is_set()
+            and self._candidate_receipt_qualified
+        )
+        self._clear_interruption_candidate()
+        return qualified
 
     async def on_pcm(self, data: bytes) -> None:
         self.pcm_buf.extend(data)
@@ -1784,18 +1884,33 @@ class Session:
         if self.candidate_emitted:
             return
         self.candidate_emitted = True
-        await self.send_json({"type": "speech_candidate"})
+        payload = {"type": "speech_candidate"}
+        if self.interruption_hint == INTERRUPTION_HINT_CAPABILITY:
+            self._candidate_sequence = (self._candidate_sequence % 0xFFFFFFFF) + 1
+            self._candidate_id = self._candidate_sequence
+            self._candidate_confirmed = False
+            self._candidate_receipt_qualified = False
+            self._candidate_receipt_event = asyncio.Event()
+            payload["candidateId"] = self._candidate_id
+        await self.send_json(payload)
 
     async def _emit_speech_confirmed(
         self,
         scope: GenerationCancelScope | None = None,
-    ) -> None:
+    ) -> int | None:
         if scope is not None and not scope.active:
-            return
+            return None
         if not self.candidate_emitted:
-            return
+            return None
         self.candidate_emitted = False
-        await self.send_json({"type": "speech_confirmed"}, scope=scope)
+        payload = {"type": "speech_confirmed"}
+        if self._candidate_id is not None:
+            payload["candidateId"] = self._candidate_id
+        if not await self.send_json(payload, scope=scope):
+            self._clear_interruption_candidate()
+            return None
+        self._candidate_confirmed = self._candidate_id is not None
+        return self._candidate_id
 
     async def _emit_speech_rejected(
         self,
@@ -1804,12 +1919,18 @@ class Session:
         if scope is not None and not scope.active:
             return
         if not self.candidate_emitted:
+            self._clear_interruption_candidate()
             return
         self.candidate_emitted = False
+        candidate_id = self._candidate_id
+        payload = {"type": "speech_rejected", "reason": "voice_rejected"}
+        if candidate_id is not None:
+            payload["candidateId"] = candidate_id
         await self.send_json(
-            {"type": "speech_rejected", "reason": "voice_rejected"},
+            payload,
             scope=scope,
         )
+        self._clear_interruption_candidate()
 
     async def _on_frame(self, frame: bytes) -> None:
         rms = pcm16_rms(frame)
@@ -1955,7 +2076,7 @@ class Session:
             if from_play_barge or self.playing:
                 log("确认打断播报")
                 self._invalidate_play()
-            await self._emit_speech_confirmed(scope)
+            candidate_id = await self._emit_speech_confirmed(scope)
             await self._emit_asr_start(scope)
             await self.send_json(
                 {"type": "asr", "text": cleaned, "interim": False},
@@ -1966,6 +2087,10 @@ class Session:
             if not scope.active:
                 return
 
+            interruption_hint = await self._consume_interruption_hint(candidate_id)
+            if not scope.active:
+                return
+
             await self.cancel_reply("turn_detected")
             if not scope.active:
                 return
@@ -1973,7 +2098,16 @@ class Session:
             if self.asr_scope is scope:
                 self.asr_scope = None
             self.response_scope = scope
-            self.reply_task = asyncio.create_task(self._reply_pipeline(cleaned, scope))
+            reply_coro = (
+                self._reply_pipeline(
+                    cleaned,
+                    scope,
+                    interruption_hint=True,
+                )
+                if interruption_hint
+                else self._reply_pipeline(cleaned, scope)
+            )
+            self.reply_task = asyncio.create_task(reply_coro)
         except asyncio.CancelledError:
             if scope.active:
                 await self._emit_asr_end_only(scope)
@@ -2002,6 +2136,8 @@ class Session:
         self,
         text: str,
         scope: GenerationCancelScope,
+        *,
+        interruption_hint: bool = False,
     ) -> None:
         sentences = StableSentenceBuffer()
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
@@ -2009,6 +2145,10 @@ class Session:
             assert _synth_tts is not None
             t1 = time.perf_counter()
             history_snapshot = self._audible_history.begin_turn(scope.generation, text)
+            if interruption_hint:
+                history_snapshot.append(
+                    {"role": "system", "content": INTERRUPTION_HINT_TEXT}
+                )
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
             start_llm_stream_producer(
                 self.system_role,
@@ -2302,6 +2442,8 @@ async def _handler(ws):
                 break
             elif typ == "playback_segment":
                 session.on_playback_segment(msg)
+            elif typ == "playback_interruption":
+                session.on_playback_interruption(msg)
     except Exception as e:
         log(f"连接结束: {e}")
     finally:

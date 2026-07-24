@@ -3,6 +3,7 @@
 // Input messages:
 //   {type:"audio", pcm:ArrayBuffer, generation?, segmentId?} - PCM16 mono @ sourceRate
 //   {type:"segment_start|segment_end", generation, segmentId}
+//   {type:"candidate_snapshot", candidateId} - exact current-segment playback snapshot
 //   {type:"duck"}                   - 30ms fade-out, then pause consumption
 //   {type:"resume"}                 - resume consumption with 60ms fade-in
 //   {type:"clear"}                  - discard queued audio immediately
@@ -36,6 +37,7 @@ class PcmPlayback extends AudioWorkletProcessor {
     this.segments = new Map();
     this.maxSpans = 128;
     this.maxSegments = 64;
+    this.activeSegmentKey = null;
 
     this.port.onmessage = (event) => this._onMessage(event.data || {});
   }
@@ -122,6 +124,34 @@ class PcmPlayback extends AudioWorkletProcessor {
         }
         break;
       }
+      case "candidate_snapshot": {
+        const candidateId = message.candidateId;
+        if (
+          !Number.isSafeInteger(candidateId) ||
+          candidateId < 1 ||
+          candidateId > 0xffffffff
+        )
+          break;
+        const segment = this.activeSegmentKey
+          ? this.segments.get(this.activeSegmentKey)
+          : null;
+        if (segment && !segment.dropped && segment.pending > 0) {
+          this._post("candidate_snapshot", {
+            candidateId,
+            generation: segment.generation,
+            segmentId: segment.segmentId,
+            playedSamples: segment.played,
+            inProgress: true,
+          });
+        } else {
+          this._post("candidate_snapshot", {
+            candidateId,
+            playedSamples: 0,
+            inProgress: false,
+          });
+        }
+        break;
+      }
       case "duck":
         if (this.state !== "paused") this.state = "ducking";
         break;
@@ -136,6 +166,7 @@ class PcmPlayback extends AudioWorkletProcessor {
         this.phase = 0;
         this.spans = [];
         this.segments.clear();
+        this.activeSegmentKey = null;
         this.state = "playing";
         this.gain = 1;
         this.wasAudible = false;
@@ -189,6 +220,7 @@ class PcmPlayback extends AudioWorkletProcessor {
     if (!span.key) return;
     const segment = this.segments.get(span.key);
     if (!segment) return;
+    this.activeSegmentKey = span.key;
     segment.pending = Math.max(0, segment.pending - 1);
     segment.played += 1;
     if (!segment.started) {
