@@ -62,6 +62,11 @@ test("replays a normal user turn and completed response", () => {
       responseId: "response-1",
       generationId: 1,
     }),
+    fixtureEvent(TRACE_EVENT.TTS_REQUEST, 180, {
+      turnId: "turn-1",
+      responseId: "response-1",
+      generationId: 1,
+    }),
     fixtureEvent(TRACE_EVENT.TTS_FIRST_AUDIO, 240, {
       turnId: "turn-1",
       responseId: "response-1",
@@ -98,9 +103,24 @@ test("replays a normal user turn and completed response", () => {
     speechToAsrFinalMs: 60,
     asrToLlmFirstOutputMs: 70,
     llmRequestToTtsFirstAudioMs: null,
+    ttsRequestToFirstAudioMs: 60,
     ttsFirstAudioToPlaybackMs: 10,
     speechToPlaybackMs: 230,
   });
+});
+
+test("TTS TTFA remains null when either observable boundary is missing", () => {
+  const requestOnly = summarizeTraceLatency(
+    [fixtureEvent(TRACE_EVENT.TTS_REQUEST, 100, { generationId: 2 })],
+    2,
+  );
+  const firstAudioOnly = summarizeTraceLatency(
+    [fixtureEvent(TRACE_EVENT.TTS_FIRST_AUDIO, 160, { generationId: 2 })],
+    2,
+  );
+
+  assert.equal(requestOnly.durations.ttsRequestToFirstAudioMs, null);
+  assert.equal(firstAudioOnly.durations.ttsRequestToFirstAudioMs, null);
 });
 
 test("restores playback after a speech candidate is rejected", () => {
@@ -323,6 +343,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+  assert.equal("ttsStream" in sockets[0].sent[0], false);
 
   const cosy = new RealtimeSession({ provider: "cosyvoice" });
   cosy._playbackMode = "worklet";
@@ -331,6 +352,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[1].onopen();
   await cosyOpen;
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+  assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
 
   const legacy = new RealtimeSession({ provider: "local" });
   legacy._playbackMode = "legacy";
@@ -342,6 +364,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   await legacyOpen;
   assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
+  assert.equal("ttsStream" in sockets[2].sent[0], false);
 
   const volcano = new RealtimeSession({ provider: "volcano" });
   const volcanoOpen = volcano._openSocket("ws://volcano", {
@@ -352,6 +375,136 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   await volcanoOpen;
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
+  assert.equal("ttsStream" in sockets[3].sent[0], false);
+});
+
+test("streamed managed segments require explicit negotiation and exact final totals", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+
+  const createSession = (ttsStream = "provider-pcm-v1") => {
+    const commands = [];
+    const session = new RealtimeSession({ provider: "cosyvoice" });
+    session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
+    session.trace.startSession();
+    session._onMessage({
+      data: JSON.stringify({
+        type: "session",
+        state: "started",
+        downlinkAudio: "managed-v1",
+        ...(ttsStream ? { ttsStream } : {}),
+      }),
+    });
+    return { session, commands };
+  };
+
+  const unnegotiated = createSession(null).session;
+  unnegotiated._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "不能放宽旧协议。",
+      streaming: true,
+    }),
+  });
+  assert.equal(unnegotiated._currentAudioSegment, null);
+
+  const { session, commands } = createSession();
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 2,
+      segmentId: 1,
+      text: "真流式句段。",
+      streaming: true,
+    }),
+  });
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 2,
+      segmentId: 1,
+      chunkSequence: 0,
+      payloadSamples: 3,
+      pcm: new Int16Array([1, 2, 3]),
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_end",
+      generation: 2,
+      segmentId: 1,
+      status: "completed",
+      samples: 3,
+      chunks: 1,
+    }),
+  });
+  assert.equal(session._audioSegments.get("2:1").dropped, false);
+  assert.deepEqual(
+    commands.filter((message) => message.type.startsWith("segment_")),
+    [
+      { type: "segment_start", generation: 2, segmentId: 1 },
+      { type: "segment_end", generation: 2, segmentId: 1 },
+    ],
+  );
+
+  const empty = createSession().session;
+  empty._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 3,
+      segmentId: 1,
+      text: "空句段也必须丢弃。",
+      streaming: true,
+    }),
+  });
+  empty._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_end",
+      generation: 3,
+      segmentId: 1,
+      status: "completed",
+      samples: 0,
+      chunks: 0,
+    }),
+  });
+  assert.equal(empty._audioSegments.get("3:1").dropped, true);
+
+  for (const end of [
+    { status: "completed", samples: 2, chunks: 1 },
+    { status: "completed", samples: 3, chunks: 2 },
+    { status: "failed", samples: 3, chunks: 1 },
+  ]) {
+    const failed = createSession().session;
+    failed._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_start",
+        generation: 3,
+        segmentId: 1,
+        text: "必须丢弃。",
+        streaming: true,
+      }),
+    });
+    failed._onMessage({
+      data: managedAudioFrame({
+        generation: 3,
+        segmentId: 1,
+        chunkSequence: 0,
+        payloadSamples: 3,
+        pcm: new Int16Array([1, 2, 3]),
+      }),
+    });
+    failed._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_end",
+        generation: 3,
+        segmentId: 1,
+        ...end,
+      }),
+    });
+    assert.equal(failed._audioSegments.get("3:1").dropped, true);
+  }
 });
 
 test("candidate-bound interruption snapshots send one text-free confirmed receipt", async () => {

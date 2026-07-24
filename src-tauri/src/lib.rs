@@ -341,6 +341,31 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
     }
 }
 
+/// 只把不透明配置指纹交给语音服务管理器；不得记录 Key、参考文案或 persona。
+fn voice_config_fingerprint(settings: &Settings) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let backend = settings.realtime_backend.trim().to_ascii_lowercase();
+    let mut hasher = DefaultHasher::new();
+    backend.hash(&mut hasher);
+    match backend.as_str() {
+        "local" => {
+            settings.persona_card_id.trim().hash(&mut hasher);
+            settings.local_ref_wav.trim().hash(&mut hasher);
+            settings.local_ref_text.trim().hash(&mut hasher);
+            voice_service::builtin_ref_stamp(&settings.persona_card_id).hash(&mut hasher);
+        }
+        "cosyvoice" | "cosy" => {
+            settings.qwen_vl_key.trim().hash(&mut hasher);
+            settings.cosyvoice_voice.trim().hash(&mut hasher);
+            settings.cosyvoice_model.trim().hash(&mut hasher);
+        }
+        _ => {}
+    }
+    format!("{:016x}", hasher.finish())
+}
+
 /// 本地语音后端的朗读 HTTP 端口（WS 端口 + 100）。
 pub(crate) fn local_tts_http_port(backend: &str) -> Option<u16> {
     match backend.trim().to_ascii_lowercase().as_str() {
@@ -1329,13 +1354,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         let state = app.state::<AppState>();
         let guard = state.settings.lock().unwrap();
         backend = guard.realtime_backend.clone();
-        voice_fp = format!(
-            "{}|{}|{}|{}",
-            guard.persona_card_id.trim(),
-            guard.local_ref_wav.trim(),
-            guard.local_ref_text.trim(),
-            voice_service::builtin_ref_stamp(&guard.persona_card_id)
-        );
+        voice_fp = voice_config_fingerprint(&guard);
     }
     voice_service::ensure(&app, &backend, &voice_fp);
     // 按所选文字服务商自动探测 / 拉起本地 Ollama（非 local 时函数内部直接返回）。
@@ -1524,13 +1543,7 @@ pub fn run() {
             }
 
             // 启动时按已保存的语音后端自动拉起本地服务。
-            let voice_fp = format!(
-                "{}|{}|{}|{}",
-                settings.persona_card_id.trim(),
-                settings.local_ref_wav.trim(),
-                settings.local_ref_text.trim(),
-                voice_service::builtin_ref_stamp(&settings.persona_card_id)
-            );
+            let voice_fp = voice_config_fingerprint(&settings);
             voice_service::ensure(&handle, &settings.realtime_backend, &voice_fp);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);

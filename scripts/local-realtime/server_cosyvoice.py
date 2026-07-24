@@ -32,6 +32,7 @@ if __name__ == "__main__":
         port=PORT,
         name="local-cosy",
         synth_tts=tts_cosyvoice.synth_tts,
+        synth_tts_stream=tts_cosyvoice.synth_tts_stream,
         synth_tts_http=tts_cosyvoice.synth_tts_http,
         prepare=prepare,
         tts_pool=_tts_pool,
