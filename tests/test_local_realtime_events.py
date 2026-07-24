@@ -297,6 +297,61 @@ class StableSentenceBufferTests(unittest.TestCase):
         self.assertEqual(buf.flush(), [])
 
 
+class AudibleHistoryTests(unittest.TestCase):
+    def test_only_contiguous_completed_segments_enter_context(self):
+        history = common.AudibleHistory(max_messages=6, max_pending_turns=2)
+        self.assertEqual(history.begin_turn(1, "第一问"), [])
+        self.assertTrue(history.add_segment(1, 1, "第一句。"))
+        self.assertTrue(history.add_segment(1, 2, "第二句。"))
+
+        history.acknowledge(1, 2, "completed")
+        self.assertEqual(history.messages, [{"role": "user", "content": "第一问"}])
+        history.acknowledge(1, 1, "completed")
+        self.assertEqual(
+            history.messages,
+            [
+                {"role": "user", "content": "第一问"},
+                {"role": "assistant", "content": "第一句。第二句。"},
+            ],
+        )
+        snapshot = history.begin_turn(2, "第二问")
+        self.assertEqual(snapshot[-1]["content"], "第一句。第二句。")
+
+    def test_unknown_receipts_and_ledgers_are_bounded(self):
+        history = common.AudibleHistory(max_messages=4, max_pending_turns=2)
+        for generation in range(1, 5):
+            history.begin_turn(generation, f"问题{generation}")
+        self.assertLessEqual(len(history.messages), 4)
+        self.assertLessEqual(len(history._turns), 2)
+        self.assertFalse(history.acknowledge(1, 1, "completed"))
+
+    def test_cancelled_turn_rejects_late_segment_receipt(self):
+        history = common.AudibleHistory()
+        history.begin_turn(1, "用户输入")
+        history.add_segment(1, 1, "不应越代写入。")
+        history.cancel_turn(1)
+
+        self.assertFalse(history.acknowledge(1, 1, "completed"))
+        self.assertEqual(
+            history.messages,
+            [{"role": "user", "content": "用户输入"}],
+        )
+
+    def test_full_history_never_leaves_orphan_assistant_at_front(self):
+        history = common.AudibleHistory(max_messages=4)
+        for generation in (1, 2):
+            history.begin_turn(generation, f"问题{generation}")
+            history.add_segment(generation, 1, f"回答{generation}")
+            history.acknowledge(generation, 1, "completed")
+        history.begin_turn(3, "被打断的问题")
+        history.cancel_turn(3)
+
+        snapshot = history.begin_turn(4, "下一问")
+        self.assertTrue(snapshot)
+        self.assertEqual(snapshot[0]["role"], "user")
+        self.assertLessEqual(len(snapshot), 4)
+
+
 class BoundedLlmProducerTests(unittest.TestCase):
     def test_cancel_unblocks_full_event_queue(self):
         original_iter = common.iter_llm_stream
@@ -664,7 +719,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         captured["events"].put_nowait({"type": "done"})
         await task
 
-        self.assertEqual(self.session.history, [])
+        self.assertEqual(
+            self.session.history,
+            [{"role": "user", "content": "用户输入"}],
+        )
         self.assertEqual(self.ws.messages, [])
         self.assertIsNone(self.session.response_scope)
 
@@ -808,7 +866,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         common._synth_tts = synth
         self.stream_events = [
             {"type": "meta", "provider": "Ollama", "thinking": False},
-            {"type": "delta", "text": "第一句已经完成。"},
+            {"type": "delta", "text": "（开心）第一句已经完成。"},
             {"type": "delta", "text": "第二句尾巴"},
             {"type": "usage", "prompt": 10, "completion": 6, "total": 16},
             {"type": "done"},
@@ -820,10 +878,29 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
         messages = self.ws.json_messages()
         assistant = [m["text"] for m in messages if m["type"] == "assistant"]
-        self.assertEqual(assistant, ["第一句已经完成。", "第二句尾巴"])
+        self.assertEqual(assistant, ["（开心）第一句已经完成。", "第二句尾巴"])
         self.assertEqual([m["type"] for m in messages].count("assistant_end"), 1)
         self.assertEqual([m["type"] for m in messages].count("tts_end"), 1)
-        self.assertEqual(synthesized, ["第一句已经完成。", "第二句尾巴"])
+        self.assertEqual(synthesized, ["（开心）第一句已经完成。", "第二句尾巴"])
+        self.assertEqual(
+            self.session.history,
+            [{"role": "user", "content": "用户输入"}],
+        )
+        segment_starts = [m for m in messages if m["type"] == "audio_segment_start"]
+        self.assertEqual(
+            [(m["segmentId"], m["text"]) for m in segment_starts],
+            [(1, "第一句已经完成。"), (2, "第二句尾巴")],
+        )
+        self.session.on_playback_segment(
+            {"generation": scope.generation, "segmentId": 1, "state": "completed"}
+        )
+        self.assertEqual(
+            self.session.history[-1],
+            {"role": "assistant", "content": "第一句已经完成。"},
+        )
+        self.session.on_playback_segment(
+            {"generation": scope.generation, "segmentId": 2, "state": "completed"}
+        )
         self.assertEqual(
             self.session.history,
             [
@@ -834,7 +911,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         usage = next(m for m in messages if m["type"] == "usage")
         self.assertEqual(usage["provider"], "Ollama+CosyVoice")
         self.assertEqual(usage["llm"]["total"], 16)
-        self.assertEqual(usage["ttsCharacters"], len("第一句已经完成。第二句尾巴"))
+        self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
 
     async def test_soft_endpoint_keeps_reopened_audio_in_one_utterance(self):
         handled = []

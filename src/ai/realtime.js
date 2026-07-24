@@ -10,8 +10,11 @@
 //       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
+//       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
 //     本地级联事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
+//     上行 text 可含 {type:"playback_segment",generation,segmentId,state:"completed"}；
+//     只回执句段标识，不回传文本或 PCM。
 //   挂断发 {type:"hangup"}。
 //
 // 音频采集/播放放前端而非 Rust 的原因：getUserMedia 自带回声消除(AEC)/降噪/AGC，
@@ -27,6 +30,11 @@ const TARGET_RATE = 16000; // 上行目标采样率
 const MAX_PENDING_PCM_CHUNKS = 64;
 const PLAYBACK_MAX_QUEUE_MS = 3000;
 const PLAYBACK_DRAIN_GRACE_MS = 300;
+const MAX_AUDIO_SEGMENTS = 64;
+
+function usesManagedCascade(provider) {
+  return provider === "local" || provider === "cosyvoice";
+}
 
 function recoverablePlaybackEnabled() {
   try {
@@ -45,6 +53,7 @@ export class RealtimeSession {
     onAsrEnd,
     onAssistant,
     onAssistantEnd,
+    onAudibleAssistant,
     onSpeaking,
     onUsage,
     onLevel,
@@ -63,6 +72,7 @@ export class RealtimeSession {
       onAsrEnd,
       onAssistant,
       onAssistantEnd,
+      onAudibleAssistant,
       onSpeaking,
       onUsage,
       onLevel,
@@ -102,6 +112,9 @@ export class RealtimeSession {
     this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
     this._backendGeneration = 0;
     this._traceAsrFinalSeen = false;
+    this._currentAudioSegment = null;
+    this._audioSegments = new Map();
+    this._legacySegments = new Map();
   }
 
   /**
@@ -202,7 +215,7 @@ export class RealtimeSession {
         metrics: { audioBytes: ev.data?.byteLength || 0 },
       });
       this._notePlayLevel(ev.data);
-      this._enqueuePcm(ev.data);
+      this._enqueuePcm(ev.data, this._currentAudioSegment);
       return;
     }
     let msg;
@@ -282,7 +295,7 @@ export class RealtimeSession {
         this._assistantActive = true;
         this.trace.startResponse();
         this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
-        this.cb.onAssistant?.(msg.text || "");
+        this.cb.onAssistant?.(msg.text || "", { generation: msg.generation });
         break;
       case "assistant_end":
         this._assistantActive = false;
@@ -299,6 +312,12 @@ export class RealtimeSession {
       case "tts_end":
         this._backendAudioPending = false;
         if (!this._hasPlayback()) this._schedulePlaybackCompletion();
+        break;
+      case "audio_segment_start":
+        this._beginAudioSegment(msg);
+        break;
+      case "audio_segment_end":
+        this._endAudioSegment(msg);
         break;
       case "speaking":
         this._assistantActive = true;
@@ -447,12 +466,151 @@ export class RealtimeSession {
   }
 
   _acceptBackendGeneration(msg) {
-    if (this.trace.provider !== "local" || msg.generation === undefined) return true;
+    if (!usesManagedCascade(this.trace.provider) || msg.generation === undefined) return true;
     const generation = msg.generation;
     if (!Number.isSafeInteger(generation) || generation < 0) return false;
     if (generation < this._backendGeneration) return false;
     this._backendGeneration = generation;
     return true;
+  }
+
+  _segmentKey(generation, segmentId) {
+    return `${generation}:${segmentId}`;
+  }
+
+  _beginAudioSegment(msg) {
+    if (!usesManagedCascade(this.trace.provider)) return;
+    const generation = msg.generation;
+    const segmentId = msg.segmentId;
+    const text = typeof msg.text === "string" ? msg.text : "";
+    if (
+      !Number.isSafeInteger(generation) ||
+      generation < 0 ||
+      !Number.isSafeInteger(segmentId) ||
+      segmentId < 1 ||
+      segmentId > MAX_AUDIO_SEGMENTS ||
+      !text ||
+      text.length > 256
+    ) {
+      this._currentAudioSegment = null;
+      return;
+    }
+    const key = this._segmentKey(generation, segmentId);
+    if (!this._audioSegments.has(key) && this._audioSegments.size >= MAX_AUDIO_SEGMENTS) {
+      const oldest = this._audioSegments.keys().next().value;
+      if (oldest !== undefined) this._audioSegments.delete(oldest);
+    }
+    const segment = { generation, segmentId, text, dropped: false, completed: false };
+    this._audioSegments.set(key, segment);
+    this._currentAudioSegment = segment;
+    this.playbackNode?.port.postMessage({ type: "segment_start", generation, segmentId });
+    if (!this.playbackNode) {
+      while (!this._legacySegments.has(key) && this._legacySegments.size >= MAX_AUDIO_SEGMENTS) {
+        this._legacySegments.delete(this._legacySegments.keys().next().value);
+      }
+      this._legacySegments.set(key, {
+        generation,
+        segmentId,
+        sources: 0,
+        scheduled: 0,
+        ended: false,
+        cancelled: false,
+      });
+    }
+  }
+
+  _endAudioSegment(msg) {
+    const generation = msg.generation;
+    const segmentId = msg.segmentId;
+    if (!Number.isSafeInteger(generation) || !Number.isSafeInteger(segmentId)) return;
+    const key = this._segmentKey(generation, segmentId);
+    if (
+      !this._currentAudioSegment ||
+      this._segmentKey(
+        this._currentAudioSegment.generation,
+        this._currentAudioSegment.segmentId,
+      ) !== key
+    ) {
+      return;
+    }
+    if (this.audioCtx && this.audioCtx.state !== "running" && this._pendingPcm.length) {
+      this._pushPendingPlayback({ type: "segment_end", generation, segmentId });
+    } else {
+      this._deliverAudioSegmentEnd(generation, segmentId);
+    }
+    this._currentAudioSegment = null;
+  }
+
+  _deliverAudioSegmentEnd(generation, segmentId) {
+    const key = this._segmentKey(generation, segmentId);
+    this.playbackNode?.port.postMessage({ type: "segment_end", generation, segmentId });
+    const legacy = this._legacySegments.get(key);
+    if (legacy) {
+      legacy.ended = true;
+      this._finishLegacySegmentIfReady(key, legacy);
+    }
+  }
+
+  _markSegmentDropped(segment) {
+    if (!segment) return;
+    const key = this._segmentKey(segment.generation, segment.segmentId);
+    const state = this._audioSegments.get(key);
+    if (state) state.dropped = true;
+    const legacy = this._legacySegments.get(key);
+    if (legacy) legacy.cancelled = true;
+  }
+
+  _handleSegmentCompleted(message) {
+    const generation = message.generation;
+    const segmentId = message.segmentId;
+    if (!Number.isSafeInteger(generation) || !Number.isSafeInteger(segmentId)) return;
+    if (usesManagedCascade(this.trace.provider) && generation < this._backendGeneration) return;
+    const key = this._segmentKey(generation, segmentId);
+    const segment = this._audioSegments.get(key);
+    if (!segment || segment.dropped) return;
+    if (this._speechCandidate) {
+      segment.completed = true;
+      return;
+    }
+    this._audioSegments.delete(key);
+    this._legacySegments.delete(key);
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(
+        JSON.stringify({
+          type: "playback_segment",
+          generation,
+          segmentId,
+          state: "completed",
+        }),
+      );
+    }
+    this.cb.onAudibleAssistant?.(segment.text, { generation, segmentId });
+  }
+
+  _commitDeferredAudioSegments() {
+    for (const segment of [...this._audioSegments.values()]) {
+      if (segment.completed && !segment.dropped) this._handleSegmentCompleted(segment);
+    }
+  }
+
+  _finishLegacySegmentIfReady(key, segment) {
+    if (
+      !segment ||
+      segment.cancelled ||
+      !segment.ended ||
+      segment.scheduled < 1 ||
+      segment.sources > 0
+    )
+      return;
+    this._handleSegmentCompleted(segment);
+  }
+
+  _discardPendingAudioSegments() {
+    this._currentAudioSegment = null;
+    for (const segment of this._audioSegments.values()) segment.dropped = true;
+    for (const segment of this._legacySegments.values()) segment.cancelled = true;
+    this._audioSegments.clear();
+    this._legacySegments.clear();
   }
 
   _confirmSpeech() {
@@ -469,6 +627,7 @@ export class RealtimeSession {
     this._candidateInterruptsResponse = false;
     this.trace.record(TRACE_EVENT.SPEECH_REJECTED, { reason });
     this._resumePlayback();
+    this._commitDeferredAudioSegments();
     this.cb.onSpeechRejected?.();
     return true;
   }
@@ -536,7 +695,9 @@ export class RealtimeSession {
       clearTimeout(this._playbackDrainTimer);
       this._playbackDrainTimer = 0;
     }
-    if (message.type === "started") {
+    if (message.type === "segment_completed") {
+      this._handleSegmentCompleted(message);
+    } else if (message.type === "started") {
       this.trace.recordOnce("playback_started", TRACE_EVENT.PLAYBACK_STARTED, {
         metrics: { queuedMs: this._playbackQueuedMs },
       });
@@ -587,18 +748,29 @@ export class RealtimeSession {
     }, PLAYBACK_DRAIN_GRACE_MS);
   }
 
-  _enqueuePcm(arrayBuffer) {
+  _enqueuePcm(arrayBuffer, segment = null) {
     if (!this.audioCtx || this.stopped) return;
     this._assistantActive = true;
     // context 尚未 running：先入队，resume 后再播，避免 start(过去时间) 整段静音。
     if (this.audioCtx.state !== "running") {
-      if (this._pendingPcm.length >= MAX_PENDING_PCM_CHUNKS) this._pendingPcm.shift();
-      this._pendingPcm.push(arrayBuffer.slice ? arrayBuffer.slice(0) : arrayBuffer);
+      this._pushPendingPlayback({
+        type: "audio",
+        pcm: arrayBuffer.slice ? arrayBuffer.slice(0) : arrayBuffer,
+        segment,
+      });
       this._kickResumeOut();
       return;
     }
     this._flushPendingPcm();
-    this._enqueuePcmNow(arrayBuffer);
+    this._enqueuePcmNow(arrayBuffer, segment);
+  }
+
+  _pushPendingPlayback(item) {
+    if (this._pendingPcm.length >= MAX_PENDING_PCM_CHUNKS) {
+      const dropped = this._pendingPcm.shift();
+      this._markSegmentDropped(dropped?.segment);
+    }
+    this._pendingPcm.push(item);
   }
 
   _kickResumeOut() {
@@ -621,17 +793,31 @@ export class RealtimeSession {
     if (!this._pendingPcm.length || !this.audioCtx || this.audioCtx.state !== "running") return;
     const pending = this._pendingPcm;
     this._pendingPcm = [];
-    for (const chunk of pending) this._enqueuePcmNow(chunk);
+    for (const item of pending) {
+      if (item.type === "segment_end") {
+        this._deliverAudioSegmentEnd(item.generation, item.segmentId);
+      } else {
+        this._enqueuePcmNow(item.pcm, item.segment);
+      }
+    }
   }
 
-  _enqueuePcmNow(arrayBuffer) {
+  _enqueuePcmNow(arrayBuffer, segment = null) {
     if (this._playbackDrainTimer) {
       clearTimeout(this._playbackDrainTimer);
       this._playbackDrainTimer = 0;
     }
     if (this.playbackNode) {
       const pcm = arrayBuffer.slice ? arrayBuffer.slice(0) : arrayBuffer;
-      this.playbackNode.port.postMessage({ type: "audio", pcm }, [pcm]);
+      this.playbackNode.port.postMessage(
+        {
+          type: "audio",
+          pcm,
+          generation: segment?.generation,
+          segmentId: segment?.segmentId,
+        },
+        [pcm],
+      );
       return;
     }
     const i16 = new Int16Array(arrayBuffer);
@@ -646,16 +832,28 @@ export class RealtimeSession {
     // 略加超前量，避免 now 与调度竞态导致首帧被跳过。
     const now = this.audioCtx.currentTime + 0.02;
     if (this.playHead < now) this.playHead = now;
+    const segmentKey = segment
+      ? this._segmentKey(segment.generation, segment.segmentId)
+      : "";
+    const legacySegment = segmentKey ? this._legacySegments.get(segmentKey) : null;
+    if (legacySegment) {
+      legacySegment.sources += 1;
+      legacySegment.scheduled += 1;
+    }
+    (this._sources ||= new Set()).add(src);
+    src.onended = () => {
+      this._sources?.delete(src);
+      if (legacySegment) {
+        legacySegment.sources = Math.max(0, legacySegment.sources - 1);
+        this._finishLegacySegmentIfReady(segmentKey, legacySegment);
+      }
+      if (!this._sources?.size) this._schedulePlaybackCompletion();
+    };
     src.start(this.playHead);
     this.trace.recordOnce("playback_started", TRACE_EVENT.PLAYBACK_STARTED, {
       metrics: { audioBytes: arrayBuffer.byteLength || 0 },
     });
     this.playHead += buf.duration;
-    (this._sources ||= new Set()).add(src);
-    src.onended = () => {
-      this._sources?.delete(src);
-      if (!this._sources?.size) this._schedulePlaybackCompletion();
-    };
   }
 
   /** 打断：停掉所有排队中的播放源，重置游标。 */
@@ -665,7 +863,9 @@ export class RealtimeSession {
     if (this._hasPlayback()) {
       this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, { reason });
     }
+    for (const pending of this._pendingPcm) this._markSegmentDropped(pending?.segment);
     this._pendingPcm = [];
+    this._discardPendingAudioSegments();
     this._playbackQueuedMs = 0;
     this.playbackNode?.port.postMessage({ type: "clear" });
     if (this._sources) {
