@@ -39,6 +39,9 @@ const MANAGED_AUDIO_HEADER_BYTES = 24;
 const MANAGED_AUDIO_CHUNK_MAX_SAMPLES = (OUTPUT_RATE * 80) / 1000;
 const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
+const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
+const CANDIDATE_ID_MAX = 0xffffffff;
+const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 
 function usesManagedCascade(provider) {
   return provider === "local" || provider === "cosyvoice";
@@ -159,6 +162,12 @@ export class RealtimeSession {
     this._audioSegments = new Map();
     this._legacySegments = new Map();
     this._downlinkAudioMode = "raw";
+    this._interruptionHintMode = "none";
+    this._candidateId = null;
+    this._candidateSnapshot = null;
+    this._candidateSegmentKeys = null;
+    this._pendingConfirmedCandidate = null;
+    this._candidateSnapshotTimer = 0;
   }
 
   /**
@@ -186,7 +195,7 @@ export class RealtimeSession {
     });
   }
 
-  /** 开始通话：连桥接 → 发 start → 起麦克风与播放。 */
+  /** 开始通话：确认播放能力 → 连桥接并协商 → 起麦克风。 */
   async start({ systemRole, botName }) {
     this.trace.startSession();
     // 若 chat.js 已在点击栈调用 prepareAudio，这里是幂等补齐。
@@ -197,11 +206,11 @@ export class RealtimeSession {
     if (this.stopped) return;
     if (!base) throw new Error("实时语音服务未启动");
 
-    await this._openSocket(base, { systemRole, botName });
-    if (this.stopped) return;
     await this._resumeAudioCtx();
     if (this.stopped) return;
     await this._startPlayback();
+    if (this.stopped) return;
+    await this._openSocket(base, { systemRole, botName });
     if (this.stopped) return;
     await this._startMic();
     if (this.stopped) return;
@@ -225,15 +234,22 @@ export class RealtimeSession {
 
       ws.onopen = () => {
         opened = true;
-        const downlinkCapability = usesManagedCascade(this.trace.provider)
+        const cascadeCapabilities = usesManagedCascade(this.trace.provider)
           ? { downlinkAudio: [MANAGED_AUDIO_CAPABILITY] }
           : {};
+        if (
+          usesManagedCascade(this.trace.provider) &&
+          this._playbackMode === "worklet" &&
+          this.playbackNode
+        ) {
+          cascadeCapabilities.interruptionHint = [INTERRUPTION_HINT_CAPABILITY];
+        }
         ws.send(
           JSON.stringify({
             type: "start",
             systemRole: startMsg.systemRole || "",
             botName: startMsg.botName || "元元",
-            ...downlinkCapability,
+            ...cascadeCapabilities,
           }),
         );
         resolve();
@@ -291,6 +307,10 @@ export class RealtimeSession {
             msg.downlinkAudio === MANAGED_AUDIO_CAPABILITY
               ? MANAGED_AUDIO_CAPABILITY
               : "raw";
+          this._interruptionHintMode =
+            msg.interruptionHint === INTERRUPTION_HINT_CAPABILITY
+              ? INTERRUPTION_HINT_CAPABILITY
+              : "none";
         }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
@@ -306,7 +326,7 @@ export class RealtimeSession {
         this._beginSpeechCandidate(msg);
         break;
       case "speech_confirmed":
-        if (this._confirmSpeech()) this.cb.onAsrStart?.();
+        if (this._confirmSpeech(msg)) this.cb.onAsrStart?.();
         break;
       case "speech_rejected":
         this._rejectSpeech(msg.reason || "voice_rejected");
@@ -514,13 +534,103 @@ export class RealtimeSession {
 
   _beginSpeechCandidate(msg = {}) {
     if (this._speechCandidate || this._userTurnOpen) return false;
+    this._resetInterruptionCandidate();
     this._speechCandidate = true;
     this._candidateInterruptsResponse = this._assistantActive || this._hasPlayback();
+    const candidateId = msg.candidateId;
+    if (
+      this._candidateInterruptsResponse &&
+      this._interruptionHintMode === INTERRUPTION_HINT_CAPABILITY &&
+      this.playbackNode &&
+      Number.isSafeInteger(candidateId) &&
+      candidateId >= 1 &&
+      candidateId <= CANDIDATE_ID_MAX
+    ) {
+      this._candidateId = candidateId;
+      this._candidateSegmentKeys = new Set(
+        [...this._audioSegments.entries()]
+          .filter(([, segment]) => !segment.dropped && !segment.completed)
+          .map(([key]) => key),
+      );
+      this.playbackNode.port.postMessage({ type: "candidate_snapshot", candidateId });
+    }
     this.trace.record(TRACE_EVENT.SPEECH_CANDIDATE, {
       metrics: { confidence: Number(msg.confidence) || 0 },
     });
     this._duckPlayback();
     this.cb.onSpeechCandidate?.();
+    return true;
+  }
+
+  _resetInterruptionCandidate() {
+    if (this._candidateSnapshotTimer) clearTimeout(this._candidateSnapshotTimer);
+    this._candidateSnapshotTimer = 0;
+    this._candidateId = null;
+    this._candidateSnapshot = null;
+    this._candidateSegmentKeys = null;
+    this._pendingConfirmedCandidate = null;
+  }
+
+  _acceptCandidateSnapshot(message) {
+    if (
+      this._interruptionHintMode !== INTERRUPTION_HINT_CAPABILITY ||
+      message.inProgress !== true
+    )
+      return;
+    const candidateId = message.candidateId;
+    const generation = message.generation;
+    const segmentId = message.segmentId;
+    const playedSamples = message.playedSamples;
+    const expectedCandidateId = this._speechCandidate
+      ? this._candidateId
+      : this._pendingConfirmedCandidate?.candidateId;
+    const eligibleSegmentKeys = this._speechCandidate
+      ? this._candidateSegmentKeys
+      : this._pendingConfirmedCandidate?.segmentKeys;
+    if (
+      !Number.isSafeInteger(candidateId) ||
+      candidateId !== expectedCandidateId ||
+      !Number.isSafeInteger(generation) ||
+      generation < 0 ||
+      !Number.isSafeInteger(segmentId) ||
+      segmentId < 1 ||
+      segmentId > MAX_AUDIO_SEGMENTS ||
+      !Number.isSafeInteger(playedSamples) ||
+      playedSamples < 0 ||
+      playedSamples > MANAGED_AUDIO_SEGMENT_MAX_SAMPLES
+    )
+      return;
+    const segmentKey = this._segmentKey(generation, segmentId);
+    if (!eligibleSegmentKeys?.has(segmentKey)) return;
+    const segment = this._audioSegments.get(segmentKey);
+    if (segment && (segment.dropped || segment.completed)) return;
+    const snapshot = { candidateId, generation, segmentId, playedSamples };
+    if (this._speechCandidate) this._candidateSnapshot = snapshot;
+    else this._sendInterruptionSnapshot(snapshot);
+  }
+
+  _sendInterruptionSnapshot(snapshot) {
+    const pending = this._pendingConfirmedCandidate;
+    if (
+      !pending ||
+      pending.candidateId !== snapshot?.candidateId ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    )
+      return false;
+    this.ws.send(
+      JSON.stringify({
+        type: "playback_interruption",
+        state: "confirmed",
+        candidateId: snapshot.candidateId,
+        generation: snapshot.generation,
+        segmentId: snapshot.segmentId,
+        playedSamples: snapshot.playedSamples,
+      }),
+    );
+    if (this._candidateSnapshotTimer) clearTimeout(this._candidateSnapshotTimer);
+    this._candidateSnapshotTimer = 0;
+    this._pendingConfirmedCandidate = null;
     return true;
   }
 
@@ -732,11 +842,36 @@ export class RealtimeSession {
     this._legacySegments.clear();
   }
 
-  _confirmSpeech() {
+  _confirmSpeech(msg = {}) {
     if (this._userTurnOpen) return false;
     const interruptsResponse = this._candidateInterruptsResponse;
+    const confirmedCandidateId = msg.candidateId;
+    const candidateMatches =
+      Number.isSafeInteger(confirmedCandidateId) &&
+      confirmedCandidateId === this._candidateId;
+    const snapshot = candidateMatches ? this._candidateSnapshot : null;
+    const segmentKeys = candidateMatches ? this._candidateSegmentKeys : null;
     this._speechCandidate = false;
     this._candidateInterruptsResponse = false;
+    this._candidateId = null;
+    this._candidateSnapshot = null;
+    this._candidateSegmentKeys = null;
+    if (candidateMatches) {
+      this._pendingConfirmedCandidate = {
+        candidateId: confirmedCandidateId,
+        segmentKeys,
+      };
+      if (!snapshot || !this._sendInterruptionSnapshot(snapshot)) {
+        this._candidateSnapshotTimer = setTimeout(() => {
+          if (this._pendingConfirmedCandidate?.candidateId === confirmedCandidateId) {
+            this._pendingConfirmedCandidate = null;
+          }
+          this._candidateSnapshotTimer = 0;
+        }, CANDIDATE_SNAPSHOT_GRACE_MS);
+      }
+    } else {
+      this._resetInterruptionCandidate();
+    }
     return this._beginUserTurn(interruptsResponse);
   }
 
@@ -744,6 +879,7 @@ export class RealtimeSession {
     if (!this._speechCandidate) return false;
     this._speechCandidate = false;
     this._candidateInterruptsResponse = false;
+    this._resetInterruptionCandidate();
     this.trace.record(TRACE_EVENT.SPEECH_REJECTED, { reason });
     this._resumePlayback();
     this._commitDeferredAudioSegments();
@@ -814,7 +950,9 @@ export class RealtimeSession {
       clearTimeout(this._playbackDrainTimer);
       this._playbackDrainTimer = 0;
     }
-    if (message.type === "segment_completed") {
+    if (message.type === "candidate_snapshot") {
+      this._acceptCandidateSnapshot(message);
+    } else if (message.type === "segment_completed") {
       this._handleSegmentCompleted(message);
     } else if (message.type === "started") {
       this.trace.recordOnce("playback_started", TRACE_EVENT.PLAYBACK_STARTED, {
@@ -1057,6 +1195,7 @@ export class RealtimeSession {
     this._levelRaf = 0;
     if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
     this._playbackDrainTimer = 0;
+    this._resetInterruptionCandidate();
     this.cb.onLevel?.(0);
     try {
       this._unsubVol?.();

@@ -316,19 +316,166 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   const { RealtimeSession } = await import("../src/ai/realtime.js");
 
   const local = new RealtimeSession({ provider: "local" });
+  local._playbackMode = "worklet";
+  local.playbackNode = { port: { postMessage: () => {} } };
   const localOpen = local._openSocket("ws://local", { systemRole: "role", botName: "元元" });
   sockets[0].onopen();
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+
+  const cosy = new RealtimeSession({ provider: "cosyvoice" });
+  cosy._playbackMode = "worklet";
+  cosy.playbackNode = { port: { postMessage: () => {} } };
+  const cosyOpen = cosy._openSocket("ws://cosy", { systemRole: "role", botName: "元元" });
+  sockets[1].onopen();
+  await cosyOpen;
+  assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+
+  const legacy = new RealtimeSession({ provider: "local" });
+  legacy._playbackMode = "legacy";
+  const legacyOpen = legacy._openSocket("ws://legacy", {
+    systemRole: "role",
+    botName: "元元",
+  });
+  sockets[2].onopen();
+  await legacyOpen;
+  assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.equal("interruptionHint" in sockets[2].sent[0], false);
 
   const volcano = new RealtimeSession({ provider: "volcano" });
   const volcanoOpen = volcano._openSocket("ws://volcano", {
     systemRole: "role",
     botName: "元元",
   });
-  sockets[1].onopen();
+  sockets[3].onopen();
   await volcanoOpen;
-  assert.equal("downlinkAudio" in sockets[1].sent[0], false);
+  assert.equal("downlinkAudio" in sockets[3].sent[0], false);
+  assert.equal("interruptionHint" in sockets[3].sent[0], false);
+});
+
+test("candidate-bound interruption snapshots send one text-free confirmed receipt", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const commands = [];
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+  session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
+  session.trace.startSession();
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      interruptionHint: "candidate-snapshot-v1",
+    }),
+  });
+
+  const beginSegment = (generation) => {
+    session._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_start",
+        generation,
+        segmentId: 1,
+        text: "仅留在本地 ledger 的候选句。",
+        samples: 48000,
+      }),
+    });
+    session._assistantActive = true;
+    session._playbackQueuedMs = 1000;
+  };
+
+  beginSegment(3);
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 11 }),
+  });
+  assert.deepEqual(
+    commands.filter((message) => message.type === "candidate_snapshot").at(-1),
+    { type: "candidate_snapshot", candidateId: 11 },
+  );
+  session._onPlaybackMessage({
+    type: "candidate_snapshot",
+    candidateId: 11,
+    generation: 3,
+    segmentId: 1,
+    playedSamples: 24000,
+    inProgress: true,
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_confirmed", candidateId: 11 }),
+  });
+  assert.deepEqual(sent, [
+    {
+      type: "playback_interruption",
+      state: "confirmed",
+      candidateId: 11,
+      generation: 3,
+      segmentId: 1,
+      playedSamples: 24000,
+    },
+  ]);
+  assert.equal(JSON.stringify(sent).includes("候选句"), false);
+  session._onPlaybackMessage({
+    type: "candidate_snapshot",
+    candidateId: 11,
+    generation: 3,
+    segmentId: 1,
+    playedSamples: 25000,
+    inProgress: true,
+  });
+  assert.equal(sent.length, 1, "one candidate may send at most one receipt");
+
+  session._userTurnOpen = false;
+  beginSegment(4);
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 12 }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_confirmed", candidateId: 12 }),
+  });
+  assert.equal(session._audioSegments.size, 0, "confirmation clears hidden text ledger");
+  session._onPlaybackMessage({
+    type: "candidate_snapshot",
+    candidateId: 12,
+    generation: 4,
+    segmentId: 1,
+    playedSamples: 24001,
+    inProgress: true,
+  });
+  assert.equal(sent.length, 2, "a snapshot arriving after clear keeps numeric identity only");
+
+  session._userTurnOpen = false;
+  beginSegment(5);
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 13 }),
+  });
+  session._audioSegments.get("5:1").dropped = true;
+  session._onPlaybackMessage({
+    type: "candidate_snapshot",
+    candidateId: 13,
+    generation: 5,
+    segmentId: 1,
+    playedSamples: 48000,
+    inProgress: true,
+  });
+  session._onPlaybackMessage({
+    type: "candidate_snapshot",
+    candidateId: 99,
+    generation: 5,
+    segmentId: 1,
+    playedSamples: 48000,
+    inProgress: true,
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_rejected", candidateId: 13 }),
+  });
+  assert.equal(
+    sent.length,
+    2,
+    "rejected, dropped and wrong-candidate snapshots never send receipts",
+  );
 });
 
 test("managed cascade accepts only current ordered identified audio", async () => {

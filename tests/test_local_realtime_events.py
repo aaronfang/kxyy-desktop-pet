@@ -881,19 +881,30 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 "systemRole": "角色",
                 "botName": "元元",
                 "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY],
             }
         )
         self.assertEqual(self.session.downlink_audio, common.MANAGED_AUDIO_CAPABILITY)
         self.assertEqual(
+            self.session.interruption_hint,
+            common.INTERRUPTION_HINT_CAPABILITY,
+        )
+        self.assertEqual(
             self.ws.json_messages()[-1]["downlinkAudio"],
             common.MANAGED_AUDIO_CAPABILITY,
+        )
+        self.assertEqual(
+            self.ws.json_messages()[-1]["interruptionHint"],
+            common.INTERRUPTION_HINT_CAPABILITY,
         )
 
         old_ws = FakeWebSocket()
         old_session = common.Session(old_ws)
         await old_session.on_start({"systemRole": "角色", "botName": "元元"})
         self.assertEqual(old_session.downlink_audio, "raw")
+        self.assertEqual(old_session.interruption_hint, "none")
         self.assertEqual(old_ws.json_messages()[-1]["downlinkAudio"], "raw")
+        self.assertEqual(old_ws.json_messages()[-1]["interruptionHint"], "none")
         old_scope = old_session._new_scope("response")
         self.assertTrue(
             await old_session.send_downlink_pcm(
@@ -904,6 +915,171 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(old_ws.messages[-1], b"\x01\x00")
+
+    async def test_candidate_ids_bind_thresholded_one_shot_interruption_receipts(self):
+        await self.session.on_start(
+            {"interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY]}
+        )
+        self.session._audible_history.begin_turn(7, "上一轮用户输入")
+        self.assertTrue(
+            self.session._audible_history.add_segment(7, 1, "未播完的隐藏尾句")
+        )
+
+        await self.session._emit_speech_candidate()
+        first_id = self.ws.json_messages()[-1]["candidateId"]
+        self.session.on_playback_interruption(
+            {
+                "state": "confirmed",
+                "candidateId": first_id,
+                "generation": 7,
+                "segmentId": 1,
+                "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES,
+            }
+        )
+        self.assertFalse(self.session._candidate_receipt_event.is_set())
+        confirmed_id = await self.session._emit_speech_confirmed()
+        self.assertEqual(confirmed_id, first_id)
+        self.session.on_playback_interruption(
+            {
+                "type": "playback_interruption",
+                "state": "confirmed",
+                "candidateId": first_id,
+                "generation": 7,
+                "segmentId": 1,
+                "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES - 1,
+            }
+        )
+        self.assertFalse(await self.session._consume_interruption_hint(first_id))
+
+        await self.session._emit_speech_candidate()
+        second_id = self.ws.json_messages()[-1]["candidateId"]
+        self.assertEqual(second_id, first_id + 1)
+        confirmed_id = await self.session._emit_speech_confirmed()
+        self.session.on_playback_interruption(
+            {
+                "type": "playback_interruption",
+                "state": "confirmed",
+                "candidateId": second_id,
+                "generation": 7,
+                "segmentId": 1,
+                "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES,
+            }
+        )
+        self.session.on_playback_interruption(
+            {
+                "type": "playback_interruption",
+                "state": "confirmed",
+                "candidateId": second_id,
+                "generation": 7,
+                "segmentId": 1,
+                "playedSamples": 0,
+            }
+        )
+        self.assertTrue(await self.session._consume_interruption_hint(confirmed_id))
+        self.assertFalse(await self.session._consume_interruption_hint(confirmed_id))
+
+        await self.session._emit_speech_candidate()
+        rejected_id = self.ws.json_messages()[-1]["candidateId"]
+        await self.session._emit_speech_rejected()
+        rejected = self.ws.json_messages()[-1]
+        self.assertEqual(rejected["candidateId"], rejected_id)
+        self.assertIsNone(self.session._candidate_id)
+
+    async def test_interruption_hint_rejects_unknown_completed_and_timeout_receipts(self):
+        await self.session.on_start(
+            {"interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY]}
+        )
+        self.session._audible_history.begin_turn(8, "上一轮用户输入")
+        self.session._audible_history.add_segment(8, 1, "已经播完")
+        self.session._audible_history.acknowledge(8, 1, "completed")
+        await self.session._emit_speech_candidate()
+        candidate_id = await self.session._emit_speech_confirmed()
+        self.session.on_playback_interruption(
+            {
+                "state": "confirmed",
+                "candidateId": candidate_id,
+                "generation": 8,
+                "segmentId": 1,
+                "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES,
+            }
+        )
+        original_timeout = common.INTERRUPTION_RECEIPT_WAIT_SECONDS
+        common.INTERRUPTION_RECEIPT_WAIT_SECONDS = 0.001
+        try:
+            self.assertFalse(await self.session._consume_interruption_hint(candidate_id))
+
+            self.session._audible_history.begin_turn(9, "另一轮用户输入")
+            self.session._audible_history.add_segment(9, 1, "已取消句段")
+            self.session._audible_history.cancel_turn(9)
+            await self.session._emit_speech_candidate()
+            candidate_id = await self.session._emit_speech_confirmed()
+            for payload in (
+                {
+                    "state": "confirmed",
+                    "candidateId": candidate_id + 1,
+                    "generation": 9,
+                    "segmentId": 1,
+                    "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES,
+                },
+                {
+                    "state": "confirmed",
+                    "candidateId": candidate_id,
+                    "generation": 999,
+                    "segmentId": 1,
+                    "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES,
+                },
+                {
+                    "state": "confirmed",
+                    "candidateId": candidate_id,
+                    "generation": 9,
+                    "segmentId": 1,
+                    "playedSamples": common.INTERRUPTION_HINT_MIN_SAMPLES,
+                },
+            ):
+                self.session.on_playback_interruption(payload)
+            self.assertFalse(self.session._candidate_receipt_event.is_set())
+            self.assertFalse(await self.session._consume_interruption_hint(candidate_id))
+        finally:
+            common.INTERRUPTION_RECEIPT_WAIT_SECONDS = original_timeout
+
+    async def test_interruption_hint_is_transient_and_never_enters_audible_history(self):
+        captured_histories = []
+
+        def capture_history(_role, history, _text, _scope, out):
+            captured_histories.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+            return None
+
+        common._synth_tts = lambda _text: b"unused"
+        common.start_llm_stream_producer = capture_history
+        first_scope = self.session._new_scope("response")
+        self.session.response_scope = first_scope
+        await self.session._reply_pipeline(
+            "第一轮用户输入",
+            first_scope,
+            interruption_hint=True,
+        )
+        second_scope = self.session._new_scope("response")
+        self.session.response_scope = second_scope
+        await self.session._reply_pipeline("第二轮用户输入", second_scope)
+
+        self.assertEqual(
+            captured_histories[0],
+            [{"role": "system", "content": common.INTERRUPTION_HINT_TEXT}],
+        )
+        self.assertFalse(
+            any(
+                message.get("content") == common.INTERRUPTION_HINT_TEXT
+                for message in captured_histories[1]
+            )
+        )
+        self.assertFalse(
+            any(
+                message.get("role") == "system"
+                or message.get("content") == common.INTERRUPTION_HINT_TEXT
+                for message in self.session.history
+            )
+        )
 
     async def test_valid_candidate_is_confirmed_before_asr_payload(self):
         original_transcribe = common.transcribe
@@ -937,6 +1113,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             types[:4],
             ["speech_confirmed", "asr_start", "asr", "asr_end"],
         )
+        self.assertNotIn("error", types)
         self.assertFalse(self.session.candidate_emitted)
 
     async def test_invalid_candidate_is_rejected_without_user_text(self):
