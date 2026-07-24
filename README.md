@@ -83,6 +83,7 @@ npm run dev        # 开发模式（tauri dev）
 - **CosyVoice 0.2.21 实测重点**：选择 CosyVoice 后接通，观察稳定句开始合成后是否更早出声、长句是否无噪声/变速、连续两句是否严格有序，并在首句中途插话确认旧音频立即停止。公开资料未规范性写明 raw PCM 字节序；若听到白噪声、严重变速或音高异常，请结束通话并保留不含文本/PCM 的 trace，不要继续计费测试。
 - **Qwen MLX 0.2.22 实测重点**：在 Apple Silicon 选择本地 Qwen3-TTS，要求一段较长回复，观察首句是否在整句生成完前开始播放、chunk 接缝是否自然，并在首句中途插话确认旧生成在下一个 provider chunk 边界后释放、ASR 能继续运行。旧 `mlx-audio` API、非 24k 模型、Windows/Linux PyTorch、legacy 播放会自动回退整句；没有真实设备 trace 前不宣称 TTFA 或打断 p95 改善。
 - **0.2.23 通话诊断**：在设置中勾选“显示聊天界面调试信息”，接通并完成测试轮次后，可在聊天底部点击“复制通话诊断 JSON”（通话中或挂断后均可）。JSON 只含固定协商枚举、重新编号的会话 ID、单调相对时间和有界数值指标，不含 Key、persona、文本、路径或 PCM。先检查 `runtime` 是否为预期的 `worklet + managed-v1 + provider-pcm-v1`，再按 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md) 2.17 的 runbook 记录 TTFA、接缝与取消恢复；`maxSampledQueuedMs` 是 500ms 采样最高值，`drainInclusiveUnderruns` 包含自然播放结束，二者都不能解释成 provider 内部指标。
+- **0.2.24 VAD 回放基础**：仓库新增不依赖账户、麦克风、模型、Torch 或 ONNX Runtime 的 512-sample 组帧、概率迟滞、generation/fallback 和 synthetic-only provenance 测试。它尚未接入本地通话 `Session`，App 仍使用原有 RMS candidate/soft endpoint；此版不能用于比较神经 VAD 听感或准确率。开发验证运行 `npm run test:python`，实现/待实验边界见路线图 2.18。
 - 设置页底部会显示本地服务状态与日志；开发模式也可直接使用仓库内 `scripts/local-realtime/`。
 
 ## 打包

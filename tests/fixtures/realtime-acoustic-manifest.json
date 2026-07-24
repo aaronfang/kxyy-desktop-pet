@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "recordingContent": "synthetic-only",
+  "artifacts": [
+    {
+      "id": "realtime-pcm-replay-v1",
+      "kind": "synthetic-spec",
+      "relativePath": "tests/fixtures/realtime-pcm-replay.json",
+      "byteLength": 2648,
+      "sha256": "0867964b9f3e0515fcfdac5e14ed01668b325bf5e5b9faca06472fc5661ddc2a",
+      "containsRecordedAudio": false,
+      "materialization": "runtime-generated",
+      "license": {
+        "spdxId": "MIT",
+        "url": "https://github.com/aaronfang/kxyy-desktop-pet/blob/main/LICENSE",
+        "redistributionAllowed": true,
+        "commercialUseAllowed": true,
+        "derivativesAllowed": true
+      },
+      "provenance": {
+        "type": "project-generated",
+        "creator": "kxyy-desktop-pet contributors",
+        "sourceUrl": "https://github.com/aaronfang/kxyy-desktop-pet"
+      },
+      "audio": {
+        "sampleRate": 16000,
+        "channels": 1,
+        "encoding": "generated-pcm-s16le",
+        "frameSamples": 480
+      },
+      "scenarioTags": [
+        "normal-turn",
+        "mandarin-pause",
+        "playback-cough",
+        "keyboard-impulse",
+        "speaker-echo",
+        "repeated-barge-in"
+      ]
+    }
+  ]
+}
