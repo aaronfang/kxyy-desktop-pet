@@ -15,6 +15,7 @@ const testFiles = [
   "tests/test_local_realtime_events.py",
   "tests/test_qwen_mlx_stream.py",
   "tests/test_vad_adapter.py",
+  "tests/test_vad_evaluator.py",
   "tests/test_silero_shadow.py",
 ];
 

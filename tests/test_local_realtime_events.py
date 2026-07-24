@@ -1138,6 +1138,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
                     confirm_frames=3,
                     reject_frames=2,
                     end_frames=3,
+                    candidate_max_frames=8,
                 ),
             )
 
@@ -1211,6 +1212,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
                     confirm_frames=3,
                     reject_frames=2,
                     end_frames=3,
+                    candidate_max_frames=8,
                 ),
             )
 
@@ -1473,6 +1475,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
                         confirm_frames=3,
                         reject_frames=3,
                         end_frames=8,
+                        candidate_max_frames=16,
                     ),
                 )
 

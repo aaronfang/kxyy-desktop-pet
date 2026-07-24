@@ -19,7 +19,10 @@ DEFAULT_FRAME_SAMPLES = 512
 DEFAULT_MAX_INPUT_FRAMES = 64
 MAX_FRAME_SAMPLES = 16000
 MAX_INPUT_FRAMES = 64
-VAD_EVENTS = frozenset(("candidate", "confirmed", "rejected", "ended"))
+VAD_EVENTS = frozenset(
+    ("candidate", "confirmed", "rejected", "ended", "candidate_timeout")
+)
+MAX_CANDIDATE_FRAMES = 4096
 SHADOW_MODES = frozenset(("shadow-v1", "silero-onnx-shadow-v1"))
 SHADOW_QUEUE_CAPACITY = 1
 SHADOW_LATENCY_SAMPLES = 64
@@ -118,6 +121,7 @@ class ProbabilityVadState:
         confirm_frames,
         reject_frames,
         end_frames,
+        candidate_max_frames,
     ):
         if isinstance(speech_threshold, (bool, str, bytes)) or isinstance(
             release_threshold, (bool, str, bytes)
@@ -140,6 +144,17 @@ class ProbabilityVadState:
         self.confirm_frames = _positive_int(confirm_frames, "confirm_frames")
         self.reject_frames = _positive_int(reject_frames, "reject_frames")
         self.end_frames = _positive_int(end_frames, "end_frames")
+        self.candidate_max_frames = _positive_int(
+            candidate_max_frames, "candidate_max_frames"
+        )
+        if self.candidate_max_frames > MAX_CANDIDATE_FRAMES:
+            raise ValueError("candidate_max_frames exceeds the fixed hard limit")
+        if self.candidate_max_frames < max(
+            self.confirm_frames, self.reject_frames + 1
+        ):
+            raise ValueError(
+                "candidate_max_frames must preserve confirm and reject paths"
+            )
         self.reset()
 
     @staticmethod
@@ -160,6 +175,13 @@ class ProbabilityVadState:
         self._phase = "idle"
         self._high_streak = 0
         self._low_streak = 0
+        self._candidate_age = 0
+
+    def _leave_candidate(self):
+        self._phase = "idle"
+        self._high_streak = 0
+        self._low_streak = 0
+        self._candidate_age = 0
 
     def update(self, value):
         probability = self._probability(value)
@@ -172,14 +194,21 @@ class ProbabilityVadState:
             if is_high:
                 self._phase = "candidate"
                 self._high_streak = 1
+                self._candidate_age = 1
                 events.append("candidate")
                 if self._high_streak >= self.confirm_frames:
                     self._phase = "confirmed"
                     self._high_streak = 0
+                    self._candidate_age = 0
                     events.append("confirmed")
             else:
                 self._high_streak = 0
             return tuple(events)
+
+        if self._phase == "candidate":
+            self._candidate_age = min(
+                self.candidate_max_frames, self._candidate_age + 1
+            )
 
         if is_high:
             self._low_streak = 0
@@ -190,14 +219,14 @@ class ProbabilityVadState:
                 if self._high_streak >= self.confirm_frames:
                     self._phase = "confirmed"
                     self._high_streak = 0
+                    self._candidate_age = 0
                     events.append("confirmed")
         elif is_low:
             self._high_streak = 0
             if self._phase == "candidate":
                 self._low_streak = min(self.reject_frames, self._low_streak + 1)
                 if self._low_streak >= self.reject_frames:
-                    self._phase = "idle"
-                    self._low_streak = 0
+                    self._leave_candidate()
                     events.append("rejected")
             elif self._phase == "confirmed":
                 self._low_streak = min(self.end_frames, self._low_streak + 1)
@@ -209,6 +238,13 @@ class ProbabilityVadState:
             # The hysteresis band retains the phase but breaks consecutive runs.
             self._high_streak = 0
             self._low_streak = 0
+
+        if (
+            self._phase == "candidate"
+            and self._candidate_age >= self.candidate_max_frames
+        ):
+            self._leave_candidate()
+            events.append("candidate_timeout")
 
         return tuple(events)
 
@@ -262,6 +298,7 @@ class NeuralVadPipeline:
         self._feeding = False
         self._reentrant_fault = False
         self._transitioning = False
+        self._closed = False
 
     def _reset_scorer(self):
         reset = getattr(self.scorer, "reset", None)
@@ -277,6 +314,8 @@ class NeuralVadPipeline:
 
     def reset(self, generation):
         generation = _generation(generation)
+        if self._closed:
+            raise RuntimeError("VAD pipeline is closed")
         if self._transitioning:
             raise RuntimeError("VAD pipeline transition is already active")
         if self._last_generation is not None and generation <= self._last_generation:
@@ -301,23 +340,28 @@ class NeuralVadPipeline:
             self._transitioning = False
 
     def close(self):
-        """Idempotently clear retained state at hangup/disconnect boundaries."""
+        """Idempotently terminate and clear retained state."""
 
+        if self._closed:
+            return
         if self._transitioning:
             raise RuntimeError("VAD pipeline transition is already active")
+        self._closed = True
         self._transitioning = True
         try:
             self.generation = None
-            self.assembler.reset()
-            self.state.reset()
-            self._end_sample = 0
-            self._disabled = True
-            self._fallback_emitted = True
-            self._reentrant_fault = False
             try:
-                self._close_scorer()
-            except Exception:
-                pass
+                self.assembler.reset()
+                self.state.reset()
+            finally:
+                self._end_sample = 0
+                self._disabled = True
+                self._fallback_emitted = True
+                self._reentrant_fault = False
+                try:
+                    self._close_scorer()
+                except Exception:
+                    pass
         finally:
             self._transitioning = False
 
@@ -604,6 +648,9 @@ class VadShadowWorker:
                 "candidateEvents": self._event_counts["candidate"],
                 "confirmedEvents": self._event_counts["confirmed"],
                 "rejectedEvents": self._event_counts["rejected"],
+                "candidateTimeoutEvents": self._event_counts[
+                    "candidate_timeout"
+                ],
                 "endedEvents": self._event_counts["ended"],
                 "latencySamples": len(latencies),
                 "inferenceP50Ms": _percentile(latencies, 50),
