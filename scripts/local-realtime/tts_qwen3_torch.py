@@ -79,7 +79,7 @@ def configure_from_settings() -> None:
 
     model_id = _resolve_model()
     _ref_wav, _ref_text = common.ensure_ref_wav()
-    common.log(f"参考音 {_ref_wav} ({len(_ref_text)} chars)")
+    common.log(f"参考音已就绪 ({len(_ref_text)} chars)")
 
     has_cuda = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
     if has_cuda:
@@ -122,7 +122,7 @@ def configure_from_settings() -> None:
         _prompt = None
         common.log(f"预构建参考音 prompt 失败（改为每次合成时传参）：{e}")
 
-    common.log(f"Qwen3-TTS 就绪 (pytorch) model={model_id} lang={_language} ref={_ref_wav}")
+    common.log(f"Qwen3-TTS 就绪 (pytorch) model={model_id} lang={_language}")
 
 
 def _wav_to_pcm24k(audio, sr: int) -> bytes:

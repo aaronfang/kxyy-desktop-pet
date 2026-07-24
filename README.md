@@ -64,7 +64,7 @@ npm run dev        # 开发模式（tauri dev）
   | **CosyVoice（通义云端）** | 在线 | 本机 Whisper + 当前文字服务（DeepSeek/Ollama），TTS 走通义云端；需通义 Key 与 CosyVoice 音色 id |
   | **Qwen3-TTS（本地）** | 本地 | 跨平台：macOS(Apple Silicon) 走 mlx-audio（保存后自动配置）；Windows / Linux 走官方 PyTorch 包 `qwen-tts`（默认 1.7B，运行 `scripts/windows/setup-qwen3-tts.cmd` 配置）。零样本克隆参考音频，不消耗火山 token |
 - **播放音量**：设置里「AI 语音播放音量」0–200%（100% 为原音量），朗读与通话共用。
-- **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话按 LLM 稳定句进入 4 项有界队列并严格按句序播放；Qwen 仍按句整段合成。0.2.21 起，CosyVoice + 播放 Worklet 会在 `managed-v1` 基础上双向协商 `provider-pcm-v1`，直接请求官方 24k mono PCM，provider binary 到达即按最多 80ms 下发；首版固定单路，不预取下一句。未协商、legacy、Qwen、旧服务与火山继续原有路径。流式句段只在结束时声明最终 samples/chunks，前端精确校验；失败、取消、错序、超限或总量不符不会产生“已完整播完”回执。0.2.20 的 `candidate-snapshot-v1` 仍只在 Worklet 本地/CosyVoice 上启用：同一 candidate 确认打断且当前句已播放至少 1 秒时，下一轮仅注入一次固定临时提示；它不进入 history、聊天摘要、长期记忆或日志，也不恢复字、音素或部分文本。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
+- **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话按 LLM 稳定句进入 4 项有界队列并严格按句序播放。CosyVoice 自 0.2.21、macOS Apple Silicon 的 MLX Qwen 自 0.2.22 起，可在播放 Worklet + `managed-v1` 上双向协商 `provider-pcm-v1`：provider 生成期音频按最多 80ms 下发，首版固定单路且不预取下一句。Windows/Linux 的官方 `qwen-tts` 当前没有公开音频 iterator，仍按句整段合成；未协商、legacy、旧服务与火山也继续原路径。流式句段只在结束时声明最终 samples/chunks，前端精确校验；失败、取消、错序、超限或总量不符不会产生“已完整播完”回执。0.2.20 的 `candidate-snapshot-v1` 仍只在 Worklet 本地/CosyVoice 上启用：同一 candidate 确认打断且当前句已播放至少 1 秒时，下一轮仅注入一次固定临时提示；它不进入 history、聊天摘要、长期记忆或日志，也不恢复字、音素或部分文本。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
 - **实时语音优化路线**：自然打断、流式管线、Qwen3-TTS/CosyVoice/火山情绪能力和 SenseVoice 评估见 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md)；其中尚未实现的目标不会作为当前功能承诺。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。
@@ -81,6 +81,7 @@ npm run dev        # 开发模式（tauri dev）
 - **macOS**：Qwen3-TTS 运行时落在 `~/Library/Application Support/com.aaronfang.kxyydesktoppet/voice-runtime`，首次选用本地后端会自动配置，也可手动执行 `scripts/macos/setup-qwen3-tts.sh`。
 - **Windows / Linux（本地 Qwen3-TTS）**：走官方 PyTorch 包 `qwen-tts`，默认加载 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`（首次运行自动下载，约数 GB）。Windows 运行 `scripts/windows/setup-qwen3-tts.cmd` 会创建独立环境 `scripts/local-realtime/.venv-qwen3` 并安装 torch + qwen-tts 等依赖（脚本按 GPU 自动选 wheel：RTX 50 系/Blackwell 用 `cu128`，其它 NVIDIA 用 `cu124`，无卡则 CPU，较慢；Python 需 3.10–3.13，3.14 暂无 wheel）。可在 `settings.json` 用 `qwen3ModelDir`（本地权重目录或模型 id）、`qwen3Language`（默认 `Auto`）覆盖。
 - **CosyVoice 0.2.21 实测重点**：选择 CosyVoice 后接通，观察稳定句开始合成后是否更早出声、长句是否无噪声/变速、连续两句是否严格有序，并在首句中途插话确认旧音频立即停止。公开资料未规范性写明 raw PCM 字节序；若听到白噪声、严重变速或音高异常，请结束通话并保留不含文本/PCM 的 trace，不要继续计费测试。
+- **Qwen MLX 0.2.22 实测重点**：在 Apple Silicon 选择本地 Qwen3-TTS，要求一段较长回复，观察首句是否在整句生成完前开始播放、chunk 接缝是否自然，并在首句中途插话确认旧生成在下一个 provider chunk 边界后释放、ASR 能继续运行。旧 `mlx-audio` API、非 24k 模型、Windows/Linux PyTorch、legacy 播放会自动回退整句；没有真实设备 trace 前不宣称 TTFA 或打断 p95 改善。
 - 设置页底部会显示本地服务状态与日志；开发模式也可直接使用仓库内 `scripts/local-realtime/`。
 
 ## 打包
