@@ -23,6 +23,7 @@ npm run sync-assets      # pull pet frame art from kxyy_ai_clone into src/assets
 npm run sync-ai          # pull ai/*.js, persona corpus, stickers from kxyy_ai_clone
 npm test                 # JS realtime trace / Worklet deterministic tests
 npm run test:python      # local realtime pure-state / replay tests
+npm run test:resources   # fixed VAD bundle mappings, file set, hashes; add -- --stripped-frontend at bundle time
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 cargo check --manifest-path src-tauri/Cargo.toml
 ```

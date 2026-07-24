@@ -9,8 +9,9 @@ name: Release
 # 在 Actions 页面对该 tag 手动 Run workflow 并勾选 include_macos 即可（会追加 dmg
 # 到同一个 Release）。
 #
-# 流程：verify（校验四处版本号与 tag 一致）→ setup-matrix（按触发方式决定构建平台）
-# → release（按矩阵并行构建 + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
+# 流程：verify（校验 tag 已在 main 且四处版本一致）→ quality（Windows 确定性测试与
+# 真实可选 ORT smoke）+ setup-matrix（按触发方式决定构建平台）→ release（按矩阵并行
+# 构建 + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
 #
 # 成本保险：GitHub 账号 Settings → Billing → Budgets 已对 Actions 设置 $0 预算
 # 且 Stop usage=Yes。免费额度（2000 min/月）用尽后会被硬性拦截，永不产生超额计费。
@@ -36,6 +37,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a tagged commit already on main
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::release 必须从 v* tag 触发；手动运行时请选择 tag ref"
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag commit 必须已经合入 main"
+            exit 1
+          fi
       - name: Check tag ↔ package.json ↔ tauri.conf.json ↔ Cargo.toml
         run: |
           TAG="${{ github.ref_name }}"
@@ -49,6 +63,73 @@ jobs:
             exit 1
           fi
 
+  # Tag 不能绕过 PR/main 的可重复验证；Windows 还覆盖可选 ORT 的真实安装与推理。
+  quality:
+    name: Verify release candidate
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deterministic scorer test dependency
+        run: python -m pip install --disable-pip-version-check numpy==2.2.6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Test realtime voice state replay
+        run: npm test
+
+      - name: Test local realtime event transitions
+        run: npm run test:python
+
+      - name: Verify bundled VAD resource contract
+        run: npm run test:resources
+
+      - name: Test Rust library state
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Check Rust application
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Check tagged merge whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git show --check --format= HEAD
+          fi
+
+      - name: Install optional VAD runtime
+        env:
+          KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
+        run: python scripts/local-realtime/install_vad_runtime.py
+
+      - name: Smoke-test optional VAD runtime
+        env:
+          KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
+          KXYY_RUN_SILERO_SMOKE: '1'
+        run: python tests/test_silero_shadow.py
+
   # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；仅当手动触发且勾选
   # include_macos 时才追加两个 macOS 目标（省下 ×10 的 macOS 额度）。
   setup-matrix:
@@ -60,9 +141,9 @@ jobs:
       - name: Compute build matrix
         id: set
         run: |
-          WIN='{"platform":"windows-latest","args":"--bundles nsis"}'
-          MAC_ARM='{"platform":"macos-latest","args":"--target aarch64-apple-darwin --bundles dmg"}'
-          MAC_X64='{"platform":"macos-latest","args":"--target x86_64-apple-darwin --bundles dmg"}'
+          WIN='{"platform":"windows-latest","args":"--bundles nsis -- --locked"}'
+          MAC_ARM='{"platform":"macos-latest","args":"--target aarch64-apple-darwin --bundles dmg -- --locked"}'
+          MAC_X64='{"platform":"macos-latest","args":"--target x86_64-apple-darwin --bundles dmg -- --locked"}'
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_macos }}" = "true" ]; then
             echo "matrix={\"include\":[$WIN,$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
             echo "构建平台：Windows + macOS(aarch64/x64)"
@@ -74,7 +155,7 @@ jobs:
   # 第三关：构建并发布。changelog 在这一步自动从 git log 生成，
   # 彻底消除"忘改 release.yml"的可能。
   release:
-    needs: [verify, setup-matrix]
+    needs: [verify, quality, setup-matrix]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
@@ -101,12 +182,13 @@ jobs:
           workspaces: "./src-tauri -> target"
 
       - name: Install frontend dependencies
-        run: npm install
+        run: npm ci
 
       # 从上一个 tag 到本 tag 的 commit，按 conventional commit 类型分桶
       # 自动归类：feat* → 新增，fix* → 修复，其余（跳过 chore(release)/docs/ci/build）→ 其他
       # merge commits 用 --no-merges 排除
       - name: Generate release notes
+        shell: bash
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
@@ -163,6 +245,9 @@ jobs:
 
       - name: Strip plaintext persona assets
         run: node scripts/bundle-assets.mjs strip
+
+      - name: Verify stripped frontend and bundled resources
+        run: npm run test:resources -- --stripped-frontend
 
       - name: Build & Release (Tauri)
         uses: tauri-apps/tauri-action@v0

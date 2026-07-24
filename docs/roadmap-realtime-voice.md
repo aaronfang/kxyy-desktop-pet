@@ -226,7 +226,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **并发与生命周期**：进程级 `VadShadowService` 在 TTS `prepare()` 之后异步预热 worker，避免阻塞 WebSocket 握手。worker 仍为 admission=1、queue=1/latest-wins；每个 Session 通过单调 token 获取独占 lease，只有旧工作完全 quiescent 后才开始新 lease。release 会先推进 epoch、清 waiting job 再开放下一 lease，旧 Session 无法用迟到 offer/release 影响新 Session，worker 仅在语音服务进程退出时关闭。第二个并发 Session 报 `busy` 并继续 RMS。
 
-**观测与验证**：诊断 schema v3 只暴露固定 `vadShadow` 枚举 `disabled|warming|busy|unavailable|shadow-v1|silero-onnx-shadow-v1`；真实模式表示握手时成功获取 scorer lease，不是整通电话的持续健康证明。不导出周期 aggregate snapshot，也不把 shadow 每帧结果写进实时 trace，因此不会为观测增加跨线程/网络背压。确定性测试覆盖 capability gate、租约/ABA、warming/busy/unavailable、queue overflow/stale、Session A/B 控制事件不变和安装 manifest；显式 real smoke 还在临时 runtime 中下载 hash-locked wheel、验证模型推理与 recurrent reset，可在无正式 App 数据写入的情况下执行。
+**观测与验证**：诊断 schema v3 只暴露固定 `vadShadow` 枚举 `disabled|warming|busy|unavailable|shadow-v1|silero-onnx-shadow-v1`；真实模式表示握手时成功获取 scorer lease，不是整通电话的持续健康证明。不导出周期 aggregate snapshot，也不把 shadow 每帧结果写进实时 trace，因此不会为观测增加跨线程/网络背压。确定性测试覆盖 capability gate、租约/ABA、warming/busy/unavailable、queue overflow/stale、Session A/B 控制事件不变和安装 manifest；显式 real smoke 还在临时 runtime 中下载 hash-locked wheel、验证模型推理与 recurrent reset，可在无正式 App 数据写入的情况下执行。PR CI 另在 macOS/Windows 都运行 JS、Python、Rust test/check 与固定资源契约，并在 Windows 临时目录执行真实安装/推理；release 只接受已经位于 `main` 的 tag，重复同一组 Windows 门禁后才构建。资源契约会递归拒绝映射目录里的 symlink、runtime/download/配置残留，固定模型/许可证/notice 哈希，并在 `strip` 后确认 `frontendDist` 不含明文 persona；恢复备份位于 `frontendDist` 之外。它仍不代表安装包已签名、公证或声学效果已验收。
 
 **设计占位，尚未接管**：真实 Silero probability 不驱动 candidate、confirmed/rejected、endpoint、Whisper 提交、播放 ring 或历史；RMS 仍是唯一实时决策路径。没有周期 probability/aggregate 遥测，没有 provider 切换，也没有修改火山协议常量。开关关闭、`warming`、`busy`、`unavailable` 与 scorer fault 都保持 0.2.25 行为。
 
