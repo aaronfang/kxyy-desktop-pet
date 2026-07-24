@@ -671,6 +671,82 @@ class BoundedLlmProducerTests(unittest.TestCase):
             common.iter_llm_stream = original_iter
 
 
+class HttpTtsAdmissionTests(unittest.TestCase):
+    class ManualFuture:
+        def __init__(self):
+            self.callbacks = []
+            self.finished = False
+
+        def add_done_callback(self, callback):
+            self.callbacks.append(callback)
+
+        def result(self, timeout=None):
+            if not self.finished:
+                raise TimeoutError(f"not finished after {timeout}")
+            return None
+
+        def finish(self):
+            self.finished = True
+            callbacks, self.callbacks = self.callbacks, []
+            for callback in callbacks:
+                callback(self)
+
+    class ManualPool:
+        def __init__(self):
+            self.futures = []
+            self.fail_submit = False
+
+        def submit(self, _synth, _text):
+            if self.fail_submit:
+                raise RuntimeError("fixed submit failure")
+            future = HttpTtsAdmissionTests.ManualFuture()
+            self.futures.append(future)
+            return future
+
+    def test_full_admission_rejects_until_actual_future_completion(self):
+        slots = threading.BoundedSemaphore(2)
+        pool = self.ManualPool()
+
+        first = common._submit_bounded_http_tts(pool, object(), "first", slots=slots)
+        second = common._submit_bounded_http_tts(pool, object(), "second", slots=slots)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIsNone(
+            common._submit_bounded_http_tts(pool, object(), "full", slots=slots)
+        )
+
+        # 模拟 HTTP 等待已经 timeout：future 还没完成，所以不得提前释放 admission。
+        with self.assertRaises(TimeoutError):
+            first.result(timeout=0)
+        self.assertIsNone(
+            common._submit_bounded_http_tts(pool, object(), "still-full", slots=slots)
+        )
+        first.finish()
+        accepted = common._submit_bounded_http_tts(
+            pool, object(), "after-completion", slots=slots
+        )
+        self.assertIsNotNone(accepted)
+        self.assertEqual(len(pool.futures), 3)
+
+    def test_submit_failure_releases_admission_immediately(self):
+        slots = threading.BoundedSemaphore(1)
+        pool = self.ManualPool()
+        pool.fail_submit = True
+
+        with self.assertRaisesRegex(RuntimeError, "fixed submit failure"):
+            common._submit_bounded_http_tts(pool, object(), "private text", slots=slots)
+
+        pool.fail_submit = False
+        self.assertIsNotNone(
+            common._submit_bounded_http_tts(pool, object(), "retry", slots=slots)
+        )
+
+    def test_busy_response_is_fixed_and_contains_no_request_content(self):
+        self.assertEqual(common.HTTP_TTS_MAX_TASKS, 2)
+        self.assertEqual(common.HTTP_TTS_BUSY_MESSAGE, "TTS 服务繁忙，请稍后重试")
+        self.assertNotIn("private text", common.HTTP_TTS_BUSY_MESSAGE)
+
+
 class BoundedOrderedTtsPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_out_of_order_synthesis_still_plays_in_submit_order(self):
         gates = {

@@ -966,6 +966,9 @@ HTTP_TTS_MAX_CHARS = 160
 # 浏览器播 WAV 更稳的采样率（24k 在部分 WebView 后半段会糊）。
 BROWSER_WAV_RATE = 48000
 HTTP_TTS_TIMEOUT_S = 60
+HTTP_TTS_MAX_TASKS = 2
+HTTP_TTS_BUSY_MESSAGE = "TTS 服务繁忙，请稍后重试"
+_http_tts_slots = threading.BoundedSemaphore(HTTP_TTS_MAX_TASKS)
 
 
 def clip_speech_text(text: str, max_chars: int = HTTP_TTS_MAX_CHARS) -> str:
@@ -1015,6 +1018,25 @@ def pcm16_to_browser_wav(pcm16: bytes, src_rate: int = OUTPUT_RATE) -> bytes:
     """PCM → 48k WAV，避免 WebView 播 24k WAV 后半段失真。"""
     pcm = pcm16_resample(pcm16, src_rate, BROWSER_WAV_RATE)
     return pcm16_to_wav_bytes(pcm, BROWSER_WAV_RATE)
+
+
+def _submit_bounded_http_tts(pool, synth, text: str, *, slots=None):
+    """有界提交 HTTP 朗读；slot 只随实际 future 结束释放。
+
+    ``Future.result(timeout=...)`` 超时只结束当前 HTTP 等待，不能终止已经开始的
+    模型调用。因此释放必须绑定 done callback，不能放在 handler 的 ``finally``；
+    否则连续超时会绕过 admission，把 executor 的内部工作队列重新变成无界。
+    """
+    admission = slots if slots is not None else _http_tts_slots
+    if not admission.acquire(blocking=False):
+        return None
+    try:
+        future = pool.submit(synth, text)
+    except BaseException:
+        admission.release()
+        raise
+    future.add_done_callback(lambda _done: admission.release())
+    return future
 
 
 def start_tts_http(port: int) -> None:
@@ -1073,14 +1095,20 @@ def start_tts_http(port: int) -> None:
             try:
                 pool = _tts_pool or _mlx_pool
                 if _synth_tts_http is not None:
-                    result = pool.submit(_synth_tts_http, text).result(
-                        timeout=HTTP_TTS_TIMEOUT_S
-                    )
+                    future = _submit_bounded_http_tts(pool, _synth_tts_http, text)
+                    if future is None:
+                        self._json_err(503, HTTP_TTS_BUSY_MESSAGE)
+                        return
+                    result = future.result(timeout=HTTP_TTS_TIMEOUT_S)
                     audio, mime = result[0], result[1]
                     if len(result) >= 3 and isinstance(result[2], dict):
                         usage = result[2]
                 else:
-                    pcm = pool.submit(_synth_tts, text).result(timeout=HTTP_TTS_TIMEOUT_S)
+                    future = _submit_bounded_http_tts(pool, _synth_tts, text)
+                    if future is None:
+                        self._json_err(503, HTTP_TTS_BUSY_MESSAGE)
+                        return
+                    pcm = future.result(timeout=HTTP_TTS_TIMEOUT_S)
                     if not pcm:
                         self._json_err(502, "TTS 未返回音频")
                         return

@@ -245,9 +245,7 @@ export class RealtimeSession {
           this.playbackNode
         ) {
           cascadeCapabilities.interruptionHint = [INTERRUPTION_HINT_CAPABILITY];
-          if (this.trace.provider === "cosyvoice") {
-            cascadeCapabilities.ttsStream = [TTS_STREAMING_CAPABILITY];
-          }
+          cascadeCapabilities.ttsStream = [TTS_STREAMING_CAPABILITY];
         }
         ws.send(
           JSON.stringify({

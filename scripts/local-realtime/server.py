@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import common
@@ -21,6 +24,10 @@ import common
 PORT = 19876
 # macOS MLX 量化权重（0.6B）；PyTorch 路径的模型见 tts_qwen3_torch.DEFAULT_MODEL。
 TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
+MLX_STREAMING_INTERVAL = 0.32
+MLX_STREAMING_MAX_TOKENS = 750
+# Fail closed if an incompatible runtime ignores the requested interval.
+MLX_STREAMING_RESULT_MAX_SAMPLES = 24000 * 2
 
 
 def _mlx_available() -> bool:
@@ -39,12 +46,14 @@ def _mlx_available() -> bool:
 _tts_model = None
 _ref_text = ""
 _ref_wav = None
+_mlx_model_gate = threading.BoundedSemaphore(1)
+_MLX_STREAM_DONE = object()
 
 
 def _load_on_mlx() -> None:
     global _tts_model, _ref_text, _ref_wav
     _ref_wav, _ref_text = common.ensure_ref_wav()
-    common.log(f"参考音 {_ref_wav} ({len(_ref_text)} chars)")
+    common.log(f"参考音已就绪 ({len(_ref_text)} chars)")
     common.log(f"加载 TTS {TTS_MODEL} …")
     from mlx_audio.tts.utils import load_model
 
@@ -55,22 +64,144 @@ def _load_on_mlx() -> None:
 
 def _prepare_mlx() -> None:
     common._mlx_pool.submit(_load_on_mlx).result()
+    if _mlx_streaming_supported(_tts_model):
+        common._synth_tts_stream = _synth_mlx_stream
+        common.log("Qwen3-TTS provider PCM 流式已启用 (mlx)")
+    else:
+        # 旧 runtime 或非 24k 模型必须在会话协商前关闭 capability，安全回退整句。
+        common._synth_tts_stream = None
+        common.log("Qwen3-TTS provider PCM 流式不可用，回退整句合成")
+
+
+def _mlx_streaming_supported(model) -> bool:
+    if model is None or int(getattr(model, "sample_rate", 0) or 0) != common.OUTPUT_RATE:
+        return False
+    try:
+        parameters = inspect.signature(model.generate).parameters
+        decoder = model.speech_tokenizer.decoder
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return "stream" in parameters and callable(
+        getattr(decoder, "reset_streaming_state", None)
+    )
+
+
+def _spoken_text(text: str) -> str:
+    spoken = common.text_for_speech(text) or (text or "").strip()
+    return common.clip_speech_text(spoken)
+
+
+def _create_mlx_stream(spoken: str):
+    return _tts_model.generate(
+        text=spoken,
+        ref_audio=str(_ref_wav),
+        ref_text=_ref_text,
+        stream=True,
+        streaming_interval=MLX_STREAMING_INTERVAL,
+        max_tokens=MLX_STREAMING_MAX_TOKENS,
+    )
+
+
+def _pull_mlx_stream(generator):
+    """Pull one provider chunk and convert it on the MLX worker thread."""
+    import numpy as np
+
+    try:
+        result = next(generator)
+    except StopIteration:
+        return _MLX_STREAM_DONE
+    sample_rate = int(getattr(result, "sample_rate", 0) or 0)
+    if sample_rate != common.OUTPUT_RATE:
+        raise RuntimeError("Qwen3-TTS 流式输出采样率不受支持")
+    declared_samples = int(getattr(result, "samples", 0) or 0)
+    if declared_samples > MLX_STREAMING_RESULT_MAX_SAMPLES:
+        raise RuntimeError("Qwen3-TTS 流式输出块过长")
+    audio = np.asarray(result.audio, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return ()
+    if audio.size > MLX_STREAMING_RESULT_MAX_SAMPLES:
+        raise RuntimeError("Qwen3-TTS 流式输出块过长")
+    if not bool(np.isfinite(audio).all()):
+        raise RuntimeError("Qwen3-TTS 流式输出包含无效采样")
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+    return tuple(common.chunk_pcm(pcm, 80))
+
+
+def _close_mlx_stream(generator) -> None:
+    """Close/reset on the same single worker that advances the stateful decoder."""
+    try:
+        generator.close()
+    finally:
+        try:
+            _tts_model.speech_tokenizer.decoder.reset_streaming_state()
+        finally:
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except ImportError:
+                pass
+
+
+async def _synth_mlx_stream(text: str):
+    """Adapt mlx-audio's sync generator to the provider-neutral PCM iterator."""
+    if _tts_model is None or _ref_wav is None:
+        raise RuntimeError("Qwen3-TTS 未加载")
+    spoken = _spoken_text(text)
+    if not spoken:
+        return
+    if not _mlx_model_gate.acquire(blocking=False):
+        raise RuntimeError("Qwen3-TTS 正忙，请稍后再试")
+
+    loop = asyncio.get_running_loop()
+    generator = None
+    try:
+        generator = _create_mlx_stream(spoken)
+        while True:
+            chunks = await loop.run_in_executor(
+                common._mlx_pool, _pull_mlx_stream, generator
+            )
+            if chunks is _MLX_STREAM_DONE:
+                break
+            for chunk in chunks:
+                yield {"type": "audio", "pcm": chunk}
+    finally:
+        if generator is None:
+            _mlx_model_gate.release()
+        else:
+            # run_in_executor cannot kill an in-flight next(). Queue cleanup behind it,
+            # and keep the model gate held until close/reset actually finishes.
+            cleanup = loop.run_in_executor(common._mlx_pool, _close_mlx_stream, generator)
+
+            def release_gate(future) -> None:
+                try:
+                    if not future.cancelled():
+                        future.exception()
+                finally:
+                    _mlx_model_gate.release()
+
+            cleanup.add_done_callback(release_gate)
+            await asyncio.shield(cleanup)
 
 
 def _synth_mlx(text: str) -> bytes:
     import numpy as np
 
-    spoken = common.text_for_speech(text) or (text or "").strip()
-    spoken = common.clip_speech_text(spoken)
+    spoken = _spoken_text(text)
     if not spoken:
         return b""
-    results = list(
-        _tts_model.generate(
-            text=spoken,
-            ref_audio=str(_ref_wav),
-            ref_text=_ref_text,
+    if not _mlx_model_gate.acquire(blocking=False):
+        raise RuntimeError("Qwen3-TTS 正忙，请稍后再试")
+    try:
+        results = list(
+            _tts_model.generate(
+                text=spoken,
+                ref_audio=str(_ref_wav),
+                ref_text=_ref_text,
+            )
         )
-    )
+    finally:
+        _mlx_model_gate.release()
     if not results:
         return b""
     audio = np.array(results[0].audio, dtype=np.float32).reshape(-1)
@@ -98,6 +229,7 @@ def _run_mlx() -> None:
         tts_pool=common._mlx_pool,
         tts_parallelism=1,
         tts_prefetch_while_playing=False,
+        synth_tts_stream=_synth_mlx_stream,
     )
 
 

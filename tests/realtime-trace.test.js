@@ -343,7 +343,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
-  assert.equal("ttsStream" in sockets[0].sent[0], false);
+  assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
 
   const cosy = new RealtimeSession({ provider: "cosyvoice" });
   cosy._playbackMode = "worklet";
@@ -351,6 +351,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   const cosyOpen = cosy._openSocket("ws://cosy", { systemRole: "role", botName: "元元" });
   sockets[1].onopen();
   await cosyOpen;
+  assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
 
