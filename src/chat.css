@@ -349,7 +349,6 @@ body {
   color: rgba(255, 255, 255, 0.45);
   font-variant-numeric: tabular-nums;
   user-select: text;
-  pointer-events: none;
 }
 #voice-debug[hidden] {
   display: none;
@@ -360,6 +359,33 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+#realtime-diagnostic-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+#copy-realtime-diagnostic {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  padding: 2px 7px;
+  color: rgba(255, 255, 255, 0.65);
+  background: rgba(255, 255, 255, 0.07);
+  font: inherit;
+  cursor: pointer;
+}
+#copy-realtime-diagnostic:hover:not(:disabled) {
+  color: rgba(255, 255, 255, 0.88);
+  background: rgba(255, 255, 255, 0.12);
+}
+#copy-realtime-diagnostic:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+#realtime-diagnostic-status {
+  color: rgba(255, 255, 255, 0.4);
 }
 #voice-debug-label {
   white-space: pre-line;
