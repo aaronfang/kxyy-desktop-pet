@@ -51,6 +51,7 @@ import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlayback
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
+import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 
 const invoke = window.__TAURI__.core.invoke;
@@ -411,6 +412,19 @@ const textDebugGenEl = document.getElementById("text-debug-gen");
 const textDebugBarEl = document.getElementById("text-debug-bar");
 const textDebugMetaEl = document.getElementById("text-debug-meta");
 const callDebugMetaEl = document.getElementById("call-debug-meta");
+const copyRealtimeDiagnosticBtn = document.getElementById("copy-realtime-diagnostic");
+const realtimeDiagnosticStatusEl = document.getElementById("realtime-diagnostic-status");
+let realtimeDiagnosticAppVersion = null;
+try {
+  void window.__TAURI__.app
+    ?.getVersion?.()
+    .then((version) => {
+      realtimeDiagnosticAppVersion = version;
+    })
+    .catch(() => {});
+} catch {
+  // 旧 WebView 全局 API 可能不含 app 模块。
+}
 
 /** 在线 / 本地文字 API 用量 debug 态（单次 usage + DeepSeek 余额；本地附带耗时）。 */
 const apiDebug = {
@@ -826,6 +840,7 @@ function updatePersonaDebug() {
 function updateVoiceDebug() {
   if (!voiceDebugEl) return;
   const show = chatDebugEnabled();
+  updateRealtimeDiagnosticAction();
   voiceDebugEl.hidden = !show;
   // 显式后备：防止某些 WebView2 环境下 hidden 属性未能正确联动 CSS display
   voiceDebugEl.style.display = show ? "" : "none";
@@ -1709,6 +1724,8 @@ async function triggerPat(avatarEl) {
 // ---- 实时语音通话 ----
 let callSession = null;
 let callActive = false;
+let lastCallTraceSnapshot = null;
+let callTraceFinalizing = false;
 // 一轮一气泡：ASR / 助手流式 token 都写进当前气泡，轮次结束再定稿。
 let callUserBubble = null;
 let callUserText = "";
@@ -1718,7 +1735,74 @@ let callLastUserMessageId = "";
 let callAudibleTurns = new Map();
 let callWaveSpeaking = false;
 const MAX_CALL_AUDIBLE_TURNS = 4;
+const CALL_CLEANUP_WAIT_MS = 1500;
 let callAudibleReceiptsActive = false;
+
+function realtimeDiagnosticSnapshot() {
+  return callSession?.getTraceSnapshot?.() || (callTraceFinalizing ? null : lastCallTraceSnapshot);
+}
+
+function updateRealtimeDiagnosticAction() {
+  if (!copyRealtimeDiagnosticBtn) return;
+  copyRealtimeDiagnosticBtn.disabled = !realtimeDiagnosticSnapshot();
+}
+
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // WebView clipboard 权限不可用时继续走选区复制后备。
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("copy unavailable");
+  } finally {
+    textarea.remove();
+  }
+}
+
+async function copyRealtimeDiagnostic() {
+  const snapshot = realtimeDiagnosticSnapshot();
+  if (!snapshot) {
+    if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "暂无通话";
+    return;
+  }
+  try {
+    const report = buildRealtimeDiagnosticReport({
+      ...snapshot,
+      appVersion: realtimeDiagnosticAppVersion,
+    });
+    await writeClipboardText(JSON.stringify(report, null, 2));
+    if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "已复制";
+  } catch {
+    if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "复制失败";
+  }
+}
+
+async function waitForCallCleanup(promise) {
+  let timer = 0;
+  const settled = Promise.resolve(promise).then(
+    () => true,
+    () => true,
+  );
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), CALL_CLEANUP_WAIT_MS);
+  });
+  try {
+    return await Promise.race([settled, timedOut]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function callUsesAudibleReceipts() {
   return callAudibleReceiptsActive;
@@ -1954,7 +2038,7 @@ function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
 
 async function startCall() {
   if (!isKxyyPersona(settings.personaCardId)) return;
-  if (callActive || busy) return;
+  if (callActive || callTraceFinalizing || busy) return;
   if (!assets) return;
   unlockAudio();
   // 通话与朗读互斥：先停掉正在放的朗读。
@@ -1968,6 +2052,8 @@ async function startCall() {
   callAsstText = "";
   callLastUserMessageId = "";
   callAudibleTurns = new Map();
+  lastCallTraceSnapshot = null;
+  if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "";
 
   setCallActive(true);
   appendPatNotice(`📞 正在接通${aiShortName()}…`);
@@ -2015,6 +2101,7 @@ async function startCall() {
       endCall({ notice: false });
     },
   });
+  updateRealtimeDiagnosticAction();
 
   // 必须在 await 之前、点击同步栈内解锁 Web Audio，否则首句 TTS 会静音。
   callSession.prepareAudio();
@@ -2030,7 +2117,7 @@ async function startCall() {
   }
 }
 
-function endCall({ notice = true } = {}) {
+async function endCall({ notice = true } = {}) {
   if (!callActive && !callSession) return;
   const s = callSession;
   callSession = null;
@@ -2040,12 +2127,34 @@ function endCall({ notice = true } = {}) {
   setCallActive(false);
   petSignal("abort");
   if (notice) appendPatNotice("📞 通话已结束");
-  if (s) s.stop().catch(() => {});
+  if (s) {
+    callTraceFinalizing = true;
+    updateRealtimeDiagnosticAction();
+    let cleanupSettled = true;
+    try {
+      cleanupSettled = await waitForCallCleanup(s.stop());
+    } catch {
+      // 诊断收尾不能妨碍挂断路径。
+    }
+    try {
+      lastCallTraceSnapshot = s.getTraceSnapshot();
+    } catch {
+      lastCallTraceSnapshot = null;
+      if (realtimeDiagnosticStatusEl) {
+        realtimeDiagnosticStatusEl.textContent = "诊断收尾失败";
+      }
+    }
+    callTraceFinalizing = false;
+    updateRealtimeDiagnosticAction();
+    if (!cleanupSettled && realtimeDiagnosticStatusEl && lastCallTraceSnapshot) {
+      realtimeDiagnosticStatusEl.textContent = "诊断已保存 · 清理中";
+    }
+  }
 }
 
 function toggleCall() {
   if (!isKxyyPersona(settings.personaCardId)) return;
-  if (callActive) endCall({ notice: true });
+  if (callActive) void endCall({ notice: true });
   else startCall();
 }
 
@@ -2112,6 +2221,7 @@ attachRemoveBtn.addEventListener("click", clearPendingImage);
 stickerRemoveBtn.addEventListener("click", clearPendingSticker);
 stickersBtn.addEventListener("click", toggleStickerPanel);
 callBtn.addEventListener("click", toggleCall);
+copyRealtimeDiagnosticBtn?.addEventListener("click", () => void copyRealtimeDiagnostic());
 
 fileEl.addEventListener("change", async () => {
   const file = fileEl.files?.[0];

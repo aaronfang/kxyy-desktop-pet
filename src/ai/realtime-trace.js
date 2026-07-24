@@ -5,6 +5,10 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 1;
+
+const MAX_DIAGNOSTIC_EVENTS = 256;
+const MAX_LATENCY_SUMMARIES = 8;
 
 export const TRACE_EVENT = Object.freeze({
   SESSION_STARTED: "session_started",
@@ -51,6 +55,7 @@ const SAFE_METRICS = new Set([
   "queuedMs",
   "silenceMs",
   "playedSamples",
+  "maxQueuedMs",
   "underruns",
 ]);
 
@@ -275,6 +280,10 @@ export function replayTrace(events, initialState = createReplayState()) {
 const LATENCY_MILESTONES = Object.freeze({
   micInputMs: [TRACE_EVENT.MIC_AUDIO_INPUT],
   speechConfirmedMs: [TRACE_EVENT.SPEECH_CONFIRMED],
+  endpointSoftEndBeforeReopenMs: [],
+  endpointReopenedMs: [TRACE_EVENT.ENDPOINT_REOPENED],
+  endpointSoftEndBeforeCommitMs: [],
+  endpointCommittedMs: [TRACE_EVENT.ENDPOINT_COMMITTED],
   asrFinalMs: [TRACE_EVENT.ASR_FINAL],
   llmRequestMs: [TRACE_EVENT.LLM_REQUEST],
   llmFirstOutputMs: [TRACE_EVENT.LLM_FIRST_TOKEN, TRACE_EVENT.LLM_RESPONSE],
@@ -292,46 +301,294 @@ function durationBetween(milestones, start, end) {
     : null;
 }
 
+function durationsFromMilestones(milestones) {
+  return {
+    speechToAsrFinalMs: durationBetween(milestones, "speechConfirmedMs", "asrFinalMs"),
+    softEndToReopenedMs: durationBetween(
+      milestones,
+      "endpointSoftEndBeforeReopenMs",
+      "endpointReopenedMs",
+    ),
+    softEndToCommittedMs: durationBetween(
+      milestones,
+      "endpointSoftEndBeforeCommitMs",
+      "endpointCommittedMs",
+    ),
+    endpointCommittedToAsrFinalMs: durationBetween(
+      milestones,
+      "endpointCommittedMs",
+      "asrFinalMs",
+    ),
+    asrToLlmFirstOutputMs: durationBetween(milestones, "asrFinalMs", "llmFirstOutputMs"),
+    llmRequestToTtsFirstAudioMs: durationBetween(
+      milestones,
+      "llmRequestMs",
+      "ttsFirstAudioMs",
+    ),
+    ttsRequestToFirstAudioMs: durationBetween(
+      milestones,
+      "ttsRequestMs",
+      "ttsFirstAudioMs",
+    ),
+    ttsFirstAudioToPlaybackMs: durationBetween(
+      milestones,
+      "ttsFirstAudioMs",
+      "playbackStartedMs",
+    ),
+    speechToPlaybackMs: durationBetween(
+      milestones,
+      "speechConfirmedMs",
+      "playbackStartedMs",
+    ),
+  };
+}
+
+function roundMetric(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function summarizeDistribution(values) {
+  const sorted = values
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .map(roundMetric)
+    .sort((a, b) => a - b);
+  if (!sorted.length) return { count: 0, p50: null, p95: null };
+  const nearestRank = (percentile) =>
+    sorted[Math.max(0, Math.ceil((percentile / 100) * sorted.length) - 1)];
+  return {
+    count: sorted.length,
+    p50: nearestRank(50),
+    p95: nearestRank(95),
+  };
+}
+
+function summarizeCandidateOutcomes(events) {
+  const confirmed = [];
+  const rejected = [];
+  let pendingAt = null;
+  let unmatchedCandidates = 0;
+  for (const event of events) {
+    if (event.eventType === TRACE_EVENT.SPEECH_CANDIDATE) {
+      if (pendingAt !== null) unmatchedCandidates += 1;
+      pendingAt = event.timestampMs;
+    } else if (
+      pendingAt !== null &&
+      (event.eventType === TRACE_EVENT.SPEECH_CONFIRMED ||
+        event.eventType === TRACE_EVENT.SPEECH_REJECTED)
+    ) {
+      const duration = event.timestampMs - pendingAt;
+      if (duration >= 0) {
+        (event.eventType === TRACE_EVENT.SPEECH_CONFIRMED ? confirmed : rejected).push(
+          duration,
+        );
+      }
+      pendingAt = null;
+    }
+  }
+  if (pendingAt !== null) unmatchedCandidates += 1;
+  return {
+    candidateToConfirmedMs: summarizeDistribution(confirmed),
+    candidateToRejectedMs: summarizeDistribution(rejected),
+    unmatchedCandidates,
+  };
+}
+
+function maxMetric(events, name) {
+  let max = 0;
+  let seen = false;
+  for (const event of events) {
+    const value = event.metrics?.[name];
+    if (!Number.isFinite(value) || value < 0) continue;
+    max = Math.max(max, value);
+    seen = true;
+  }
+  return seen ? roundMetric(max) : null;
+}
+
 /** Derive per-generation phase latency without consulting a wall clock. */
 export function summarizeTraceLatency(events, generationId) {
   const safeEvents = Array.isArray(events) ? events : [];
   const targetGeneration = Number.isSafeInteger(generationId)
     ? generationId
     : safeEvents.reduce((max, event) => Math.max(max, event.generationId || 0), 0);
-  const milestones = {};
-  for (const [name, eventTypes] of Object.entries(LATENCY_MILESTONES)) {
-    const event = safeEvents.find(
-      (item) => item.generationId === targetGeneration && eventTypes.includes(item.eventType),
-    );
-    milestones[name] = event?.timestampMs ?? null;
+  let summary = emptyLatencySummary(targetGeneration);
+  for (const event of safeEvents) {
+    if (event.generationId === targetGeneration) {
+      summary = updateLatencySummary(summary, event);
+    }
   }
   return {
     generationId: targetGeneration,
+    milestones: summary.milestones,
+    durations: summary.durations,
+  };
+}
+
+function emptyLatencySummary(generationId) {
+  const milestones = Object.fromEntries(
+    Object.keys(LATENCY_MILESTONES).map((name) => [name, null]),
+  );
+  return {
+    generationId,
     milestones,
-    durations: {
-      speechToAsrFinalMs: durationBetween(milestones, "speechConfirmedMs", "asrFinalMs"),
-      asrToLlmFirstOutputMs: durationBetween(milestones, "asrFinalMs", "llmFirstOutputMs"),
-      llmRequestToTtsFirstAudioMs: durationBetween(
-        milestones,
-        "llmRequestMs",
-        "ttsFirstAudioMs",
-      ),
-      ttsRequestToFirstAudioMs: durationBetween(
-        milestones,
-        "ttsRequestMs",
-        "ttsFirstAudioMs",
-      ),
-      ttsFirstAudioToPlaybackMs: durationBetween(
-        milestones,
-        "ttsFirstAudioMs",
-        "playbackStartedMs",
-      ),
-      speechToPlaybackMs: durationBetween(
-        milestones,
-        "speechConfirmedMs",
-        "playbackStartedMs",
-      ),
+    durations: durationsFromMilestones(milestones),
+    lastEndpointSoftEndMs: null,
+  };
+}
+
+function updateLatencySummary(summary, event) {
+  const next = {
+    generationId: summary.generationId,
+    milestones: { ...summary.milestones },
+    lastEndpointSoftEndMs: summary.lastEndpointSoftEndMs,
+  };
+  if (event.eventType === TRACE_EVENT.ENDPOINT_SOFT_END) {
+    next.lastEndpointSoftEndMs = event.timestampMs;
+  } else if (
+    event.eventType === TRACE_EVENT.ENDPOINT_REOPENED &&
+    next.milestones.endpointReopenedMs === null
+  ) {
+    next.milestones.endpointSoftEndBeforeReopenMs = next.lastEndpointSoftEndMs;
+  } else if (
+    event.eventType === TRACE_EVENT.ENDPOINT_COMMITTED &&
+    next.milestones.endpointCommittedMs === null
+  ) {
+    next.milestones.endpointSoftEndBeforeCommitMs = next.lastEndpointSoftEndMs;
+  }
+  for (const [name, eventTypes] of Object.entries(LATENCY_MILESTONES)) {
+    if (next.milestones[name] === null && eventTypes.includes(event.eventType)) {
+      next.milestones[name] = event.timestampMs;
+    }
+  }
+  next.durations = durationsFromMilestones(next.milestones);
+  return next;
+}
+
+function safeEnum(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
+function sanitizeAppVersion(value) {
+  const version = String(value || "").trim();
+  return /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version) ? version : null;
+}
+
+function sanitizeRuntimeSummary(runtime) {
+  const value = runtime && typeof runtime === "object" ? runtime : {};
+  return {
+    provider: normalizeProvider(value.provider),
+    playbackMode: safeEnum(value.playbackMode, ["worklet", "legacy", "none"], "none"),
+    downlinkAudio: safeEnum(value.downlinkAudio, ["managed-v1", "raw"], "raw"),
+    ttsStream: safeEnum(value.ttsStream, ["provider-pcm-v1", "none"], "none"),
+    interruptionHint: safeEnum(
+      value.interruptionHint,
+      ["candidate-snapshot-v1", "none"],
+      "none",
+    ),
+  };
+}
+
+function sanitizeLatencySummary(summary) {
+  if (!summary || !Number.isSafeInteger(summary.generationId) || summary.generationId < 0) {
+    return null;
+  }
+  const milestones = {};
+  for (const name of Object.keys(LATENCY_MILESTONES)) {
+    const value = summary.milestones?.[name];
+    milestones[name] = Number.isFinite(value) && value >= 0 ? value : null;
+  }
+  return {
+    generationId: summary.generationId,
+    milestones,
+    durations: durationsFromMilestones(milestones),
+  };
+}
+
+/**
+ * Re-sanitize a snapshot into the only JSON shape exposed to users.
+ * The report never trusts caller-supplied objects and stays bounded even when
+ * used with imported fixtures instead of a live RealtimeTrace snapshot.
+ */
+export function buildRealtimeDiagnosticReport(snapshot) {
+  const source = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const sourceEvents = Array.isArray(source.events) ? source.events : [];
+  const candidateEvents = sourceEvents.slice(-MAX_DIAGNOSTIC_EVENTS);
+  const events = [];
+  const sessionIds = new Map();
+  const turnIds = new Map();
+  const responseIds = new Map();
+  const aliasId = (value, prefix, aliases) => {
+    if (!value) return null;
+    if (!aliases.has(value)) aliases.set(value, `${prefix}-${aliases.size + 1}`);
+    return aliases.get(value);
+  };
+  let rejectedItems = 0;
+  for (const event of candidateEvents) {
+    try {
+      if (event?.schemaVersion !== TRACE_SCHEMA_VERSION) throw new Error("schema mismatch");
+      const safe = createTraceEvent(event);
+      events.push(
+        createTraceEvent({
+          ...safe,
+          sessionId: aliasId(safe.sessionId, "session", sessionIds),
+          turnId: aliasId(safe.turnId, "turn", turnIds),
+          responseId: aliasId(safe.responseId, "response", responseIds),
+        }),
+      );
+    } catch {
+      rejectedItems += 1;
+    }
+  }
+
+  const sourceLatencies = Array.isArray(source.latencies)
+    ? source.latencies
+    : source.latency
+      ? [source.latency]
+      : [];
+  const latencies = [];
+  for (const summary of sourceLatencies.slice(-MAX_LATENCY_SUMMARIES)) {
+    const safe = sanitizeLatencySummary(summary);
+    if (safe) latencies.push(safe);
+    else rejectedItems += 1;
+  }
+
+  const sourceDroppedEvents = Number.isSafeInteger(source.droppedEvents)
+    ? Math.max(0, source.droppedEvents)
+    : 0;
+  const coalescedPlaybackStats = Number.isSafeInteger(source.coalescedPlaybackStats)
+    ? Math.max(0, source.coalescedPlaybackStats)
+    : 0;
+  const latency = {};
+  for (const name of Object.keys(durationsFromMilestones({}))) {
+    latency[name] = summarizeDistribution(
+      latencies.map((summary) => summary.durations[name]),
+    );
+  }
+  return {
+    diagnosticSchemaVersion: REALTIME_DIAGNOSTIC_SCHEMA_VERSION,
+    traceSchemaVersion: TRACE_SCHEMA_VERSION,
+    appVersion: sanitizeAppVersion(source.appVersion),
+    runtime: sanitizeRuntimeSummary(source.runtime),
+    exportStats: {
+      sourceDroppedEvents,
+      truncatedEvents: Math.max(0, sourceEvents.length - MAX_DIAGNOSTIC_EVENTS),
+      rejectedItems,
+      coalescedPlaybackStats,
     },
+    aggregate: {
+      latency,
+      interruptions: summarizeCandidateOutcomes(events),
+      playback: {
+        maxSampledQueuedMs:
+          maxMetric(events, "maxQueuedMs") ?? maxMetric(events, "queuedMs"),
+        droppedSamples: maxMetric(events, "droppedSamples"),
+        playedSamples: maxMetric(events, "playedSamples"),
+        drainInclusiveUnderruns: maxMetric(events, "underruns"),
+        underrunSemantics: "includes-natural-drain",
+      },
+    },
+    latencies,
+    events,
   };
 }
 
@@ -360,6 +617,8 @@ export class RealtimeTrace {
     this.generationId = 0;
     this.originMs = 0;
     this._once = new Set();
+    this._latencyByGeneration = new Map();
+    this.coalescedPlaybackStats = 0;
   }
 
   startSession() {
@@ -372,6 +631,8 @@ export class RealtimeTrace {
     this.droppedEvents = 0;
     this.state = createReplayState();
     this._once.clear();
+    this._latencyByGeneration.clear();
+    this.coalescedPlaybackStats = 0;
     return this.record(TRACE_EVENT.SESSION_STARTED);
   }
 
@@ -399,7 +660,7 @@ export class RealtimeTrace {
   record(eventType, { reason = null, metrics = {}, turnId, responseId, generationId } = {}) {
     if (!this.sessionId) return null;
     const elapsed = Math.max(0, this.clock() - this.originMs);
-    const event = createTraceEvent({
+    let event = createTraceEvent({
       eventType,
       timestampMs: Math.round(elapsed * 1000) / 1000,
       sessionId: this.sessionId,
@@ -412,11 +673,47 @@ export class RealtimeTrace {
       metrics,
     });
     this.state = reduceTraceEvent(this.state, event);
-    if (this.events.length >= this.maxEvents) {
-      this.events.shift();
-      this.droppedEvents += 1;
+    if (event.generationId > 0) {
+      if (!this._latencyByGeneration.has(event.generationId)) {
+        while (this._latencyByGeneration.size >= MAX_LATENCY_SUMMARIES) {
+          this._latencyByGeneration.delete(this._latencyByGeneration.keys().next().value);
+        }
+        this._latencyByGeneration.set(
+          event.generationId,
+          emptyLatencySummary(event.generationId),
+        );
+      }
+      this._latencyByGeneration.set(
+        event.generationId,
+        updateLatencySummary(this._latencyByGeneration.get(event.generationId), event),
+      );
     }
-    this.events.push(event);
+    const last = this.events.at(-1);
+    if (
+      event.eventType === TRACE_EVENT.PLAYBACK_STATS &&
+      last?.eventType === TRACE_EVENT.PLAYBACK_STATS &&
+      last.generationId === event.generationId
+    ) {
+      event = createTraceEvent({
+        ...event,
+        metrics: {
+          ...event.metrics,
+          maxQueuedMs: Math.max(
+            Number(last.metrics.maxQueuedMs) || 0,
+            Number(last.metrics.queuedMs) || 0,
+            Number(event.metrics.queuedMs) || 0,
+          ),
+        },
+      });
+      this.events[this.events.length - 1] = event;
+      this.coalescedPlaybackStats += 1;
+    } else {
+      if (this.events.length >= this.maxEvents) {
+        this.events.shift();
+        this.droppedEvents += 1;
+      }
+      this.events.push(event);
+    }
     try {
       this.onEvent?.(event, this.state.lastDecision);
     } catch {
@@ -426,11 +723,20 @@ export class RealtimeTrace {
   }
 
   snapshot() {
+    const latencies = [...this._latencyByGeneration.values()].map((summary) => ({
+      generationId: summary.generationId,
+      milestones: { ...summary.milestones },
+      durations: { ...summary.durations },
+    }));
     return {
       schemaVersion: TRACE_SCHEMA_VERSION,
       droppedEvents: this.droppedEvents,
+      coalescedPlaybackStats: this.coalescedPlaybackStats,
       events: this.events.slice(),
-      latency: summarizeTraceLatency(this.events, this.generationId),
+      latency:
+        latencies.find((summary) => summary.generationId === this.generationId) ||
+        summarizeTraceLatency(this.events, this.generationId),
+      latencies,
       state: { ...this.state, lastDecision: { ...this.state.lastDecision } },
     };
   }

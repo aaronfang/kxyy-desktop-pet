@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   RealtimeTrace,
   TRACE_EVENT,
+  buildRealtimeDiagnosticReport,
   createTraceEvent,
   replayTrace,
   summarizeTraceLatency,
@@ -101,6 +102,9 @@ test("replays a normal user turn and completed response", () => {
   const latency = summarizeTraceLatency(events, 1);
   assert.deepEqual(latency.durations, {
     speechToAsrFinalMs: 60,
+    softEndToReopenedMs: null,
+    softEndToCommittedMs: null,
+    endpointCommittedToAsrFinalMs: null,
     asrToLlmFirstOutputMs: 70,
     llmRequestToTtsFirstAudioMs: null,
     ttsRequestToFirstAudioMs: 60,
@@ -258,6 +262,238 @@ test("runtime collector stays bounded and strips unsafe metadata", () => {
   assert.equal(JSON.stringify(snapshot).includes("forbidden"), false);
 });
 
+test("keeps eight generation latency summaries outside the rolling event queue", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  for (let generation = 1; generation <= 10; generation++) {
+    now += 10;
+    trace.openTurn();
+    now += 10;
+    trace.record(TRACE_EVENT.TTS_REQUEST);
+    for (let stat = 0; stat < 20; stat++) {
+      now += 1;
+      trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: stat } });
+    }
+    now += 30;
+    trace.record(TRACE_EVENT.TTS_FIRST_AUDIO);
+  }
+
+  const snapshot = trace.snapshot();
+  assert.deepEqual(snapshot.latencies.map((item) => item.generationId), [3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.equal(snapshot.latencies[0].durations.ttsRequestToFirstAudioMs, 50);
+  assert.ok(snapshot.events.length <= 16);
+  const playbackStats = snapshot.events.filter(
+    (event) => event.eventType === TRACE_EVENT.PLAYBACK_STATS,
+  );
+  assert.equal(
+    new Set(playbackStats.map((event) => event.generationId)).size,
+    playbackStats.length,
+    "each retained generation should have at most one coalesced playback stat",
+  );
+  assert.equal(snapshot.coalescedPlaybackStats, 190);
+  assert.ok(playbackStats.every((event) => event.metrics.maxQueuedMs === 19));
+});
+
+test("diagnostic export is bounded and independently strips unsafe fields", () => {
+  const events = [];
+  for (let index = 0; index < 260; index++) {
+    events.push({
+      ...fixtureEvent(TRACE_EVENT.MIC_AUDIO_INPUT, index),
+      ...(index === 259
+        ? {
+            sessionId: "sk-secret-access-token",
+            turnId: "persona-kxyy-yuanyuan",
+            responseId: "private-path-marker",
+          }
+        : {}),
+      settings: { realtimeAccessKey: "forbidden-secret" },
+      text: "forbidden-transcript",
+      metrics: { audioBytes: index, rawPcm: "forbidden-pcm" },
+    });
+  }
+  events.push({ schemaVersion: 999, text: "forbidden-invalid" });
+
+  const report = buildRealtimeDiagnosticReport({
+    appVersion: "0.2.23",
+    droppedEvents: 17,
+    coalescedPlaybackStats: 23,
+    runtime: {
+      provider: "cosy",
+      playbackMode: "worklet",
+      downlinkAudio: "managed-v1",
+      ttsStream: "provider-pcm-v1",
+      interruptionHint: "candidate-snapshot-v1",
+      url: "forbidden-url",
+    },
+    events,
+    latencies: [summarizeTraceLatency(events, 0)],
+    persona: "forbidden-persona",
+  });
+
+  assert.deepEqual(report.runtime, {
+    provider: "cosyvoice",
+    playbackMode: "worklet",
+    downlinkAudio: "managed-v1",
+    ttsStream: "provider-pcm-v1",
+    interruptionHint: "candidate-snapshot-v1",
+  });
+  assert.deepEqual(report.exportStats, {
+    sourceDroppedEvents: 17,
+    truncatedEvents: 5,
+    rejectedItems: 1,
+    coalescedPlaybackStats: 23,
+  });
+  assert.equal(report.appVersion, "0.2.23");
+  assert.equal(report.events.length, 255);
+  assert.equal(report.events.at(-1).metrics.audioBytes, 259);
+  assert.deepEqual(
+    {
+      sessionId: report.events.at(-1).sessionId,
+      turnId: report.events.at(-1).turnId,
+      responseId: report.events.at(-1).responseId,
+    },
+    { sessionId: "session-2", turnId: "turn-1", responseId: "response-1" },
+  );
+  const json = JSON.stringify(report);
+  for (const forbidden of [
+    "forbidden-secret",
+    "forbidden-transcript",
+    "forbidden-pcm",
+    "forbidden-url",
+    "forbidden-persona",
+    "sk-secret-access-token",
+    "persona-kxyy-yuanyuan",
+    "private-path-marker",
+  ]) {
+    assert.equal(json.includes(forbidden), false);
+  }
+});
+
+test("diagnostic export fails closed on unknown runtime capability values", () => {
+  const report = buildRealtimeDiagnosticReport({
+    runtime: {
+      provider: "custom-provider",
+      playbackMode: "future-mode",
+      downlinkAudio: "future-envelope",
+      ttsStream: "future-stream",
+      interruptionHint: "future-hint",
+    },
+  });
+  assert.deepEqual(report.runtime, {
+    provider: "unknown",
+    playbackMode: "none",
+    downlinkAudio: "raw",
+    ttsStream: "none",
+    interruptionHint: "none",
+  });
+});
+
+test("diagnostic report aggregates latency and interruption distributions", () => {
+  const latencies = [100, 200, 300].map((ttfa, index) => ({
+    generationId: index + 1,
+    milestones: {
+      endpointSoftEndBeforeCommitMs: 10,
+      endpointCommittedMs: 40 + index * 10,
+      ttsRequestMs: 1000,
+      ttsFirstAudioMs: 1000 + ttfa,
+    },
+  }));
+  const report = buildRealtimeDiagnosticReport({
+    latencies,
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 10, { generationId: 1 }),
+      fixtureEvent(TRACE_EVENT.SPEECH_CONFIRMED, 40, { generationId: 1 }),
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 100, { generationId: 2 }),
+      fixtureEvent(TRACE_EVENT.SPEECH_REJECTED, 150, { generationId: 2 }),
+      fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, 160, {
+        generationId: 2,
+        metrics: { queuedMs: 220, maxQueuedMs: 480, droppedSamples: 12, underruns: 3 },
+      }),
+    ],
+  });
+
+  assert.deepEqual(report.aggregate.latency.ttsRequestToFirstAudioMs, {
+    count: 3,
+    p50: 200,
+    p95: 300,
+  });
+  assert.deepEqual(report.aggregate.latency.softEndToCommittedMs, {
+    count: 3,
+    p50: 40,
+    p95: 50,
+  });
+  assert.deepEqual(report.aggregate.interruptions.candidateToConfirmedMs, {
+    count: 1,
+    p50: 30,
+    p95: 30,
+  });
+  assert.deepEqual(report.aggregate.interruptions.candidateToRejectedMs, {
+    count: 1,
+    p50: 50,
+    p95: 50,
+  });
+  assert.deepEqual(report.aggregate.playback, {
+    maxSampledQueuedMs: 480,
+    droppedSamples: 12,
+    playedSamples: null,
+    drainInclusiveUnderruns: 3,
+    underrunSemantics: "includes-natural-drain",
+  });
+});
+
+test("endpoint latency pairs commit with the latest soft end after a reopen", () => {
+  const latency = summarizeTraceLatency(
+    [
+      fixtureEvent(TRACE_EVENT.ENDPOINT_SOFT_END, 10, { generationId: 1 }),
+      fixtureEvent(TRACE_EVENT.ENDPOINT_REOPENED, 25, { generationId: 1 }),
+      fixtureEvent(TRACE_EVENT.ENDPOINT_SOFT_END, 100, { generationId: 1 }),
+      fixtureEvent(TRACE_EVENT.ENDPOINT_COMMITTED, 150, { generationId: 1 }),
+      fixtureEvent(TRACE_EVENT.ASR_FINAL, 180, { generationId: 1 }),
+    ],
+    1,
+  );
+  assert.equal(latency.durations.softEndToReopenedMs, 15);
+  assert.equal(latency.durations.softEndToCommittedMs, 50);
+  assert.equal(latency.durations.endpointCommittedToAsrFinalMs, 30);
+});
+
+test("diagnostic report preserves an end-to-end recovery chain after cancellation", () => {
+  const events = [
+    fixtureEvent(TRACE_EVENT.RESPONSE_STARTED, 10, {
+      generationId: 1,
+      responseId: "old-response",
+    }),
+    fixtureEvent(TRACE_EVENT.RESPONSE_CANCELLED, 20, {
+      generationId: 1,
+      responseId: "old-response",
+      reason: "turn_detected",
+    }),
+    fixtureEvent(TRACE_EVENT.SPEECH_CONFIRMED, 30, { generationId: 2 }),
+    fixtureEvent(TRACE_EVENT.ASR_FINAL, 80, { generationId: 2 }),
+    fixtureEvent(TRACE_EVENT.TTS_REQUEST, 100, { generationId: 2 }),
+    fixtureEvent(TRACE_EVENT.TTS_FIRST_AUDIO, 180, { generationId: 2 }),
+    fixtureEvent(TRACE_EVENT.PLAYBACK_STARTED, 190, { generationId: 2 }),
+    fixtureEvent(TRACE_EVENT.RESPONSE_COMPLETED, 500, {
+      generationId: 2,
+      reason: "completed",
+    }),
+  ];
+  const report = buildRealtimeDiagnosticReport({ events });
+  assert.deepEqual(
+    report.events.map((event) => [event.generationId, event.eventType]),
+    events.map((event) => [event.generationId, event.eventType]),
+  );
+  assert.equal(report.events[0].responseId, "response-1");
+  assert.equal(report.events[1].responseId, "response-1");
+});
+
 test("schema rejects text-like identifiers and trace callbacks cannot break recording", () => {
   assert.throws(
     () => fixtureEvent(TRACE_EVENT.SESSION_STARTED, 0, { sessionId: "完整用户文本 不应成为 ID" }),
@@ -344,6 +580,23 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
+  local.trace.startSession();
+  local._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      interruptionHint: "candidate-snapshot-v1",
+      ttsStream: "provider-pcm-v1",
+    }),
+  });
+  assert.deepEqual(local.getTraceSnapshot().runtime, {
+    provider: "local",
+    playbackMode: "worklet",
+    downlinkAudio: "managed-v1",
+    ttsStream: "provider-pcm-v1",
+    interruptionHint: "candidate-snapshot-v1",
+  });
 
   const cosy = new RealtimeSession({ provider: "cosyvoice" });
   cosy._playbackMode = "worklet";
@@ -1225,6 +1478,30 @@ test("local response stays active across stable-sentence TTS gaps", async () => 
   session._onMessage({ data: JSON.stringify({ type: "tts_end", generation: 1 }) });
   await new Promise((resolve) => setTimeout(resolve, 350));
   assert.equal(session.trace.state.response, "completed");
+});
+
+test("stop records a final diagnostic snapshot before audio cleanup settles", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  session.trace.startSession();
+  session.trace.startResponse();
+  session.audioCtx = {
+    currentTime: 0,
+    close: () => new Promise(() => {}),
+  };
+
+  void session.stop();
+  const snapshot = session.getTraceSnapshot();
+  assert.equal(session.stopped, true);
+  assert.equal(snapshot.state.lifecycle, "ended");
+  assert.deepEqual(
+    snapshot.events.slice(-2).map((event) => [event.eventType, event.reason]),
+    [
+      [TRACE_EVENT.RESPONSE_CANCELLED, "hangup"],
+      [TRACE_EVENT.SESSION_ENDED, "hangup"],
+    ],
+  );
 });
 
 test("desktop session records privacy-safe soft endpoint transitions", async () => {

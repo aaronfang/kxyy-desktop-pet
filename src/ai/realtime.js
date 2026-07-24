@@ -150,7 +150,7 @@ export class RealtimeSession {
     this._unsubVol = null;
     this._micPrepare = null; // 在用户手势栈内发起的 getUserMedia Promise
     this.playbackNode = null;
-    this._playbackMode = "legacy";
+    this._playbackMode = "none";
     this._playbackQueuedMs = 0;
     this._audioGate = false;
     this._speechCandidate = false;
@@ -1283,6 +1283,15 @@ export class RealtimeSession {
 
   /** 返回隐私安全、固定上限的 trace 快照，供诊断或导出测试夹具。 */
   getTraceSnapshot() {
-    return this.trace.snapshot();
+    return {
+      ...this.trace.snapshot(),
+      runtime: {
+        provider: this.trace.provider,
+        playbackMode: this._playbackMode,
+        downlinkAudio: this._downlinkAudioMode,
+        ttsStream: this._ttsStreamingMode,
+        interruptionHint: this._interruptionHintMode,
+      },
+    };
   }
 }
