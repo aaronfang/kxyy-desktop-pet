@@ -119,6 +119,9 @@ class SileroCapability:
                     confirm_frames=3,
                     reject_frames=3,
                     end_frames=8,
+                    # 96 model frames = 3.072s. This is a shadow/offline
+                    # mechanical ceiling, not a validated live threshold.
+                    candidate_max_frames=96,
                 ),
             )
 

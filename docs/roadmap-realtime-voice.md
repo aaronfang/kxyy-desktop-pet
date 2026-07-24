@@ -6,7 +6,7 @@
 
 本工程的火山后端是端到端实时语音模型，本地后端则是 VAD、ASR、LLM、TTS 级联管线。二者不应强行合并成同一种实现，但应通过统一的前端会话事件、播放缓冲和响应代号获得一致的打断体验。
 
-可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 Whisper。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow。Windows/Linux PyTorch、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、candidate 最大时长、阈值/超时验收和字/音素级恢复仍是后续工作。CosyVoice 的真实字节序/TTFA/听感与 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性 fake transport 或真实模型能够执行就宣称体验改善。
+可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 Whisper。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator。Windows/Linux PyTorch、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。CosyVoice 的真实字节序/TTFA/听感与 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性 fake transport、合成 evaluator 或真实模型能够执行就宣称体验改善。
 
 情绪语音不能只靠增加一个 `emotion` 字段解决。当前能力应按后端区分：
 
@@ -204,7 +204,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **设计占位，尚未上线**：`common.py::Session` 没有导入上述模块，默认 App 继续精确使用现有 480-sample / 30ms RMS 判定、soft endpoint 和 ASR 流程；fallback 也没有把 RMS 冒充为模型 probability。此版不分发 Silero 权重，不安装 ONNX Runtime，不修改 live 阈值、3 秒 ring、adaptive endpoint、provider 协议或火山常量。迟滞中间带保留 latch 的纯机械语义尚无真实声学超时参数，因此不能驱动前端 duck/confirmed。
 
-**待实验**：公开许可真人/房间回声录音仍为零，加入前必须升级 schema 并独立审核具体音频的许可、署名、商业/衍生授权和声音同意，不能用 SPDX 名称或布尔值代替证据。未来 Silero 路径需固定官方 tag、权重 hash、许可证与 512-sample recurrent contract，并为 macOS arm64/x64、Windows、Python 3.10–3.14 分别验证 ORT wheel；真实推理必须放入独立单 worker/queue=1，不能阻塞 WebSocket event loop 或占用 `_mlx_pool`。在真实回放阈值和 candidate 最大时长验证前，线上 RMS 保持权威路径。
+**该版本的待实验边界**：公开许可真人/房间回声录音仍为零，加入前必须升级 schema 并独立审核具体音频的许可、署名、商业/衍生授权和声音同意，不能用 SPDX 名称或布尔值代替证据。这里列出的固定官方 tag、权重 hash、许可证、512-sample recurrent contract、受支持 ORT matrix 与独立 single-worker/queue=1 已在 0.2.26 实现；0.2.27 又补了纯 frame 机械 deadline。但许可录音、live 单调时钟上限和真实回放阈值仍未实现，线上 RMS 继续保持权威路径。
 
 ### 2.19 P2 bounded VAD shadow worker（已实现，0.2.25）
 
@@ -216,7 +216,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **已验证**：真实 `Session.on_pcm` 的 8 个 320-sample / 20ms frontend chunk 会在 fake scorer 中形成 5 个连续 512-sample frame。blocking scorer 回放覆盖 queue overflow、waiting replacement、旧结果丢弃、non-blocking double close 和 admission 释放；factory 错误不泄露异常。既有六个合成 PCM 场景使用 always-high shadow 与无 shadow 做 A/B，WebSocket 控制事件、commit PCM、endpoint 与 RMS 状态完全一致。
 
-**仍未实现/待实验**：本版不含 Silero/ORT/真实 scorer，没有用户可感知的打断改善，也不能把 `shadow-v1` fake 测试解释成模型准确率。官方 ORT wheel 无法用单一版本覆盖 macOS arm64/x64、Windows 与 Python 3.10–3.14，所以下一版必须采用 capability-gated optional runtime：支持组合才启用真实 shadow，不支持或故障明确 `unavailable`，且不影响语音服务启动。candidate 最大时长、阈值、真实许可录音和 live confirmed/rejected 接管继续待数据验证。
+**0.2.25 当时仍未实现/待实验**：该版本不含 Silero/ORT/真实 scorer，没有用户可感知的打断改善，也不能把 `shadow-v1` fake 测试解释成模型准确率。0.2.26 已按这里的门槛采用 capability-gated optional runtime：支持组合才启用真实 shadow，不支持或故障固定为 `unavailable`，且不影响语音服务启动。0.2.27 已补纯 frame 机械 deadline；live 单调时钟上限、阈值、真实许可录音和 live confirmed/rejected 接管仍待数据验证。
 
 ### 2.20 P2 capability-gated 真实 Silero shadow（已实现，0.2.26）
 
@@ -230,7 +230,17 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **设计占位，尚未接管**：真实 Silero probability 不驱动 candidate、confirmed/rejected、endpoint、Whisper 提交、播放 ring 或历史；RMS 仍是唯一实时决策路径。没有周期 probability/aggregate 遥测，没有 provider 切换，也没有修改火山协议常量。开关关闭、`warming`、`busy`、`unavailable` 与 scorer fault 都保持 0.2.25 行为。
 
-**待实验**：仓库仍没有已审核许可、声音同意与商业/衍生使用边界的真人/房间回声录音。下一步先建立声学回放集并定义 candidate 最大持续时间，再离线验证概率阈值、迟滞、超时、误候选恢复和 30 分钟误打断目标；只有该证据和真实设备 p95 均达标后，才设计最小 live takeover。不能把 `silero-onnx-shadow-v1` 理解为准确率或体验已经改善。
+**待实验**：仓库仍没有已审核许可、声音同意与商业/衍生使用边界的真人/房间回声录音。0.2.27 的纯 frame deadline 只解决 shadow latch 的机械有界性；下一步仍需建立声学回放集、定义 live 单调时钟 candidate 最大持续时间，再离线验证概率阈值、迟滞、超时、误候选恢复和 30 分钟误打断目标。只有该证据和真实设备 p95 均达标后，才设计最小 live takeover。不能把 `silero-onnx-shadow-v1` 理解为准确率或体验已经改善。
+
+### 2.21 P2 candidate frame deadline 与 aggregate evaluator（已实现，0.2.27）
+
+`ProbabilityVadState` 现在要求显式 `candidate_max_frames`，并以 4096 frame 为代码硬上限；配置还必须保留完整 confirm 与 reject 路径。candidate 首个 high frame 记 age=1，此后每个已通过数值校验、属于当前 generation 且被连续处理的 high/low/迟滞中间带 frame 都推进 age。声学 confirmed/rejected 在截止 frame 上优先；只有处理完该 frame 后仍停留 candidate 才产生独立内部事件 `candidate_timeout` 并清空 phase/streak/age。invalid probability、scorer fault、reset/close、generation/epoch 切换都不消费或继承预算，也不会补发终止事件。Silero shadow 暂用 96×512 samples=3.072 秒机械保护值；它只限制 shadow 状态 latch，不能解释为用户开口的墙钟上限，worker stall/overflow 不推进 frame age，未来 live takeover 仍需独立 `perf_counter` watchdog 与实测数值。
+
+`vad_evaluator.py` 是未接入 Session/Tauri resource 的纯标准库离线模块。调用方逐 case 提供总 samples、最多 256 个有序不重叠 speech interval 与流式 PCM chunk；既有 pipeline 立即消费 PCM，单次输入仍不超过 64 个模型 frame，只保留 `<1024 bytes` 组帧余量、最多 4096 个固定事件和 frame/sample 数字。默认 limit 为 32 cases；代码硬上限为 64 cases、每 case 56,250 frames、总计 262,144 frames。case 结果事务提交：scorer/factory/NaN/越界/limit 失败会丢弃该 case 已产生的局部事件、tail 与延迟，只增加 fixed fallback/limited counter；异常文本绝不进入报告。报告 schema v1 只有固定 case/frame/truth/event/classification 计数、整数 ppm 和固定 bucket 的 p50/p95/max，不包含逐 case id、概率、PCM、路径、文本、persona、provider 或异常详情。
+
+**已验证**：确定性测试覆盖 deadline off-by-one、同截止 frame confirm/reject 优先、invalid 不消费预算、generation reset、worker timeout aggregate、clean speech/短脉冲/悬空 timeout/miss/持续 false confirm、512/480/奇数字节切包等价、fault 事务回滚、下一 case 恢复、tail/limit/lifecycle 与固定小报告隐私。全部使用内存合成 PCM 和注入 scorer，不需要账号、麦克风、NumPy、ORT 或模型。
+
+**设计占位，仍拒绝录音**：`acoustic_manifest.py` schema v1 继续是唯一 executable allowlist，只接受 project-generated synthetic spec；本版没有用虚构 consent fixture 开放 recorded-audio 正向路径。未来 schema v2 必须为每个具体素材固定 upstream revision/hash、许可证文本快照与 attribution、redistribution/commercial/derivative/ML scope、独立声音同意 evidence reference、衍生链、bounded sample-offset ground truth 及 rights/consent/privacy 人工复核记录。公开可下载、SPDX/布尔字段或 dataset license 都不能单独等同于说话者同意。真人/房间回声素材、threshold sweep、30 分钟误打断和真实设备 p95 仍待获得具体合法数据后实验；RMS 继续是唯一线上决策路径。
 
 ## 3. 外部工程对比
 
@@ -434,7 +444,8 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - **已实现（0.2.24 纯状态基础）**：有界 512-sample 组帧、显式概率迟滞、generation/reset/reentrant/fallback 隔离和 fake scorer 回放；模块未接 `Session`，不能称为神经 VAD 上线。
 - **已实现（0.2.25 shadow 基础）**：dedicated single worker、queue=1、全进程 admission=1、overflow epoch/reset、迟到丢弃和 Session 生命周期旁路；默认无 factory，RMS 行为不变。
 - **已实现（0.2.26 真实 shadow）**：显式 opt-in、固定 Silero v6.2.1 模型、ABI 精确且 hash-locked 的可选 ORT runtime、真实 recurrent scorer、tokenized 单 Session lease 和固定 capability enum；模型仍不参与线上决策。
-- **待实现**：许可声学回放、候选最大时长、阈值/超时实验、噪声自适应和满足 p95 600ms 目标的 adaptive endpoint；当前不能把真实 shadow 称为神经 VAD 完整方案或 live takeover。
+- **已实现（0.2.27 deadline/evaluator 基础）**：纯 frame candidate budget、独立内部 timeout event、有界流式 case evaluator、事务 aggregate、固定延迟桶与 synthetic/fake-scorer 隐私测试；96-frame Silero 值仅为 shadow 机械保护，不是 live 数值结论。
+- **待实现**：许可声学回放、live 单调时钟候选上限、阈值/超时实验、噪声自适应和满足 p95 600ms 目标的 adaptive endpoint；当前不能把真实 shadow 或合成 evaluator 称为神经 VAD 完整方案或 live takeover。
 - **待实验**：实测 CosyVoice PCM 字节序/TTFA 与 macOS MLX Qwen TTFA/接缝/取消资源恢复；Windows/Linux 继续等待官方音频 iterator。不得把整段音频再切块冒充真 streaming。
 
 ### P3：情绪闭环
@@ -463,6 +474,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 | 中文停顿 | 句中停顿 300–900ms 后继续 | soft-end 可 reopen，不拆成两轮 |
 | VAD adapter 基础 | 480→512 cadence、奇数字节切包、非法概率、批内故障、stale/reentrant generation、synthetic manifest 路径/hash/许可 | 余量与队列有界；故障只发一次固定 fallback；旧代不污染新代；schema v1 不接纳录音 |
 | VAD shadow worker | 1 in-flight + 1 waiting、overflow epoch、blocked scorer late result、double close、admission、六场景 RMS A/B | producer 不阻塞；缺口不串帧；迟到不发布；默认无 scorer；控制事件/commit PCM 不变 |
+| Candidate deadline / evaluator | deadline N-1/N、截止 frame confirm/reject 优先、invalid/reset/generation、clean/miss/false alarm/timeout、512/480/奇数字节、fault/limit/tail/privacy | 纯 frame budget 有界且不冒充墙钟；case 事务聚合；报告无逐 case、概率、PCM、路径、文本或异常；不接 live |
 | 情绪 | 每种 style 的固定文本集 | 人工盲测 + 情绪分类器一致性 |
 | 音色 | neutral 与情绪 prompt 对比 | CAM++ 相似度不显著低于 neutral 基线 |
 | 性能 | 冷启动、热启动、首 token、首音频 | 记录 p50/p95、TTFA、RTF、内存/显存 |
@@ -478,12 +490,12 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - Qwen 官方声称的最低合成延迟是特定条件下的模型指标，不能直接写成本工程端到端承诺。
 - 火山模型版本、复刻音色类型、角色控制字段和动态更新事件存在账号/商品差异，实施前必须用当前账号文档和真实请求验证。
 - `KXAU`/`managed-v1` 只属于桌面本地/CosyVoice 级联协议，不能据此推断或修改火山帧布局、事件码或任何协议常量。
-- 0.2.26 已可显式运行真实 Silero shadow，但它没有决策权；不得把模型可执行、fake probability、shadow event count 或 RMS 数值写成准确率/体验改善，也不得在 candidate 超时和许可声学阈值验证前驱动线上打断。
+- 0.2.27 已让 Silero shadow candidate latch 与离线 evaluator 机械有界，但模型仍没有决策权；不得把 96-frame 保护值、合成 aggregate、模型可执行、fake probability、shadow event count 或 RMS 数值写成准确率/体验改善，也不得在 live 单调时钟 deadline 和许可声学阈值验证前驱动线上打断。
 - 复制 Apache-2.0 项目代码时保留许可证、版权和修改说明；优先重新实现所需机制。
 
 ## 9. 推荐决策
 
-1. 播放 Worklet、两阶段打断测试版、candidate-bound interrupted UX、VAD adapter、bounded worker 与 capability-gated Silero/ORT 真实 shadow 已完成；下一步建立许可声学回放并决定候选最大时长、概率阈值与超时，unsupported/fault 继续明确回退，不能直接替换 RMS。
+1. 播放 Worklet、两阶段打断测试版、candidate-bound interrupted UX、VAD adapter、bounded worker、capability-gated Silero/ORT 真实 shadow、纯 frame deadline 与 aggregate evaluator 已完成；下一步建立许可声学回放并决定 live 单调时钟上限、概率阈值与超时，unsupported/fault 继续明确回退，不能直接替换 RMS。
 2. 固定 2 秒判停、LLM SSE、句级 audible history、有界有序 TTS consumer、本地/CosyVoice managed identity、一次性 interrupted hint、CosyVoice PCM、macOS MLX Qwen 真流式 adapter 与诊断导出入口已完成测试切片；继续按 2.17 runbook 用真实 CosyVoice 账号和 Apple Silicon runtime 分别验证 PCM/TTFA/接缝/取消恢复。Windows/Linux Qwen 在官方公开音频 iterator 前保持整句，3 秒 ring 在快速确认实测前不收紧。
 3. 情绪路线默认保证复刻音色；CosyVoice 作为“复刻 + instruction”的表现力基准，Qwen CustomVoice 作为可选模式。
 4. SenseVoice 先作为 final ASR/SER 实验后端，不直接承担快速打断或 partial transcript。

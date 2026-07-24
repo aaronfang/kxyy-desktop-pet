@@ -44,6 +44,7 @@ def new_state(**overrides):
         "confirm_frames": 3,
         "reject_frames": 2,
         "end_frames": 3,
+        "candidate_max_frames": 8,
     }
     config.update(overrides)
     return vad.ProbabilityVadState(**config)
@@ -191,10 +192,67 @@ class ProbabilityVadStateTests(unittest.TestCase):
             with self.subTest(speech=speech, release=release):
                 with self.assertRaises(ValueError):
                     new_state(speech_threshold=speech, release_threshold=release)
-        for field in ("confirm_frames", "reject_frames", "end_frames"):
+        for field in (
+            "confirm_frames",
+            "reject_frames",
+            "end_frames",
+            "candidate_max_frames",
+        ):
             with self.subTest(field=field):
                 with self.assertRaises(ValueError):
                     new_state(**{field: True})
+        for value in (0, -1, vad.MAX_CANDIDATE_FRAMES + 1):
+            with self.subTest(candidate_max_frames=value):
+                with self.assertRaises(ValueError):
+                    new_state(candidate_max_frames=value)
+        with self.assertRaisesRegex(ValueError, "preserve confirm and reject"):
+            new_state(confirm_frames=5, candidate_max_frames=4)
+        with self.assertRaisesRegex(ValueError, "preserve confirm and reject"):
+            new_state(reject_frames=4, candidate_max_frames=4)
+
+    def test_candidate_deadline_counts_every_valid_candidate_frame(self):
+        state = new_state(
+            confirm_frames=3,
+            reject_frames=2,
+            candidate_max_frames=5,
+        )
+        self.assertEqual(state.update(0.9), ("candidate",))
+        for value in (0.5, 0.9, 0.5):
+            self.assertEqual(state.update(value), ())
+        self.assertEqual(state.update(0.5), ("candidate_timeout",))
+        self.assertEqual(state.update(0.9), ("candidate",))
+
+    def test_acoustic_terminal_transition_wins_on_deadline_frame(self):
+        confirmed = new_state(
+            confirm_frames=3,
+            reject_frames=2,
+            candidate_max_frames=3,
+        )
+        self.assertEqual(confirmed.update(0.9), ("candidate",))
+        self.assertEqual(confirmed.update(0.9), ())
+        self.assertEqual(confirmed.update(0.9), ("confirmed",))
+        for _ in range(8):
+            self.assertEqual(confirmed.update(0.5), ())
+        for value in (0.2, 0.2):
+            self.assertEqual(confirmed.update(value), ())
+        self.assertEqual(confirmed.update(0.2), ("ended",))
+
+        rejected = new_state(
+            confirm_frames=3,
+            reject_frames=2,
+            candidate_max_frames=3,
+        )
+        self.assertEqual(rejected.update(0.9), ("candidate",))
+        self.assertEqual(rejected.update(0.2), ())
+        self.assertEqual(rejected.update(0.2), ("rejected",))
+
+    def test_invalid_probability_does_not_consume_candidate_budget(self):
+        state = new_state(candidate_max_frames=3)
+        self.assertEqual(state.update(0.9), ("candidate",))
+        self.assertEqual(state.update(0.5), ())
+        with self.assertRaises(ValueError):
+            state.update(math.nan)
+        self.assertEqual(state.update(0.5), ("candidate_timeout",))
 
     def test_reset_replays_the_same_event_sequence(self):
         probabilities = (0.8, 0.8, 0.8, 0.2, 0.2, 0.2)
@@ -388,19 +446,28 @@ class NeuralVadPipelineTests(unittest.TestCase):
         )
         self.assertEqual(scorer.asserted, ())
 
-    def test_close_is_idempotent_and_requires_a_new_explicit_reset(self):
-        pipeline = vad.NeuralVadPipeline(FakeScorer([0.9]), new_state())
+    def test_close_is_idempotent_and_terminal(self):
+        class CloseTrackedScorer(FakeScorer):
+            def __init__(self):
+                super().__init__([0.9])
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        scorer = CloseTrackedScorer()
+        pipeline = vad.NeuralVadPipeline(scorer, new_state())
         pipeline.reset(1)
         pipeline.feed(bytes(960), generation=1)
         pipeline.close()
         pipeline.close()
+        self.assertEqual(scorer.close_count, 1)
         self.assertEqual(pipeline.assembler.pending_byte_count, 0)
         with self.assertRaises(RuntimeError):
             pipeline.feed(bytes(64), generation=1)
-        for old_generation in (0, 1):
-            with self.assertRaises(ValueError):
-                pipeline.reset(old_generation)
-        pipeline.reset(2)
+        for generation in (0, 1, 2):
+            with self.assertRaisesRegex(RuntimeError, "pipeline is closed"):
+                pipeline.reset(generation)
 
     def test_scorer_reset_callback_cannot_feed_during_transition(self):
         class ResetCallbackScorer:
@@ -426,6 +493,24 @@ class NeuralVadPipelineTests(unittest.TestCase):
         observation = pipeline.feed(bytes(1024), generation=3)
         self.assertEqual(observation[0].end_sample, 512)
         self.assertEqual(observation[0].events, ("candidate",))
+
+    def test_generation_reset_restores_the_full_candidate_budget(self):
+        scorer = FakeScorer([0.9, 0.5, 0.9, 0.5, 0.5])
+        pipeline = vad.NeuralVadPipeline(
+            scorer,
+            new_state(candidate_max_frames=3),
+        )
+        pipeline.reset(1)
+        first = pipeline.feed(bytes(2048), generation=1)
+        self.assertEqual(first[0].events, ("candidate",))
+        self.assertEqual(first[1].events, ())
+        pipeline.reset(2)
+        second = pipeline.feed(bytes(3072), generation=2)
+        self.assertEqual(second[0].events, ("candidate",))
+        self.assertEqual(second[1].events, ())
+        self.assertEqual(second[2].events, ("candidate_timeout",))
+        self.assertEqual(second[2].generation, 2)
+        self.assertEqual(second[2].end_sample, 1536)
 
     def test_generation_contract_is_explicit_and_monotonic(self):
         pipeline = vad.NeuralVadPipeline(None, new_state())
@@ -614,6 +699,7 @@ class VadShadowWorkerTests(unittest.TestCase):
         self.assertEqual(snapshot["candidateEvents"], 0)
         self.assertEqual(snapshot["confirmedEvents"], 0)
         self.assertEqual(snapshot["rejectedEvents"], 0)
+        self.assertEqual(snapshot["candidateTimeoutEvents"], 0)
         self.assertEqual(snapshot["endedEvents"], 0)
         self.assertEqual(snapshot["latencySamples"], 0)
         self.assertEqual(snapshot["staleResults"], 1)
@@ -652,6 +738,27 @@ class VadShadowWorkerTests(unittest.TestCase):
         self.assertIsNotNone(recovered)
         recovered.close()
         self.assertTrue(recovered.wait_closed(1))
+
+    def test_worker_counts_only_current_epoch_candidate_timeouts(self):
+        scorer = FakeScorer([0.9, 0.5, 0.5])
+        worker = vad.VadShadowWorker.try_start(
+            lambda: vad.NeuralVadPipeline(
+                scorer,
+                new_state(candidate_max_frames=3),
+            ),
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertIsNotNone(worker)
+        worker.begin_epoch()
+        self.assertTrue(worker.offer(bytes(3072)))
+        snapshot = wait_for_snapshot(
+            worker, lambda value: value["processedFrames"] == 3
+        )
+        self.assertEqual(snapshot["candidateEvents"], 1)
+        self.assertEqual(snapshot["candidateTimeoutEvents"], 1)
+        self.assertEqual(snapshot["rejectedEvents"], 0)
+        worker.close()
+        self.assertTrue(worker.wait_closed(1))
 
     def test_invalid_input_advances_epoch_without_copy_or_worker_failure(self):
         worker = vad.VadShadowWorker.try_start(
