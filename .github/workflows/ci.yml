@@ -122,6 +122,8 @@ jobs:
         if: runner.os == 'Windows'
         env:
           KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
         run: python scripts/local-realtime/install_vad_runtime.py
 
       - name: Smoke-test optional VAD runtime
@@ -129,6 +131,8 @@ jobs:
         env:
           KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
           KXYY_RUN_SILERO_SMOKE: '1'
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
         run: python tests/test_silero_shadow.py
 
       - name: Strip plaintext persona assets

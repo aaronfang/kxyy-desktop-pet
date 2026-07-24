@@ -103,6 +103,10 @@ jobs:
       - name: Verify bundled VAD resource contract
         run: npm run test:resources
 
+      # build.rs embeds this generated ciphertext even for cargo test/check.
+      - name: Encrypt persona assets for Rust checks
+        run: npm run encrypt-assets
+
       - name: Test Rust library state
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
@@ -122,12 +126,16 @@ jobs:
       - name: Install optional VAD runtime
         env:
           KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
         run: python scripts/local-realtime/install_vad_runtime.py
 
       - name: Smoke-test optional VAD runtime
         env:
           KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
           KXYY_RUN_SILERO_SMOKE: '1'
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
         run: python tests/test_silero_shadow.py
 
   # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；仅当手动触发且勾选
