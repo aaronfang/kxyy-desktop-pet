@@ -79,6 +79,10 @@ function syncVoiceFields() {
   if (refBox) {
     refBox.hidden = backend !== "local";
   }
+  const vadBox = el("vadShadowFields");
+  if (vadBox) {
+    vadBox.hidden = backend !== "local" && backend !== "cosyvoice";
+  }
 }
 
 function syncVoiceVolumeLabel() {
@@ -138,6 +142,7 @@ function fill(s) {
   syncVoiceFields();
   el("autoSpeak").checked = !!s.autoSpeak;
   el("showChatDebug").checked = s.showChatDebug === true;
+  el("vadShadowEnabled").checked = s.vadShadowEnabled === true;
   el("personaCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("textModel").value = s.textModel || "";
@@ -503,6 +508,7 @@ function collect() {
     ),
     autoSpeak: el("autoSpeak").checked,
     showChatDebug: el("showChatDebug").checked,
+    vadShadowEnabled: el("vadShadowEnabled").checked,
     textProvider: currentTextProvider(),
     textModel: el("textModel").value,
     localTextModel: el("localTextModel").value.trim(),
@@ -815,6 +821,21 @@ el("textProvider").addEventListener("change", () => {
 el("vlProvider").addEventListener("change", syncVlFields);
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
 
+el("installVadShadow")?.addEventListener("click", async () => {
+  const btn = el("installVadShadow");
+  const status = el("vadShadowInstallStatus");
+  btn.disabled = true;
+  status.style.color = "";
+  status.textContent = "正在启动安装…";
+  try {
+    await invoke("install_vad_shadow_runtime", { backend: currentBackend() });
+  } catch (e) {
+    btn.disabled = false;
+    status.style.color = "#dc2626";
+    status.textContent = `无法安装：${e}`;
+  }
+});
+
 // ---- 参考音频「浏览…」：调用系统文件对话框，取本地绝对路径写回输入框 ----
 el("localRefWavBrowse")?.addEventListener("click", async () => {
   try {
@@ -844,6 +865,16 @@ FIELDS.forEach((id) => {
 
 listen("voice-service-status", ({ payload }) => applyVoiceServiceStatus(payload));
 listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));
+listen("vad-shadow-install-status", ({ payload }) => {
+  const btn = el("installVadShadow");
+  const status = el("vadShadowInstallStatus");
+  if (!status) return;
+  status.textContent = payload?.message || "";
+  status.style.color = payload?.state === "failed" ? "#dc2626" : payload?.state === "ready" ? "#16a34a" : "";
+  if (payload?.state === "failed" || payload?.state === "ready") {
+    if (btn) btn.disabled = false;
+  }
+});
 
 el("clearMemory").addEventListener("click", async () => {
   const ok = window.confirm(

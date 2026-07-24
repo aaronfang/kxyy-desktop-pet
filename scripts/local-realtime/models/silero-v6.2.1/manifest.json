@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "modelId": "silero-vad-v6.2.1-16k-op15",
+  "upstream": {
+    "repository": "https://github.com/snakers4/silero-vad",
+    "tag": "v6.2.1",
+    "commit": "7e30209a3e901f9842f81b225f3e93d8199902b1"
+  },
+  "model": {
+    "path": "silero_vad_16k_op15.onnx",
+    "byteLength": 1289603,
+    "sha256": "7ed98ddbad84ccac4cd0aeb3099049280713df825c610a8ed34543318f1b2c49",
+    "sampleRate": 16000,
+    "frameSamples": 512,
+    "contextSamples": 64,
+    "signature": "silero-vad-v6.2.1-16k-op15"
+  },
+  "license": {
+    "spdx": "MIT",
+    "path": "LICENSE",
+    "byteLength": 1076,
+    "sha256": "51c19c8be941a3fb00ccf58f0bf9053de9f7237a0b37327896eabad32dffe873"
+  },
+  "modified": false
+}

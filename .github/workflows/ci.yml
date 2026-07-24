@@ -13,14 +13,12 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    # 路径过滤：纯文档/纯脚本/纯 .gitignore 改动不消耗 CI 分钟。
-    # （scripts/** 里的 Python/PowerShell 是用户手动跑的本地脚本，不 embed 到 Rust 二进制，
-    #   跟 Tauri 编译无关；*.md / docs/** 同理。）
+    # 路径过滤：纯文档 / .gitignore 改动不消耗 CI 分钟。
+    # scripts/local-realtime/** 会作为 Tauri resource 分发，不能忽略。
     # PR 不加此过滤——PR 是 merge 前的安全网，必须全跑防止代码混进。
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - 'scripts/**'
       - '.gitignore'
   pull_request:
     branches: [main]
@@ -66,6 +64,14 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
+      - name: Setup Python for deterministic realtime tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deterministic scorer test dependency
+        run: python -m pip install --disable-pip-version-check numpy==2.2.6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

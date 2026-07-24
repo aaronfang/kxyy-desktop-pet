@@ -79,7 +79,7 @@ graph TD
 | 文字对话 | DeepSeek (`deepseek-chat`/`deepseek-reasoner`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
-| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper + 当前文字 provider / CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24/0.2.25 依次补 VAD adapter 与默认关闭的 bounded shadow worker，线上仍用 RMS；Windows/Linux Qwen/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
+| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper + 当前文字 provider / CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.26 依次补 VAD adapter、bounded worker 与显式 opt-in 的真实 Silero shadow，线上仍只用 RMS 决策；Windows/Linux Qwen/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
 | 长期记忆 | — | `localStorage`（按昵称分档） | `persona.js` | 仅浏览器本地，无跨设备同步 |
 | 会话摘要 | 复用文字模型 | 同上 | `persona.js::updateRollingDigest` | 滚动摘要覆盖超窗口旧对话 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |
@@ -127,7 +127,7 @@ graph TD
 
 | 现状 | 具体缺口 | 影响 |
 |---|---|---|
-| 火山实时通话已有快速打断信号，本地通话确认仍偏晚 | 本地后端已用较高 RMS 门槛建立 candidate 并让前端立即 duck/暂停，约 1.05 秒 soft-end/reopen 后提交整段 Whisper；只有 ASR 验证通过才 confirmed 并清空旧回复，误触会 rejected/resume。0.2.24/0.2.25 已补 512-sample adapter、synthetic provenance 与 dedicated queue=1 shadow worker 基础。 | 两阶段让声已有可跑测版本，但 confirmed 仍受句尾和整段 Whisper 限制；真实 scorer、live 接管、candidate 超时、adaptive endpoint 与真实声学 p95 仍待实验。 |
+| 火山实时通话已有快速打断信号，本地通话确认仍偏晚 | 本地后端已用较高 RMS 门槛建立 candidate 并让前端立即 duck/暂停，约 1.05 秒 soft-end/reopen 后提交整段 Whisper；只有 ASR 验证通过才 confirmed 并清空旧回复，误触会 rejected/resume。0.2.24–0.2.26 已补 512-sample adapter、synthetic provenance、dedicated queue=1 worker 与 capability-gated 真实 Silero shadow。 | 两阶段让声已有可跑测版本，但 confirmed 仍受句尾和整段 Whisper 限制；真实 scorer 只旁路运行，live 接管、candidate 超时、许可声学阈值与真实 p95 仍待实验。 |
 | **本地 ASR 仅支持 Whisper，缺少用户情绪信号** | SenseVoiceSmall 的已发布 checkpoint 支持普通话、粤语、英语、日语、韩语，并输出 SER/AED 标签；官方基准称同参数量下快于 Whisper-Small 5 倍以上、快于 Whisper-Large 15 倍以上。它不是原生真流式，第三方伪流式方案会牺牲精度。 | 适合作为 final ASR + 用户情绪确认层，不应直接承担快速 VAD 或被描述成无损流式替代。 |
 | 文字 TTS 已部分情绪化，实时链路仍缺统一编排 | 火山文字 TTS 已传 emotion；CosyVoice 已传自然语言 instruction 和 rate；Qwen3-TTS Base 保持复刻音色但官方不支持 instruction。火山端到端路径主要依赖人设和会话级说话风格。 | 需要统一的 provider-neutral `SpeechStyle`，再按后端能力映射；不能继续把所有后端概括成“没有情绪参数”。 |
 | 情绪→动作映射粗粒度 | `app.js::EMOTION_ACTION` 表把 ~15 个情绪词压缩进 6 个既有动作（dance/pet/spin/trip/sit/forcethink），例如"开心""得意""点赞""期待"全部映射为同一个 `dance`。 | 情绪表达的动作区分度低，观感上"AI 情绪很丰富，桌宠动作很单一"。 |
@@ -243,7 +243,7 @@ graph TD
 | 扩展记忆层级：事实/承诺/观点/偏好 | 3.1 | 可与情感状态字段合并实施 | 中 | `- [ ]` |
 | 好感度系统（轻量版） | 3.2 | 依赖上一条 | 中 | `- [ ]` |
 | 统一情绪→动作/语音映射表 | 3.3 | 无前置依赖，建议尽早做以避免情绪词表继续分裂 | 低 | `- [ ]` |
-| **两阶段自然打断与播放缓冲** | 3.3 | AudioWorklet ring、candidate/confirmed/rejected 已有测试版；0.2.24/0.2.25 已补 VAD adapter、synthetic provenance 与 bounded shadow worker，仍待 capability-gated 真实 scorer、许可声学回放与 live 调参 | 中 | `- [~]` 🔧 测试版（0.2.11+） |
+| **两阶段自然打断与播放缓冲** | 3.3 | AudioWorklet ring、candidate/confirmed/rejected 已有测试版；0.2.24–0.2.26 已补 VAD adapter、synthetic provenance、bounded worker 与 capability-gated 真实 Silero shadow，仍待许可声学回放、candidate 最大时长与 live 调参 | 中 | `- [~]` 🔧 测试版（0.2.11+） |
 | **SenseVoice final ASR + SER 实验** | 3.3 | 先验证中文识别、情绪标签、加载资源和与 VAD 的组合；不直接替换默认 Whisper | 低 | `- [ ]` |
 | 结构化关系画像编辑器 | 3.1 | 无 | 低 | `- [ ]` |
 | 打断后的可听上下文与反馈话术 | 3.3 | 0.2.20 已完成 Worklet/local/CosyVoice candidate-bound、>=1 秒、one-shot 临时提示；字/音素位置、部分文本恢复、legacy/火山 parity 仍未实现 | 低 | `- [x]` ✅ 基础完成（0.2.20） |
@@ -769,6 +769,7 @@ A: 将 `scripts/persona-distill/` 目录整体复制即可——它不依赖项�
 
 ## 8.8 变更日志
 
+- 2026-07-24 / 0.2.26：固定分发 Silero VAD v6.2.1 `16k/op15` 模型、MIT 许可与严格 manifest；用户显式开启 shadow 并运行设置页安装器后，受支持的 macOS/Windows + CPython 3.10–3.14 组合会安装 hash-locked、ABI 精确的可选 ORT runtime，并在发布前做真实 recurrent inference。进程级 worker 使用 tokenized 单 Session lease，warming/busy/unavailable 均安全回退 RMS；诊断 schema v3 只暴露固定枚举，不导出概率/PCM/文本/路径。Silero 仍不驱动 candidate、endpoint 或 ASR，许可声学回放与 live takeover 待后续验证。
 - 2026-07-24 / 0.2.25：新增 dedicated daemon VAD shadow worker、全进程 admission=1、queue=1、overflow epoch/reset 与迟到结果丢弃；`Session` 只旁路投递，六个合成场景 A/B 证明 RMS 控制事件与 commit PCM 不变。诊断 schema v2 增加固定 `vadShadow` 枚举；默认无 scorer/factory，不含 Silero/ORT，不宣称神经 VAD 上线。
 - 2026-07-24 / 0.2.24：新增纯标准库的 512-sample 有界 PCM 组帧、显式概率迟滞、generation/reset/reentrant/fallback 隔离与 deterministic fake scorer 测试；synthetic-only manifest v1 校验既有合成规则的路径、大小、hash、许可和 16k mono 元数据，明确不含录音。本版未接 `Session`，不含 Silero/ORT，不改变 RMS、ring、endpoint 或 provider 协议。
 - 2026-07-24 / 0.2.23：实时通话新增当前/最近会话诊断 JSON 复制入口，固定枚举实际协商模式，保留最多 8 轮 latency 与 p50/p95、candidate/endpoint/播放队列指标；导出不含 Key、persona、文本、路径或 PCM。此版只补真实设备验证基础，不提前调整 VAD、ring 或 provider 协议。

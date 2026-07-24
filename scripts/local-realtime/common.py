@@ -749,6 +749,9 @@ _synth_tts_stream = None
 _synth_tts_http: Callable[[str], tuple] | None = None
 _vad_shadow_pipeline_factory = None
 _vad_shadow_admission = VAD_SHADOW_ADMISSION
+_vad_shadow_service = None
+_vad_shadow_start_status = "disabled"
+_vad_shadow_mode = "shadow-v1"
 _system_suffix = ""
 _tts_parallelism = 1
 _tts_prefetch_while_playing = False
@@ -1646,6 +1649,150 @@ def mp3_to_pcm24k(mp3: bytes) -> bytes:
     return proc.stdout
 
 
+class VadShadowLease:
+    def __init__(self, service, lease_id):
+        self._service = service
+        self._lease_id = lease_id
+
+    def offer(self, pcm):
+        return self._service.offer(self._lease_id, pcm)
+
+    def begin_epoch(self):
+        return self._service.begin_epoch(self._lease_id)
+
+    def snapshot(self):
+        return self._service.snapshot(self._lease_id)
+
+
+class VadShadowService:
+    """Process-wide prepared shadow worker leased to at most one Session."""
+
+    def __init__(self, worker, mode, start_status):
+        self._worker = worker
+        self.mode = mode
+        self.start_status = start_status
+        self._lock = threading.Lock()
+        self._leased = False
+        self._lease_id = 0
+        self._closed = False
+
+    @classmethod
+    def prepare(cls, pipeline_factory, *, mode="shadow-v1", admission=None):
+        if pipeline_factory is None:
+            return cls(None, mode, "unavailable")
+        worker = VadShadowWorker.try_start(
+            pipeline_factory,
+            admission=admission or _vad_shadow_admission,
+            mode=mode,
+        )
+        if worker is None:
+            return cls(None, mode, "unavailable")
+        return cls(worker, mode, "warming")
+
+    def current_status(self):
+        with self._lock:
+            if self._closed or self._worker is None:
+                return "unavailable"
+            if self._leased:
+                return "busy"
+            worker = self._worker
+            if not worker.wait_ready(0):
+                return "warming"
+            try:
+                return self.mode if worker.snapshot().get("status") == "active" else "unavailable"
+            except Exception:
+                return "unavailable"
+
+    def acquire(self):
+        with self._lock:
+            worker = self._worker
+            if self._closed or worker is None:
+                return None, "unavailable"
+            if self._leased:
+                return None, "busy"
+            if not worker.wait_ready(0):
+                return None, "warming"
+            try:
+                if worker.snapshot().get("status") != "active":
+                    return None, "unavailable"
+                if not worker.begin_lease():
+                    return None, "busy"
+            except Exception:
+                return None, "unavailable"
+            if self._lease_id >= (1 << 63) - 1:
+                return None, "unavailable"
+            self._lease_id += 1
+            self._leased = True
+            return VadShadowLease(self, self._lease_id), self.mode
+
+    def _owned_worker(self, lease_id):
+        if (
+            self._closed
+            or not self._leased
+            or lease_id != self._lease_id
+            or self._worker is None
+        ):
+            return None
+        return self._worker
+
+    def offer(self, lease_id, pcm):
+        with self._lock:
+            worker = self._owned_worker(lease_id)
+            if worker is None:
+                return False
+            try:
+                return worker.offer(pcm)
+            except Exception:
+                return False
+
+    def begin_epoch(self, lease_id):
+        with self._lock:
+            worker = self._owned_worker(lease_id)
+            if worker is None:
+                return False
+            try:
+                worker.begin_epoch()
+                return True
+            except Exception:
+                return False
+
+    def snapshot(self, lease_id):
+        with self._lock:
+            worker = self._owned_worker(lease_id)
+            if worker is None:
+                return {
+                    "mode": self.mode,
+                    "status": "unavailable",
+                    "queueCapacity": 1,
+                }
+            return worker.snapshot()
+
+    def release(self, lease):
+        with self._lock:
+            if not isinstance(lease, VadShadowLease) or lease._service is not self:
+                return
+            worker = self._owned_worker(lease._lease_id)
+            if worker is None:
+                return
+            try:
+                worker.begin_epoch()
+            except Exception:
+                pass
+            self._leased = False
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            worker = self._worker
+        if worker is not None:
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+
 class Session:
     def __init__(
         self,
@@ -1653,6 +1800,9 @@ class Session:
         *,
         vad_shadow_pipeline_factory=None,
         vad_shadow_admission=None,
+        vad_shadow_service=None,
+        vad_shadow_start_status=None,
+        vad_shadow_mode="shadow-v1",
     ):
         self.ws = ws
         self.system_role = "你是元元，口语化简短回复，一两句即可。"
@@ -1694,14 +1844,36 @@ class Session:
         self._candidate_receipt_event = asyncio.Event()
         self._vad_shadow_pipeline_factory = vad_shadow_pipeline_factory
         self._vad_shadow_admission = vad_shadow_admission or _vad_shadow_admission
+        self._vad_shadow_service = vad_shadow_service
+        self._vad_shadow_mode = vad_shadow_mode
         self._vad_shadow = None
-        self._vad_shadow_start_status = (
-            "disabled" if vad_shadow_pipeline_factory is None else "pending"
+        self._vad_shadow_start_status = vad_shadow_start_status or (
+            "disabled"
+            if vad_shadow_pipeline_factory is None and vad_shadow_service is None
+            else "pending"
         )
 
     async def _start_or_reset_vad_shadow(self) -> str:
+        if self._vad_shadow_service is not None:
+            if self._vad_shadow is None:
+                self._vad_shadow, status = self._vad_shadow_service.acquire()
+            else:
+                try:
+                    reset = self._vad_shadow.begin_epoch()
+                except Exception:
+                    reset = False
+                if not reset:
+                    self._vad_shadow_service.release(self._vad_shadow)
+                    self._vad_shadow = None
+                    self._vad_shadow_start_status = "unavailable"
+                    return self._vad_shadow_start_status
+            if self._vad_shadow is None:
+                self._vad_shadow_start_status = status
+                return self._vad_shadow_start_status
+            self._vad_shadow_mode = self._vad_shadow_service.mode
+            self._vad_shadow_start_status = self._vad_shadow_mode
+            return self._vad_shadow_start_status
         if self._vad_shadow_pipeline_factory is None:
-            self._vad_shadow_start_status = "disabled"
             return self._vad_shadow_start_status
         if self._vad_shadow is None:
             try:
@@ -1752,6 +1924,10 @@ class Session:
         shadow = self._vad_shadow
         if shadow is None:
             return
+        if self._vad_shadow_service is not None:
+            self._vad_shadow_service.release(shadow)
+            self._vad_shadow = None
+            return
         try:
             shadow.close()
         except Exception:
@@ -1761,7 +1937,7 @@ class Session:
         shadow = self._vad_shadow
         if shadow is None:
             return {
-                "mode": "shadow-v1",
+                "mode": self._vad_shadow_mode,
                 "status": self._vad_shadow_start_status,
                 "queueCapacity": 1,
             }
@@ -1769,7 +1945,7 @@ class Session:
             return shadow.snapshot()
         except Exception:
             return {
-                "mode": "shadow-v1",
+                "mode": self._vad_shadow_mode,
                 "status": "unavailable",
                 "queueCapacity": 1,
             }
@@ -2727,6 +2903,9 @@ async def _handler(ws):
         ws,
         vad_shadow_pipeline_factory=_vad_shadow_pipeline_factory,
         vad_shadow_admission=_vad_shadow_admission,
+        vad_shadow_service=_vad_shadow_service,
+        vad_shadow_start_status=_vad_shadow_start_status,
+        vad_shadow_mode=_vad_shadow_mode,
     )
     log("客户端已连接")
     try:
@@ -2770,11 +2949,14 @@ def run(
     synth_tts_http: Callable[[str], tuple] | None = None,
     synth_tts_stream=None,
     vad_shadow_pipeline_factory=None,
+    vad_shadow_start_status="disabled",
+    vad_shadow_mode="shadow-v1",
 ) -> None:
     """prepare() 在监听前调用（加载模型等）。"""
     global _log_prefix, _synth_tts, _synth_tts_http, _synth_tts_stream, _tts_pool
     global _tts_parallelism, _tts_prefetch_while_playing, _system_suffix
-    global _vad_shadow_pipeline_factory
+    global _vad_shadow_pipeline_factory, _vad_shadow_service
+    global _vad_shadow_start_status, _vad_shadow_mode
     _log_prefix = name
     _synth_tts = synth_tts
     _synth_tts_http = synth_tts_http
@@ -2784,6 +2966,8 @@ def run(
     _tts_prefetch_while_playing = bool(tts_prefetch_while_playing)
     _system_suffix = system_suffix
     _vad_shadow_pipeline_factory = vad_shadow_pipeline_factory
+    _vad_shadow_start_status = vad_shadow_start_status
+    _vad_shadow_mode = vad_shadow_mode
 
     try:
         import websockets
@@ -2793,6 +2977,16 @@ def run(
     load_llm_settings()
     _ensure_cli_path()
     prepare()
+    _vad_shadow_service = None
+    if vad_shadow_pipeline_factory is not None:
+        _vad_shadow_service = VadShadowService.prepare(
+            vad_shadow_pipeline_factory,
+            mode=vad_shadow_mode,
+            admission=_vad_shadow_admission,
+        )
+        _vad_shadow_start_status = _vad_shadow_service.start_status
+        # Session acquires the prepared service; it must never start a second worker.
+        _vad_shadow_pipeline_factory = None
     start_tts_http(port)
     # HTTP /health 与朗读已就绪，再后台预热 ASR：首通电话不必等 whisper 冷加载。
     _mlx_pool.submit(warmup_asr)
@@ -2806,3 +3000,6 @@ def run(
         asyncio.run(main_async())
     except KeyboardInterrupt:
         log("退出")
+    finally:
+        if _vad_shadow_service is not None:
+            _vad_shadow_service.close()

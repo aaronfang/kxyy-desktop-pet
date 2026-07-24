@@ -330,7 +330,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
-      vadShadow: "shadow-v1",
+      vadShadow: "silero-onnx-shadow-v1",
       url: "forbidden-url",
     },
     events,
@@ -338,7 +338,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 2);
+  assert.equal(report.diagnosticSchemaVersion, 3);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -346,7 +346,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
-    vadShadow: "shadow-v1",
+    vadShadow: "silero-onnx-shadow-v1",
   });
   assert.deepEqual(report.exportStats, {
     sourceDroppedEvents: 17,

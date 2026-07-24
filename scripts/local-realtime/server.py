@@ -20,6 +20,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import common
+import silero_shadow
 
 PORT = 19876
 # macOS MLX 量化权重（0.6B）；PyTorch 路径的模型见 tts_qwen3_torch.DEFAULT_MODEL。
@@ -229,6 +230,7 @@ def _synth_mlx(text: str) -> bytes:
 
 # ====================== 入口：按平台选择后端拉起服务 ======================
 def _run_mlx() -> None:
+    vad_capability = silero_shadow.capability_from_environment()
     common.run(
         port=PORT,
         name="local-qwen",
@@ -238,6 +240,9 @@ def _run_mlx() -> None:
         tts_parallelism=1,
         tts_prefetch_while_playing=False,
         synth_tts_stream=_synth_mlx_stream,
+        vad_shadow_pipeline_factory=vad_capability.pipeline_factory(),
+        vad_shadow_start_status=vad_capability.status,
+        vad_shadow_mode=vad_capability.mode,
     )
 
 
@@ -256,6 +261,7 @@ def _run_torch() -> None:
             common.log("朗读 HTTP 仍可用（如需通话请安装 openai-whisper）。")
         common.log("Qwen3-TTS 本地服务就绪 (pytorch)")
 
+    vad_capability = silero_shadow.capability_from_environment()
     common.run(
         port=PORT,
         name="local-qwen",
@@ -265,6 +271,9 @@ def _run_torch() -> None:
         tts_pool=tts_pool,
         tts_parallelism=1,
         tts_prefetch_while_playing=True,
+        vad_shadow_pipeline_factory=vad_capability.pipeline_factory(),
+        vad_shadow_start_status=vad_capability.status,
+        vad_shadow_mode=vad_capability.mode,
     )
 
 

@@ -108,6 +108,9 @@ struct Settings {
     /// 是否在聊天 UI 显示语音调试信息（后端 / 合成进度）。
     #[serde(default = "default_true")]
     show_chat_debug: bool,
+    /// 实验性 Silero/ONNX Runtime VAD shadow；只观测，不参与实时打断决策。
+    #[serde(default)]
+    vad_shadow_enabled: bool,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-chat / deepseek-reasoner）。
     #[serde(default)]
     text_model: String,
@@ -253,6 +256,7 @@ impl Settings {
             local_ref_text: String::new(),
             voice_volume: default_voice_volume(),
             show_chat_debug: false,
+            vad_shadow_enabled: false,
             text_model: String::new(),
             text_provider: default_text_provider(),
             local_text_model: String::new(),
@@ -349,6 +353,7 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
     let backend = settings.realtime_backend.trim().to_ascii_lowercase();
     let mut hasher = DefaultHasher::new();
     backend.hash(&mut hasher);
+    settings.vad_shadow_enabled.hash(&mut hasher);
     match backend.as_str() {
         "local" => {
             settings.persona_card_id.trim().hash(&mut hasher);
@@ -1230,6 +1235,8 @@ struct AiSettingsInput {
     voice_volume: u32,
     #[serde(default = "default_true")]
     show_chat_debug: bool,
+    #[serde(default)]
+    vad_shadow_enabled: bool,
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
@@ -1315,6 +1322,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.local_ref_text = settings.local_ref_text.trim().to_string();
         s.voice_volume = settings.voice_volume.min(200);
         s.show_chat_debug = settings.show_chat_debug;
+        s.vad_shadow_enabled = settings.vad_shadow_enabled;
         s.text_model = settings.text_model.trim().to_string();
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
@@ -1392,6 +1400,12 @@ fn pull_local_text_model(app: AppHandle, model: String) {
         model
     };
     local_text::pull_model(app, model);
+}
+
+/// 显式安装实验性 Silero shadow 所需的 hash-locked ONNX Runtime。
+#[tauri::command]
+fn install_vad_shadow_runtime(app: AppHandle, backend: String) -> Result<(), String> {
+    voice_service::install_vad_shadow_runtime(&app, &backend)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1610,7 +1624,8 @@ pub fn run() {
             memory_flushed,
             probe_local_text_backend,
             list_local_text_models,
-            pull_local_text_model
+            pull_local_text_model,
+            install_vad_shadow_runtime
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1622,4 +1637,20 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{voice_config_fingerprint, Settings};
+
+    #[test]
+    fn vad_shadow_is_opt_in_and_changes_voice_fingerprint() {
+        let mut settings = Settings::defaults();
+        assert!(!settings.vad_shadow_enabled);
+        let disabled = voice_config_fingerprint(&settings);
+
+        settings.vad_shadow_enabled = true;
+        let enabled = voice_config_fingerprint(&settings);
+        assert_ne!(disabled, enabled);
+    }
 }
