@@ -11,6 +11,7 @@
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
 //       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
+//       session/asr_end.vadShadowSummary / {type:"vad_shadow_summary",final:true,summary} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
 //     managed-v1 每个 PCM chunk 自带 generation/segment/chunk identity；binary 不推进 generation。
 //     本地级联控制事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
@@ -22,7 +23,11 @@
 // 桌宠是外放场景，没有 AEC 会自己听到自己造成啸叫与误打断。
 
 import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
-import { RealtimeTrace, TRACE_EVENT } from "./realtime-trace.js";
+import {
+  RealtimeTrace,
+  TRACE_EVENT,
+  sanitizeVadShadowSummary,
+} from "./realtime-trace.js";
 
 const invoke = window.__TAURI__.core.invoke;
 
@@ -43,6 +48,7 @@ const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
+const VAD_SHADOW_FINAL_WAIT_MS = 50;
 
 function usesManagedCascade(provider) {
   return provider === "local" || provider === "cosyvoice";
@@ -166,6 +172,8 @@ export class RealtimeSession {
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
     this._vadShadowMode = "disabled";
+    this._vadShadowSummary = sanitizeVadShadowSummary();
+    this._resolveVadShadowFinal = null;
     this._candidateId = null;
     this._candidateSnapshot = null;
     this._candidateSegmentKeys = null;
@@ -304,6 +312,9 @@ export class RealtimeSession {
       return;
     }
     if (!this._acceptBackendGeneration(msg)) return;
+    if (usesManagedCascade(this.trace.provider) && msg.vadShadowSummary !== undefined) {
+      this._vadShadowSummary = sanitizeVadShadowSummary(msg.vadShadowSummary);
+    }
     switch (msg.type) {
       case "session":
         if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
@@ -340,6 +351,13 @@ export class RealtimeSession {
           });
         }
         this.cb.onState?.(msg.state);
+        break;
+      case "vad_shadow_summary":
+        if (!usesManagedCascade(this.trace.provider)) break;
+        this._vadShadowSummary = sanitizeVadShadowSummary(msg.summary);
+        if (msg.final === true && msg.summary?.schemaVersion === 1) {
+          this._resolveVadShadowFinal?.();
+        }
         break;
       case "asr_start":
         if (this._confirmSpeech()) this.cb.onAsrStart?.();
@@ -669,6 +687,30 @@ export class RealtimeSession {
     if (generation < this._backendGeneration) return false;
     this._backendGeneration = generation;
     return true;
+  }
+
+  _waitForFinalVadShadowSummary() {
+    if (
+      !usesManagedCascade(this.trace.provider) ||
+      !["shadow-v1", "silero-onnx-shadow-v1"].includes(this._vadShadowMode)
+    ) {
+      return Promise.resolve(false);
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (received) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this._resolveVadShadowFinal === receiveFinal) {
+          this._resolveVadShadowFinal = null;
+        }
+        resolve(received);
+      };
+      const receiveFinal = () => finish(true);
+      const timer = setTimeout(() => finish(false), VAD_SHADOW_FINAL_WAIT_MS);
+      this._resolveVadShadowFinal = receiveFinal;
+    });
   }
 
   _segmentKey(generation, segmentId) {
@@ -1244,6 +1286,7 @@ export class RealtimeSession {
       /* ignore */
     }
     this._unsubVol = null;
+    const finalVadShadowSummary = this._waitForFinalVadShadowSummary();
     try {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: "hangup" }));
@@ -1282,6 +1325,7 @@ export class RealtimeSession {
     } catch {
       /* ignore */
     }
+    await finalVadShadowSummary;
     try {
       this.ws?.close();
     } catch {
@@ -1307,6 +1351,7 @@ export class RealtimeSession {
         interruptionHint: this._interruptionHintMode,
         vadShadow: this._vadShadowMode,
       },
+      vadShadowSummary: { ...this._vadShadowSummary },
     };
   }
 }

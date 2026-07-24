@@ -7,6 +7,7 @@ import {
   buildRealtimeDiagnosticReport,
   createTraceEvent,
   replayTrace,
+  sanitizeVadShadowSummary,
   summarizeTraceLatency,
 } from "../src/ai/realtime-trace.js";
 
@@ -45,6 +46,36 @@ function fixtureEvent(eventType, timestampMs, fields = {}) {
     mode: "cascaded",
     ...fields,
   });
+}
+
+function fixtureVadShadowSummary(fields = {}) {
+  return {
+    schemaVersion: 1,
+    configRevision: "silero-v6.2.1-p0700-r0350-c3-r3-e8-m96",
+    mode: "silero-onnx-shadow-v1",
+    status: "active",
+    complete: true,
+    outstanding: 0,
+    queueCapacity: 1,
+    maxQueueDepth: 1,
+    offered: 8,
+    accepted: 8,
+    dropped: 0,
+    processedJobs: 8,
+    processedFrames: 5,
+    staleResults: 0,
+    fallbacks: 0,
+    faults: 0,
+    candidateEvents: 1,
+    confirmedEvents: 1,
+    rejectedEvents: 0,
+    candidateTimeoutEvents: 0,
+    endedEvents: 1,
+    latencySamples: 8,
+    inferenceP50Ms: 1.2344,
+    inferenceP95Ms: 2.3456,
+    ...fields,
+  };
 }
 
 test("replays a normal user turn and completed response", () => {
@@ -333,12 +364,17 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       vadShadow: "silero-onnx-shadow-v1",
       url: "forbidden-url",
     },
+    vadShadowSummary: fixtureVadShadowSummary({
+      secret: "forbidden-shadow-secret",
+      rawProbability: [0.1, 0.9],
+      transcript: "forbidden-shadow-transcript",
+    }),
     events,
     latencies: [summarizeTraceLatency(events, 0)],
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 3);
+  assert.equal(report.diagnosticSchemaVersion, 4);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -354,6 +390,10 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     rejectedItems: 1,
     coalescedPlaybackStats: 23,
   });
+  assert.deepEqual(
+    report.aggregate.vadShadow,
+    fixtureVadShadowSummary({ inferenceP50Ms: 1.234, inferenceP95Ms: 2.346 }),
+  );
   assert.equal(report.appVersion, "0.2.23");
   assert.equal(report.events.length, 255);
   assert.equal(report.events.at(-1).metrics.audioBytes, 259);
@@ -375,6 +415,9 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "sk-secret-access-token",
     "persona-kxyy-yuanyuan",
     "private-path-marker",
+    "forbidden-shadow-secret",
+    "forbidden-shadow-transcript",
+    "rawProbability",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -399,6 +442,64 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     interruptionHint: "none",
     vadShadow: "disabled",
   });
+  assert.deepEqual(report.aggregate.vadShadow, sanitizeVadShadowSummary());
+});
+
+test("VAD shadow summary is a fixed bounded whitelist with an explicit legacy fallback", () => {
+  assert.deepEqual(sanitizeVadShadowSummary(), {
+    schemaVersion: 1,
+    configRevision: "none",
+    mode: "disabled",
+    status: "not-reported",
+    complete: false,
+    outstanding: 0,
+    queueCapacity: 1,
+    maxQueueDepth: 0,
+    offered: 0,
+    accepted: 0,
+    dropped: 0,
+    processedJobs: 0,
+    processedFrames: 0,
+    staleResults: 0,
+    fallbacks: 0,
+    faults: 0,
+    candidateEvents: 0,
+    confirmedEvents: 0,
+    rejectedEvents: 0,
+    candidateTimeoutEvents: 0,
+    endedEvents: 0,
+    latencySamples: 0,
+    inferenceP50Ms: null,
+    inferenceP95Ms: null,
+  });
+
+  const sanitized = sanitizeVadShadowSummary(
+    fixtureVadShadowSummary({
+      complete: true,
+      outstanding: 3,
+      maxQueueDepth: 2,
+      offered: Number.MAX_SAFE_INTEGER + 1,
+      dropped: -1,
+      latencySamples: 65,
+      inferenceP50Ms: Number.NaN,
+      inferenceP95Ms: 2,
+      path: "/private/audio.raw",
+      persona: "private persona",
+      pcm: "raw samples",
+    }),
+  );
+  assert.equal(sanitized.complete, false);
+  assert.equal(sanitized.outstanding, 0);
+  assert.equal(sanitized.maxQueueDepth, 0);
+  assert.equal(sanitized.offered, 0);
+  assert.equal(sanitized.dropped, 0);
+  assert.equal(sanitized.latencySamples, 0);
+  assert.equal(sanitized.inferenceP50Ms, null);
+  assert.equal(sanitized.inferenceP95Ms, null);
+  const json = JSON.stringify(sanitized);
+  for (const forbidden of ["/private", "persona", "pcm", "raw samples"]) {
+    assert.equal(json.includes(forbidden), false);
+  }
 });
 
 test("diagnostic report aggregates latency and interruption distributions", () => {
@@ -1485,6 +1586,127 @@ test("local response stays active across stable-sentence TTS gaps", async () => 
   session._onMessage({ data: JSON.stringify({ type: "tts_end", generation: 1 }) });
   await new Promise((resolve) => setTimeout(resolve, 350));
   assert.equal(session.trace.state.response, "completed");
+});
+
+test("desktop session retains only the latest sanitized VAD shadow summary outside trace", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  session.trace.startSession();
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      vadShadow: "silero-onnx-shadow-v1",
+      vadShadowSummary: fixtureVadShadowSummary({
+        offered: 3,
+        secret: "first-secret",
+      }),
+    }),
+  });
+  const traceEvents = session.getTraceSnapshot().events.length;
+  const first = session.getTraceSnapshot();
+  assert.equal(first.vadShadowSummary.offered, 3);
+  first.vadShadowSummary.offered = 999;
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "asr_end",
+      vadShadowSummary: fixtureVadShadowSummary({
+        offered: 7,
+        transcript: "latest-secret",
+      }),
+    }),
+  });
+  const latest = session.getTraceSnapshot();
+  assert.equal(latest.vadShadowSummary.offered, 7);
+  assert.equal(latest.events.length, traceEvents);
+  assert.equal(JSON.stringify(latest).includes("latest-secret"), false);
+});
+
+test("active local and Cosy shadow stops wait only for their final summary", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  for (const [index, provider] of ["local", "cosyvoice"].entries()) {
+    const session = new RealtimeSession({ provider });
+    session.trace.startSession();
+    session._onMessage({
+      data: JSON.stringify({
+        type: "session",
+        state: "started",
+        vadShadow: "silero-onnx-shadow-v1",
+      }),
+    });
+    let socketClosed = false;
+    session.ws = {
+      readyState: 1,
+      send(message) {
+        if (JSON.parse(message).type !== "hangup") return;
+        queueMicrotask(() => {
+          session._onMessage({
+            data: JSON.stringify({
+              type: "vad_shadow_summary",
+              final: true,
+              summary: fixtureVadShadowSummary({
+                offered: 21 + index,
+                processedFrames: 13 + index,
+              }),
+            }),
+          });
+        });
+      },
+      close() {
+        socketClosed = true;
+      },
+    };
+
+    await session.stop();
+    const snapshot = session.getTraceSnapshot();
+    assert.equal(socketClosed, true);
+    assert.equal(snapshot.vadShadowSummary.offered, 21 + index);
+    assert.equal(snapshot.vadShadowSummary.processedFrames, 13 + index);
+    assert.equal(
+      snapshot.events.some((event) => event.eventType === "vad_shadow_summary"),
+      false,
+    );
+  }
+});
+
+test("old local services time out on one short wait while Volcano never waits", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const originalSetTimeout = globalThis.setTimeout;
+  const scheduled = [];
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    scheduled.push(delay);
+    return originalSetTimeout(callback, 0, ...args);
+  };
+  try {
+    const legacyLocal = new RealtimeSession({ provider: "local" });
+    legacyLocal.trace.startSession();
+    legacyLocal._onMessage({
+      data: JSON.stringify({
+        type: "session",
+        state: "started",
+        vadShadow: "silero-onnx-shadow-v1",
+      }),
+    });
+    legacyLocal.ws = { readyState: 1, send() {}, close() {} };
+    await legacyLocal.stop();
+    assert.deepEqual(scheduled, [50]);
+    assert.equal(legacyLocal.getTraceSnapshot().vadShadowSummary.status, "not-reported");
+
+    const volcano = new RealtimeSession({ provider: "volc" });
+    volcano.trace.startSession();
+    volcano._vadShadowMode = "silero-onnx-shadow-v1";
+    volcano.ws = { readyState: 1, send() {}, close() {} };
+    await volcano.stop();
+    assert.deepEqual(scheduled, [50]);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
 
 test("stop records a final diagnostic snapshot before audio cleanup settles", async () => {

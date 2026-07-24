@@ -535,7 +535,156 @@ def wait_for_snapshot(worker, predicate, timeout=2.0):
     raise AssertionError(f"shadow worker condition not reached: {worker.snapshot()}")
 
 
+SHADOW_SNAPSHOT_KEYS = {
+    "mode",
+    "configRevision",
+    "status",
+    "epoch",
+    "queueCapacity",
+    "maxQueueDepth",
+    "offered",
+    "accepted",
+    "dropped",
+    "processedJobs",
+    "processedFrames",
+    "staleResults",
+    "fallbacks",
+    "faults",
+    "candidateEvents",
+    "confirmedEvents",
+    "rejectedEvents",
+    "candidateTimeoutEvents",
+    "endedEvents",
+    "latencySamples",
+    "inferenceP50Ms",
+    "inferenceP95Ms",
+    "outstanding",
+    "complete",
+}
+
+
 class VadShadowWorkerTests(unittest.TestCase):
+    def test_snapshot_schema_revision_and_completion_are_fixed(self):
+        class QuietPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                return ()
+
+            def close(self):
+                pass
+
+        worker = vad.VadShadowWorker.try_start(
+            QuietPipeline,
+            admission=threading.BoundedSemaphore(1),
+            mode="silero-onnx-shadow-v1",
+            config_revision=vad.SILERO_VAD_CONFIG_REVISION,
+        )
+        self.assertIsNotNone(worker)
+        self.assertTrue(worker.wait_ready(1))
+        snapshot = worker.snapshot()
+        self.assertEqual(set(snapshot), SHADOW_SNAPSHOT_KEYS)
+        self.assertEqual(snapshot["mode"], "silero-onnx-shadow-v1")
+        self.assertEqual(
+            snapshot["configRevision"], vad.SILERO_VAD_CONFIG_REVISION
+        )
+        self.assertEqual(snapshot["queueCapacity"], 1)
+        self.assertEqual(snapshot["outstanding"], 0)
+        self.assertIs(snapshot["complete"], True)
+
+        worker.close()
+        self.assertTrue(worker.wait_closed(1))
+        closed = worker.snapshot()
+        self.assertEqual(set(closed), SHADOW_SNAPSHOT_KEYS)
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["outstanding"], 0)
+        self.assertIs(closed["complete"], True)
+
+    def test_blocked_scorer_keeps_snapshot_offer_and_close_nonblocking(self):
+        entered = threading.Event()
+        scorer_release = threading.Event()
+
+        class BlockingPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                entered.set()
+                scorer_release.wait(2)
+                return (vad.VadObservation(generation, 512, 0.9, ()),)
+
+            def close(self):
+                pass
+
+        worker = vad.VadShadowWorker.try_start(
+            BlockingPipeline,
+            admission=threading.BoundedSemaphore(1),
+            config_revision="unversioned",
+        )
+        self.assertIsNotNone(worker)
+        self.assertTrue(worker.wait_ready(1))
+        worker.begin_epoch()
+        self.assertTrue(worker.offer(bytes(1024)))
+        self.assertTrue(entered.wait(1))
+
+        captured = {}
+        snapshot_done = threading.Event()
+
+        def capture_snapshot():
+            captured["snapshot"] = worker.snapshot()
+            snapshot_done.set()
+
+        snapshot_thread = threading.Thread(target=capture_snapshot)
+        snapshot_thread.start()
+        self.assertTrue(snapshot_done.wait(1))
+        snapshot_thread.join(1)
+        self.assertFalse(snapshot_thread.is_alive())
+        blocked = captured["snapshot"]
+        self.assertEqual(set(blocked), SHADOW_SNAPSHOT_KEYS)
+        self.assertEqual(blocked["outstanding"], 1)
+        self.assertIs(blocked["complete"], False)
+        self.assertEqual(blocked["processedJobs"], 0)
+        self.assertEqual(blocked["latencySamples"], 0)
+
+        offer_done = threading.Event()
+        offer_result = {}
+
+        def offer_waiting():
+            offer_result["accepted"] = worker.offer(b"\x22" * 1024)
+            offer_done.set()
+
+        offer_thread = threading.Thread(target=offer_waiting)
+        offer_thread.start()
+        self.assertTrue(offer_done.wait(1))
+        offer_thread.join(1)
+        self.assertFalse(offer_thread.is_alive())
+        self.assertIs(offer_result["accepted"], True)
+
+        close_done = threading.Event()
+
+        def close_worker():
+            worker.close()
+            close_done.set()
+
+        close_thread = threading.Thread(target=close_worker)
+        close_thread.start()
+        self.assertTrue(close_done.wait(1))
+        close_thread.join(1)
+        self.assertFalse(close_thread.is_alive())
+        closing = worker.snapshot()
+        self.assertEqual(closing["status"], "closed")
+        self.assertEqual(closing["outstanding"], 1)
+        self.assertIs(closing["complete"], False)
+
+        scorer_release.set()
+        self.assertTrue(worker.wait_closed(1))
+        final = worker.snapshot()
+        self.assertEqual(final["outstanding"], 0)
+        self.assertIs(final["complete"], True)
+        self.assertEqual(final["processedJobs"], 0)
+        self.assertEqual(final["staleResults"], 1)
+
     def test_ready_is_published_only_after_start_status_is_final(self):
         factory_entered = threading.Event()
         factory_release = threading.Event()

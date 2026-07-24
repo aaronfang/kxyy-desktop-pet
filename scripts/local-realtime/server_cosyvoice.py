@@ -44,4 +44,5 @@ if __name__ == "__main__":
         vad_shadow_pipeline_factory=vad_capability.pipeline_factory(),
         vad_shadow_start_status=vad_capability.status,
         vad_shadow_mode=vad_capability.mode,
+        vad_shadow_config_revision=getattr(vad_capability, "config_revision", "none"),
     )
