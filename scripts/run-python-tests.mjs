@@ -14,6 +14,7 @@ const candidates =
 const testFiles = [
   "tests/test_local_realtime_events.py",
   "tests/test_qwen_mlx_stream.py",
+  "tests/test_vad_adapter.py",
 ];
 
 for (const [command, prefixArgs] of candidates) {
