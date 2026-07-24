@@ -29,6 +29,12 @@ on:
 permissions:
   contents: write
 
+# A tag push and a manual macOS append must never mutate the same Release at
+# the same time. Keep an active run intact instead of cancelling mid-upload.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   # 第一关：版本号一致性校验。任何一处不一致都让整个 release 失败。
   # 解决"bump 完忘打 tag"与"打 tag 前忘 bump"两种旧坑。
@@ -138,8 +144,8 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/test_silero_shadow.py
 
-  # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；仅当手动触发且勾选
-  # include_macos 时才追加两个 macOS 目标（省下 ×10 的 macOS 额度）。
+  # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；手动触发且勾选
+  # include_macos 时只追加两个 macOS 目标，绝不删除/重传已有 Windows asset。
   setup-matrix:
     needs: verify
     runs-on: ubuntu-latest
@@ -153,8 +159,8 @@ jobs:
           MAC_ARM='{"platform":"macos-latest","args":"--target aarch64-apple-darwin --bundles dmg -- --locked"}'
           MAC_X64='{"platform":"macos-latest","args":"--target x86_64-apple-darwin --bundles dmg -- --locked"}'
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_macos }}" = "true" ]; then
-            echo "matrix={\"include\":[$WIN,$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
-            echo "构建平台：Windows + macOS(aarch64/x64)"
+            echo "matrix={\"include\":[$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
+            echo "构建平台：仅追加 macOS(aarch64/x64)"
           else
             echo "matrix={\"include\":[$WIN]}" >> "$GITHUB_OUTPUT"
             echo "构建平台：仅 Windows（如需 macOS 请手动触发并勾选 include_macos）"
