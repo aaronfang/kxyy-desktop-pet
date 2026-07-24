@@ -323,7 +323,14 @@ export class RealtimeSession {
           this._vadShadowMode =
             msg.vadShadow === undefined
               ? "disabled"
-              : ["shadow-v1", "disabled", "unavailable"].includes(msg.vadShadow)
+              : [
+                  "shadow-v1",
+                  "silero-onnx-shadow-v1",
+                  "disabled",
+                  "warming",
+                  "busy",
+                  "unavailable",
+                ].includes(msg.vadShadow)
                 ? msg.vadShadow
                 : "unavailable";
         }

@@ -28,12 +28,22 @@ def _load_server():
     fake_common.clip_speech_text = lambda text: text.strip()
     fake_common.chunk_pcm = lambda pcm, _milliseconds: (pcm,)
     fake_common.run = lambda **_kwargs: None
+    fake_capability = types.SimpleNamespace(
+        status="disabled",
+        mode="disabled",
+        pipeline_factory=lambda: None,
+    )
+    fake_silero = types.SimpleNamespace(
+        capability_from_environment=lambda: fake_capability
+    )
 
     spec = importlib.util.spec_from_file_location("kxyy_qwen_mlx_server", SERVER_PATH)
     server = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     previous_common = sys.modules.get("common")
+    previous_silero = sys.modules.get("silero_shadow")
     sys.modules["common"] = fake_common
+    sys.modules["silero_shadow"] = fake_silero
     try:
         spec.loader.exec_module(server)
     finally:
@@ -41,6 +51,10 @@ def _load_server():
             sys.modules.pop("common", None)
         else:
             sys.modules["common"] = previous_common
+        if previous_silero is None:
+            sys.modules.pop("silero_shadow", None)
+        else:
+            sys.modules["silero_shadow"] = previous_silero
     return server, fake_common
 
 

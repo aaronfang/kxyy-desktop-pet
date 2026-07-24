@@ -66,6 +66,7 @@ pub struct VoiceServiceStatus {
 
 pub struct VoiceServiceManager {
     inner: Mutex<Inner>,
+    lifecycle: Mutex<()>,
 }
 
 struct Inner {
@@ -76,8 +77,14 @@ struct Inner {
     child: Option<Child>,
     /// 子进程最近日志（失败时带回设置页）。
     recent_logs: Arc<Mutex<VecDeque<String>>>,
-    /// 正在跑自动配置脚本（macOS Qwen3 / Windows GPU）
-    setup_running: bool,
+    /// 正在跑 Qwen 自动配置脚本；不得与 VAD 安装 admission 混为同一状态。
+    qwen_setup_running: bool,
+    /// VAD runtime 安装目标；同后端 ensure 必须等待，避免重新占用 ORT DLL。
+    vad_install_backend: String,
+    /// 最近一次 settings-driven ensure 的目标；后台完成回调只能服从它。
+    desired_backend: String,
+    desired_fingerprint: String,
+    desired_epoch: u64,
 }
 
 impl VoiceServiceManager {
@@ -88,8 +95,13 @@ impl VoiceServiceManager {
                 voice_fingerprint: String::new(),
                 child: None,
                 recent_logs: Arc::new(Mutex::new(VecDeque::new())),
-                setup_running: false,
+                qwen_setup_running: false,
+                vad_install_backend: String::new(),
+                desired_backend: String::new(),
+                desired_fingerprint: String::new(),
+                desired_epoch: 0,
             }),
+            lifecycle: Mutex::new(()),
         }
     }
 }
@@ -212,7 +224,11 @@ fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> 
 
 #[cfg(test)]
 mod fingerprint_tests {
-    use super::should_restart_for_fingerprint;
+    use super::{
+        backend_still_selected, begin_vad_runtime_install, finish_vad_runtime_install,
+        record_desired_voice_config, should_defer_for_vad_install, should_restart_for_fingerprint,
+        supports_vad_runtime_install, VoiceServiceManager,
+    };
 
     #[test]
     fn restarts_managed_voice_backends_only_for_nonempty_changes() {
@@ -223,6 +239,53 @@ mod fingerprint_tests {
         }
         assert!(!should_restart_for_fingerprint("volc", "old", "new"));
         assert!(!should_restart_for_fingerprint("", "old", "new"));
+    }
+
+    #[test]
+    fn vad_runtime_installer_accepts_only_managed_voice_backends() {
+        assert!(supports_vad_runtime_install("local"));
+        assert!(supports_vad_runtime_install("cosyvoice"));
+        for backend in ["volc", "", "unknown"] {
+            assert!(!supports_vad_runtime_install(backend));
+        }
+    }
+
+    #[test]
+    fn vad_install_admission_clears_after_every_child_outcome() {
+        let manager = VoiceServiceManager::new();
+        let mut inner = manager.inner.lock().unwrap();
+        inner.qwen_setup_running = true;
+        assert!(!begin_vad_runtime_install(&mut inner, "cosyvoice"));
+        inner.qwen_setup_running = false;
+        assert!(begin_vad_runtime_install(&mut inner, "local"));
+        assert!(!begin_vad_runtime_install(&mut inner, "local"));
+        assert!(!begin_vad_runtime_install(&mut inner, "cosyvoice"));
+        assert!(!inner.qwen_setup_running);
+        assert_eq!(inner.vad_install_backend, "local");
+
+        // Both a zero and non-zero child status use this same unconditional cleanup.
+        finish_vad_runtime_install(&mut inner, "local");
+        assert!(!inner.qwen_setup_running);
+        assert!(inner.vad_install_backend.is_empty());
+        assert!(begin_vad_runtime_install(&mut inner, "cosyvoice"));
+    }
+
+    #[test]
+    fn vad_install_defers_only_same_backend_and_restarts_only_if_still_selected() {
+        assert!(should_defer_for_vad_install("local", "local"));
+        assert!(!should_defer_for_vad_install("cosyvoice", "local"));
+        assert!(!should_defer_for_vad_install("", "local"));
+
+        let manager = VoiceServiceManager::new();
+        let mut inner = manager.inner.lock().unwrap();
+        record_desired_voice_config(&mut inner, "local", "fp-1");
+        assert!(backend_still_selected(&inner, "local"));
+        let first_epoch = inner.desired_epoch;
+        record_desired_voice_config(&mut inner, "cosyvoice", "fp-2");
+        assert!(!backend_still_selected(&inner, "local"));
+        assert_eq!(inner.desired_backend, "cosyvoice");
+        assert_eq!(inner.desired_fingerprint, "fp-2");
+        assert!(inner.desired_epoch > first_epoch);
     }
 }
 
@@ -749,6 +812,160 @@ pub fn read_setting_str(key: &str) -> String {
         .to_string()
 }
 
+fn read_setting_bool(key: &str) -> bool {
+    let Some(p) = dirs_settings_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(p) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    v.get(key).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+fn vad_runtime_root() -> Option<PathBuf> {
+    Some(dirs_settings_path()?.parent()?.join("vad-runtime"))
+}
+
+fn supports_vad_runtime_install(backend: &str) -> bool {
+    matches!(backend, "local" | "cosyvoice")
+}
+
+fn begin_vad_runtime_install(inner: &mut Inner, backend: &str) -> bool {
+    if inner.qwen_setup_running || !inner.vad_install_backend.is_empty() {
+        return false;
+    }
+    inner.vad_install_backend = backend.to_string();
+    true
+}
+
+fn finish_vad_runtime_install(inner: &mut Inner, backend: &str) {
+    if inner.vad_install_backend == backend {
+        inner.vad_install_backend.clear();
+    }
+}
+
+fn should_defer_for_vad_install(requested_backend: &str, installing_backend: &str) -> bool {
+    !installing_backend.is_empty() && requested_backend == installing_backend
+}
+
+fn record_desired_voice_config(inner: &mut Inner, backend: &str, fingerprint: &str) {
+    inner.desired_backend = backend.to_string();
+    inner.desired_fingerprint = fingerprint.to_string();
+    inner.desired_epoch = inner.desired_epoch.saturating_add(1);
+}
+
+fn backend_still_selected(inner: &Inner, completed_backend: &str) -> bool {
+    inner.desired_backend == completed_backend
+}
+
+pub fn install_vad_shadow_runtime(app: &AppHandle, backend_raw: &str) -> Result<(), String> {
+    let backend = normalize_backend(backend_raw);
+    if !supports_vad_runtime_install(&backend) {
+        return Err("请先选择本地 Qwen3-TTS 或 CosyVoice 后端".into());
+    }
+    let repo = scripts_root(app).ok_or_else(|| "找不到随包语音资源".to_string())?;
+    let script = repo
+        .join("scripts/local-realtime")
+        .join("install_vad_runtime.py");
+    if !script.is_file() {
+        return Err("安装脚本未随应用提供".into());
+    }
+    let python = resolve_python(&repo, &backend)
+        .ok_or_else(|| "当前语音后端的 Python 运行时尚未就绪".to_string())?;
+    let runtime_root = vad_runtime_root().ok_or_else(|| "无法定位 App 数据目录".to_string())?;
+
+    let manager = app.state::<VoiceServiceManager>();
+    let lifecycle = manager
+        .lifecycle
+        .lock()
+        .map_err(|_| "语音服务状态不可用")?;
+    let should_stop = {
+        let mut inner = manager.inner.lock().map_err(|_| "语音服务状态不可用")?;
+        if !begin_vad_runtime_install(&mut inner, &backend) {
+            return Err("已有语音运行时安装任务正在进行".into());
+        }
+        backend_still_selected(&inner, &backend)
+    };
+
+    // 安装器可能修复已存在的 target；先停掉当前相同后端，避免 Windows
+    // 在 Python worker 持有 ORT DLL 时尝试目录交换。失败后也会恢复 RMS 服务。
+    if should_stop {
+        stop(app);
+    }
+    drop(lifecycle);
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let _ = app2.emit(
+            "vad-shadow-install-status",
+            serde_json::json!({"state":"installing","message":"正在安装实验性 VAD runtime…"}),
+        );
+        let mut cmd = Command::new(&python);
+        cmd.arg(&script)
+            .current_dir(script.parent().unwrap_or(Path::new(".")))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("KXYY_VAD_RUNTIME_ROOT", &runtime_root)
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PATH", augmented_tool_path());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let success = cmd.status().map(|status| status.success()).unwrap_or(false);
+        let manager = app2.state::<VoiceServiceManager>();
+        let Ok(_lifecycle) = manager.lifecycle.lock() else {
+            return;
+        };
+        let (still_selected, current_backend, current_fp) = match manager.inner.lock() {
+            Ok(mut inner) => {
+                finish_vad_runtime_install(&mut inner, &backend);
+                (
+                    backend_still_selected(&inner, &backend),
+                    inner.desired_backend.clone(),
+                    inner.desired_fingerprint.clone(),
+                )
+            }
+            Err(_) => return,
+        };
+        if success {
+            if still_selected {
+                let _ = app2.emit(
+                    "vad-shadow-install-status",
+                    serde_json::json!({"state":"ready","message":"VAD runtime 已就绪，正在重启当前语音服务…"}),
+                );
+                ensure_impl(&app2, current_backend, current_fp);
+            } else {
+                let _ = app2.emit(
+                    "vad-shadow-install-status",
+                    serde_json::json!({"state":"ready","message":"VAD runtime 已就绪；当前语音后端已改变，未重启服务"}),
+                );
+            }
+        } else {
+            if still_selected {
+                let _ = app2.emit(
+                    "vad-shadow-install-status",
+                    serde_json::json!({"state":"failed","message":"VAD runtime 安装失败；正在恢复原 RMS 语音服务"}),
+                );
+                ensure_impl(&app2, current_backend, current_fp);
+            } else {
+                let _ = app2.emit(
+                    "vad-shadow-install-status",
+                    serde_json::json!({"state":"failed","message":"VAD runtime 安装失败；当前语音后端已改变，未重启服务"}),
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
 /// HF 镜像站点：默认用 hf-mirror.com（国内可用），可通过 settings.json 的 hfEndpoint 覆盖。
 fn hf_mirror() -> String {
     let custom = read_setting_str("hfEndpoint");
@@ -933,8 +1150,39 @@ pub fn stop(app: &AppHandle) {
 /// `voice_fingerprint`：调用方生成的不透明配置指纹；不得包含可供日志展开的原值。
 pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
     let backend = normalize_backend(backend_raw);
-    let port = port_for(&backend);
     let fp = voice_fingerprint.trim().to_string();
+    let manager = app.state::<VoiceServiceManager>();
+    let Ok(_lifecycle) = manager.lifecycle.lock() else {
+        return;
+    };
+    if let Ok(mut inner) = manager.inner.lock() {
+        record_desired_voice_config(&mut inner, &backend, &fp);
+    }
+    ensure_impl(app, backend, fp);
+}
+
+fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
+    let port = port_for(&backend);
+
+    let installing_backend = app
+        .state::<VoiceServiceManager>()
+        .inner
+        .lock()
+        .ok()
+        .map(|inner| inner.vad_install_backend.clone())
+        .unwrap_or_default();
+    if should_defer_for_vad_install(&backend, &installing_backend) {
+        emit(
+            app,
+            VoiceServiceStatus {
+                backend,
+                state: "starting".into(),
+                message: "正在安装实验性 VAD runtime；语音服务将在完成后恢复".into(),
+                port,
+            },
+        );
+        return;
+    }
 
     // 关闭语音：停服务、不启动
     if backend.is_empty() {
@@ -1109,9 +1357,9 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
                 // 在同一锁作用域内 check-and-set，避免两次 ensure 并发都读到 false 而重复拉起配置脚本。
                 let already = match app.state::<VoiceServiceManager>().inner.lock() {
                     Ok(mut inner) => {
-                        let was = inner.setup_running;
+                        let was = inner.qwen_setup_running;
                         if !was {
-                            inner.setup_running = true;
+                            inner.qwen_setup_running = true;
                         }
                         was
                     }
@@ -1141,35 +1389,49 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
                 let app2 = app.clone();
                 let repo2 = repo.clone();
                 let rt2 = rt.clone();
-                let fp2 = fp.clone();
                 std::thread::spawn(move || {
                     let result = run_macos_qwen3_setup(&app2, &repo2, &rt2);
-                    if let Ok(mut inner) = app2.state::<VoiceServiceManager>().inner.lock() {
-                        inner.setup_running = false;
-                    }
+                    let manager = app2.state::<VoiceServiceManager>();
+                    let Ok(_lifecycle) = manager.lifecycle.lock() else {
+                        return;
+                    };
+                    let (still_selected, current_fp) = match manager.inner.lock() {
+                        Ok(mut inner) => {
+                            inner.qwen_setup_running = false;
+                            (
+                                backend_still_selected(&inner, "local"),
+                                inner.desired_fingerprint.clone(),
+                            )
+                        }
+                        Err(_) => return,
+                    };
                     match result {
                         Ok(()) => {
-                            emit(
-                                &app2,
-                                VoiceServiceStatus {
-                                    backend: "local".into(),
-                                    state: "starting".into(),
-                                    message: "配置完成，正在启动语音服务…".into(),
-                                    port: 19876,
-                                },
-                            );
-                            ensure(&app2, "local", &fp2);
+                            if still_selected {
+                                emit(
+                                    &app2,
+                                    VoiceServiceStatus {
+                                        backend: "local".into(),
+                                        state: "starting".into(),
+                                        message: "配置完成，正在启动语音服务…".into(),
+                                        port: 19876,
+                                    },
+                                );
+                                ensure_impl(&app2, "local".into(), current_fp);
+                            }
                         }
                         Err(msg) => {
-                            emit(
-                                &app2,
-                                VoiceServiceStatus {
-                                    backend: "local".into(),
-                                    state: "failed".into(),
-                                    message: msg,
-                                    port: 19876,
-                                },
-                            );
+                            if still_selected {
+                                emit(
+                                    &app2,
+                                    VoiceServiceStatus {
+                                        backend: "local".into(),
+                                        state: "failed".into(),
+                                        message: msg,
+                                        port: 19876,
+                                    },
+                                );
+                            }
                         }
                     }
                 });
@@ -1253,6 +1515,12 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);
+    }
+    if read_setting_bool("vadShadowEnabled") {
+        if let Some(root) = vad_runtime_root() {
+            cmd.env("KXYY_VAD_SHADOW", "1")
+                .env("KXYY_VAD_RUNTIME_ROOT", root);
+        }
     }
 
     #[cfg(unix)]

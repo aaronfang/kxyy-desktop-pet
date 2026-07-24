@@ -241,6 +241,17 @@
             <input id="showChatDebug" type="checkbox" />
             <span>显示聊天界面调试信息（语音诊断 / 本地文字进度与用量）</span>
           </label>
+          <div id="vadShadowFields" hidden>
+            <label class="row-inline">
+              <input id="vadShadowEnabled" type="checkbox" />
+              <span>启用实验性 Silero VAD shadow（只观测，不改变打断）</span>
+            </label>
+            <div class="row-actions">
+              <button id="installVadShadow" type="button" class="ghost">安装 / 检查 VAD runtime</button>
+              <span id="vadShadowInstallStatus" class="hint"></span>
+            </div>
+            <p class="hint">仅本地 Qwen3 / CosyVoice：随包模型固定为 Silero v6.2.1；ONNX Runtime 会在你点击后安装到 App 数据目录，不修改全局 Python。先勾选并保存，再安装；不支持或安装失败时继续使用原 RMS。</p>
+          </div>
           <label>
             <span>AI 语音播放音量<small>朗读与通话，100% 为原音量，最高 200%</small></span>
             <div class="range-row">

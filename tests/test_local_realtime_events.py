@@ -1352,6 +1352,227 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
                 replacement.close()
                 self.assertTrue(replacement.wait_closed(1))
 
+    async def test_prepared_shadow_service_never_blocks_warming_handshake(self):
+        factory_entered = threading.Event()
+        factory_release = threading.Event()
+
+        class QuietPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                return ()
+
+            def close(self):
+                pass
+
+        def slow_factory():
+            factory_entered.set()
+            factory_release.wait(2)
+            return QuietPipeline()
+
+        service = common.VadShadowService.prepare(
+            slow_factory,
+            mode="silero-onnx-shadow-v1",
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertTrue(factory_entered.wait(1))
+        warming = common.Session(
+            FakeWebSocket(),
+            vad_shadow_service=service,
+            vad_shadow_start_status="warming",
+            vad_shadow_mode="silero-onnx-shadow-v1",
+        )
+        started = asyncio.get_running_loop().time()
+        await warming.on_start({})
+        self.assertLess(asyncio.get_running_loop().time() - started, 0.05)
+        self.assertEqual(warming.ws.json_messages()[-1]["vadShadow"], "warming")
+
+        factory_release.set()
+        self.assertTrue(service._worker.wait_ready(1))
+        active = common.Session(
+            FakeWebSocket(),
+            vad_shadow_service=service,
+            vad_shadow_start_status="warming",
+            vad_shadow_mode="silero-onnx-shadow-v1",
+        )
+        await active.on_start({})
+        self.assertEqual(
+            active.ws.json_messages()[-1]["vadShadow"],
+            "silero-onnx-shadow-v1",
+        )
+        await active.cancel_all("hangup")
+        service.close()
+        self.assertTrue(service._worker.wait_closed(1))
+
+    async def test_prepared_service_releases_lease_when_terminal_cancellation_raises(self):
+        class QuietPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                return ()
+
+            def close(self):
+                pass
+
+        for failing_method in ("cancel_asr", "cancel_reply"):
+            with self.subTest(failing_method=failing_method):
+                admission = threading.BoundedSemaphore(1)
+                service = common.VadShadowService.prepare(
+                    QuietPipeline,
+                    mode="silero-onnx-shadow-v1",
+                    admission=admission,
+                )
+                self.assertTrue(service._worker.wait_ready(1))
+                session = common.Session(
+                    FakeWebSocket(),
+                    vad_shadow_service=service,
+                    vad_shadow_start_status="warming",
+                    vad_shadow_mode="silero-onnx-shadow-v1",
+                )
+                await session.on_start({})
+
+                async def succeed(_reason):
+                    pass
+
+                async def fail(_reason):
+                    raise RuntimeError("synthetic cancellation failure")
+
+                session.cancel_asr = fail if failing_method == "cancel_asr" else succeed
+                session.cancel_reply = fail if failing_method == "cancel_reply" else succeed
+                with self.assertRaisesRegex(RuntimeError, "synthetic cancellation"):
+                    await session.cancel_all("hangup")
+                self.assertIsNone(session._vad_shadow)
+
+                replacement_lease, status = service.acquire()
+                self.assertEqual(status, "silero-onnx-shadow-v1")
+                self.assertIsNotNone(replacement_lease)
+                service.release(replacement_lease)
+                self.assertIsNone(
+                    vad.VadShadowWorker.try_start(QuietPipeline, admission=admission)
+                )
+                service.close()
+                self.assertTrue(service._worker.wait_closed(1))
+                replacement_worker = vad.VadShadowWorker.try_start(
+                    QuietPipeline,
+                    admission=admission,
+                )
+                self.assertIsNotNone(replacement_worker)
+                replacement_worker.close()
+                self.assertTrue(replacement_worker.wait_closed(1))
+
+    async def test_repeated_start_resets_prepared_shadow_epoch_and_pcm_remainder(self):
+        class CountingPipeline:
+            def __init__(self):
+                self.pipeline = vad.NeuralVadPipeline(
+                    lambda _frame: 0.1,
+                    vad.ProbabilityVadState(
+                        speech_threshold=0.7,
+                        release_threshold=0.3,
+                        confirm_frames=3,
+                        reject_frames=3,
+                        end_frames=8,
+                    ),
+                )
+
+            def reset(self, generation):
+                self.pipeline.reset(generation)
+
+            def feed(self, pcm, *, generation):
+                return self.pipeline.feed(pcm, generation=generation)
+
+            def close(self):
+                self.pipeline.close()
+
+        service = common.VadShadowService.prepare(
+            CountingPipeline,
+            mode="silero-onnx-shadow-v1",
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertTrue(service._worker.wait_ready(1))
+        session = common.Session(
+            FakeWebSocket(),
+            vad_shadow_service=service,
+            vad_shadow_start_status="warming",
+            vad_shadow_mode="silero-onnx-shadow-v1",
+        )
+        await session.on_start({})
+        first_epoch = session.vad_shadow_snapshot()["epoch"]
+        self.assertTrue(session._vad_shadow.offer(bytes(480 * 2)))
+        deadline = asyncio.get_running_loop().time() + 1
+        while session.vad_shadow_snapshot().get("processedJobs", 0) < 1:
+            self.assertLess(asyncio.get_running_loop().time(), deadline)
+            await asyncio.sleep(0.001)
+        self.assertEqual(session.vad_shadow_snapshot()["processedFrames"], 0)
+
+        await session.on_start({})
+        self.assertGreater(session.vad_shadow_snapshot()["epoch"], first_epoch)
+        self.assertTrue(session._vad_shadow.offer(bytes(32 * 2)))
+        deadline = asyncio.get_running_loop().time() + 1
+        while session.vad_shadow_snapshot().get("processedJobs", 0) < 2:
+            self.assertLess(asyncio.get_running_loop().time(), deadline)
+            await asyncio.sleep(0.001)
+        self.assertEqual(session.vad_shadow_snapshot()["processedFrames"], 0)
+        await session.cancel_all("hangup")
+        service.close()
+        self.assertTrue(service._worker.wait_closed(1))
+
+    async def test_prepared_shadow_leases_reject_busy_and_stale_owners(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingPipeline:
+            def reset(self, _generation):
+                pass
+
+            def feed(self, _pcm, *, generation):
+                entered.set()
+                release.wait(2)
+                return (vad.VadObservation(generation, 512, 0.9, ()),)
+
+            def close(self):
+                pass
+
+        service = common.VadShadowService.prepare(
+            BlockingPipeline,
+            mode="silero-onnx-shadow-v1",
+            admission=threading.BoundedSemaphore(1),
+        )
+        self.assertTrue(service._worker.wait_ready(1))
+        first, first_status = service.acquire()
+        self.assertEqual(first_status, "silero-onnx-shadow-v1")
+        self.assertIsNotNone(first)
+        contender, contender_status = service.acquire()
+        self.assertIsNone(contender)
+        self.assertEqual(contender_status, "busy")
+
+        self.assertTrue(first.offer(bytes(1024)))
+        self.assertTrue(entered.wait(1))
+        service.release(first)
+        service.release(first)
+        self.assertFalse(first.offer(bytes(1024)))
+        self.assertFalse(first.begin_epoch())
+        while_busy, while_busy_status = service.acquire()
+        self.assertIsNone(while_busy)
+        self.assertEqual(while_busy_status, "busy")
+
+        release.set()
+        deadline = asyncio.get_running_loop().time() + 1
+        second = None
+        while second is None:
+            self.assertLess(asyncio.get_running_loop().time(), deadline)
+            second, second_status = service.acquire()
+            if second is None:
+                self.assertEqual(second_status, "busy")
+                await asyncio.sleep(0.001)
+        self.assertEqual(second_status, "silero-onnx-shadow-v1")
+        service.release(first)
+        self.assertTrue(second.offer(bytes(1024)))
+        service.release(second)
+        service.close()
+        self.assertTrue(service._worker.wait_closed(1))
+
 
 class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

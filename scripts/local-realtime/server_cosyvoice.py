@@ -15,6 +15,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import common
+import silero_shadow
 import tts_cosyvoice
 
 PORT = 19877
@@ -28,6 +29,7 @@ def prepare() -> None:
 
 
 if __name__ == "__main__":
+    vad_capability = silero_shadow.capability_from_environment()
     common.run(
         port=PORT,
         name="local-cosy",
@@ -39,4 +41,7 @@ if __name__ == "__main__":
         tts_parallelism=2,
         tts_prefetch_while_playing=True,
         system_suffix=tts_cosyvoice.SYSTEM_SUFFIX,
+        vad_shadow_pipeline_factory=vad_capability.pipeline_factory(),
+        vad_shadow_start_status=vad_capability.status,
+        vad_shadow_mode=vad_capability.mode,
     )
