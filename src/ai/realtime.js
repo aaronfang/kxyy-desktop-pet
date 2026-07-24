@@ -9,7 +9,7 @@
 //       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
 //       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
-//       {type:"assistant",text} / {type:"assistant_end"} /
+//       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
 //     本地级联事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //   挂断发 {type:"hangup"}。
@@ -86,6 +86,7 @@ export class RealtimeSession {
     this._bargeInTurn = false; // 本轮用户说话是否已打断过播报
     this._userTurnOpen = false; // asr_start…asr_end 之间为 true
     this._assistantActive = false; // 助手正在出字/出声
+    this._backendAudioPending = false; // 本地逐句 TTS 尚可能继续产出 PCM
     this._keepAliveOsc = null;
     this._keepAliveGain = null;
     this._outGain = null; // 下行播放主音量
@@ -280,19 +281,24 @@ export class RealtimeSession {
       case "assistant":
         this._assistantActive = true;
         this.trace.startResponse();
-        if (this.trace.mode === "end_to_end") {
-          this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
-        } else {
-          // 本地级联后端当前整段返回，不能把整段首包冒充流式 first token。
-          this.trace.recordOnce("llm_response", TRACE_EVENT.LLM_RESPONSE);
-        }
+        this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
         this.cb.onAssistant?.(msg.text || "");
         break;
       case "assistant_end":
         this._assistantActive = false;
         this.trace.recordOnce("llm_response", TRACE_EVENT.LLM_RESPONSE);
-        this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
+        if (this.trace.mode === "end_to_end") {
+          this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
+        }
         this.cb.onAssistantEnd?.();
+        break;
+      case "tts_start":
+        this._backendAudioPending = true;
+        this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
+        break;
+      case "tts_end":
+        this._backendAudioPending = false;
+        if (!this._hasPlayback()) this._schedulePlaybackCompletion();
         break;
       case "speaking":
         this._assistantActive = true;
@@ -305,6 +311,8 @@ export class RealtimeSession {
         this.cb.onUsage?.(msg);
         break;
       case "error":
+        this._backendAudioPending = false;
+        if (!this._hasPlayback()) this._schedulePlaybackCompletion();
         if (this.trace.responseId && this.trace.state.response === "active") {
           this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "error" });
         }
@@ -471,6 +479,7 @@ export class RealtimeSession {
     const assistantWasActive = this._assistantActive;
     this._userTurnOpen = true;
     this._assistantActive = false;
+    this._backendAudioPending = false;
     if (alreadyOpen) return false;
     const interruptsResponse =
       candidateInterruptedResponse || assistantWasActive || this._hasPlayback();
@@ -559,7 +568,13 @@ export class RealtimeSession {
     if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
     this._playbackDrainTimer = setTimeout(() => {
       this._playbackDrainTimer = 0;
-      if (this.stopped || this._playbackQueuedMs > 0 || this._sources?.size) return;
+      if (
+        this.stopped ||
+        this._backendAudioPending ||
+        this._playbackQueuedMs > 0 ||
+        this._sources?.size
+      )
+        return;
       this._assistantActive = false;
       this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, {
         reason: "completed",
@@ -717,6 +732,7 @@ export class RealtimeSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this._backendAudioPending = false;
     if (this._levelRaf) cancelAnimationFrame(this._levelRaf);
     this._levelRaf = 0;
     if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);

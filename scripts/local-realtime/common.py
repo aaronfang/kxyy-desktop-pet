@@ -9,11 +9,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import re
 import ssl
 import struct
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -347,6 +349,13 @@ BARGE_IN_FRAMES = 6
 BARGE_IN_RMS_PLAY = 0.04
 BARGE_IN_FRAMES_PLAY = 12  # ~360ms
 MAX_HISTORY_MESSAGES = 24
+LLM_STREAM_QUEUE_MAX = 32
+LLM_STREAM_MAX_PRODUCERS = 2
+TTS_STREAM_MAX_TASKS = 2
+LLM_REPLY_MAX_CHARS = 4096
+STABLE_SENTENCE_MIN_CHARS = 6
+STABLE_SENTENCE_SOFT_CHARS = 40
+STABLE_SENTENCE_HARD_CHARS = 60
 MIN_SPEECH_MS_PLAY = 800
 NO_SPEECH_PROB_MAX = 0.55
 MIN_CJK_CHARS = 2
@@ -411,6 +420,7 @@ class GenerationCancelScope:
         self.stage = stage
         self.state = "active"
         self.reason = ""
+        self.inactive = threading.Event()
 
     @property
     def active(self) -> bool:
@@ -420,14 +430,93 @@ class GenerationCancelScope:
         if self.active:
             self.state = "cancelled"
             self.reason = reason
+            self.inactive.set()
 
     def complete(self) -> None:
         if self.active:
             self.state = "completed"
+            self.inactive.set()
 
     def promote(self, stage: str) -> None:
         if self.active:
             self.stage = stage
+
+
+class StableSentenceBuffer:
+    """有界纯状态分句器：优先强句末，长句回退到弱断点，最后硬切。"""
+
+    STRONG = frozenset("。！？!?；;\n")
+    WEAK = frozenset("，,、：:")
+
+    def __init__(
+        self,
+        *,
+        min_chars: int = STABLE_SENTENCE_MIN_CHARS,
+        soft_chars: int = STABLE_SENTENCE_SOFT_CHARS,
+        hard_chars: int = STABLE_SENTENCE_HARD_CHARS,
+    ):
+        if not (0 < min_chars <= soft_chars <= hard_chars and min_chars * 2 <= hard_chars):
+            raise ValueError(
+                "sentence limits must satisfy 0 < min <= soft <= hard and 2*min <= hard"
+            )
+        self.min_chars = min_chars
+        self.soft_chars = soft_chars
+        self.hard_chars = hard_chars
+        self._buffer = ""
+        self._cancelled = False
+
+    @property
+    def buffered_chars(self) -> int:
+        return len(self._buffer)
+
+    def feed(self, delta: str) -> list[str]:
+        if self._cancelled or not delta:
+            return []
+        self._buffer += str(delta)
+        ready: list[str] = []
+        while self._buffer:
+            cut = self._strong_cut()
+            if cut is None and len(self._buffer) >= self.soft_chars:
+                cut = self._weak_cut()
+            if cut is None and len(self._buffer) >= self.hard_chars:
+                # 给下一 delta 至少保留 min_chars；若句号紧随 hard boundary 到达，
+                # 它会与尾段一起提交，而不会成为单独的标点 TTS 请求。
+                cut = self.hard_chars - self.min_chars
+            if cut is None:
+                break
+            part = self._buffer[:cut].strip()
+            self._buffer = self._buffer[cut:]
+            if part and any(char.isalnum() for char in part):
+                ready.append(part)
+        return ready
+
+    def flush(self) -> list[str]:
+        if self._cancelled:
+            return []
+        part = self._buffer.strip()
+        self._buffer = ""
+        return [part] if part and any(char.isalnum() for char in part) else []
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._buffer = ""
+
+    def _strong_cut(self) -> int | None:
+        for index, char in enumerate(self._buffer[: self.hard_chars]):
+            if char in self.STRONG and index + 1 >= self.min_chars:
+                return index + 1
+        return None
+
+    def _weak_cut(self) -> int | None:
+        upper = min(len(self._buffer), self.hard_chars)
+        for index in range(upper - 1, self.min_chars - 2, -1):
+            if self._buffer[index] in self.WEAK:
+                return index + 1
+        return None
+
+
+class SafeRealtimeError(RuntimeError):
+    """可安全回给前端/日志的固定文案；原始上游异常只保留为 exception cause。"""
 
 
 # 各 TTS 后端共用的 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
@@ -672,7 +761,7 @@ def build_llm_proxy_payload(
         "provider": "text",
         "messages": messages,
         "max_tokens": 200,
-        "stream": False,
+        "stream": True,
     }
 
 
@@ -998,44 +1087,171 @@ def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
     return text
 
 
-def chat_llm(system_role: str, history: list[dict], user_text: str) -> tuple[str, dict]:
-    """经桌面统一代理返回 (reply_text, usage)，不在 Python 内持有 provider Key。"""
+def iter_llm_stream(system_role: str, history: list[dict], user_text: str):
+    """逐条解析桌面代理 SSE；不产出思维链，也不在 Python 内持有 provider Key。"""
     payload = build_llm_proxy_payload(system_role, history, user_text)
     body = json.dumps(payload).encode("utf-8")
+    secret = os.environ.get("KXYY_TTS_SECRET") or ""
+    if not secret:
+        raise SafeRealtimeError("本地文字代理鉴权未就绪，请从元元桌宠启动语音服务")
     req = urllib.request.Request(
         _ai_proxy_chat_url(),
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-Kxyy-Internal-Secret": secret,
+        },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             provider_header = str(resp.headers.get("X-Kxyy-Text-Provider") or "")
             provider = provider_header if provider_header in {"DeepSeek", "Ollama"} else "文字模型"
-            data = json.loads(resp.read().decode("utf-8"))
+            thinking = str(resp.headers.get("X-Kxyy-Thinking") or "1") != "0"
+            yield {"type": "meta", "provider": provider, "thinking": thinking}
+            content_chars = 0
+            reasoning_fallback = ""
+            for raw_line in resp:
+                try:
+                    line = raw_line.decode("utf-8").rstrip("\r\n")
+                except (AttributeError, UnicodeDecodeError) as e:
+                    raise SafeRealtimeError(f"{provider} 返回格式无效") from e
+                if not line.startswith("data:"):
+                    continue
+                raw_data = line[5:].lstrip()
+                if not raw_data:
+                    continue
+                if raw_data == "[DONE]":
+                    break
+                try:
+                    data = json.loads(raw_data)
+                except json.JSONDecodeError as e:
+                    raise SafeRealtimeError(f"{provider} 返回格式无效") from e
+                usage = data.get("usage") or {}
+                if usage:
+                    prompt = int(usage.get("prompt_tokens") or 0)
+                    completion = int(usage.get("completion_tokens") or 0)
+                    yield {
+                        "type": "usage",
+                        "prompt": prompt,
+                        "completion": completion,
+                        "total": int(usage.get("total_tokens") or (prompt + completion)),
+                    }
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    if content_chars == 0 and content.isspace():
+                        continue
+                    if content_chars + len(content) > LLM_REPLY_MAX_CHARS:
+                        raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
+                    content_chars += len(content)
+                    reasoning_fallback = ""
+                    yield {"type": "delta", "text": content}
+                    continue
+                # 只有明确关闭思考且整条流始终没有 content 时，才把 reasoning 当兼容正文。
+                # 不能逐 chunk 回退，否则显式 reasoner 可能先播出思维链、随后又播正文。
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if not thinking and isinstance(reasoning, str) and reasoning:
+                    remaining = LLM_REPLY_MAX_CHARS - len(reasoning_fallback)
+                    if remaining <= 0 or len(reasoning) > remaining:
+                        raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
+                    reasoning_fallback += reasoning
+            if content_chars == 0 and reasoning_fallback:
+                yield {"type": "delta", "text": reasoning_fallback}
     except urllib.error.HTTPError as e:
-        try:
-            error_data = json.loads(e.read().decode("utf-8"))
-            message = str(error_data.get("error") or "").strip()
-        except Exception:
-            message = ""
-        raise RuntimeError(message or f"文字模型请求失败（HTTP {e.code}）") from e
+        if e.code in {401, 403}:
+            message = "文字模型鉴权失败，请检查当前服务设置"
+        else:
+            message = f"文字模型请求失败（HTTP {e.code}）"
+        raise SafeRealtimeError(message) from e
     except urllib.error.URLError as e:
-        raise RuntimeError("本地文字代理连接失败，请稍后重试") from e
+        raise SafeRealtimeError("本地文字代理连接失败，请稍后重试") from e
+
+
+_llm_stream_slots = threading.BoundedSemaphore(LLM_STREAM_MAX_PRODUCERS)
+_tts_stream_slots = threading.BoundedSemaphore(TTS_STREAM_MAX_TASKS)
+
+
+def _put_llm_event(
+    out: "queue.Queue[dict]",
+    scope: GenerationCancelScope,
+    event: dict,
+) -> bool:
+    while not scope.inactive.is_set():
+        try:
+            out.put(event, timeout=0.05)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def start_llm_stream_producer(
+    system_role: str,
+    history: list[dict],
+    user_text: str,
+    scope: GenerationCancelScope,
+    out: "queue.Queue[dict]",
+) -> threading.Thread | None:
+    """启动最多两个 daemon producer；取消时有界 put 会及时退出，不堆积 executor 任务。"""
+    slots = _llm_stream_slots
+    if not slots.acquire(blocking=False):
+        _put_llm_event(
+            out,
+            scope,
+            {"type": "error", "message": "文字模型仍在结束上一轮请求，请稍后再试"},
+        )
+        return None
+
+    def produce() -> None:
+        try:
+            for event in iter_llm_stream(system_role, history, user_text):
+                if not _put_llm_event(out, scope, event):
+                    return
+            _put_llm_event(out, scope, {"type": "done"})
+        except Exception as e:
+            if scope.active:
+                message = (
+                    str(e)
+                    if isinstance(e, SafeRealtimeError)
+                    else "文字模型流式响应失败，请稍后重试"
+                )
+                _put_llm_event(out, scope, {"type": "error", "message": message})
+        finally:
+            slots.release()
+
+    thread = threading.Thread(
+        target=produce,
+        name=f"llm-stream-{scope.generation}",
+        daemon=True,
+    )
     try:
-        text = str(data["choices"][0]["message"]["content"] or "").strip()
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"{provider} 返回格式无效") from e
-    u = data.get("usage") or {}
-    prompt = int(u.get("prompt_tokens") or 0)
-    completion = int(u.get("completion_tokens") or 0)
-    total = int(u.get("total_tokens") or (prompt + completion))
-    return text, {
-        "prompt": prompt,
-        "completion": completion,
-        "total": total,
-        "_provider": provider,
-    }
+        thread.start()
+    except Exception:
+        slots.release()
+        raise
+    return thread
+
+
+def _run_scoped_tts(slots, synth: Callable[[str], object], text: str):
+    try:
+        return synth(text)
+    finally:
+        slots.release()
+
+
+def _drain_background_future(done) -> None:
+    """外层可先取消；静默取走后台异常，避免把异常正文交给 loop logger。"""
+    if done.cancelled():
+        return
+    try:
+        done.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 def chunk_pcm(pcm: bytes, ms: int = 80):
@@ -1426,59 +1642,163 @@ class Session:
         text: str,
         scope: GenerationCancelScope,
     ) -> None:
+        sentences = StableSentenceBuffer()
         try:
             assert _synth_tts is not None
             t1 = time.perf_counter()
-            reply, llm_usage = await self.loop.run_in_executor(
-                None, chat_llm, self.system_role, list(self.history), text
+            events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
+            start_llm_stream_producer(
+                self.system_role,
+                list(self.history),
+                text,
+                scope,
+                events,
             )
-            llm_usage = dict(llm_usage or {})
-            llm_provider = str(llm_usage.pop("_provider", "DeepSeek"))
+            reply_parts: list[str] = []
+            reply_chars = 0
+            llm_usage = {"prompt": 0, "completion": 0, "total": 0}
+            llm_provider = "文字模型"
+            tts_chars = 0
+            tts_provider = ""
+            tts_started = False
+            speaking_sent = False
+
+            async def speak_sentence(sentence: str) -> None:
+                nonlocal tts_chars, tts_provider, tts_started, speaking_sent
+                if not sentence or not scope.active:
+                    return
+                if not tts_started:
+                    if not await self.send_json({"type": "tts_start"}, scope=scope):
+                        return
+                    tts_started = True
+                tts_slots = _tts_stream_slots
+                if not tts_slots.acquire(blocking=False):
+                    raise SafeRealtimeError("语音合成仍在结束上一轮请求，请稍后再试")
+                pool = _tts_pool if _tts_pool is not None else _mlx_pool
+                try:
+                    future = self.loop.run_in_executor(
+                        pool,
+                        _run_scoped_tts,
+                        tts_slots,
+                        _synth_tts,
+                        sentence,
+                    )
+                    future.add_done_callback(_drain_background_future)
+                except Exception:
+                    tts_slots.release()
+                    raise
+                t2 = time.perf_counter()
+                try:
+                    # asyncio.wait 被取消时不会取消集合里的 executor future；后台合成仍能在
+                    # finally 释放 slot，且不会触发 Python 3.14 shield 的强制异常日志。
+                    done, _pending = await asyncio.wait({future})
+                    tts_result = next(iter(done)).result()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    raise SafeRealtimeError("语音合成失败，请稍后重试") from e
+                billed = 0
+                provider = ""
+                if isinstance(tts_result, tuple):
+                    audio = tts_result[0]
+                    extra = tts_result[1] if len(tts_result) > 1 else None
+                    if isinstance(extra, dict):
+                        billed = int(extra.get("characters") or 0)
+                        provider = str(extra.get("provider") or "").strip()
+                    elif isinstance(extra, (int, float)):
+                        billed = int(extra)
+                else:
+                    audio = tts_result
+                log(
+                    f"TTS sentence {time.perf_counter()-t2:.2f}s "
+                    f"({len(audio or b'')} bytes, billed={billed or '-'})"
+                )
+                if not scope.active:
+                    log(f"丢弃过期 TTS gen={scope.generation}")
+                    return
+                tts_chars += billed
+                if provider:
+                    tts_provider = provider
+                if not audio:
+                    return
+                self.playing = True
+                if not speaking_sent:
+                    self.play_enabled = not self.in_speech
+                    if not self.play_enabled:
+                        log("用户仍在说话，暂缓播报")
+                    if not await self.send_json({"type": "speaking"}, scope=scope):
+                        return
+                    speaking_sent = True
+                for chunk in chunk_pcm(audio, 80):
+                    if not scope.active:
+                        log("播报被新话术取代")
+                        return
+                    while not self.play_enabled and scope.active:
+                        await asyncio.sleep(0.02)
+                    if not scope.active or not await self.send_pcm(chunk, scope=scope):
+                        return
+                    await asyncio.sleep(0.06)
+
+            stream_done = False
+            while scope.active and not stream_done:
+                try:
+                    event = events.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
+                    continue
+                event_type = event.get("type")
+                if event_type == "meta":
+                    llm_provider = str(event.get("provider") or "文字模型")
+                elif event_type == "usage":
+                    llm_usage = {
+                        "prompt": int(event.get("prompt") or 0),
+                        "completion": int(event.get("completion") or 0),
+                        "total": int(event.get("total") or 0),
+                    }
+                elif event_type == "delta":
+                    delta = str(event.get("text") or "")
+                    if not delta:
+                        continue
+                    if reply_chars + len(delta) > LLM_REPLY_MAX_CHARS:
+                        raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
+                    reply_parts.append(delta)
+                    reply_chars += len(delta)
+                    if not await self.send_json(
+                        {"type": "assistant", "text": delta},
+                        scope=scope,
+                    ):
+                        return
+                    for sentence in sentences.feed(delta):
+                        await speak_sentence(sentence)
+                elif event_type == "error":
+                    raise SafeRealtimeError(
+                        str(event.get("message") or "文字模型请求失败")
+                    )
+                elif event_type == "done":
+                    stream_done = True
+
+            if not scope.active:
+                return
+            reply = "".join(reply_parts).strip()
             log(
                 f"LLM {time.perf_counter()-t1:.2f}s "
                 f"tok={llm_usage.get('total', 0)} chars={len(reply or '')}"
             )
-            if not scope.active:
-                log(f"丢弃过期 LLM 结果 gen={scope.generation}")
-                return
             if not reply:
                 return
 
+            if not await self.send_json({"type": "assistant_end"}, scope=scope):
+                return
             self.history.append({"role": "user", "content": text})
             self.history.append({"role": "assistant", "content": reply})
             if len(self.history) > MAX_HISTORY_MESSAGES:
                 del self.history[:-MAX_HISTORY_MESSAGES]
 
-            await self.send_json(
-                {"type": "assistant", "text": reply},
-                scope=scope,
-            )
-            await self.send_json({"type": "assistant_end"}, scope=scope)
-            if not scope.active:
-                return
+            for sentence in sentences.flush():
+                await speak_sentence(sentence)
 
-            t2 = time.perf_counter()
-            pool = _tts_pool if _tts_pool is not None else _mlx_pool
-            tts_result = await self.loop.run_in_executor(pool, _synth_tts, reply)
-            tts_chars = 0
-            tts_provider = ""
-            if isinstance(tts_result, tuple):
-                audio = tts_result[0]
-                extra = tts_result[1] if len(tts_result) > 1 else None
-                if isinstance(extra, dict):
-                    tts_chars = int(extra.get("characters") or 0)
-                    tts_provider = str(extra.get("provider") or "").strip()
-                elif isinstance(extra, (int, float)):
-                    tts_chars = int(extra)
-            else:
-                audio = tts_result
-            log(
-                f"TTS {time.perf_counter()-t2:.2f}s "
-                f"({len(audio)} bytes, billed={tts_chars or '-'})"
-            )
-            if not scope.active:
-                log(f"丢弃过期 TTS gen={scope.generation}")
-                return
+            if tts_started:
+                await self.send_json({"type": "tts_end"}, scope=scope)
 
             # 本轮用量：当前文字 provider token +（若有）云端 TTS 计费字符。
             provider = llm_provider
@@ -1495,39 +1815,22 @@ class Session:
                 },
                 scope=scope,
             )
-
-            if not audio or not scope.active:
-                return
-
-            self.playing = True
-            self.play_enabled = not self.in_speech
-            if not self.play_enabled:
-                log("用户仍在说话，暂缓播报")
-            await self.send_json({"type": "speaking"}, scope=scope)
-
-            for chunk in chunk_pcm(audio, 80):
-                if not scope.active:
-                    log("播报被新话术取代")
-                    break
-                while not self.play_enabled and scope.active:
-                    await asyncio.sleep(0.02)
-                if not scope.active:
-                    break
-                if not await self.send_pcm(chunk, scope=scope):
-                    break
-                # 每片 80ms 音频。发送节奏贴近实时（0.06s，留 ~20ms 提前量抗抖动），
-                # 不再把整段回复瞬间灌满前端队列——万一真被打断/flush，也只损失一小段，
-                # 而不是「说一半后半句全没」。
-                await asyncio.sleep(0.06)
         except asyncio.CancelledError:
+            sentences.cancel()
             raise
         except Exception as e:
             if scope.active:
-                log(f"回复失败: {e}")
+                message = (
+                    str(e)
+                    if isinstance(e, SafeRealtimeError)
+                    else "本地实时语音处理失败，请稍后重试"
+                )
+                log(f"回复失败: {type(e).__name__}")
                 await self.send_json(
-                    {"type": "error", "message": str(e)},
+                    {"type": "error", "message": message},
                     scope=scope,
                 )
+                scope.cancel("response_error")
         finally:
             if self.reply_task is asyncio.current_task():
                 self.reply_task = None

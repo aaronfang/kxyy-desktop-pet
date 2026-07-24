@@ -12,6 +12,8 @@ const VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const VL_MODEL: &str = "qwen3-vl-plus";
 // 本地文字模型：Ollama 的 OpenAI 兼容端点，无需 Key（Authorization 头会被忽略）。
 const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+// 仅受托管本地语音子进程携带；普通 WebView 请求不得用它绕过 Windows SSE 缓冲路径。
+const INTERNAL_SECRET_HEADER: &str = "X-Kxyy-Internal-Secret";
 
 /// 把 Ollama 的 400（尤其是超上下文）翻译成用户能看懂的中文。
 fn local_ollama_error_message(status: u16, detail: &str) -> String {
@@ -266,6 +268,10 @@ fn messages_have_image(messages: &serde_json::Value) -> bool {
 }
 
 fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: tiny_http::Request) {
+    let trusted_internal_request = internal_secret_matches(
+        req_header(&request, INTERNAL_SECRET_HEADER),
+        crate::voice_service::tts_secret(),
+    );
     let mut raw = String::new();
     if request.as_reader().read_to_string(&mut raw).is_err() {
         return error_json(request, 400, "读取请求体失败");
@@ -359,6 +365,12 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         max_tokens_in
     };
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+    let passthrough_internal_sse = should_passthrough_internal_sse(
+        stream,
+        force,
+        use_vision,
+        trusted_internal_request,
+    );
 
     let mut payload = serde_json::json!({
         "model": model,
@@ -459,6 +471,26 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         return respond_json_with_text_provider(request, text, provider);
     }
 
+    // 托管的本地实时语音服务需要逐 token 消费上游 SSE，才能在完整回复结束前把稳定句送入
+    // TTS。共享 secret 由桌面进程在拉起 Python 时注入；普通 WebView 即便请求 stream=true
+    // 仍继续走下方带 Content-Length 的缓冲兼容路径，避免重新引入 Windows WebView2 空回复。
+    // Response 的长度留空，由 tiny_http 使用 chunked；不解析或记录正文。
+    if passthrough_internal_sse {
+        let provider = if is_local_text { "Ollama" } else { "DeepSeek" };
+        let mut headers = cors_headers();
+        headers.push(header("Content-Type", "text/event-stream; charset=utf-8"));
+        headers.push(header("Cache-Control", "no-cache, no-transform"));
+        headers.push(header("X-Kxyy-Text-Provider", provider));
+        let reasoning_enabled = is_reasoner || (is_local_text && thinking);
+        headers.push(header(
+            "X-Kxyy-Thinking",
+            if reasoning_enabled { "1" } else { "0" },
+        ));
+        let resp = Response::new(StatusCode(200), headers, upstream, None, None);
+        let _ = request.respond(resp);
+        return;
+    }
+
     // 流式：原先把上游 Response 当 Read 直接透传给 tiny_http 走 chunked（无 Content-Length）。
     // 但 Windows 的 WebView2 对 127.0.0.1 的「chunked 流式 fetch + getReader()」读取存在
     // 兼容问题：常常一个数据块都读不到，前端遂判定「回复为空」（且时好时坏，取决于时序）。
@@ -485,7 +517,10 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         std::io::Cursor::new(bytes),
         Some(len),
         None,
-    );
+    )
+    // tiny_http 默认在 >=32KiB 时即使已知长度也改用 chunked；显式关闭该阈值，
+    // 保证普通 WebView2 始终收到稳定的 Content-Length 缓冲响应。
+    .with_chunked_threshold(usize::MAX);
     let _ = request.respond(resp);
 }
 
@@ -558,6 +593,93 @@ fn req_header<'a>(request: &'a tiny_http::Request, name: &str) -> Option<&'a str
             None
         }
     })
+}
+
+fn internal_secret_matches(provided: Option<&str>, expected: &str) -> bool {
+    !expected.is_empty() && provided == Some(expected)
+}
+
+fn should_passthrough_internal_sse(
+    stream: bool,
+    force: Option<&str>,
+    use_vision: bool,
+    trusted: bool,
+) -> bool {
+    stream && force == Some("text") && !use_vision && trusted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{header, internal_secret_matches, req_header, should_passthrough_internal_sse};
+    use std::io::Cursor;
+    use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
+
+    #[test]
+    fn internal_stream_secret_requires_an_exact_non_empty_match() {
+        assert!(internal_secret_matches(Some("managed-secret"), "managed-secret"));
+        assert!(!internal_secret_matches(Some("wrong"), "managed-secret"));
+        assert!(!internal_secret_matches(None, "managed-secret"));
+        assert!(!internal_secret_matches(Some(""), ""));
+    }
+
+    #[test]
+    fn internal_sse_gate_requires_every_trusted_text_stream_condition() {
+        assert!(should_passthrough_internal_sse(true, Some("text"), false, true));
+        assert!(!should_passthrough_internal_sse(false, Some("text"), false, true));
+        assert!(!should_passthrough_internal_sse(true, None, false, true));
+        assert!(!should_passthrough_internal_sse(true, Some("vl"), true, true));
+        assert!(!should_passthrough_internal_sse(true, Some("text"), false, false));
+    }
+
+    #[test]
+    fn internal_secret_header_lookup_is_case_insensitive() {
+        let request = TestRequest::new()
+            .with_header(header("x-kXyY-iNtErNaL-sEcReT", "managed-secret"))
+            .into();
+        assert_eq!(req_header(&request, "X-Kxyy-Internal-Secret"), Some("managed-secret"));
+    }
+
+    fn raw_headers(response: Response<Cursor<Vec<u8>>>) -> String {
+        let mut output = Vec::new();
+        response
+            .raw_print(
+                &mut output,
+                HTTPVersion(1, 1),
+                &[],
+                true,
+                None,
+            )
+            .expect("response should serialize");
+        String::from_utf8(output).expect("headers should be utf-8")
+    }
+
+    #[test]
+    fn internal_stream_is_chunked_but_large_webview_buffer_keeps_content_length() {
+        let body = vec![0_u8; 40 * 1024];
+        let streamed = raw_headers(Response::new(
+            StatusCode(200),
+            vec![],
+            Cursor::new(body.clone()),
+            None,
+            None,
+        ));
+        assert!(streamed.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!streamed.contains("Content-Length:"));
+
+        let len = body.len();
+        let buffered = raw_headers(
+            Response::new(
+                StatusCode(200),
+                vec![],
+                Cursor::new(body),
+                Some(len),
+                None,
+            )
+            .with_chunked_threshold(usize::MAX),
+        );
+        assert!(buffered.contains(&format!("Content-Length: {len}\r\n")));
+        assert!(!buffered.contains("Transfer-Encoding:"));
+    }
 }
 
 /// 标准 base64 解码（火山返回的整段 mp3 以 base64 放在 data 字段）。无外部依赖，
