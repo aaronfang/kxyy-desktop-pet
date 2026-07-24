@@ -172,8 +172,13 @@ async def _synth_mlx_stream(text: str):
             # run_in_executor cannot kill an in-flight next(). Queue cleanup behind it,
             # and keep the model gate held until close/reset actually finishes.
             cleanup = loop.run_in_executor(common._mlx_pool, _close_mlx_stream, generator)
+            gate_released = False
 
             def release_gate(future) -> None:
+                nonlocal gate_released
+                if gate_released:
+                    return
+                gate_released = True
                 try:
                     if not future.cancelled():
                         future.exception()
@@ -182,6 +187,9 @@ async def _synth_mlx_stream(text: str):
 
             cleanup.add_done_callback(release_gate)
             await asyncio.shield(cleanup)
+            # asyncio schedules done callbacks with call_soon; release synchronously
+            # after a successful await so a completed stream is immediately reusable.
+            release_gate(cleanup)
 
 
 def _synth_mlx(text: str) -> bytes:
