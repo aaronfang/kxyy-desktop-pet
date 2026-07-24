@@ -3,7 +3,7 @@
 // 与本地 Rust 桥接（realtime.rs）的私有协议：
 //   连上后先发 {type:"start", systemRole, botName}；随后：
 //     上行 binary = 麦克风 PCM16 mono 16k（worklet 产出）；
-//     下行 binary = 播放 PCM16 mono 24k；
+//     下行 binary = 火山/旧服务为 PCM16 mono 24k；本地/Cosy 可协商 managed-v1 envelope；
 //     下行 text  = 事件 JSON：
 //       {type:"session",state} / {type:"asr_start"} /
 //       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
@@ -12,7 +12,8 @@
 //       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
 //       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
-//     本地级联事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
+//     managed-v1 每个 PCM chunk 自带 generation/segment/chunk identity；binary 不推进 generation。
+//     本地级联控制事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //     上行 text 可含 {type:"playback_segment",generation,segmentId,state:"completed"}；
 //     只回执句段标识，不回传文本或 PCM。
 //   挂断发 {type:"hangup"}。
@@ -31,6 +32,13 @@ const MAX_PENDING_PCM_CHUNKS = 64;
 const PLAYBACK_MAX_QUEUE_MS = 3000;
 const PLAYBACK_DRAIN_GRACE_MS = 300;
 const MAX_AUDIO_SEGMENTS = 64;
+const MANAGED_AUDIO_CAPABILITY = "managed-v1";
+const MANAGED_AUDIO_MAGIC = 0x4b584155; // ASCII KXAU; not a Volcano protocol constant.
+const MANAGED_AUDIO_VERSION = 1;
+const MANAGED_AUDIO_HEADER_BYTES = 24;
+const MANAGED_AUDIO_CHUNK_MAX_SAMPLES = (OUTPUT_RATE * 80) / 1000;
+const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
+const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 
 function usesManagedCascade(provider) {
   return provider === "local" || provider === "cosyvoice";
@@ -42,6 +50,41 @@ function recoverablePlaybackEnabled() {
   } catch {
     return true;
   }
+}
+
+export function decodeManagedAudioFrame(data) {
+  if (!(data instanceof ArrayBuffer) || data.byteLength < MANAGED_AUDIO_HEADER_BYTES + 2) {
+    return null;
+  }
+  const view = new DataView(data);
+  const magic = view.getUint32(0, false);
+  const version = view.getUint8(4);
+  const flags = view.getUint8(5);
+  const headerBytes = view.getUint16(6, false);
+  const generation = view.getUint32(8, false);
+  const segmentId = view.getUint32(12, false);
+  const chunkSequence = view.getUint32(16, false);
+  const payloadSamples = view.getUint32(20, false);
+  if (
+    magic !== MANAGED_AUDIO_MAGIC ||
+    version !== MANAGED_AUDIO_VERSION ||
+    flags !== 0 ||
+    headerBytes !== MANAGED_AUDIO_HEADER_BYTES ||
+    segmentId < 1 ||
+    chunkSequence >= MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX ||
+    payloadSamples < 1 ||
+    payloadSamples > MANAGED_AUDIO_CHUNK_MAX_SAMPLES ||
+    data.byteLength !== headerBytes + payloadSamples * 2
+  ) {
+    return null;
+  }
+  return {
+    generation,
+    segmentId,
+    chunkSequence,
+    payloadSamples,
+    pcm: data.slice(headerBytes),
+  };
 }
 
 /** 通话会话：封装 WS、麦克风采集、可恢复 Worklet 播放与两阶段打断。 */
@@ -115,6 +158,7 @@ export class RealtimeSession {
     this._currentAudioSegment = null;
     this._audioSegments = new Map();
     this._legacySegments = new Map();
+    this._downlinkAudioMode = "raw";
   }
 
   /**
@@ -181,11 +225,15 @@ export class RealtimeSession {
 
       ws.onopen = () => {
         opened = true;
+        const downlinkCapability = usesManagedCascade(this.trace.provider)
+          ? { downlinkAudio: [MANAGED_AUDIO_CAPABILITY] }
+          : {};
         ws.send(
           JSON.stringify({
             type: "start",
             systemRole: startMsg.systemRole || "",
             botName: startMsg.botName || "元元",
+            ...downlinkCapability,
           }),
         );
         resolve();
@@ -207,15 +255,26 @@ export class RealtimeSession {
     if (typeof ev.data !== "string") {
       // 下行音频 PCM16 24k
       if (this._audioGate) return;
+      let pcm = ev.data;
+      let segment = this._currentAudioSegment;
+      if (
+        usesManagedCascade(this.trace.provider) &&
+        this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY
+      ) {
+        const frame = decodeManagedAudioFrame(ev.data);
+        segment = this._acceptManagedAudioFrame(frame);
+        if (!segment) return;
+        pcm = frame.pcm;
+      }
       this.trace.startResponse();
       this.trace.recordOnce("tts_first_audio", TRACE_EVENT.TTS_FIRST_AUDIO, {
-        metrics: { audioBytes: ev.data?.byteLength || 0 },
+        metrics: { audioBytes: pcm?.byteLength || 0 },
       });
       this.trace.recordOnce("playback_queued", TRACE_EVENT.PLAYBACK_QUEUED, {
-        metrics: { audioBytes: ev.data?.byteLength || 0 },
+        metrics: { audioBytes: pcm?.byteLength || 0 },
       });
-      this._notePlayLevel(ev.data);
-      this._enqueuePcm(ev.data, this._currentAudioSegment);
+      this._notePlayLevel(pcm);
+      this._enqueuePcm(pcm, segment);
       return;
     }
     let msg;
@@ -227,6 +286,12 @@ export class RealtimeSession {
     if (!this._acceptBackendGeneration(msg)) return;
     switch (msg.type) {
       case "session":
+        if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
+          this._downlinkAudioMode =
+            msg.downlinkAudio === MANAGED_AUDIO_CAPABILITY
+              ? MANAGED_AUDIO_CAPABILITY
+              : "raw";
+        }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
             reason: "session_ended",
@@ -478,11 +543,36 @@ export class RealtimeSession {
     return `${generation}:${segmentId}`;
   }
 
+  _acceptManagedAudioFrame(frame) {
+    if (!frame || frame.generation !== this._backendGeneration) return null;
+    const key = this._segmentKey(frame.generation, frame.segmentId);
+    const segment = this._audioSegments.get(key);
+    const currentKey = this._currentAudioSegment
+      ? this._segmentKey(
+          this._currentAudioSegment.generation,
+          this._currentAudioSegment.segmentId,
+        )
+      : "";
+    if (!segment || key !== currentKey || segment.ended || segment.dropped) return null;
+    if (
+      frame.chunkSequence !== segment.nextChunkSequence ||
+      segment.receivedSamples + frame.payloadSamples > segment.expectedSamples
+    ) {
+      this._markSegmentDropped(segment);
+      return null;
+    }
+    segment.nextChunkSequence += 1;
+    segment.receivedSamples += frame.payloadSamples;
+    return segment;
+  }
+
   _beginAudioSegment(msg) {
     if (!usesManagedCascade(this.trace.provider)) return;
     const generation = msg.generation;
     const segmentId = msg.segmentId;
     const text = typeof msg.text === "string" ? msg.text : "";
+    const expectedSamples = msg.samples;
+    const managed = this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY;
     if (
       !Number.isSafeInteger(generation) ||
       generation < 0 ||
@@ -490,17 +580,38 @@ export class RealtimeSession {
       segmentId < 1 ||
       segmentId > MAX_AUDIO_SEGMENTS ||
       !text ||
-      text.length > 256
+      text.length > 256 ||
+      (managed &&
+        (!Number.isSafeInteger(expectedSamples) ||
+          expectedSamples < 1 ||
+          expectedSamples > MANAGED_AUDIO_SEGMENT_MAX_SAMPLES))
     ) {
-      this._currentAudioSegment = null;
       return;
     }
     const key = this._segmentKey(generation, segmentId);
+    if (this._currentAudioSegment) {
+      if (!this._currentAudioSegment.dropped) return;
+      const dropped = this._currentAudioSegment;
+      dropped.ended = true;
+      this._deliverAudioSegmentEnd(dropped.generation, dropped.segmentId);
+      this._currentAudioSegment = null;
+    }
+    if (this._audioSegments.has(key)) return;
     if (!this._audioSegments.has(key) && this._audioSegments.size >= MAX_AUDIO_SEGMENTS) {
       const oldest = this._audioSegments.keys().next().value;
       if (oldest !== undefined) this._audioSegments.delete(oldest);
     }
-    const segment = { generation, segmentId, text, dropped: false, completed: false };
+    const segment = {
+      generation,
+      segmentId,
+      text,
+      dropped: false,
+      completed: false,
+      ended: false,
+      expectedSamples: managed ? expectedSamples : null,
+      receivedSamples: 0,
+      nextChunkSequence: 0,
+    };
     this._audioSegments.set(key, segment);
     this._currentAudioSegment = segment;
     this.playbackNode?.port.postMessage({ type: "segment_start", generation, segmentId });
@@ -532,6 +643,14 @@ export class RealtimeSession {
       ) !== key
     ) {
       return;
+    }
+    const segment = this._currentAudioSegment;
+    segment.ended = true;
+    if (
+      this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
+      (segment.nextChunkSequence < 1 || segment.receivedSamples !== segment.expectedSamples)
+    ) {
+      this._markSegmentDropped(segment);
     }
     if (this.audioCtx && this.audioCtx.state !== "running" && this._pendingPcm.length) {
       this._pushPendingPlayback({ type: "segment_end", generation, segmentId });
@@ -796,13 +915,14 @@ export class RealtimeSession {
     for (const item of pending) {
       if (item.type === "segment_end") {
         this._deliverAudioSegmentEnd(item.generation, item.segmentId);
-      } else {
+      } else if (!item.segment?.dropped) {
         this._enqueuePcmNow(item.pcm, item.segment);
       }
     }
   }
 
   _enqueuePcmNow(arrayBuffer, segment = null) {
+    if (segment?.dropped) return;
     if (this._playbackDrainTimer) {
       clearTimeout(this._playbackDrainTimer);
       this._playbackDrainTimer = 0;

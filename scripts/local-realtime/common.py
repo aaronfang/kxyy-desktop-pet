@@ -358,6 +358,13 @@ TTS_SENTENCE_QUEUE_MAX = 4
 TTS_PARALLELISM_MAX = 2
 # 单个稳定句最多保留 60 秒 24kHz mono s16le；数量有界之外也限制 PCM 字节。
 TTS_SENTENCE_MAX_SAMPLES = OUTPUT_RATE * 60
+MANAGED_AUDIO_CAPABILITY = "managed-v1"
+MANAGED_AUDIO_MAGIC = b"KXAU"
+MANAGED_AUDIO_VERSION = 1
+MANAGED_AUDIO_HEADER = struct.Struct(">4sBBHIIII")
+MANAGED_AUDIO_HEADER_BYTES = MANAGED_AUDIO_HEADER.size
+MANAGED_AUDIO_CHUNK_MAX_SAMPLES = OUTPUT_RATE * 80 // 1000
+MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750
 LLM_REPLY_MAX_CHARS = 4096
 STABLE_SENTENCE_MIN_CHARS = 6
 STABLE_SENTENCE_SOFT_CHARS = 40
@@ -1366,6 +1373,39 @@ def _drain_background_future(done) -> None:
         pass
 
 
+def pack_managed_audio_frame(
+    pcm: bytes,
+    *,
+    generation: int,
+    segment_id: int,
+    chunk_sequence: int,
+) -> bytes:
+    """给本地/CosyVoice 下行 PCM 加版本化身份；payload 仍是 PCM16LE。"""
+    if not isinstance(pcm, bytes) or not pcm or len(pcm) % 2 != 0:
+        raise ValueError("managed audio payload must be non-empty PCM16LE bytes")
+    payload_samples = len(pcm) // 2
+    if payload_samples > MANAGED_AUDIO_CHUNK_MAX_SAMPLES:
+        raise ValueError("managed audio payload exceeds one 80ms chunk")
+    values = (generation, segment_id, chunk_sequence)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise ValueError("managed audio ids must be integers")
+    if not (0 <= generation <= 0xFFFFFFFF and 1 <= segment_id <= 0xFFFFFFFF):
+        raise ValueError("managed audio generation or segment is out of range")
+    if not (0 <= chunk_sequence < MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX):
+        raise ValueError("managed audio chunk sequence is out of range")
+    header = MANAGED_AUDIO_HEADER.pack(
+        MANAGED_AUDIO_MAGIC,
+        MANAGED_AUDIO_VERSION,
+        0,
+        MANAGED_AUDIO_HEADER_BYTES,
+        generation,
+        segment_id,
+        chunk_sequence,
+        payload_samples,
+    )
+    return header + pcm
+
+
 class BoundedOrderedTtsPipeline:
     """有界句队列 + 有界并行合成 + 单路有序播放。
 
@@ -1582,6 +1622,7 @@ class Session:
         self.asr_task: asyncio.Task | None = None
         self.tts_parallelism = _tts_parallelism
         self.tts_prefetch_while_playing = _tts_prefetch_while_playing
+        self.downlink_audio = "raw"
 
     def _busy(self) -> bool:
         return self.reply_task is not None and not self.reply_task.done()
@@ -1620,6 +1661,24 @@ class Session:
                 return False
             await self.ws.send(pcm)
         return not self.closed and (scope is None or scope.active)
+
+    async def send_downlink_pcm(
+        self,
+        pcm: bytes,
+        *,
+        scope: GenerationCancelScope,
+        segment_id: int,
+        chunk_sequence: int,
+    ) -> bool:
+        payload = pcm
+        if self.downlink_audio == MANAGED_AUDIO_CAPABILITY:
+            payload = pack_managed_audio_frame(
+                pcm,
+                generation=scope.generation,
+                segment_id=segment_id,
+                chunk_sequence=chunk_sequence,
+            )
+        return await self.send_pcm(payload, scope=scope)
 
     def _invalidate_play(self) -> None:
         self.play_enabled = False
@@ -1662,7 +1721,19 @@ class Session:
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
         self.bot_name = (msg.get("botName") or "元元").strip() or "元元"
-        await self.send_json({"type": "session", "state": "started"})
+        offered = msg.get("downlinkAudio")
+        self.downlink_audio = (
+            MANAGED_AUDIO_CAPABILITY
+            if isinstance(offered, list) and MANAGED_AUDIO_CAPABILITY in offered
+            else "raw"
+        )
+        await self.send_json(
+            {
+                "type": "session",
+                "state": "started",
+                "downlinkAudio": self.downlink_audio,
+            }
+        )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
 
     def on_playback_segment(self, msg: dict) -> None:
@@ -2071,13 +2142,18 @@ class Session:
                     if not await self.send_json({"type": "speaking"}, scope=scope):
                         return
                     speaking_sent = True
-                for chunk in chunk_pcm(audio, 80):
+                for chunk_sequence, chunk in enumerate(chunk_pcm(audio, 80)):
                     if not scope.active:
                         log("播报被新话术取代")
                         return
                     while not self.play_enabled and scope.active:
                         await asyncio.sleep(0.02)
-                    if not scope.active or not await self.send_pcm(chunk, scope=scope):
+                    if not scope.active or not await self.send_downlink_pcm(
+                        chunk,
+                        scope=scope,
+                        segment_id=segment_id,
+                        chunk_sequence=chunk_sequence,
+                    ):
                         return
                     await asyncio.sleep(0.06)
                 await self.send_json(

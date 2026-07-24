@@ -297,6 +297,56 @@ class StableSentenceBufferTests(unittest.TestCase):
         self.assertEqual(buf.flush(), [])
 
 
+class ManagedAudioEnvelopeTests(unittest.TestCase):
+    def test_frame_has_fixed_big_endian_identity_and_pcm16le_payload(self):
+        pcm = struct.pack("<hhh", -1, 2, 300)
+        frame = common.pack_managed_audio_frame(
+            pcm,
+            generation=0x01020304,
+            segment_id=7,
+            chunk_sequence=9,
+        )
+        header = common.MANAGED_AUDIO_HEADER.unpack(
+            frame[: common.MANAGED_AUDIO_HEADER_BYTES]
+        )
+
+        self.assertEqual(
+            header,
+            (
+                b"KXAU",
+                1,
+                0,
+                24,
+                0x01020304,
+                7,
+                9,
+                3,
+            ),
+        )
+        self.assertEqual(frame[common.MANAGED_AUDIO_HEADER_BYTES :], pcm)
+
+    def test_frame_rejects_invalid_payload_and_ids(self):
+        valid = {"generation": 1, "segment_id": 1, "chunk_sequence": 0}
+        cases = [
+            (b"", valid),
+            (b"\x00", valid),
+            (b"\x00\x00" * (common.MANAGED_AUDIO_CHUNK_MAX_SAMPLES + 1), valid),
+            (b"\x00\x00", {**valid, "generation": -1}),
+            (b"\x00\x00", {**valid, "segment_id": 0}),
+            (
+                b"\x00\x00",
+                {
+                    **valid,
+                    "chunk_sequence": common.MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX,
+                },
+            ),
+        ]
+        for pcm, kwargs in cases:
+            with self.subTest(pcm_bytes=len(pcm), kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    common.pack_managed_audio_frame(pcm, **kwargs)
+
+
 class AudibleHistoryTests(unittest.TestCase):
     def test_only_contiguous_completed_segments_enter_context(self):
         history = common.AudibleHistory(max_messages=6, max_pending_turns=2)
@@ -825,6 +875,36 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(types.count("speech_candidate"), 1)
         self.assertTrue(self.session.play_barge_pending)
 
+    async def test_start_negotiates_managed_audio_and_old_client_stays_raw(self):
+        await self.session.on_start(
+            {
+                "systemRole": "角色",
+                "botName": "元元",
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            }
+        )
+        self.assertEqual(self.session.downlink_audio, common.MANAGED_AUDIO_CAPABILITY)
+        self.assertEqual(
+            self.ws.json_messages()[-1]["downlinkAudio"],
+            common.MANAGED_AUDIO_CAPABILITY,
+        )
+
+        old_ws = FakeWebSocket()
+        old_session = common.Session(old_ws)
+        await old_session.on_start({"systemRole": "角色", "botName": "元元"})
+        self.assertEqual(old_session.downlink_audio, "raw")
+        self.assertEqual(old_ws.json_messages()[-1]["downlinkAudio"], "raw")
+        old_scope = old_session._new_scope("response")
+        self.assertTrue(
+            await old_session.send_downlink_pcm(
+                b"\x01\x00",
+                scope=old_scope,
+                segment_id=1,
+                chunk_sequence=0,
+            )
+        )
+        self.assertEqual(old_ws.messages[-1], b"\x01\x00")
+
     async def test_valid_candidate_is_confirmed_before_asr_payload(self):
         original_transcribe = common.transcribe
         original_validate = common.is_valid_asr
@@ -1052,6 +1132,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         audio = b"\x01\x00" * (common.OUTPUT_RATE // 5)
         tts_future.set_result(audio)
         session.loop = ControlledLoop([tts_future])
+        session.downlink_audio = common.MANAGED_AUDIO_CAPABILITY
         scope = session._new_scope("response")
         session.response_scope = scope
         task = asyncio.create_task(session._reply_pipeline("用户输入", scope))
@@ -1065,6 +1146,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         binary_messages = [message for message in ws.messages if isinstance(message, bytes)]
         self.assertEqual(ws.pcm_attempts, 1)
         self.assertEqual(len(binary_messages), 1)
+        header = common.MANAGED_AUDIO_HEADER.unpack(
+            binary_messages[0][: common.MANAGED_AUDIO_HEADER_BYTES]
+        )
+        self.assertEqual(header[4:7], (scope.generation, 1, 0))
         self.assertIsNone(session.response_scope)
 
     async def test_send_lock_rechecks_generation_before_queued_control_event(self):
@@ -1141,6 +1226,41 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["provider"], "Ollama+CosyVoice")
         self.assertEqual(usage["llm"]["total"], 16)
         self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
+
+    async def test_managed_audio_chunks_are_identified_between_segment_markers(self):
+        common._synth_tts = lambda _text: b"\x01\x00" * 4000
+        self.session.downlink_audio = common.MANAGED_AUDIO_CAPABILITY
+        self.stream_events = [
+            {"type": "delta", "text": "按块发送的完整句子。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+
+        await self.session._reply_pipeline("用户输入", scope)
+
+        decoded = []
+        marker_order = []
+        for message in self.ws.messages:
+            if isinstance(message, bytes):
+                header = common.MANAGED_AUDIO_HEADER.unpack(
+                    message[: common.MANAGED_AUDIO_HEADER_BYTES]
+                )
+                decoded.append(header)
+                marker_order.append("audio")
+            else:
+                event_type = json.loads(message).get("type")
+                if event_type in {"audio_segment_start", "audio_segment_end"}:
+                    marker_order.append(event_type)
+
+        self.assertEqual(
+            marker_order,
+            ["audio_segment_start", "audio", "audio", "audio", "audio_segment_end"],
+        )
+        self.assertEqual([header[4] for header in decoded], [scope.generation] * 3)
+        self.assertEqual([header[5] for header in decoded], [1, 1, 1])
+        self.assertEqual([header[6] for header in decoded], [0, 1, 2])
+        self.assertEqual([header[7] for header in decoded], [1920, 1920, 160])
 
     async def test_parallel_synthesis_keeps_wire_and_history_ordered(self):
         common._synth_tts = lambda _text: b"unused"

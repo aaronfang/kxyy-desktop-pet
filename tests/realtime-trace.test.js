@@ -9,6 +9,31 @@ import {
   summarizeTraceLatency,
 } from "../src/ai/realtime-trace.js";
 
+function managedAudioFrame({
+  generation = 1,
+  segmentId = 1,
+  chunkSequence = 0,
+  pcm = new Int16Array([1, 2, 3]),
+  magic = 0x4b584155,
+  version = 1,
+  flags = 0,
+  headerBytes = 24,
+  payloadSamples = pcm.length,
+} = {}) {
+  const frame = new ArrayBuffer(24 + pcm.byteLength);
+  const view = new DataView(frame);
+  view.setUint32(0, magic, false);
+  view.setUint8(4, version);
+  view.setUint8(5, flags);
+  view.setUint16(6, headerBytes, false);
+  view.setUint32(8, generation, false);
+  view.setUint32(12, segmentId, false);
+  view.setUint32(16, chunkSequence, false);
+  view.setUint32(20, payloadSamples, false);
+  new Uint8Array(frame, 24).set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength));
+  return frame;
+}
+
 function fixtureEvent(eventType, timestampMs, fields = {}) {
   return createTraceEvent({
     eventType,
@@ -230,6 +255,345 @@ test("schema rejects text-like identifiers and trace callbacks cannot break reco
   });
   assert.doesNotThrow(() => trace.startSession());
   assert.equal(trace.snapshot().events.length, 1);
+});
+
+test("managed audio decoder validates the complete fixed header and payload", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { decodeManagedAudioFrame } = await import("../src/ai/realtime.js");
+  const valid = managedAudioFrame({
+    generation: 0x01020304,
+    segmentId: 7,
+    chunkSequence: 9,
+    pcm: new Int16Array([-1, 2, 300]),
+  });
+  const decoded = decodeManagedAudioFrame(valid);
+  assert.deepEqual(
+    {
+      generation: decoded.generation,
+      segmentId: decoded.segmentId,
+      chunkSequence: decoded.chunkSequence,
+      payloadSamples: decoded.payloadSamples,
+      pcm: [...new Int16Array(decoded.pcm)],
+    },
+    {
+      generation: 0x01020304,
+      segmentId: 7,
+      chunkSequence: 9,
+      payloadSamples: 3,
+      pcm: [-1, 2, 300],
+    },
+  );
+
+  const invalid = [
+    new ArrayBuffer(24),
+    valid.slice(0, valid.byteLength - 1),
+    managedAudioFrame({ magic: 0 }),
+    managedAudioFrame({ version: 2 }),
+    managedAudioFrame({ flags: 1 }),
+    managedAudioFrame({ headerBytes: 22 }),
+    managedAudioFrame({ segmentId: 0 }),
+    managedAudioFrame({ chunkSequence: 750 }),
+    managedAudioFrame({ payloadSamples: 0 }),
+    managedAudioFrame({ payloadSamples: 4 }),
+    managedAudioFrame({ pcm: new Int16Array(1921) }),
+  ];
+  for (const frame of invalid) assert.equal(decodeManagedAudioFrame(frame), null);
+});
+
+test("managed audio is explicitly offered only by cascade clients", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    constructor() {
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+
+  const local = new RealtimeSession({ provider: "local" });
+  const localOpen = local._openSocket("ws://local", { systemRole: "role", botName: "元元" });
+  sockets[0].onopen();
+  await localOpen;
+  assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
+
+  const volcano = new RealtimeSession({ provider: "volcano" });
+  const volcanoOpen = volcano._openSocket("ws://volcano", {
+    systemRole: "role",
+    botName: "元元",
+  });
+  sockets[1].onopen();
+  await volcanoOpen;
+  assert.equal("downlinkAudio" in sockets[1].sent[0], false);
+});
+
+test("managed cascade accepts only current ordered identified audio", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const commands = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.audioCtx = { state: "suspended", resume: () => new Promise(() => {}) };
+  session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 3,
+      segmentId: 1,
+      text: "有身份的音频。",
+      samples: 6,
+    }),
+  });
+
+  session._onMessage({ data: managedAudioFrame({ generation: 2 }) });
+  session._onMessage({ data: managedAudioFrame({ generation: 4 }) });
+  session._onMessage({ data: managedAudioFrame({ generation: 3, segmentId: 2 }) });
+  session._onMessage({ data: new Int16Array([9, 9, 9]).buffer });
+  assert.equal(session._backendGeneration, 3, "binary must never advance generation");
+  assert.equal(session._pendingPcm.length, 0);
+
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 3,
+      segmentId: 1,
+      chunkSequence: 0,
+      pcm: new Int16Array([1, 2, 3]),
+    }),
+  });
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 3,
+      segmentId: 1,
+      chunkSequence: 1,
+      pcm: new Int16Array([4, 5, 6]),
+    }),
+  });
+  assert.equal(session._pendingPcm.length, 2);
+  assert.deepEqual(
+    session._pendingPcm.map((item) => [...new Int16Array(item.pcm)]),
+    [
+      [1, 2, 3],
+      [4, 5, 6],
+    ],
+  );
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 3, segmentId: 1 }),
+  });
+  assert.equal(session._audioSegments.get("3:1").dropped, false);
+  assert.deepEqual(commands.map((message) => message.type), ["segment_start"]);
+});
+
+test("managed sequence gaps and declared sample mismatch suppress completion receipts", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "cosyvoice" });
+  session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+  session.audioCtx = { state: "suspended", resume: () => new Promise(() => {}) };
+  session.playbackNode = { port: { postMessage: () => {} } };
+  session._onMessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
+
+  const start = (generation, samples) =>
+    session._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_start",
+        generation,
+        segmentId: 1,
+        text: "不能进入历史的部分句。",
+        samples,
+      }),
+    });
+  start(1, 6);
+  session._onMessage({
+    data: managedAudioFrame({ generation: 1, chunkSequence: 1 }),
+  });
+  assert.equal(session._audioSegments.get("1:1").dropped, true);
+
+  start(2, 6);
+  session._onMessage({
+    data: managedAudioFrame({ generation: 2, pcm: new Int16Array([1, 2, 3]) }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 2, segmentId: 1 }),
+  });
+  assert.equal(session._audioSegments.get("2:1").dropped, true);
+  session._onPlaybackMessage({ type: "segment_completed", generation: 2, segmentId: 1 });
+  assert.deepEqual(sent, []);
+
+  start(3, 3);
+  session._onMessage({ data: managedAudioFrame({ generation: 3 }) });
+  session._onMessage({ data: managedAudioFrame({ generation: 3 }) });
+  assert.equal(session._audioSegments.get("3:1").dropped, true, "duplicate seq must drop");
+});
+
+test("managed audio completes a receipt and a later generation recovers after invalid audio", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const audible = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAudibleAssistant: (text, meta) => audible.push({ text, ...meta }),
+  });
+  session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+  session.audioCtx = { state: "running" };
+  session.playbackNode = { port: { postMessage: () => {} } };
+  session._onMessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
+
+  const start = (generation, text, samples) =>
+    session._onMessage({
+      data: JSON.stringify({
+        type: "audio_segment_start",
+        generation,
+        segmentId: 1,
+        text,
+        samples,
+      }),
+    });
+
+  start(1, "损坏的旧句。", 3);
+  session._onMessage({
+    data: managedAudioFrame({ generation: 1, chunkSequence: 1 }),
+  });
+  assert.equal(session._audioSegments.get("1:1").dropped, true);
+
+  start(2, "恢复后完整播完。", 6);
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 2,
+      chunkSequence: 0,
+      pcm: new Int16Array([1, 2, 3]),
+    }),
+  });
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 2,
+      chunkSequence: 1,
+      pcm: new Int16Array([4, 5, 6]),
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 2, segmentId: 1 }),
+  });
+  session._onPlaybackMessage({ type: "segment_completed", generation: 2, segmentId: 1 });
+
+  assert.deepEqual(sent, [
+    { type: "playback_segment", generation: 2, segmentId: 1, state: "completed" },
+  ]);
+  assert.deepEqual(audible, [
+    { text: "恢复后完整播完。", generation: 2, segmentId: 1 },
+  ]);
+  assert.equal(JSON.stringify(sent).includes("恢复后"), false);
+});
+
+test("managed suspended-queue overflow never delivers partial segment audio", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const commands = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.audioCtx = { state: "suspended", resume: () => new Promise(() => {}) };
+  session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
+  session._onMessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "挂起队列溢出的句子。",
+      samples: 65,
+    }),
+  });
+  for (let chunkSequence = 0; chunkSequence < 65; chunkSequence++) {
+    session._onMessage({
+      data: managedAudioFrame({
+        generation: 1,
+        chunkSequence,
+        pcm: new Int16Array([chunkSequence]),
+      }),
+    });
+  }
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 1, segmentId: 1 }),
+  });
+
+  assert.equal(session._audioSegments.get("1:1").dropped, true);
+  session.audioCtx.state = "running";
+  session._flushPendingPcm();
+  assert.deepEqual(commands.map((message) => message.type), ["segment_start", "segment_end"]);
+});
+
+test("managed malformed and duplicate segment starts cannot replace the active ledger", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const commands = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
+  session._onMessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "合法句段。",
+      samples: 3,
+    }),
+  });
+  const active = session._currentAudioSegment;
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 2,
+      text: "无效样本数。",
+      samples: 0,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "重复句段。",
+      samples: 3,
+    }),
+  });
+
+  assert.equal(session._currentAudioSegment, active);
+  assert.equal(session._audioSegments.size, 1);
+  assert.deepEqual(commands.map((message) => message.type), ["segment_start"]);
+  session._onMessage({ data: managedAudioFrame({ generation: 1 }) });
+  assert.equal(active.receivedSamples, 3);
+});
+
+test("Volcano keeps accepting raw downlink PCM without managed negotiation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "volcano" });
+  session.audioCtx = { state: "suspended", resume: () => new Promise(() => {}) };
+  session._onMessage({ data: new Int16Array([1, 2, 3]).buffer });
+  assert.equal(session._downlinkAudioMode, "raw");
+  assert.equal(session._pendingPcm.length, 1);
+  assert.equal(session._pendingPcm[0].segment, null);
 });
 
 test("desktop session maps local cascade events without retaining transcript text", async () => {
