@@ -97,6 +97,10 @@ jobs:
       - name: Verify bundled VAD resource contract
         run: npm run test:resources
 
+      # build.rs embeds this generated ciphertext even for cargo test/check.
+      - name: Encrypt persona assets
+        run: npm run encrypt-assets
+
       - name: Test Rust library state
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
@@ -126,9 +130,6 @@ jobs:
           KXYY_VAD_RUNTIME_ROOT: ${{ runner.temp }}\kxyy-vad-runtime
           KXYY_RUN_SILERO_SMOKE: '1'
         run: python tests/test_silero_shadow.py
-
-      - name: Encrypt persona assets
-        run: npm run encrypt-assets
 
       - name: Strip plaintext persona assets
         run: node scripts/bundle-assets.mjs strip
