@@ -143,7 +143,7 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
             {
                 "text": "spoken sentence",
                 "stream": True,
-                "ref_audio": "/fake/ref.wav",
+                "ref_audio": str(server._ref_wav),
                 "ref_text": "reference",
                 "streaming_interval": 0.32,
                 "max_tokens": 750,
