@@ -71,7 +71,7 @@ pub struct VoiceServiceManager {
 struct Inner {
     /// 当前由本进程托管的后端（空 = 未托管）。
     backend: String,
-    /// 本地克隆音色指纹（personaCardId|localRefWav|localRefText）；变化时需重启以换参考音。
+    /// 不透明语音配置指纹；变化时重启以应用本地参考音或 CosyVoice 凭据/音色。
     voice_fingerprint: String,
     child: Option<Child>,
     /// 子进程最近日志（失败时带回设置页）。
@@ -203,6 +203,26 @@ pub fn normalize_backend(backend: &str) -> String {
         "cosyvoice" | "cosy" => "cosyvoice".into(),
         "volc" => "volc".into(),
         _ => String::new(), // 空/其他=关闭
+    }
+}
+
+fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> bool {
+    matches!(backend, "local" | "cosyvoice") && !next.is_empty() && previous != next
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::should_restart_for_fingerprint;
+
+    #[test]
+    fn restarts_managed_voice_backends_only_for_nonempty_changes() {
+        for backend in ["local", "cosyvoice"] {
+            assert!(should_restart_for_fingerprint(backend, "old", "new"));
+            assert!(!should_restart_for_fingerprint(backend, "same", "same"));
+            assert!(!should_restart_for_fingerprint(backend, "old", ""));
+        }
+        assert!(!should_restart_for_fingerprint("volc", "old", "new"));
+        assert!(!should_restart_for_fingerprint("", "old", "new"));
     }
 }
 
@@ -910,7 +930,7 @@ pub fn stop(app: &AppHandle) {
 }
 
 /// 按当前语音后端确保服务在跑（volc 则停掉托管进程；空=关闭则不启动）。
-/// `voice_fingerprint`：人设卡 + 参考音路径/文案指纹；本地后端下变化时强制重启以换克隆音色。
+/// `voice_fingerprint`：调用方生成的不透明配置指纹；不得包含可供日志展开的原值。
 pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
     let backend = normalize_backend(backend_raw);
     let port = port_for(&backend);
@@ -946,7 +966,7 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
         return;
     };
 
-    // 本地后端：参考音 / 人设卡变化时必须重启，否则 Python 进程仍用旧克隆音色。
+    // 本地参考音或 CosyVoice Key/音色/模型变化时必须重启，否则 Python 仍用旧配置。
     let prev_fp = app
         .state::<VoiceServiceManager>()
         .inner
@@ -954,8 +974,8 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
         .ok()
         .map(|inner| inner.voice_fingerprint.clone())
         .unwrap_or_default();
-    if backend == "local" && !fp.is_empty() && prev_fp != fp && service_running(port) {
-        eprintln!("[voice-service] 参考音/人设变更，重启本地 TTS（{prev_fp} → {fp}）");
+    if should_restart_for_fingerprint(&backend, &prev_fp, &fp) && service_running(port) {
+        eprintln!("[voice-service] 语音配置已变更，重启当前 TTS 服务");
         stop(app);
         let _ = clear_stale_voice_listeners(port);
     }
@@ -1031,8 +1051,16 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
             if let Some(child) = inner.child.as_mut() {
                 match child.try_wait() {
                     Ok(None) => {
-                        // 进程还在，但端口被占且不健康 → 冲突/僵尸，停掉后重拉。
-                        if port_listener_busy(port) && !service_running(port) {
+                        // 启动期保存新配置也必须立即重拉，不能等旧进程健康后继续使用旧 Key/音色。
+                        if should_restart_for_fingerprint(
+                            &backend,
+                            &inner.voice_fingerprint,
+                            &fp,
+                        ) {
+                            eprintln!("[voice-service] 启动期间语音配置已变更，重启当前 TTS 服务");
+                            stop_inner(&mut inner);
+                            // 进程还在，但端口被占且不健康 → 冲突/僵尸，停掉后重拉。
+                        } else if port_listener_busy(port) && !service_running(port) {
                             stop_inner(&mut inner);
                         } else {
                             emit(

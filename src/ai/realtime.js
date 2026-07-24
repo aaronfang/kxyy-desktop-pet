@@ -39,6 +39,7 @@ const MANAGED_AUDIO_HEADER_BYTES = 24;
 const MANAGED_AUDIO_CHUNK_MAX_SAMPLES = (OUTPUT_RATE * 80) / 1000;
 const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
+const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
@@ -162,6 +163,7 @@ export class RealtimeSession {
     this._audioSegments = new Map();
     this._legacySegments = new Map();
     this._downlinkAudioMode = "raw";
+    this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
     this._candidateId = null;
     this._candidateSnapshot = null;
@@ -243,6 +245,9 @@ export class RealtimeSession {
           this.playbackNode
         ) {
           cascadeCapabilities.interruptionHint = [INTERRUPTION_HINT_CAPABILITY];
+          if (this.trace.provider === "cosyvoice") {
+            cascadeCapabilities.ttsStream = [TTS_STREAMING_CAPABILITY];
+          }
         }
         ws.send(
           JSON.stringify({
@@ -307,6 +312,11 @@ export class RealtimeSession {
             msg.downlinkAudio === MANAGED_AUDIO_CAPABILITY
               ? MANAGED_AUDIO_CAPABILITY
               : "raw";
+          this._ttsStreamingMode =
+            this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
+            msg.ttsStream === TTS_STREAMING_CAPABILITY
+              ? TTS_STREAMING_CAPABILITY
+              : "none";
           this._interruptionHintMode =
             msg.interruptionHint === INTERRUPTION_HINT_CAPABILITY
               ? INTERRUPTION_HINT_CAPABILITY
@@ -664,9 +674,11 @@ export class RealtimeSession {
         )
       : "";
     if (!segment || key !== currentKey || segment.ended || segment.dropped) return null;
+    const streaming = Boolean(segment.streaming);
     if (
       frame.chunkSequence !== segment.nextChunkSequence ||
-      segment.receivedSamples + frame.payloadSamples > segment.expectedSamples
+      segment.receivedSamples + frame.payloadSamples >
+        (streaming ? MANAGED_AUDIO_SEGMENT_MAX_SAMPLES : segment.expectedSamples)
     ) {
       this._markSegmentDropped(segment);
       return null;
@@ -683,6 +695,10 @@ export class RealtimeSession {
     const text = typeof msg.text === "string" ? msg.text : "";
     const expectedSamples = msg.samples;
     const managed = this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY;
+    const streaming =
+      managed &&
+      this._ttsStreamingMode === TTS_STREAMING_CAPABILITY &&
+      msg.streaming === true;
     if (
       !Number.isSafeInteger(generation) ||
       generation < 0 ||
@@ -692,9 +708,11 @@ export class RealtimeSession {
       !text ||
       text.length > 256 ||
       (managed &&
+        !streaming &&
         (!Number.isSafeInteger(expectedSamples) ||
           expectedSamples < 1 ||
-          expectedSamples > MANAGED_AUDIO_SEGMENT_MAX_SAMPLES))
+          expectedSamples > MANAGED_AUDIO_SEGMENT_MAX_SAMPLES)) ||
+      (streaming && expectedSamples !== undefined)
     ) {
       return;
     }
@@ -718,7 +736,8 @@ export class RealtimeSession {
       dropped: false,
       completed: false,
       ended: false,
-      expectedSamples: managed ? expectedSamples : null,
+      streaming,
+      expectedSamples: managed && !streaming ? expectedSamples : null,
       receivedSamples: 0,
       nextChunkSequence: 0,
     };
@@ -756,11 +775,21 @@ export class RealtimeSession {
     }
     const segment = this._currentAudioSegment;
     segment.ended = true;
-    if (
-      this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
-      (segment.nextChunkSequence < 1 || segment.receivedSamples !== segment.expectedSamples)
-    ) {
-      this._markSegmentDropped(segment);
+    if (this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY) {
+      const invalidStreamEnd =
+        segment.streaming &&
+        (segment.nextChunkSequence < 1 ||
+          segment.receivedSamples < 1 ||
+          msg.status !== "completed" ||
+          !Number.isSafeInteger(msg.samples) ||
+          msg.samples !== segment.receivedSamples ||
+          !Number.isSafeInteger(msg.chunks) ||
+          msg.chunks !== segment.nextChunkSequence);
+      const invalidBufferedEnd =
+        !segment.streaming &&
+        (segment.nextChunkSequence < 1 ||
+          segment.receivedSamples !== segment.expectedSamples);
+      if (invalidStreamEnd || invalidBufferedEnd) this._markSegmentDropped(segment);
     }
     if (this.audioCtx && this.audioCtx.state !== "running" && this._pendingPcm.length) {
       this._pushPendingPlayback({ type: "segment_end", generation, segmentId });

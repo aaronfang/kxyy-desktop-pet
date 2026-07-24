@@ -245,6 +245,156 @@ async def _synthesize_mp3(text: str, *, instruction: str, rate, pitch, volume) -
     return b"".join(chunks), usage_chars
 
 
+async def _synthesize_pcm_stream(
+    text: str,
+    *,
+    instruction: str,
+    rate,
+    pitch,
+    volume,
+    connector=None,
+):
+    """逐块产出官方 raw PCM24k，并在 task-finished 后产出计费事件。
+
+    provider 的 binary 边界不是项目协议边界：这里保留最多 1 个奇数字节，
+    重新切成 KXAU 可承载的 <=80ms PCM 块。连接接收队列固定为 2，consumer
+    的发送 pacing 会自然向 DashScope 施加反压。
+    """
+    if connector is None:
+        import websockets
+
+        connector = websockets.connect
+
+    task_id = str(uuid.uuid4())
+    params: dict[str, Any] = {
+        "text_type": "PlainText",
+        "voice": _voice,
+        "format": "pcm",
+        "sample_rate": common.OUTPUT_RATE,
+    }
+    if instruction:
+        params["instruction"] = instruction
+    if rate is not None:
+        params["rate"] = rate
+    if pitch is not None:
+        params["pitch"] = pitch
+    if volume is not None:
+        params["volume"] = volume
+
+    usage_chars = 0
+    started = False
+    saw_audio = False
+    pending_pcm = bytearray()
+    total_bytes = 0
+    ssl_ctx = common.https_context()
+    async with connector(
+        WS_URL,
+        additional_headers={"Authorization": f"Bearer {_api_key}"},
+        ssl=ssl_ctx,
+        open_timeout=15,
+        max_size=8 * 1024 * 1024,
+        max_queue=2,
+    ) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "header": {
+                        "action": "run-task",
+                        "task_id": task_id,
+                        "streaming": "duplex",
+                    },
+                    "payload": {
+                        "task_group": "audio",
+                        "task": "tts",
+                        "function": "SpeechSynthesizer",
+                        "model": _model,
+                        "parameters": params,
+                        "input": {},
+                    },
+                }
+            )
+        )
+        while True:
+            message = await asyncio.wait_for(ws.recv(), timeout=TIMEOUT_S)
+            if isinstance(message, (bytes, bytearray)):
+                total_bytes += len(message)
+                if total_bytes > common.TTS_SENTENCE_MAX_SAMPLES * 2:
+                    raise RuntimeError("CosyVoice PCM exceeded sentence limit")
+                raw = memoryview(message)
+                offset = 0
+                chunk_bytes = common.MANAGED_AUDIO_CHUNK_MAX_SAMPLES * 2
+                if pending_pcm:
+                    take = min(chunk_bytes - len(pending_pcm), len(raw))
+                    pending_pcm.extend(raw[:take])
+                    offset += take
+                    if len(pending_pcm) == chunk_bytes:
+                        saw_audio = True
+                        yield {"type": "audio", "pcm": bytes(pending_pcm)}
+                        pending_pcm.clear()
+                while len(raw) - offset >= chunk_bytes:
+                    chunk = bytes(raw[offset : offset + chunk_bytes])
+                    offset += chunk_bytes
+                    saw_audio = True
+                    yield {"type": "audio", "pcm": chunk}
+                if offset < len(raw):
+                    pending_pcm.extend(raw[offset:])
+                continue
+            try:
+                evt = json.loads(message)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            event = (evt.get("header") or {}).get("event")
+            usage = (evt.get("payload") or {}).get("usage") or {}
+            chars = usage.get("characters")
+            if isinstance(chars, (int, float)) and not isinstance(chars, bool) and chars > 0:
+                usage_chars = int(chars)
+            if event == "task-started" and not started:
+                started = True
+                await ws.send(
+                    json.dumps(
+                        {
+                            "header": {
+                                "action": "continue-task",
+                                "task_id": task_id,
+                                "streaming": "duplex",
+                            },
+                            "payload": {"input": {"text": text}},
+                        }
+                    )
+                )
+                await ws.send(
+                    json.dumps(
+                        {
+                            "header": {
+                                "action": "finish-task",
+                                "task_id": task_id,
+                                "streaming": "duplex",
+                            },
+                            "payload": {"input": {}},
+                        }
+                    )
+                )
+            elif event == "task-finished":
+                if len(pending_pcm) % 2:
+                    raise RuntimeError("CosyVoice returned partial PCM sample")
+                if pending_pcm:
+                    saw_audio = True
+                    yield {"type": "audio", "pcm": bytes(pending_pcm)}
+                    pending_pcm.clear()
+                if not saw_audio:
+                    raise RuntimeError("CosyVoice returned no PCM")
+                if usage_chars <= 0:
+                    usage_chars = _instruct_units(text)
+                yield {
+                    "type": "done",
+                    "characters": usage_chars,
+                    "provider": "CosyVoice",
+                }
+                return
+            elif event == "task-failed":
+                raise RuntimeError("CosyVoice streaming task failed")
+
+
 def _split_speech_chunks(text: str, max_chunk: int = 48) -> list[str]:
     """按句切开，避免单次请求过长导致慢/糊。"""
     t = (text or "").strip()
@@ -281,7 +431,7 @@ def _synth_mp3_once(spoken: str, *, emotion: str) -> tuple[bytes, int]:
         instruction = build_instruction(emotion)
     common.log(
         f"CosyVoice emotion={emotion} rate={rate:.3f} "
-        f"chars={len(spoken)} instruct={instruction!r}"
+        f"chars={len(spoken)} instruction={bool(instruction)}"
     )
     return asyncio.run(
         _synthesize_mp3(
@@ -326,3 +476,26 @@ def synth_tts(text: str) -> tuple[bytes, dict]:
     if not mp3:
         return b"", {}
     return common.mp3_to_pcm24k(mp3), {"characters": billed, "provider": "CosyVoice"}
+
+
+async def synth_tts_stream(text: str):
+    """实时通话真流式入口：DashScope binary 到达即产出 PCM24k。"""
+    emotion = detect_emotion(text)
+    spoken = text_for_speech(text) or (text or "").strip()
+    spoken = common.clip_speech_text(spoken)
+    if not spoken:
+        return
+    instruction = build_instruction(emotion) if _model in INSTRUCT_MODELS else ""
+    rate = base_rate_for(emotion)
+    common.log(
+        f"CosyVoice stream emotion={emotion} rate={rate:.3f} "
+        f"chars={len(spoken)} instruction={bool(instruction)}"
+    )
+    async for event in _synthesize_pcm_stream(
+        spoken,
+        instruction=instruction,
+        rate=rate,
+        pitch=None,
+        volume=None,
+    ):
+        yield event

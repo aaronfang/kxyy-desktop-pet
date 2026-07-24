@@ -316,6 +316,11 @@ export function summarizeTraceLatency(events, generationId) {
         "llmRequestMs",
         "ttsFirstAudioMs",
       ),
+      ttsRequestToFirstAudioMs: durationBetween(
+        milestones,
+        "ttsRequestMs",
+        "ttsFirstAudioMs",
+      ),
       ttsFirstAudioToPlaybackMs: durationBetween(
         milestones,
         "ttsFirstAudioMs",

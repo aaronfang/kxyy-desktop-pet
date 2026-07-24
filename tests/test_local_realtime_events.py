@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import importlib.util
 import io
 import json
@@ -14,11 +15,32 @@ from pathlib import Path
 
 
 COMMON_PATH = Path(__file__).resolve().parents[1] / "scripts" / "local-realtime" / "common.py"
+TTS_COSYVOICE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "local-realtime"
+    / "tts_cosyvoice.py"
+)
 PCM_REPLAY_PATH = Path(__file__).resolve().parent / "fixtures" / "realtime-pcm-replay.json"
 SPEC = importlib.util.spec_from_file_location("kxyy_local_realtime_common", COMMON_PATH)
 common = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(common)
+
+TTS_COSYVOICE_SPEC = importlib.util.spec_from_file_location(
+    "kxyy_local_realtime_tts_cosyvoice", TTS_COSYVOICE_PATH
+)
+tts_cosyvoice = importlib.util.module_from_spec(TTS_COSYVOICE_SPEC)
+assert TTS_COSYVOICE_SPEC and TTS_COSYVOICE_SPEC.loader
+_previous_common_module = sys.modules.get("common")
+sys.modules["common"] = common
+try:
+    TTS_COSYVOICE_SPEC.loader.exec_module(tts_cosyvoice)
+finally:
+    if _previous_common_module is None:
+        sys.modules.pop("common", None)
+    else:
+        sys.modules["common"] = _previous_common_module
 
 
 class FakeWebSocket:
@@ -53,6 +75,182 @@ class BlockingPcmWebSocket(FakeWebSocket):
             self.pcm_entered.set()
             await self.pcm_release.wait()
         self.messages.append(message)
+
+
+class FakeCosyVoiceWebSocket(FakeWebSocket):
+    def __init__(self, messages=()):
+        super().__init__()
+        self.incoming = collections.deque(messages)
+        self.ready = asyncio.Event()
+        if self.incoming:
+            self.ready.set()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def feed(self, message):
+        self.incoming.append(message)
+        self.ready.set()
+
+    async def recv(self):
+        while not self.incoming:
+            self.ready.clear()
+            await self.ready.wait()
+        message = self.incoming.popleft()
+        if not self.incoming:
+            self.ready.clear()
+        return message
+
+
+class FakeCosyVoiceConnector:
+    def __init__(self, messages=()):
+        self.websocket = FakeCosyVoiceWebSocket(messages)
+        self.calls = []
+
+    def __call__(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.websocket
+
+
+def cosyvoice_event(event, *, usage=None, error_message=None):
+    header = {"event": event}
+    if error_message is not None:
+        header["error_message"] = error_message
+    payload = {}
+    if usage is not None:
+        payload["usage"] = usage
+    return json.dumps({"header": header, "payload": payload})
+
+
+class CosyVoiceStreamingAdapterTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.original_api_key = tts_cosyvoice._api_key
+        self.original_voice = tts_cosyvoice._voice
+        self.original_model = tts_cosyvoice._model
+        tts_cosyvoice._api_key = "test-api-key"
+        tts_cosyvoice._voice = "cosyvoice-test-voice"
+        tts_cosyvoice._model = "cosyvoice-v3.5-flash"
+
+    def tearDown(self):
+        tts_cosyvoice._api_key = self.original_api_key
+        tts_cosyvoice._voice = self.original_voice
+        tts_cosyvoice._model = self.original_model
+
+    def stream(self, connector):
+        return tts_cosyvoice._synthesize_pcm_stream(
+            "测试文本。",
+            instruction="温柔一点。",
+            rate=0.96,
+            pitch=None,
+            volume=None,
+            connector=connector,
+        )
+
+    async def test_requests_pcm24k_with_bounded_receive_queue_and_yields_before_finish(self):
+        connector = FakeCosyVoiceConnector(
+            [
+                cosyvoice_event("task-started"),
+                b"\x01\x00" * common.MANAGED_AUDIO_CHUNK_MAX_SAMPLES,
+            ]
+        )
+        stream = self.stream(connector)
+
+        first = await anext(stream)
+        self.assertEqual(
+            first,
+            {
+                "type": "audio",
+                "pcm": b"\x01\x00" * common.MANAGED_AUDIO_CHUNK_MAX_SAMPLES,
+            },
+        )
+        self.assertEqual(len(connector.calls), 1)
+        _, connect_kwargs = connector.calls[0]
+        self.assertEqual(connect_kwargs["max_queue"], 2)
+
+        sent = connector.websocket.json_messages()
+        self.assertEqual(
+            [message["header"]["action"] for message in sent],
+            ["run-task", "continue-task", "finish-task"],
+        )
+        parameters = sent[0]["payload"]["parameters"]
+        self.assertEqual(parameters["format"], "pcm")
+        self.assertEqual(parameters["sample_rate"], 24000)
+
+        connector.websocket.feed(
+            cosyvoice_event("result-generated", usage={"characters": 12})
+        )
+        connector.websocket.feed(cosyvoice_event("task-finished"))
+        done = await anext(stream)
+        self.assertEqual(
+            done,
+            {"type": "done", "characters": 12, "provider": "CosyVoice"},
+        )
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
+    async def test_reassembles_odd_provider_boundaries_and_caps_output_chunks(self):
+        provider_pcm = b"\x01" + b"\x02" + (b"\x03" * 3840)
+        connector = FakeCosyVoiceConnector(
+            [
+                cosyvoice_event("task-started"),
+                provider_pcm[:1],
+                provider_pcm[1:],
+                cosyvoice_event("task-finished", usage={"characters": 7}),
+            ]
+        )
+
+        events = [event async for event in self.stream(connector)]
+        audio = [event["pcm"] for event in events if event["type"] == "audio"]
+
+        self.assertEqual(b"".join(audio), provider_pcm)
+        self.assertEqual([len(chunk) // 2 for chunk in audio], [1920, 1])
+        self.assertTrue(
+            all(len(chunk) // 2 <= common.MANAGED_AUDIO_CHUNK_MAX_SAMPLES for chunk in audio)
+        )
+        self.assertEqual(
+            events[-1],
+            {"type": "done", "characters": 7, "provider": "CosyVoice"},
+        )
+
+    async def test_task_failed_is_terminal(self):
+        connector = FakeCosyVoiceConnector(
+            [
+                cosyvoice_event("task-started"),
+                cosyvoice_event("task-failed", error_message="provider detail"),
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "streaming task failed"):
+            [event async for event in self.stream(connector)]
+
+    async def test_partial_pcm_sample_at_finish_is_rejected(self):
+        connector = FakeCosyVoiceConnector(
+            [
+                cosyvoice_event("task-started"),
+                b"\x01\x02\x03",
+                cosyvoice_event("task-finished"),
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "partial PCM sample"):
+            [event async for event in self.stream(connector)]
+
+    async def test_pcm_over_sixty_seconds_is_rejected_before_any_done_event(self):
+        connector = FakeCosyVoiceConnector(
+            [
+                cosyvoice_event("task-started"),
+                b"\x00\x00" * (common.TTS_SENTENCE_MAX_SAMPLES + 1),
+            ]
+        )
+
+        events = []
+        with self.assertRaisesRegex(RuntimeError, "sentence limit"):
+            async for event in self.stream(connector):
+                events.append(event)
+        self.assertFalse(any(event["type"] == "done" for event in events))
 
 
 class GenerationCancelScopeTests(unittest.IsolatedAsyncioTestCase):
@@ -846,6 +1044,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.ws = FakeWebSocket()
         self.session = common.Session(self.ws)
         self.original_synth_tts = common._synth_tts
+        self.original_synth_tts_stream = common._synth_tts_stream
         self.original_start_llm_stream = common.start_llm_stream_producer
         self.stream_events = []
 
@@ -861,6 +1060,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         if self.session.reply_task:
             await self.session.reply_task
         common._synth_tts = self.original_synth_tts
+        common._synth_tts_stream = self.original_synth_tts_stream
         common.start_llm_stream_producer = self.original_start_llm_stream
 
     async def test_playback_voice_threshold_emits_one_candidate(self):
@@ -876,11 +1076,17 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.session.play_barge_pending)
 
     async def test_start_negotiates_managed_audio_and_old_client_stays_raw(self):
+        async def unused_stream(_text):
+            if False:
+                yield None
+
+        common._synth_tts_stream = unused_stream
         await self.session.on_start(
             {
                 "systemRole": "角色",
                 "botName": "元元",
                 "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
                 "interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY],
             }
         )
@@ -893,6 +1099,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.ws.json_messages()[-1]["downlinkAudio"],
             common.MANAGED_AUDIO_CAPABILITY,
         )
+        self.assertEqual(self.session.tts_streaming, common.TTS_STREAMING_CAPABILITY)
+        self.assertEqual(
+            self.ws.json_messages()[-1]["ttsStream"],
+            common.TTS_STREAMING_CAPABILITY,
+        )
         self.assertEqual(
             self.ws.json_messages()[-1]["interruptionHint"],
             common.INTERRUPTION_HINT_CAPABILITY,
@@ -902,8 +1113,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         old_session = common.Session(old_ws)
         await old_session.on_start({"systemRole": "角色", "botName": "元元"})
         self.assertEqual(old_session.downlink_audio, "raw")
+        self.assertEqual(old_session.tts_streaming, "none")
         self.assertEqual(old_session.interruption_hint, "none")
         self.assertEqual(old_ws.json_messages()[-1]["downlinkAudio"], "raw")
+        self.assertEqual(old_ws.json_messages()[-1]["ttsStream"], "none")
         self.assertEqual(old_ws.json_messages()[-1]["interruptionHint"], "none")
         old_scope = old_session._new_scope("response")
         self.assertTrue(
@@ -915,6 +1128,16 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(old_ws.messages[-1], b"\x01\x00")
+
+        no_adapter = common.Session(FakeWebSocket())
+        common._synth_tts_stream = None
+        await no_adapter.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.assertEqual(no_adapter.tts_streaming, "none")
 
     async def test_candidate_ids_bind_thresholded_one_shot_interruption_receipts(self):
         await self.session.on_start(
@@ -1403,6 +1626,180 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["provider"], "Ollama+CosyVoice")
         self.assertEqual(usage["llm"]["total"], 16)
         self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
+
+    async def test_provider_pcm_stream_sends_first_audio_before_provider_finishes(self):
+        provider_finish = asyncio.Event()
+
+        async def fake_stream(_text):
+            yield {"type": "audio", "pcm": b"\x01\x00" * 4}
+            await provider_finish.wait()
+            yield {"type": "audio", "pcm": b"\x02\x00" * 3}
+            yield {"type": "done", "characters": 7, "provider": "CosyVoice"}
+
+        common._synth_tts = lambda _text: b"buffered path must not run"
+        common._synth_tts_stream = fake_stream
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.stream_events = [
+            {"type": "meta", "provider": "Ollama", "thinking": False},
+            {"type": "delta", "text": "真流式句子已经完成。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+
+        for _ in range(100):
+            if any(isinstance(message, bytes) for message in self.ws.messages):
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(any(isinstance(message, bytes) for message in self.ws.messages))
+        messages = self.ws.json_messages()
+        start = next(m for m in messages if m["type"] == "audio_segment_start")
+        self.assertTrue(start["streaming"])
+        self.assertNotIn("samples", start)
+        self.assertFalse(any(m["type"] == "audio_segment_end" for m in messages))
+
+        provider_finish.set()
+        await task
+        messages = self.ws.json_messages()
+        end = next(m for m in messages if m["type"] == "audio_segment_end")
+        self.assertEqual(
+            (end["status"], end["samples"], end["chunks"]),
+            ("completed", 7, 2),
+        )
+        usage = next(m for m in messages if m["type"] == "usage")
+        self.assertEqual(usage["ttsCharacters"], 7)
+
+    async def test_provider_pcm_stream_failure_closes_dropped_segment_without_history(self):
+        async def failing_stream(_text):
+            yield {"type": "audio", "pcm": b"\x01\x00" * 4}
+            raise RuntimeError("provider detail must stay private")
+
+        common._synth_tts = lambda _text: b"unused"
+        common._synth_tts_stream = failing_stream
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.stream_events = [
+            {"type": "delta", "text": "会在流中失败的句子。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+
+        await self.session._reply_pipeline("用户输入", scope)
+
+        messages = self.ws.json_messages()
+        end = next(m for m in messages if m["type"] == "audio_segment_end")
+        self.assertEqual(end["status"], "failed")
+        self.assertFalse(any(m["type"] == "tts_end" for m in messages))
+        self.assertNotIn("provider detail", messages[-1].get("message", ""))
+        self.session.on_playback_segment(
+            {"generation": scope.generation, "segmentId": 1, "state": "completed"}
+        )
+        self.assertEqual(
+            self.session.history,
+            [{"role": "user", "content": "用户输入"}],
+        )
+
+    async def test_provider_pcm_stream_cancel_closes_generator_and_releases_slot(self):
+        provider_wait = asyncio.Event()
+        provider_closed = asyncio.Event()
+
+        async def cancellable_stream(_text):
+            try:
+                yield {"type": "audio", "pcm": b"\x01\x00" * 4}
+                await provider_wait.wait()
+            finally:
+                provider_closed.set()
+
+        common._synth_tts = lambda _text: b"unused"
+        common._synth_tts_stream = cancellable_stream
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.stream_events = [
+            {"type": "delta", "text": "等待取消的流式句子。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+        for _ in range(100):
+            if any(isinstance(message, bytes) for message in self.ws.messages):
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(any(isinstance(message, bytes) for message in self.ws.messages))
+
+        scope.cancel("turn_detected")
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(provider_closed.is_set())
+        self.assertTrue(common._tts_stream_slots.acquire(blocking=False))
+        self.assertTrue(common._tts_stream_slots.acquire(blocking=False))
+        self.assertFalse(common._tts_stream_slots.acquire(blocking=False))
+        common._tts_stream_slots.release()
+        common._tts_stream_slots.release()
+        completed = [
+            message
+            for message in self.ws.json_messages()
+            if message["type"] == "audio_segment_end"
+            and message.get("status") == "completed"
+        ]
+        self.assertEqual(completed, [])
+
+    async def test_provider_pcm_stream_releases_slot_when_aclose_raises(self):
+        class ExplodingCloseStream:
+            def __init__(self):
+                self.count = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.count += 1
+                if self.count == 1:
+                    return {"type": "audio", "pcm": b"\x01\x00" * 4}
+                raise RuntimeError("provider read failed")
+
+            async def aclose(self):
+                raise RuntimeError("provider cleanup failed")
+
+        common._synth_tts = lambda _text: b"unused"
+        common._synth_tts_stream = lambda _text: ExplodingCloseStream()
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.stream_events = [
+            {"type": "delta", "text": "清理也会失败的流式句子。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+
+        await self.session._reply_pipeline("用户输入", scope)
+
+        self.assertTrue(common._tts_stream_slots.acquire(blocking=False))
+        self.assertTrue(common._tts_stream_slots.acquire(blocking=False))
+        self.assertFalse(common._tts_stream_slots.acquire(blocking=False))
+        common._tts_stream_slots.release()
+        common._tts_stream_slots.release()
+        self.assertEqual(self.ws.json_messages()[-1]["type"], "error")
+        self.assertNotIn("cleanup failed", self.ws.json_messages()[-1]["message"])
 
     async def test_managed_audio_chunks_are_identified_between_segment_markers(self):
         common._synth_tts = lambda _text: b"\x01\x00" * 4000

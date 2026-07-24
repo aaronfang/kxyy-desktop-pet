@@ -365,6 +365,7 @@ MANAGED_AUDIO_HEADER = struct.Struct(">4sBBHIIII")
 MANAGED_AUDIO_HEADER_BYTES = MANAGED_AUDIO_HEADER.size
 MANAGED_AUDIO_CHUNK_MAX_SAMPLES = OUTPUT_RATE * 80 // 1000
 MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750
+TTS_STREAMING_CAPABILITY = "provider-pcm-v1"
 INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1"
 INTERRUPTION_HINT_MIN_SAMPLES = OUTPUT_RATE
 INTERRUPTION_RECEIPT_WAIT_SECONDS = 0.05
@@ -734,6 +735,8 @@ _mlx_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 _tts_pool: Executor | None = None
 # 返回 bytes，或 (pcm_bytes, usage_dict)（CosyVoice 通话带计费字符）。
 _synth_tts: Callable[[str], bytes | tuple] | None = None
+# 可选的 provider 原生 PCM async iterator；只在显式双向协商后使用。
+_synth_tts_stream = None
 # 朗读专用：返回 (audio_bytes, mime)。CosyVoice 直接回 MP3，避免 ffmpeg+24k WAV 失真。
 # 返回 (audio, mime) 或 (audio, mime, usage_dict)；usage 含 characters / provider。
 _synth_tts_http: Callable[[str], tuple] | None = None
@@ -1639,6 +1642,7 @@ class Session:
         self.tts_parallelism = _tts_parallelism
         self.tts_prefetch_while_playing = _tts_prefetch_while_playing
         self.downlink_audio = "raw"
+        self.tts_streaming = "none"
         self.interruption_hint = "none"
         self._candidate_sequence = 0
         self._candidate_id: int | None = None
@@ -1750,6 +1754,15 @@ class Session:
             if isinstance(offered, list) and MANAGED_AUDIO_CAPABILITY in offered
             else "raw"
         )
+        offered_tts_stream = msg.get("ttsStream")
+        self.tts_streaming = (
+            TTS_STREAMING_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and _synth_tts_stream is not None
+            and isinstance(offered_tts_stream, list)
+            and TTS_STREAMING_CAPABILITY in offered_tts_stream
+            else "none"
+        )
         offered_interruption = msg.get("interruptionHint")
         self.interruption_hint = (
             INTERRUPTION_HINT_CAPABILITY
@@ -1763,6 +1776,7 @@ class Session:
                 "type": "session",
                 "state": "started",
                 "downlinkAudio": self.downlink_audio,
+                "ttsStream": self.tts_streaming,
                 "interruptionHint": self.interruption_hint,
             }
         )
@@ -2170,6 +2184,20 @@ class Session:
             async def synthesize_sentence(_sequence: int, sentence: str) -> dict:
                 if not sentence or not scope.active:
                     return {"audio": b"", "billed": 0, "provider": "", "spoken": ""}
+                spoken_sentence = clip_speech_text(
+                    text_for_speech(sentence) or sentence.strip()
+                )
+                if (
+                    self.tts_streaming == TTS_STREAMING_CAPABILITY
+                    and _synth_tts_stream is not None
+                ):
+                    return {
+                        "audio": b"",
+                        "billed": 0,
+                        "provider": "",
+                        "spoken": spoken_sentence,
+                        "stream": _synth_tts_stream(sentence),
+                    }
                 tts_slots = _tts_stream_slots
                 if not tts_slots.acquire(blocking=False):
                     raise SafeRealtimeError("语音合成仍在结束上一轮请求，请稍后再试")
@@ -2233,9 +2261,6 @@ class Session:
                     raise SafeRealtimeError("语音合成返回了无效音频，请稍后重试")
                 if audio_bytes // 2 > TTS_SENTENCE_MAX_SAMPLES:
                     raise SafeRealtimeError("单句语音过长，已停止播报")
-                spoken_sentence = clip_speech_text(
-                    text_for_speech(sentence) or sentence.strip()
-                )
                 return {
                     "audio": bytes(audio),
                     "billed": billed,
@@ -2247,6 +2272,131 @@ class Session:
                 nonlocal tts_chars, tts_provider, speaking_sent, segment_seq
                 if not scope.active:
                     return
+                stream = result.get("stream")
+                if stream is not None:
+                    spoken_sentence = str(result.get("spoken") or "")
+                    if not spoken_sentence:
+                        return
+                    if not _tts_stream_slots.acquire(blocking=False):
+                        raise SafeRealtimeError("语音合成仍在结束上一轮请求，请稍后再试")
+                    segment_id = 0
+                    samples_sent = 0
+                    chunks_sent = 0
+                    stream_started_at = 0.0
+                    try:
+                        async for event in stream:
+                            if not scope.active:
+                                return
+                            if not isinstance(event, dict):
+                                raise SafeRealtimeError("语音合成返回了无效音频，请稍后重试")
+                            event_type = event.get("type")
+                            if event_type == "done":
+                                billed = int(event.get("characters") or 0)
+                                provider = str(event.get("provider") or "").strip()
+                                if billed > 0:
+                                    tts_chars += billed
+                                if provider:
+                                    tts_provider = provider
+                                continue
+                            if event_type != "audio":
+                                continue
+                            chunk = event.get("pcm")
+                            if not isinstance(chunk, bytes) or not chunk or len(chunk) % 2:
+                                raise SafeRealtimeError("语音合成返回了无效音频，请稍后重试")
+                            chunk_samples = len(chunk) // 2
+                            if chunk_samples > MANAGED_AUDIO_CHUNK_MAX_SAMPLES:
+                                raise SafeRealtimeError("语音合成返回了无效音频，请稍后重试")
+                            if (
+                                chunks_sent >= MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX
+                                or samples_sent + chunk_samples > TTS_SENTENCE_MAX_SAMPLES
+                            ):
+                                raise SafeRealtimeError("单句语音过长，已停止播报")
+                            if segment_id == 0:
+                                segment_seq += 1
+                                segment_id = segment_seq
+                                if not self._audible_history.add_segment(
+                                    scope.generation,
+                                    segment_id,
+                                    spoken_sentence,
+                                ):
+                                    raise SafeRealtimeError("本轮语音句段过多，已停止播报")
+                                if not await self.send_json(
+                                    {
+                                        "type": "audio_segment_start",
+                                        "segmentId": segment_id,
+                                        "text": spoken_sentence,
+                                        "streaming": True,
+                                    },
+                                    scope=scope,
+                                ):
+                                    return
+                                self.playing = True
+                                if not speaking_sent:
+                                    self.play_enabled = not self.in_speech
+                                    if not self.play_enabled:
+                                        log("用户仍在说话，暂缓播报")
+                                    if not await self.send_json({"type": "speaking"}, scope=scope):
+                                        return
+                                    speaking_sent = True
+                                stream_started_at = time.perf_counter()
+                            while not self.play_enabled and scope.active:
+                                await asyncio.sleep(0.02)
+                            if not scope.active or not await self.send_downlink_pcm(
+                                chunk,
+                                scope=scope,
+                                segment_id=segment_id,
+                                chunk_sequence=chunks_sent,
+                            ):
+                                return
+                            chunks_sent += 1
+                            samples_sent += chunk_samples
+                            # Provider 可能突发返回；单调 pacer 把发送速率限制在实时音频的
+                            # 约 1.33x，避免一次塞满前端 3 秒测试 ring。
+                            target_elapsed = (samples_sent / OUTPUT_RATE) * 0.75
+                            delay = target_elapsed - (time.perf_counter() - stream_started_at)
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                        if not scope.active:
+                            return
+                        if segment_id == 0 or chunks_sent < 1:
+                            raise SafeRealtimeError("语音合成未返回音频，请稍后重试")
+                        await self.send_json(
+                            {
+                                "type": "audio_segment_end",
+                                "segmentId": segment_id,
+                                "status": "completed",
+                                "samples": samples_sent,
+                                "chunks": chunks_sent,
+                            },
+                            scope=scope,
+                        )
+                        log(
+                            f"TTS stream {time.perf_counter()-stream_started_at:.2f}s "
+                            f"({samples_sent * 2} bytes, chunks={chunks_sent})"
+                        )
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if segment_id and scope.active:
+                            await self.send_json(
+                                {
+                                    "type": "audio_segment_end",
+                                    "segmentId": segment_id,
+                                    "status": "failed",
+                                    "samples": samples_sent,
+                                    "chunks": chunks_sent,
+                                },
+                                scope=scope,
+                            )
+                        raise
+                    finally:
+                        try:
+                            close = getattr(stream, "aclose", None)
+                            if close is not None:
+                                await close()
+                        finally:
+                            _tts_stream_slots.release()
                 audio = result["audio"]
                 billed = int(result["billed"] or 0)
                 provider = str(result["provider"] or "").strip()
@@ -2315,8 +2465,16 @@ class Session:
             tts_pipeline = BoundedOrderedTtsPipeline(
                 synthesize_sentence,
                 play_sentence,
-                parallelism=self.tts_parallelism,
-                prefetch_while_playing=self.tts_prefetch_while_playing,
+                parallelism=(
+                    1
+                    if self.tts_streaming == TTS_STREAMING_CAPABILITY
+                    else self.tts_parallelism
+                ),
+                prefetch_while_playing=(
+                    False
+                    if self.tts_streaming == TTS_STREAMING_CAPABILITY
+                    else self.tts_prefetch_while_playing
+                ),
             )
 
             stream_done = False
@@ -2408,6 +2566,7 @@ class Session:
                     {"type": "error", "message": message},
                     scope=scope,
                 )
+                self._audible_history.cancel_turn(scope.generation)
                 scope.cancel("response_error")
         finally:
             if tts_pipeline is not None:
@@ -2463,13 +2622,15 @@ def run(
     tts_prefetch_while_playing: bool = False,
     system_suffix: str = "",
     synth_tts_http: Callable[[str], tuple] | None = None,
+    synth_tts_stream=None,
 ) -> None:
     """prepare() 在监听前调用（加载模型等）。"""
-    global _log_prefix, _synth_tts, _synth_tts_http, _tts_pool
+    global _log_prefix, _synth_tts, _synth_tts_http, _synth_tts_stream, _tts_pool
     global _tts_parallelism, _tts_prefetch_while_playing, _system_suffix
     _log_prefix = name
     _synth_tts = synth_tts
     _synth_tts_http = synth_tts_http
+    _synth_tts_stream = synth_tts_stream
     _tts_pool = tts_pool
     _tts_parallelism = max(1, min(TTS_PARALLELISM_MAX, int(tts_parallelism)))
     _tts_prefetch_while_playing = bool(tts_prefetch_while_playing)
