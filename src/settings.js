@@ -20,6 +20,7 @@ const FIELDS = [
   "localRefWav",
   "localRefText",
   "asrProvider",
+  "turnPauseTolerance",
   "voiceVolume",
   "textProvider",
   "textModel",
@@ -75,6 +76,11 @@ function currentAsrProvider() {
     : "whisper";
 }
 
+function currentTurnPauseTolerance() {
+  const value = (el("turnPauseTolerance")?.value || "standard").toLowerCase();
+  return value === "fast" || value === "long" ? value : "standard";
+}
+
 /** 按所选语音后端只展示对应设置项。 */
 function syncVoiceFields() {
   const backend = currentBackend();
@@ -93,6 +99,10 @@ function syncVoiceFields() {
   const asrBox = el("asrFields");
   if (asrBox) {
     asrBox.hidden = backend !== "local" && backend !== "cosyvoice";
+  }
+  const pauseBox = el("turnPauseFields");
+  if (pauseBox) {
+    pauseBox.hidden = backend !== "local" && backend !== "cosyvoice";
   }
   const installSenseVoice = el("installSenseVoiceRuntime");
   if (installSenseVoice) {
@@ -149,6 +159,10 @@ function fill(s) {
   el("localRefWav").value = s.localRefWav || "";
   el("localRefText").value = s.localRefText || "";
   el("asrProvider").value = s.asrProvider === "sensevoice" ? "sensevoice" : "whisper";
+  el("turnPauseTolerance").value =
+    s.turnPauseTolerance === "fast" || s.turnPauseTolerance === "long"
+      ? s.turnPauseTolerance
+      : "standard";
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
   const vol = Number(s.voiceVolume);
   el("voiceVolume").value = Number.isFinite(vol)
@@ -519,6 +533,7 @@ function collect() {
     localRefWav: el("localRefWav").value.trim(),
     localRefText: el("localRefText").value.trim(),
     asrProvider: currentAsrProvider(),
+    turnPauseTolerance: currentTurnPauseTolerance(),
     voiceVolume: Math.max(
       0,
       Math.min(200, parseInt(el("voiceVolume").value, 10) || 100),

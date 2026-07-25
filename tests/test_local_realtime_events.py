@@ -580,9 +580,10 @@ class StableSentenceBufferTests(unittest.TestCase):
     def test_realtime_minimum_coalesces_short_sentences_into_one_clone_request(self):
         buf = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
         self.assertEqual(buf.feed("第一句很短。"), [])
+        self.assertEqual(buf.feed("第二句也会和前句一起合成。"), [])
         self.assertEqual(
-            buf.feed("第二句也会和前句一起合成。"),
-            ["第一句很短。第二句也会和前句一起合成。"],
+            buf.feed("第三句正好补足稳定长度。"),
+            ["第一句很短。第二句也会和前句一起合成。第三句正好补足稳定长度。"],
         )
 
         boundary = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
@@ -592,6 +593,17 @@ class StableSentenceBufferTests(unittest.TestCase):
         short_only = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
         self.assertEqual(short_only.feed("只有一句。"), [])
         self.assertEqual(short_only.flush(), ["只有一句。"])
+
+    def test_realtime_minimum_reduces_medium_sentence_clone_requests(self):
+        buf = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        first = "甲" * 19 + "。"
+        second = "乙" * 19 + "。"
+        third = "丙" * 19 + "。"
+
+        self.assertEqual(buf.feed(first), [])
+        self.assertEqual(buf.feed(second), [first + second])
+        self.assertEqual(buf.feed(third), [])
+        self.assertEqual(buf.flush(), [third])
 
 
 class ManagedAudioEnvelopeTests(unittest.TestCase):
@@ -1058,6 +1070,36 @@ class BoundedOrderedTtsPipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SoftEndpointTests(unittest.TestCase):
+    def test_pause_tolerance_presets_are_fixed_and_frame_aligned(self):
+        self.assertEqual(common.normalize_turn_pause_tolerance(" fast "), "fast")
+        self.assertEqual(common.normalize_turn_pause_tolerance("long"), "long")
+        for value in (None, "", "custom", "2250"):
+            self.assertEqual(
+                common.normalize_turn_pause_tolerance(value),
+                "standard",
+            )
+
+        expected_commit_ms = {
+            "fast": 1050,
+            "standard": 1650,
+            "long": 2250,
+        }
+        for preset, commit_ms in expected_commit_ms.items():
+            reopen_ms = common.TURN_PAUSE_REOPEN_MS[preset]
+            self.assertEqual(common.SOFT_END_MS + reopen_ms, commit_ms)
+            self.assertEqual(reopen_ms % common.FRAME_MS, 0)
+
+    def test_each_pause_tolerance_commits_at_its_fixed_deadline(self):
+        for preset, reopen_ms in common.TURN_PAUSE_REOPEN_MS.items():
+            endpoint = common.SoftEndpoint(reopen_ms=reopen_ms)
+            events = []
+            commit_ms = common.SOFT_END_MS + reopen_ms
+            for _ in range(commit_ms // common.FRAME_MS):
+                event = endpoint.observe(False, eligible=True)
+                if event:
+                    events.append(event)
+            self.assertEqual(events, ["soft_end", "committed"], preset)
+
     def test_soft_end_reopens_before_deterministic_commit(self):
         endpoint = common.SoftEndpoint()
         events = []
@@ -1484,7 +1526,8 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
         quiet = bytes(common.FRAME_SAMPLES * 2)
         for _ in range(20):
             await session._on_frame(voice)
-        for _ in range(34):
+        commit_frames = common.ENDPOINT_COMMIT_MS // common.FRAME_MS
+        for _ in range(commit_frames - 1):
             await session._on_frame(quiet)
         self.assertEqual(
             sum(
@@ -1517,7 +1560,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
         quiet = bytes(common.FRAME_SAMPLES * 2)
         for _ in range(20):
             await session._on_frame(voice)
-        for _ in range(35):
+        for _ in range(common.ENDPOINT_COMMIT_MS // common.FRAME_MS):
             await session._on_frame(quiet)
 
         self.assertEqual(len(committed), 1)
@@ -2813,6 +2856,38 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["llm"]["total"], 16)
         self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
 
+    async def test_tts_chunk_sequence_is_independent_of_text_provider_metadata(self):
+        first = "甲" * 19 + "。"
+        second = "乙" * 19 + "。"
+        third = "丙" * 19 + "。"
+
+        async def run_pipeline(provider):
+            synthesized = []
+
+            def synth(sentence):
+                synthesized.append(sentence)
+                return b"\x01\x00" * 4
+
+            common._synth_tts = synth
+            self.stream_events = [
+                {"type": "meta", "provider": provider, "thinking": False},
+                {"type": "delta", "text": first},
+                {"type": "delta", "text": second},
+                {"type": "delta", "text": third},
+                {"type": "done"},
+            ]
+            session = common.Session(FakeWebSocket())
+            scope = session._new_scope("response")
+            session.response_scope = scope
+            await session._reply_pipeline("用户输入", scope)
+            return synthesized
+
+        deepseek_chunks = await run_pipeline("DeepSeek")
+        ollama_chunks = await run_pipeline("Ollama")
+
+        self.assertEqual(deepseek_chunks, [first + second, third])
+        self.assertEqual(ollama_chunks, deepseek_chunks)
+
     async def test_provider_pcm_stream_sends_first_audio_before_provider_finishes(self):
         provider_finish = asyncio.Event()
 
@@ -3029,8 +3104,8 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         second = loop.create_future()
         self.session.loop = ControlledLoop([first, second])
         self.session.tts_parallelism = 2
-        first_text = "第一句已经完成，而且内容足够长可以独立合成。"
-        second_text = "第二句也已经完成，而且同样足够长可以独立合成。"
+        first_text = "第一句已经完成，而且内容足够长，可以独立合成并验证并行顺序稳定。"
+        second_text = "第二句也已经完成，而且同样足够长，可以独立合成并验证并行顺序稳定。"
         self.stream_events = [
             {"type": "delta", "text": first_text},
             {"type": "delta", "text": second_text},

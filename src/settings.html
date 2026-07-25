@@ -233,6 +233,18 @@
             <p class="hint">保存后自动启动 <code>server_cosyvoice.py</code>（通话 :19877，朗读 :19977）。本机 Whisper + DeepSeek，TTS 走通义云端（上方通义 Key），不消耗火山 token。</p>
           </div>
 
+          <div id="turnPauseFields" hidden>
+            <label>
+              <span>说话停顿容忍度<small>仅本地 Qwen3 / CosyVoice 通话</small></span>
+              <select id="turnPauseTolerance">
+                <option value="fast">快速（约 1.05 秒）</option>
+                <option value="standard" selected>标准（约 1.65 秒）</option>
+                <option value="long">长停顿（约 2.25 秒）</option>
+              </select>
+            </label>
+            <p class="hint">等待更久可减少思考停顿被拆成两轮，但会相应延后 AI 开始回答的时间。</p>
+          </div>
+
           <div id="asrFields" hidden>
             <label>
               <span>用户语音识别（final ASR）<small>仅本地 Qwen3 / CosyVoice 通话</small></span>

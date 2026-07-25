@@ -271,9 +271,14 @@ async fn handle_frontend(
     let (system_role, bot_name) = loop {
         match front_rx.next().await {
             Some(Ok(Message::Text(t))) => {
-                let v: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
+                let v: serde_json::Value =
+                    serde_json::from_str(&t).unwrap_or(serde_json::Value::Null);
                 if v.get("type").and_then(|x| x.as_str()) == Some("start") {
-                    let sr = v.get("systemRole").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let sr = v
+                        .get("systemRole")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let bn = v
                         .get("botName")
                         .and_then(|x| x.as_str())
@@ -293,7 +298,9 @@ async fn handle_frontend(
         Ok(ws) => ws,
         Err(e) => {
             let _ = front_tx
-                .send(Message::Text(to_frontend_error(&format!("连接火山失败：{e}")).to_string()))
+                .send(Message::Text(
+                    to_frontend_error(&format!("连接火山失败：{e}")).to_string(),
+                ))
                 .await;
             return Ok(());
         }
@@ -308,13 +315,20 @@ async fn handle_frontend(
         .await
         .map_err(|e| format!("发送 StartConnection 失败: {e}"))?;
     volc_tx
-        .send(Message::Binary(build_start_session(&session_id, &cfg, &system_role, &bot_name)))
+        .send(Message::Binary(build_start_session(
+            &session_id,
+            &cfg,
+            &system_role,
+            &bot_name,
+        )))
         .await
         .map_err(|e| format!("发送 StartSession 失败: {e}"))?;
 
     // 用 mpsc 把「发往火山」的帧汇聚到单一写端，避免两个任务同时借用 volc_tx。
     let (to_volc_tx, mut to_volc_rx) = mpsc::unbounded_channel::<Message>();
-    let meter = Arc::new(Mutex::new(TurnMeter::new(system_role.chars().count() as u64)));
+    let meter = Arc::new(Mutex::new(TurnMeter::new(
+        system_role.chars().count() as u64
+    )));
 
     // 任务 A：前端 → 火山。
     let a_session = session_id.clone();
@@ -332,7 +346,10 @@ async fn handle_frontend(
                         m.input_pcm = m.input_pcm.saturating_add(pcm.len() as u64);
                     }
                     // 上行音频帧（TaskRequest）。
-                    if to_volc_a.send(Message::Binary(build_audio_request(&a_session, &pcm))).is_err() {
+                    if to_volc_a
+                        .send(Message::Binary(build_audio_request(&a_session, &pcm)))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -463,9 +480,7 @@ async fn handle_frontend(
 async fn connect_volc(
     cfg: &RealtimeConfig,
 ) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -473,11 +488,12 @@ async fn connect_volc(
         .into_client_request()
         .map_err(|e| e.to_string())?;
     let h = req.headers_mut();
-    let put = |h: &mut tokio_tungstenite::tungstenite::http::HeaderMap, k: &'static str, v: &str| {
-        if let Ok(val) = v.parse() {
-            h.insert(k, val);
-        }
-    };
+    let put =
+        |h: &mut tokio_tungstenite::tungstenite::http::HeaderMap, k: &'static str, v: &str| {
+            if let Ok(val) = v.parse() {
+                h.insert(k, val);
+            }
+        };
     put(h, "X-Api-App-ID", &cfg.app_id);
     put(h, "X-Api-Access-Key", &cfg.access_key);
     put(h, "X-Api-Resource-Id", protocol::RESOURCE_ID);
@@ -576,7 +592,11 @@ fn build_start_session(
 }
 
 fn build_finish_session(session_id: &str) -> Vec<u8> {
-    build_full_client(protocol::EV_FINISH_SESSION, Some(session_id), &serde_json::json!({}))
+    build_full_client(
+        protocol::EV_FINISH_SESSION,
+        Some(session_id),
+        &serde_json::json!({}),
+    )
 }
 
 /// 上行音频帧：AUDIO_ONLY_CLIENT + TaskRequest 事件，payload 为原始 PCM（不压缩）。
@@ -630,7 +650,8 @@ fn parse_server_frame(data: &[u8]) -> Option<ServerFrame> {
                 return None;
             }
             let sid_len =
-                u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
             pos += 4;
             if data.len() < pos + sid_len {
                 return None;
@@ -643,7 +664,8 @@ fn parse_server_frame(data: &[u8]) -> Option<ServerFrame> {
     if data.len() < pos + 4 {
         return None;
     }
-    let plen = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    let plen =
+        u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
     pos += 4;
     if data.len() < pos + plen {
         return None;
@@ -657,7 +679,9 @@ fn parse_server_frame(data: &[u8]) -> Option<ServerFrame> {
 
     match message_type {
         protocol::MT_AUDIO_SERVER => Some(ServerFrame::Audio(payload)),
-        protocol::MT_FULL_SERVER | protocol::MT_ERROR => Some(ServerFrame::Event { event, payload }),
+        protocol::MT_FULL_SERVER | protocol::MT_ERROR => {
+            Some(ServerFrame::Event { event, payload })
+        }
         _ => None,
     }
 }
@@ -710,7 +734,8 @@ fn usage_u64(usage: &serde_json::Value, key: &str) -> u64 {
 
 /// 累计本轮 ASR / 助手文本字数，供无官方 usage 时估算。
 fn note_turn_text(event: i32, payload: &[u8], meter: &Arc<Mutex<TurnMeter>>) {
-    let json: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+    let json: serde_json::Value =
+        serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
     let Ok(mut m) = meter.lock() else {
         return;
     };
@@ -745,7 +770,8 @@ fn note_turn_text(event: i32, payload: &[u8], meter: &Arc<Mutex<TurnMeter>>) {
 ///   asr_start → asr(text,interim)… → asr_end
 ///   assistant(text delta)… → assistant_end
 fn server_event_to_frontend(event: i32, payload: &[u8]) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
+    let json: serde_json::Value =
+        serde_json::from_slice(payload).unwrap_or(serde_json::Value::Null);
     match event {
         // 只在 SessionStarted 通知前端「已接通」，避免 ConnectionStarted 再弹一次。
         protocol::EV_SESSION_STARTED => Some(to_frontend_session("started").to_string()),
@@ -761,7 +787,10 @@ fn server_event_to_frontend(event: i32, payload: &[u8]) -> Option<String> {
             if text.is_empty() {
                 None
             } else {
-                Some(serde_json::json!({ "type": "asr", "text": text, "interim": interim }).to_string())
+                Some(
+                    serde_json::json!({ "type": "asr", "text": text, "interim": interim })
+                        .to_string(),
+                )
             }
         }
         protocol::EV_ASR_ENDED => Some(serde_json::json!({ "type": "asr_end" }).to_string()),
@@ -774,7 +803,9 @@ fn server_event_to_frontend(event: i32, payload: &[u8]) -> Option<String> {
             }
         }
         protocol::EV_CHAT_ENDED => Some(serde_json::json!({ "type": "assistant_end" }).to_string()),
-        protocol::EV_TTS_SENTENCE_START => Some(serde_json::json!({ "type": "speaking" }).to_string()),
+        protocol::EV_TTS_SENTENCE_START => {
+            Some(serde_json::json!({ "type": "speaking" }).to_string())
+        }
         protocol::EV_TTS_ENDED => None,
         _ => {
             // 错误帧（含 error 字段）也带给前端便于定位。

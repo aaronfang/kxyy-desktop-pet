@@ -15,7 +15,7 @@
       "mode": "idle",
       "segments": [
         { "level": "voice", "frames": 20 },
-        { "level": "quiet", "frames": 35 }
+        { "level": "quiet", "frames": 55 }
       ],
       "expect": {
         "candidateCount": 0,
@@ -30,7 +30,7 @@
         { "level": "voice", "frames": 20 },
         { "level": "quiet", "frames": 30 },
         { "level": "voice", "frames": 10 },
-        { "level": "quiet", "frames": 35 }
+        { "level": "quiet", "frames": 55 }
       ],
       "expect": {
         "candidateCount": 0,
@@ -90,9 +90,9 @@
       "mode": "playback",
       "segments": [
         { "level": "voice", "frames": 20 },
-        { "level": "quiet", "frames": 35 },
+        { "level": "quiet", "frames": 55 },
         { "level": "voice", "frames": 20 },
-        { "level": "quiet", "frames": 35 }
+        { "level": "quiet", "frames": 55 }
       ],
       "expect": {
         "candidateCount": 2,

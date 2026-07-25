@@ -1,9 +1,9 @@
 //! 人设语料：编译期嵌入 XOR 密文作为默认，运行时支持从 persona-cards/ 动态加载覆盖。
 
+use base64::Engine as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use base64::Engine as _;
 
 const ENCRYPTED: &[u8] = include_bytes!("../assets/persona-assets.enc");
 const XOR_KEY: &[u8] = b"kxyy-prompt-v1";
@@ -45,8 +45,6 @@ pub struct CardMeta {
     pub is_local: bool,
 }
 
-
-
 /// 列出所有本地已安装的人设卡（不含 kxyy-yuanyuan 默认卡）。
 pub fn list_all_cards(resource_dir: &PathBuf) -> Result<Vec<CardMeta>, String> {
     let local_ids = list_cards(resource_dir).unwrap_or_default();
@@ -77,10 +75,10 @@ pub fn list_all_cards(resource_dir: &PathBuf) -> Result<Vec<CardMeta>, String> {
 fn read_card_description(card_id: &str, resource_dir: &PathBuf) -> Result<String, String> {
     let cards_dir = find_persona_cards_dir(resource_dir).ok_or("未找到 persona-cards 目录")?;
     let card_path = cards_dir.join(card_id).join("persona-card.json");
-    let raw = fs::read_to_string(&card_path)
-        .map_err(|e| format!("无法读取人格卡 {card_id}: {e}"))?;
-    let card: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let raw =
+        fs::read_to_string(&card_path).map_err(|e| format!("无法读取人格卡 {card_id}: {e}"))?;
+    let card: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("JSON 解析失败: {e}"))?;
     Ok(card
         .get("meta")
         .and_then(|v| v.get("description"))
@@ -102,8 +100,7 @@ pub fn delete_card(card_id: &str, resource_dir: &PathBuf) -> Result<(), String> 
     if !card_dir.is_dir() {
         return Err(format!("卡片不存在: {card_id}"));
     }
-    fs::remove_dir_all(&card_dir)
-        .map_err(|e| format!("删除失败: {e}"))?;
+    fs::remove_dir_all(&card_dir).map_err(|e| format!("删除失败: {e}"))?;
     // 如果当前活跃卡就是被删除的卡，重置为默认
     if let Ok(mut guard) = DYNAMIC_CARD.lock() {
         if let Some(ref card_json) = *guard {
@@ -119,15 +116,18 @@ pub fn delete_card(card_id: &str, resource_dir: &PathBuf) -> Result<(), String> 
 pub fn export_card_json(card_id: &str, resource_dir: &PathBuf) -> Result<String, String> {
     let cards_dir = find_persona_cards_dir(resource_dir).ok_or("未找到 persona-cards 目录")?;
     let card_path = cards_dir.join(card_id).join("persona-card.json");
-    fs::read_to_string(&card_path)
-        .map_err(|e| format!("读取失败: {e}"))
+    fs::read_to_string(&card_path).map_err(|e| format!("读取失败: {e}"))
 }
 
 /// 导入人格卡：将 JSON 字符串写入 persona-cards/<card_id>/persona-card.json。
-pub fn import_card_json(card_id: &str, json_content: &str, resource_dir: &PathBuf) -> Result<String, String> {
+pub fn import_card_json(
+    card_id: &str,
+    json_content: &str,
+    resource_dir: &PathBuf,
+) -> Result<String, String> {
     // 基础校验：JSON 合法且包含必要字段
-    let card: serde_json::Value = serde_json::from_str(json_content)
-        .map_err(|e| format!("JSON 格式无效: {e}"))?;
+    let card: serde_json::Value =
+        serde_json::from_str(json_content).map_err(|e| format!("JSON 格式无效: {e}"))?;
     let has_identity = card.get("identity").is_some();
     let has_system = card.get("system_prompt").is_some();
     if !has_identity && !has_system {
@@ -136,14 +136,14 @@ pub fn import_card_json(card_id: &str, json_content: &str, resource_dir: &PathBu
 
     let cards_dir = find_persona_cards_dir(resource_dir).ok_or("未找到 persona-cards 目录")?;
     let card_dir = cards_dir.join(card_id);
-    fs::create_dir_all(&card_dir)
-        .map_err(|e| format!("创建目录失败: {e}"))?;
+    fs::create_dir_all(&card_dir).map_err(|e| format!("创建目录失败: {e}"))?;
     fs::write(card_dir.join("persona-card.json"), json_content)
         .map_err(|e| format!("写入失败: {e}"))?;
 
     // 返回显示名
     let display_name = card
-        .get("identity").and_then(|v| v.get("name"))
+        .get("identity")
+        .and_then(|v| v.get("name"))
         .or_else(|| card.get("meta").and_then(|v| v.get("name")))
         .and_then(|v| v.as_str())
         .unwrap_or(card_id);
@@ -177,11 +177,14 @@ pub fn load_card_from_file(card_id: &str, resource_dir: &PathBuf) -> Result<(), 
     let raw = fs::read_to_string(&card_path)
         .map_err(|e| format!("无法读取人格卡 {}: {e}", card_path.display()))?;
 
-    let card: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("人格卡 JSON 解析失败: {e}"))?;
+    let card: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("人格卡 JSON 解析失败: {e}"))?;
 
     // 用户画像与卡绑定：每张卡自带 user_profile，未定义则留空。
-    let user_profile = card.get("user_profile").cloned().unwrap_or(serde_json::json!({}));
+    let user_profile = card
+        .get("user_profile")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     // 提取卡名（优先 identity.name，其次 meta.name，最后用 card_id）
     let display_name = card
@@ -208,14 +211,13 @@ pub fn load_card_from_file(card_id: &str, resource_dir: &PathBuf) -> Result<(), 
         "tts": card.get("tts").cloned().unwrap_or(serde_json::Value::Null),
     });
 
-    let json = serde_json::to_string(&assets)
-        .map_err(|e| format!("序列化 assets 失败: {e}"))?;
+    let json = serde_json::to_string(&assets).map_err(|e| format!("序列化 assets 失败: {e}"))?;
 
     if let Ok(mut guard) = DYNAMIC_CARD.lock() {
         *guard = Some(json);
     }
     Ok(())
-}  
+}
 
 /// 列出 persona-cards/ 下所有含 persona-card.json 的子目录名（card_id）。
 pub fn list_cards(resource_dir: &PathBuf) -> Result<Vec<String>, String> {
@@ -224,8 +226,8 @@ pub fn list_cards(resource_dir: &PathBuf) -> Result<Vec<String>, String> {
         None => return Ok(vec![]),
     };
     let mut cards = Vec::new();
-    let entries = fs::read_dir(&cards_dir)
-        .map_err(|e| format!("无法读取 persona-cards 目录: {e}"))?;
+    let entries =
+        fs::read_dir(&cards_dir).map_err(|e| format!("无法读取 persona-cards 目录: {e}"))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("目录遍历错误: {e}"))?;
         let path = entry.path();
@@ -255,11 +257,15 @@ pub fn reset_to_default() {
 pub fn get_card_avatar(card_id: &str, resource_dir: &PathBuf) -> Result<String, String> {
     let cards_dir = find_persona_cards_dir(resource_dir).ok_or("未找到 persona-cards 目录")?;
     let card_path = cards_dir.join(card_id).join("persona-card.json");
-    let raw = fs::read_to_string(&card_path)
-        .map_err(|e| format!("无法读取人格卡 {card_id}: {e}"))?;
-    let card: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("人格卡 JSON 解析失败: {e}"))?;
-    let avatar_raw = card.get("avatar").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw =
+        fs::read_to_string(&card_path).map_err(|e| format!("无法读取人格卡 {card_id}: {e}"))?;
+    let card: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("人格卡 JSON 解析失败: {e}"))?;
+    let avatar_raw = card
+        .get("avatar")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if avatar_raw.is_empty() {
         return Ok(String::new());
     }
@@ -283,10 +289,10 @@ pub fn get_card_avatar(card_id: &str, resource_dir: &PathBuf) -> Result<String, 
 pub fn get_card_display_name(card_id: &str, resource_dir: &PathBuf) -> Result<String, String> {
     let cards_dir = find_persona_cards_dir(resource_dir).ok_or("未找到 persona-cards 目录")?;
     let card_path = cards_dir.join(card_id).join("persona-card.json");
-    let raw = fs::read_to_string(&card_path)
-        .map_err(|e| format!("无法读取人格卡 {card_id}: {e}"))?;
-    let card: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("人格卡 JSON 解析失败: {e}"))?;
+    let raw =
+        fs::read_to_string(&card_path).map_err(|e| format!("无法读取人格卡 {card_id}: {e}"))?;
+    let card: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("人格卡 JSON 解析失败: {e}"))?;
     Ok(card
         .get("identity")
         .and_then(|v| v.get("name"))
@@ -295,4 +301,3 @@ pub fn get_card_display_name(card_id: &str, resource_dir: &PathBuf) -> Result<St
         .unwrap_or(card_id)
         .to_string())
 }
-
