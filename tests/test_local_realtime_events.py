@@ -167,6 +167,7 @@ class CosyVoiceStreamingAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.original_api_key = tts_cosyvoice._api_key
         self.original_voice = tts_cosyvoice._voice
         self.original_model = tts_cosyvoice._model
+        self.original_style = dict(tts_cosyvoice._style)
         tts_cosyvoice._api_key = "test-api-key"
         tts_cosyvoice._voice = "cosyvoice-test-voice"
         tts_cosyvoice._model = "cosyvoice-v3.5-flash"
@@ -175,6 +176,7 @@ class CosyVoiceStreamingAdapterTests(unittest.IsolatedAsyncioTestCase):
         tts_cosyvoice._api_key = self.original_api_key
         tts_cosyvoice._voice = self.original_voice
         tts_cosyvoice._model = self.original_model
+        tts_cosyvoice._style = self.original_style
 
     def stream(self, connector):
         return tts_cosyvoice._synthesize_pcm_stream(
@@ -227,6 +229,50 @@ class CosyVoiceStreamingAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
+
+    async def test_realtime_wrapper_keeps_neutral_rate_and_instruction_across_sentences(self):
+        captured = []
+        original = tts_cosyvoice._synthesize_pcm_stream
+        tts_cosyvoice._style = {"suggested_rate": 0.94}
+
+        async def fake_stream(text, **kwargs):
+            captured.append((text, kwargs))
+            yield {"type": "done", "characters": len(text), "provider": "CosyVoice"}
+
+        tts_cosyvoice._synthesize_pcm_stream = fake_stream
+        try:
+            for sentence in ("（开心）第一句！", "（难过）第二句。"):
+                events = [event async for event in tts_cosyvoice.synth_tts_stream(sentence)]
+                self.assertEqual(events[-1]["type"], "done")
+        finally:
+            tts_cosyvoice._synthesize_pcm_stream = original
+
+        self.assertEqual([item[0] for item in captured], ["第一句！", "第二句。"])
+        for _text, kwargs in captured:
+            self.assertEqual(kwargs["instruction"], "")
+            self.assertEqual(kwargs["rate"], 0.94)
+
+    def test_buffered_realtime_fallback_is_neutral_but_http_keeps_emotion(self):
+        captured = []
+        original_once = tts_cosyvoice._synth_mp3_once
+        original_convert = common.mp3_to_pcm24k
+
+        def fake_once(spoken, *, emotion):
+            captured.append((spoken, emotion))
+            return b"mp3", len(spoken)
+
+        tts_cosyvoice._synth_mp3_once = fake_once
+        common.mp3_to_pcm24k = lambda data: b"\x01\x00" if data else b""
+        try:
+            pcm, _usage = tts_cosyvoice.synth_tts("（开心）实时回复！")
+            self.assertEqual(pcm, b"\x01\x00")
+            self.assertEqual(captured[-1][1], "neutral")
+
+            tts_cosyvoice.synth_tts_mp3("（开心）普通朗读！")
+            self.assertEqual(captured[-1][1], "excited")
+        finally:
+            tts_cosyvoice._synth_mp3_once = original_once
+            common.mp3_to_pcm24k = original_convert
 
     async def test_reassembles_odd_provider_boundaries_and_caps_output_chunks(self):
         provider_pcm = b"\x01" + b"\x02" + (b"\x03" * 3840)
@@ -530,6 +576,22 @@ class StableSentenceBufferTests(unittest.TestCase):
         buf.cancel()
         self.assertEqual(buf.feed("也不会新增。"), [])
         self.assertEqual(buf.flush(), [])
+
+    def test_realtime_minimum_coalesces_short_sentences_into_one_clone_request(self):
+        buf = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        self.assertEqual(buf.feed("第一句很短。"), [])
+        self.assertEqual(
+            buf.feed("第二句也会和前句一起合成。"),
+            ["第一句很短。第二句也会和前句一起合成。"],
+        )
+
+        boundary = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        sentence = "甲" * (common.REALTIME_TTS_MIN_CHARS - 1) + "。"
+        self.assertEqual(boundary.feed(sentence), [sentence])
+
+        short_only = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        self.assertEqual(short_only.feed("只有一句。"), [])
+        self.assertEqual(short_only.flush(), ["只有一句。"])
 
 
 class ManagedAudioEnvelopeTests(unittest.TestCase):
@@ -1079,6 +1141,7 @@ class InMemoryAsrTests(unittest.TestCase):
         self.assertAlmostEqual(captured["audio"][0], -1.0)
         self.assertAlmostEqual(captured["audio"][2], 32767 / 32768)
         self.assertEqual(captured["kwargs"]["language"], "zh")
+        self.assertIs(captured["kwargs"]["condition_on_previous_text"], False)
 
     def test_openai_receives_the_same_memory_audio_contract(self):
         captured = {}
@@ -1104,6 +1167,38 @@ class InMemoryAsrTests(unittest.TestCase):
         self.assertAlmostEqual(no_speech_prob, 0.2)
         self.assertFalse(isinstance(captured["audio"], (str, Path)))
         self.assertEqual(captured["kwargs"]["initial_prompt"], common.WHISPER_PROMPT)
+        self.assertIs(captured["kwargs"]["condition_on_previous_text"], False)
+
+    def test_long_repetition_hallucinations_are_rejected_without_harming_short_emphasis(self):
+        voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        rejected = (
+            "乖" * 40,
+            "乱，" * 40,
+            "你好" * 20,
+            "不要乱跑" * 8,
+        )
+        for text in rejected:
+            with self.subTest(text_length=len(text)):
+                self.assertIsNone(common.is_valid_asr(text, 0.1, voiced))
+
+        accepted = (
+            "好好好，我马上就来。",
+            "我真的真的真的很喜欢这个设计。",
+            "今天我们一起出去散步吧。",
+        )
+        for text in accepted:
+            with self.subTest(text=text):
+                self.assertEqual(common.is_valid_asr(text, 0.1, voiced), text)
+
+    def test_asr_text_length_is_fail_closed_at_fixed_boundary(self):
+        voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        phrase = "今天一起讨论新功能和测试安排，也要认真检查所有边界条件。"
+        normal = phrase * (common.ASR_TEXT_MAX_CHARS // len(phrase) + 1)
+        within_limit = normal[: common.ASR_TEXT_MAX_CHARS]
+        over_limit = within_limit + "啊"
+        self.assertLessEqual(len(within_limit), common.ASR_TEXT_MAX_CHARS)
+        self.assertEqual(common.is_valid_asr(within_limit, 0.1, voiced), within_limit)
+        self.assertIsNone(common.is_valid_asr(over_limit, 0.1, voiced))
 
 
 class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
@@ -2382,7 +2477,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         await task
 
         types = [message["type"] for message in self.ws.json_messages()]
-        self.assertEqual(types, ["assistant", "tts_start"])
+        self.assertEqual(types, ["assistant", "assistant_end", "tts_start"])
         self.assertFalse(any(isinstance(message, bytes) for message in self.ws.messages))
         self.assertNotIn("usage", types)
         self.assertNotIn("speaking", types)
@@ -2537,7 +2632,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assistant, ["（开心）第一句已经完成。", "第二句尾巴"])
         self.assertEqual([m["type"] for m in messages].count("assistant_end"), 1)
         self.assertEqual([m["type"] for m in messages].count("tts_end"), 1)
-        self.assertEqual(synthesized, ["（开心）第一句已经完成。", "第二句尾巴"])
+        self.assertEqual(synthesized, ["（开心）第一句已经完成。第二句尾巴"])
         self.assertEqual(
             self.session.history,
             [{"role": "user", "content": "用户输入"}],
@@ -2545,17 +2640,14 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         segment_starts = [m for m in messages if m["type"] == "audio_segment_start"]
         self.assertEqual(
             [(m["segmentId"], m["text"]) for m in segment_starts],
-            [(1, "第一句已经完成。"), (2, "第二句尾巴")],
+            [(1, "第一句已经完成。第二句尾巴")],
         )
         self.session.on_playback_segment(
             {"generation": scope.generation, "segmentId": 1, "state": "completed"}
         )
         self.assertEqual(
             self.session.history[-1],
-            {"role": "assistant", "content": "第一句已经完成。"},
-        )
-        self.session.on_playback_segment(
-            {"generation": scope.generation, "segmentId": 2, "state": "completed"}
+            {"role": "assistant", "content": "第一句已经完成。第二句尾巴"},
         )
         self.assertEqual(
             self.session.history,
@@ -2785,9 +2877,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         second = loop.create_future()
         self.session.loop = ControlledLoop([first, second])
         self.session.tts_parallelism = 2
+        first_text = "第一句已经完成，而且内容足够长可以独立合成。"
+        second_text = "第二句也已经完成，而且同样足够长可以独立合成。"
         self.stream_events = [
-            {"type": "delta", "text": "第一句已经完成。"},
-            {"type": "delta", "text": "第二句也完成了。"},
+            {"type": "delta", "text": first_text},
+            {"type": "delta", "text": second_text},
             {"type": "done"},
         ]
         scope = self.session._new_scope("response")
@@ -2818,7 +2912,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             starts,
-            [(1, "第一句已经完成。"), (2, "第二句也完成了。")],
+            [(1, first_text), (2, second_text)],
         )
         self.session.on_playback_segment(
             {"generation": scope.generation, "segmentId": 2, "state": "completed"}
@@ -2832,7 +2926,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.session.history[-1]["content"],
-            "第一句已经完成。第二句也完成了。",
+            first_text + second_text,
         )
 
     async def test_invalid_sentence_pcm_is_rejected_before_segment_registration(self):

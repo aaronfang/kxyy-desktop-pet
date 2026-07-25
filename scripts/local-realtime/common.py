@@ -529,6 +529,9 @@ LLM_STREAM_MAX_PRODUCERS = 2
 TTS_STREAM_MAX_TASKS = 2
 TTS_SENTENCE_QUEUE_MAX = 4
 TTS_PARALLELISM_MAX = 2
+# 实时回复把相邻短句合并到同一次 voice-clone，减少每句重新随机采样造成的音色漂移。
+# soft/hard 上限保持不变；不足此长度的单句在 SSE done 时立即 flush。
+REALTIME_TTS_MIN_CHARS = 18
 # 单个稳定句最多保留 60 秒 24kHz mono s16le；数量有界之外也限制 PCM 字节。
 TTS_SENTENCE_MAX_SAMPLES = OUTPUT_RATE * 60
 MANAGED_AUDIO_CAPABILITY = "managed-v1"
@@ -553,6 +556,10 @@ STABLE_SENTENCE_HARD_CHARS = 60
 MIN_SPEECH_MS_PLAY = 800
 NO_SPEECH_PROB_MAX = 0.55
 MIN_CJK_CHARS = 2
+ASR_TEXT_MAX_CHARS = 512
+ASR_REPETITION_MIN_SPAN = 16
+ASR_REPETITION_MIN_COPIES = 6
+ASR_REPETITION_MAX_UNIT = 8
 
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 WHISPER_PROMPT = "以下是一段中文对话，角色名叫元元。"
@@ -1359,6 +1366,7 @@ def transcribe(pcm16: bytes) -> tuple[str, float]:
             path_or_hf_repo=WHISPER_MODEL,
             language="zh",
             initial_prompt=WHISPER_PROMPT,
+            condition_on_previous_text=False,
             verbose=False,
         )
         text = (result.get("text") or "").strip()
@@ -1371,6 +1379,7 @@ def transcribe(pcm16: bytes) -> tuple[str, float]:
             audio,
             language="zh",
             initial_prompt=WHISPER_PROMPT,
+            condition_on_previous_text=False,
             verbose=False,
         )
         text = (result.get("text") or "").strip()
@@ -1406,12 +1415,46 @@ def warmup_asr() -> None:
         log(f"ASR 预热跳过：{e}")
 
 
+def has_pathological_asr_repetition(text: str) -> bool:
+    """Bounded text-only guard for long Whisper repetition loops."""
+    bare = re.sub(r"[\s\W_]+", "", str(text or ""), flags=re.UNICODE)
+    length = len(bare)
+    if length < ASR_REPETITION_MIN_SPAN:
+        return False
+
+    counts: dict[str, int] = {}
+    for char in bare:
+        counts[char] = counts.get(char, 0) + 1
+    dominant = max(counts.values(), default=0)
+    if dominant >= ASR_REPETITION_MIN_SPAN and dominant * 100 >= length * 80:
+        return True
+
+    max_unit = min(ASR_REPETITION_MAX_UNIT, length // ASR_REPETITION_MIN_COPIES)
+    for unit_len in range(1, max_unit + 1):
+        for start in range(0, length - unit_len * ASR_REPETITION_MIN_COPIES + 1):
+            unit = bare[start : start + unit_len]
+            copies = 1
+            cursor = start + unit_len
+            while cursor + unit_len <= length and bare[cursor : cursor + unit_len] == unit:
+                copies += 1
+                cursor += unit_len
+            if (
+                copies >= ASR_REPETITION_MIN_COPIES
+                and copies * unit_len >= ASR_REPETITION_MIN_SPAN
+            ):
+                return True
+    return False
+
+
 def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
     if no_speech_prob >= NO_SPEECH_PROB_MAX:
         log(f"过滤: no_speech_prob={no_speech_prob:.2f}")
         return None
     text = (text or "").strip()
     if not text:
+        return None
+    if len(text) > ASR_TEXT_MAX_CHARS:
+        log(f"过滤: ASR 文本过长 ({len(text)} chars)")
         return None
     if _HALLUCINATION_RE.search(text):
         log(f"过滤: 幻觉文本 ({len(text)} chars)")
@@ -1425,6 +1468,9 @@ def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
         return None
     if _FILLER_RE.match(bare):
         log(f"过滤: 填充词 ({len(text)} chars)")
+        return None
+    if has_pathological_asr_repetition(text):
+        log(f"过滤: 重复幻觉 ({len(text)} chars)")
         return None
     if pcm16_rms(pcm) < SPEECH_RMS * 0.55:
         log("过滤: 整段能量过低")
@@ -2758,7 +2804,7 @@ class Session:
         *,
         interruption_hint: bool = False,
     ) -> None:
-        sentences = StableSentenceBuffer()
+        sentences = StableSentenceBuffer(min_chars=REALTIME_TTS_MIN_CHARS)
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
         try:
             assert _synth_tts is not None

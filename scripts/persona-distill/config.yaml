@@ -113,8 +113,8 @@ distill:
 
   # -- DeepSeek API 配置 --
   deepseek:
-    # 模型: "deepseek-chat" (V3) 或 "deepseek-reasoner" (R1)
-    model: "deepseek-chat"
+    # 当前 DeepSeek 模型；思考参数由调用方按当前 API 独立控制。
+    model: "deepseek-v4-flash"
     base_url: "https://api.deepseek.com"
     # API Key 优先读取环境变量 DEEPSEEK_API_KEY，这里可留空
     api_key: null

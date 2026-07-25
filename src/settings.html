@@ -56,8 +56,8 @@
               <span>文字模型</span>
               <select id="textModel">
                 <option value="">自动（按思考模式）</option>
-                <option value="deepseek-chat">deepseek-chat（快）</option>
-                <option value="deepseek-reasoner">deepseek-reasoner（会思考）</option>
+                <option value="deepseek-v4-flash">deepseek-v4-flash（快）</option>
+                <option value="deepseek-v4-pro">deepseek-v4-pro（强）</option>
               </select>
             </label>
             <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
@@ -80,21 +80,21 @@
             </div>
             <p id="localTextServiceStatus" class="hint voice-service-status">检测中…</p>
 
-            <label class="row-inline">
-              <input id="thinking" type="checkbox" />
-              <span>开启思考模式<small>本地 Qwen3→思考链（更慢，回复预算会自动加大）</small></span>
-            </label>
-
-            <label>
-              <span>采样温度<small>0~2，越高越发散</small></span>
-              <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
-            </label>
-
             <p class="hint">
               需先安装 <a href="https://ollama.com/download" target="_blank" rel="noreferrer">Ollama</a>（Windows / macOS 均可，5080 / M4 Pro 由其自动调用 CUDA / Metal 加速）。
               保存后本 App 会自动探测并尝试拉起 Ollama 服务；首次使用可从 <code>hf-mirror</code> / ModelScope 导入 GGUF，或点「下载 / 更新模型」。
             </p>
           </div>
+
+          <label class="row-inline">
+            <input id="thinking" type="checkbox" />
+            <span>开启思考模式<small>DeepSeek / 本地 Qwen3 均适用；更慢，回复预算会自动加大</small></span>
+          </label>
+
+          <label>
+            <span>采样温度<small>0~2，越高越发散；思考模式下由模型管理</small></span>
+            <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
+          </label>
 
           <div class="memory-actions">
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
