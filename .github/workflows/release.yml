@@ -144,6 +144,20 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/test_silero_shadow.py
 
+      - name: Install optional SenseVoice final-ASR runtime
+        env:
+          KXYY_ASR_RUNTIME_ROOT: ${{ runner.temp }}/kxyy-sensevoice-runtime
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: python scripts/local-realtime/install_sensevoice_runtime.py
+
+      - name: Revalidate optional SenseVoice final-ASR runtime
+        env:
+          KXYY_ASR_RUNTIME_ROOT: ${{ runner.temp }}/kxyy-sensevoice-runtime
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: python scripts/local-realtime/install_sensevoice_runtime.py
+
   # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；手动触发且勾选
   # include_macos 时只追加两个 macOS 目标，绝不删除/重传已有 Windows asset。
   setup-matrix:
