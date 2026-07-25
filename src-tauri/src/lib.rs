@@ -111,7 +111,7 @@ struct Settings {
     /// 实验性 Silero/ONNX Runtime VAD shadow；只观测，不参与实时打断决策。
     #[serde(default)]
     vad_shadow_enabled: bool,
-    /// 文字模型；空串表示自动（按 thinking 选 deepseek-chat / deepseek-reasoner）。
+    /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
     #[serde(default)]
     text_model: String,
     /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
@@ -126,7 +126,7 @@ struct Settings {
     /// 视觉模型服务商：`qwen`（在线通义千问）/ `local`（本地 Ollama VL）。
     #[serde(default = "default_vl_provider")]
     vl_provider: String,
-    /// 思考模式（deepseek-reasoner）。
+    /// 思考模式（DeepSeek thinking.type / 本地 Qwen reasoning_effort）。
     #[serde(default)]
     thinking: bool,
     /// 采样温度。

@@ -8,12 +8,37 @@ use tauri::AppHandle;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 const TEXT_BASE_URL: &str = "https://api.deepseek.com";
+const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
+const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const VL_MODEL: &str = "qwen3-vl-plus";
 // 本地文字模型：Ollama 的 OpenAI 兼容端点，无需 Key（Authorization 头会被忽略）。
 const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 // 仅受托管本地语音子进程携带；普通 WebView 请求不得用它绕过 Windows SSE 缓冲路径。
 const INTERNAL_SECRET_HEADER: &str = "X-Kxyy-Internal-Secret";
+
+/// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
+fn normalize_deepseek_model(configured: &str, thinking: bool) -> &'static str {
+    match configured.trim() {
+        "deepseek-v4-flash" | "deepseek-chat" => DEEPSEEK_FLASH_MODEL,
+        "deepseek-v4-pro" | "deepseek-reasoner" => DEEPSEEK_PRO_MODEL,
+        _ if thinking => DEEPSEEK_PRO_MODEL,
+        _ => DEEPSEEK_FLASH_MODEL,
+    }
+}
+
+fn apply_deepseek_generation_options(
+    payload: &mut serde_json::Value,
+    thinking: bool,
+    temperature: f64,
+) {
+    payload["thinking"] = serde_json::json!({
+        "type": if thinking { "enabled" } else { "disabled" }
+    });
+    if !thinking {
+        payload["temperature"] = serde_json::json!(temperature);
+    }
+}
 
 /// 把 Ollama 的 400（尤其是超上下文）翻译成用户能看懂的中文。
 fn local_ollama_error_message(status: u16, detail: &str) -> String {
@@ -325,13 +350,7 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         // Ollama 忽略 Authorization 头，占位值即可，避免下面的空 Key 检查误判。
         (OLLAMA_CHAT_BASE_URL.to_string(), model, "ollama".to_string(), "本地模型")
     } else {
-        let model = if !cfg.text_model.is_empty() {
-            cfg.text_model.clone()
-        } else if thinking {
-            "deepseek-reasoner".to_string()
-        } else {
-            "deepseek-chat".to_string()
-        };
+        let model = normalize_deepseek_model(&cfg.text_model, thinking).to_string();
         (TEXT_BASE_URL.to_string(), model, cfg.deepseek_key.clone(), "DeepSeek")
     };
 
@@ -344,7 +363,8 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         return error_json(request, 401, msg);
     }
 
-    let is_reasoner = model.to_lowercase().contains("reasoner");
+    let deepseek_thinking = !use_vision && !is_local_text && thinking;
+    let reasoning_enabled = deepseek_thinking || (is_local_text && thinking);
     let temperature = body
         .get("temperature")
         .and_then(|v| v.as_f64())
@@ -355,9 +375,9 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         .and_then(|v| v.as_i64())
         .unwrap_or(400);
     // 预算：
-    // - DeepSeek reasoner / 本地开启思考：思考链占用同一 max_tokens，需大幅放大，避免正文被截空。
+    // - DeepSeek / 本地开启思考：思考链占用同一 max_tokens，需大幅放大，避免正文被截空。
     // - 本地关闭思考：保留小幅余量即可（前端 normal≈800）；过大的硬下限会拖慢本地生成。
-    let max_tokens = if is_reasoner || (is_local_text && thinking) {
+    let max_tokens = if reasoning_enabled {
         (max_tokens_in * 6).max(4096)
     } else if is_local_text {
         max_tokens_in.max(512)
@@ -382,8 +402,10 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     if stream {
         payload["stream_options"] = serde_json::json!({ "include_usage": true });
     }
-    // deepseek-reasoner 会忽略 temperature，非 reasoner 时照常下发。
-    if !is_reasoner {
+    // 思考模式由当前 DeepSeek API 的 thinking.type 显式控制；思考时不下发 temperature。
+    if !use_vision && !is_local_text {
+        apply_deepseek_generation_options(&mut payload, deepseek_thinking, temperature);
+    } else if !reasoning_enabled {
         payload["temperature"] = serde_json::json!(temperature);
     }
     // 本地 Qwen3 等思考模型：OpenAI 兼容端点用 reasoning_effort 控制开关
@@ -448,10 +470,15 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         } else {
             format!("{provider_name} 错误 {}", status.as_u16())
         };
-        let body = serde_json::json!({
-            "error": friendly,
-            "detail": detail.chars().take(500).collect::<String>(),
-        })
+        let body = if is_local_text || is_local_vl {
+            serde_json::json!({
+                "error": friendly,
+                "detail": detail.chars().take(500).collect::<String>(),
+            })
+        } else {
+            // 远端原始错误不进入 WebView/console；普通 UI 只接收固定 provider + status。
+            serde_json::json!({ "error": friendly })
+        }
         .to_string();
         return respond_json(request, status.as_u16(), body);
     }
@@ -481,7 +508,6 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         headers.push(header("Content-Type", "text/event-stream; charset=utf-8"));
         headers.push(header("Cache-Control", "no-cache, no-transform"));
         headers.push(header("X-Kxyy-Text-Provider", provider));
-        let reasoning_enabled = is_reasoner || (is_local_text && thinking);
         headers.push(header(
             "X-Kxyy-Thinking",
             if reasoning_enabled { "1" } else { "0" },
@@ -610,7 +636,11 @@ fn should_passthrough_internal_sse(
 
 #[cfg(test)]
 mod tests {
-    use super::{header, internal_secret_matches, req_header, should_passthrough_internal_sse};
+    use super::{
+        apply_deepseek_generation_options, header, internal_secret_matches,
+        normalize_deepseek_model, req_header, should_passthrough_internal_sse,
+        DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
+    };
     use std::io::Cursor;
     use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
 
@@ -629,6 +659,31 @@ mod tests {
         assert!(!should_passthrough_internal_sse(true, None, false, true));
         assert!(!should_passthrough_internal_sse(true, Some("vl"), true, true));
         assert!(!should_passthrough_internal_sse(true, Some("text"), false, false));
+    }
+
+    #[test]
+    fn deepseek_models_are_allowlisted_and_legacy_values_migrate() {
+        assert_eq!(normalize_deepseek_model("deepseek-v4-flash", true), DEEPSEEK_FLASH_MODEL);
+        assert_eq!(normalize_deepseek_model("deepseek-v4-pro", false), DEEPSEEK_PRO_MODEL);
+        assert_eq!(normalize_deepseek_model("deepseek-chat", true), DEEPSEEK_FLASH_MODEL);
+        assert_eq!(normalize_deepseek_model("deepseek-reasoner", false), DEEPSEEK_PRO_MODEL);
+        assert_eq!(normalize_deepseek_model("", false), DEEPSEEK_FLASH_MODEL);
+        assert_eq!(normalize_deepseek_model("", true), DEEPSEEK_PRO_MODEL);
+        assert_eq!(normalize_deepseek_model("qwen3:8b", false), DEEPSEEK_FLASH_MODEL);
+        assert_eq!(normalize_deepseek_model("unreviewed", true), DEEPSEEK_PRO_MODEL);
+    }
+
+    #[test]
+    fn deepseek_thinking_uses_current_fixed_shape_and_omits_temperature() {
+        let mut enabled = serde_json::json!({});
+        apply_deepseek_generation_options(&mut enabled, true, 0.8);
+        assert_eq!(enabled["thinking"]["type"], "enabled");
+        assert!(enabled.get("temperature").is_none());
+
+        let mut disabled = serde_json::json!({});
+        apply_deepseek_generation_options(&mut disabled, false, 0.7);
+        assert_eq!(disabled["thinking"]["type"], "disabled");
+        assert_eq!(disabled["temperature"], 0.7);
     }
 
     #[test]

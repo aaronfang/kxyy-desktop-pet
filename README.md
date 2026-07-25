@@ -55,7 +55,7 @@ npm run dev        # 开发模式（tauri dev）
 
 按 **`Ctrl+Shift+Space`**（可在设置中改）或点托盘「聊天」，在桌宠上方唤出聊天气泡，与「元元」对话；再按一次或点窗口外收起。
 
-- **文字对话**：默认由 DeepSeek 驱动，支持流式输出；可在设置里切换 `deepseek-chat`（快）/ `deepseek-reasoner`（会思考）与采样温度。也可在「文字服务商」切到**本地模型（Ollama）**离线对话（无网络时兜底），需先安装 Ollama 并下载模型；设置里的「思考模式」对本地 Qwen3 同样生效（关=`reasoning_effort: none`，开=`medium`，并自动加大 `max_tokens`）。
+- **文字对话**：默认由 DeepSeek 驱动，支持流式输出；0.2.29 使用当前 `deepseek-v4-flash` / `deepseek-v4-pro`，并用独立的思考开关控制 `thinking.type`。旧 `deepseek-chat` / `deepseek-reasoner` 设置会在本地安全迁移，未知模型不会原样上送。也可在「文字服务商」切到**本地模型（Ollama）**离线对话（无网络时兜底），需先安装 Ollama 并下载模型；设置里的「思考模式」对本地 Qwen3 同样生效（关=`reasoning_effort: none`，开=`medium`，并自动加大 `max_tokens`）。
 - **发图看图**：附带图片时用通义千问 VL 识图（需填通义 Key）。
 - **语音朗读 / 实时通话**：朗读与通话共用「语音后端」，在设置里切换：
   | 后端 | 类型 | 说明 |
@@ -88,6 +88,7 @@ npm run dev        # 开发模式（tauri dev）
 - **0.2.26 真实 Silero shadow（实验、默认关闭）**：安装包内固定携带未经修改的 Silero VAD v6.2.1 `16k/op15` ONNX 模型、MIT 许可证与严格 manifest，但不把 ONNX Runtime 作为默认依赖，也不会静默安装。要测试时先选择 Qwen3-TTS 或 CosyVoice，在设置中勾选“启用实验性神经 VAD shadow”并保存，再点击“安装 / 检查 VAD runtime”；安装器只接受审核过的 64 位 macOS/Windows、CPython 3.10–3.14 组合，按固定 wheel 名称和 SHA-256 下载到 App 自有版本目录，并在发布前执行真实模型推理。语音服务重启后接通电话，诊断中的 `runtime.vadShadow=silero-onnx-shadow-v1` 表示握手时已成功获取真实 scorer 的独占 shadow lease；它不是整通电话持续健康遥测，`warming`、`busy`、`unavailable` 或 `disabled` 也都不是有效模型测试。此版本仍由 RMS 独占 candidate、endpoint 与 ASR 决策，正常听感和打断行为应与 0.2.25 一致；不记录概率、PCM、文本或路径。诊断 schema 为 v3。真实声学回放、live 单调时钟 candidate 上限与阈值验收完成前不得让 Silero 接管线上决策。
 - **0.2.27 candidate deadline / 离线评估基础（仍为 shadow）**：纯概率状态机现在要求显式、硬上限的 candidate frame budget；合法当前代 frame 都推进 age，confirmed/rejected 在截止帧优先，只有仍悬空的候选产生内部 `candidate_timeout`。真实 Silero shadow 使用 96 个 512-sample frame（3.072 秒）的机械保护值，它不是线上墙钟承诺或声学阈值结论。新增纯标准库、流式且事务化的离线 evaluator：每次只保留 `<1024 bytes` 组帧余量和有界事件/真值数字，输出固定 aggregate 计数、整数 ppm 与延迟桶，不输出概率序列、PCM、路径、文本、persona 或异常详情。它当前只由合成 PCM / 注入 fake scorer 确定性测试覆盖，未接入 Session，也没有让 Silero 获得 candidate、endpoint、ASR 或播放决策权。
 - **0.2.28 shadow 诊断闭环（仍为实验、默认关闭）**：本地/CosyVoice 会把固定、provider-neutral 的 VAD shadow 聚合搭载在原本就要发送的 session / ASR-end 控制消息上，并在挂断时单独发送 final；因此通话中可复制到最新结果，又不会为观测增加会阻塞 RMS/ASR 的额外发送。诊断 JSON schema v4 在 `aggregate.vadShadow` 展示配置 revision、运行状态、queue=1 峰值、offer/drop/process/stale/fault、五类纯状态事件和最多 64 个推理耗时样本的 p50/p95。挂断只短暂等待 final summary，阻塞 scorer 会以 `complete:false` / `outstanding>0` 如实结束。报告不含 epoch、lease token、概率、PCM、文本、persona、路径或异常；旧服务固定显示 `not-reported`。这些数字只证明 shadow 是否实际运行及其机械负载，不能解释为准确率、阈值通过或体验改善，Silero 仍没有 candidate、endpoint、ASR 或播放决策权。
+- **0.2.29 对话质量修复**：本地/CosyVoice 通话不再把不足 18 个 Unicode 字符（含标点/神态 cue）的短块立刻拆成独立 voice-clone 请求，而是在下一稳定边界或 LLM 完成时有界合并，减少同一回复内每句重新随机采样造成的音色/韵律漂移；单句短回复因此可能等到文字生成完成才开始播音，40 字 soft 阈值、60 字 buffer ceiling、4 项队列和 60 秒音频上限不变。合并块只有整体播完才进入可听历史，中途打断会保守排除整块。CosyVoice 实时通话（含未协商流式时的 buffered fallback）固定使用参考音 neutral 基线 rate，不再逐稳定块改变 instruction/rate；普通文字朗读仍保留情绪映射。Whisper 两条本地路径关闭跨窗口前文条件，并拒绝超过 512 字或长周期重复的识别结果，专门拦截几十个“乖/乱”等幻觉；短重复强调仍允许。播放仍固定 24kHz，没有做 DSP 变速；Qwen 采样档位、真实 TTFA/音色改善和 ASR 召回率仍须设备试听，不能由纯状态测试推断。
 - 设置页底部会显示本地服务状态与日志；开发模式也可直接使用仓库内 `scripts/local-realtime/`。
 
 ## 打包

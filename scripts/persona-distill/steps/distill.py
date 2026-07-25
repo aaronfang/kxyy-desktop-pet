@@ -109,7 +109,7 @@ class OllamaEngine:
 class DeepSeekEngine:
     """DeepSeek API 引擎 (OpenAI 兼容协议)"""
 
-    def __init__(self, api_key: str, model: str = "deepseek-chat",
+    def __init__(self, api_key: str, model: str = "deepseek-v4-flash",
                  base_url: str = "https://api.deepseek.com",
                  frequency_penalty: float = 0.0):
         self.api_key = api_key
@@ -206,7 +206,7 @@ def create_engine(config: Dict) -> Callable:
             )
         engine = DeepSeekEngine(
             api_key=api_key,
-            model=cfg.get("model", "deepseek-chat"),
+            model=cfg.get("model", "deepseek-v4-flash"),
             base_url=cfg.get("base_url", "https://api.deepseek.com"),
             frequency_penalty=cfg.get("frequency_penalty", 0.15),
         )

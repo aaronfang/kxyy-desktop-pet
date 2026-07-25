@@ -440,9 +440,9 @@ def _synth_mp3_once(spoken: str, *, emotion: str) -> tuple[bytes, int]:
     )
 
 
-def synth_tts_mp3(text: str) -> tuple[bytes, int]:
-    """合成 MP3（可多句拼接）。返回 (mp3, 累计计费字符)。"""
-    emotion = detect_emotion(text)
+def _synth_tts_mp3(text: str, *, realtime_neutral: bool) -> tuple[bytes, int]:
+    """合成 MP3（可多句拼接）；实时 fallback 固定 neutral 风格。"""
+    emotion = "neutral" if realtime_neutral else detect_emotion(text)
     spoken = text_for_speech(text) or (text or "").strip()
     spoken = common.clip_speech_text(spoken)
     if not spoken:
@@ -461,6 +461,11 @@ def synth_tts_mp3(text: str) -> tuple[bytes, int]:
     return b"".join(parts), billed
 
 
+def synth_tts_mp3(text: str) -> tuple[bytes, int]:
+    """HTTP 朗读 MP3；保留整段首句情绪映射。"""
+    return _synth_tts_mp3(text, realtime_neutral=False)
+
+
 def synth_tts_http(text: str) -> tuple[bytes, str, dict | None]:
     """桌面端朗读：直接返回 audio/mpeg；第三项为计费用量（供 debug）。"""
     mp3, billed = synth_tts_mp3(text)
@@ -472,7 +477,7 @@ def synth_tts_http(text: str) -> tuple[bytes, str, dict | None]:
 
 def synth_tts(text: str) -> tuple[bytes, dict]:
     """实时通话入口：MP3 → PCM16 24k；附带计费字符供 debug。"""
-    mp3, billed = synth_tts_mp3(text)
+    mp3, billed = _synth_tts_mp3(text, realtime_neutral=True)
     if not mp3:
         return b"", {}
     return common.mp3_to_pcm24k(mp3), {"characters": billed, "provider": "CosyVoice"}
@@ -480,13 +485,15 @@ def synth_tts(text: str) -> tuple[bytes, dict]:
 
 async def synth_tts_stream(text: str):
     """实时通话真流式入口：DashScope binary 到达即产出 PCM24k。"""
-    emotion = detect_emotion(text)
     spoken = text_for_speech(text) or (text or "").strip()
     spoken = common.clip_speech_text(spoken)
     if not spoken:
         return
-    instruction = build_instruction(emotion) if _model in INSTRUCT_MODELS else ""
-    rate = base_rate_for(emotion)
+    # 实时回复由多个稳定块组成；逐块改变 instruction/rate 会让同一轮听起来像换人或变速。
+    # 固定到参考音的 neutral 基线。HTTP 整段朗读仍保留原有情绪映射。
+    emotion = "neutral"
+    instruction = ""
+    rate = base_rate_for("neutral")
     common.log(
         f"CosyVoice stream emotion={emotion} rate={rate:.3f} "
         f"chars={len(spoken)} instruction={bool(instruction)}"

@@ -76,7 +76,7 @@ graph TD
 
 | 能力 | 云端选项 | 本地选项 | 代理落点 | 备注 |
 |---|---|---|---|---|
-| 文字对话 | DeepSeek (`deepseek-chat`/`deepseek-reasoner`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换 |
+| 文字对话 | DeepSeek (`deepseek-v4-flash`/`deepseek-v4-pro` + `thinking.type`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换；0.2.29 本地迁移旧模型名并拒绝透传未知值 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
 | 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + Whisper + 当前文字 provider / CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.26 依次补 VAD adapter、bounded worker 与显式 opt-in 的真实 Silero shadow，0.2.27 再补纯 frame candidate deadline 与 aggregate evaluator，0.2.28 把 bounded shadow 聚合接入诊断 schema v4；线上仍只用 RMS 决策；Windows/Linux Qwen/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
@@ -668,7 +668,7 @@ graph LR
 distill:
   engine: "deepseek"      # deepseek | ollama | llamacpp
   deepseek:
-    model: "deepseek-chat"
+    model: "deepseek-v4-flash"
     api_key: "${DEEPSEEK_API_KEY}"
   ollama:
     model: "qwen3:14b"
@@ -770,6 +770,7 @@ A: 将 `scripts/persona-distill/` 目录整体复制即可——它不依赖项�
 ## 8.8 变更日志
 
 - 2026-07-25 / 0.2.28：把既有 bounded VAD shadow 计数以固定 provider-neutral schema 接入本地/CosyVoice 私有 wire 与诊断 JSON v4；只保留最新聚合，挂断有界等待 final snapshot，阻塞 scorer 以 `complete:false` 结束而不阻塞。导出不含概率、PCM、文本、persona、路径、异常、epoch 或 lease token；RMS 继续独占全部实时决策，阈值/准确率/体验仍无结论。
+- 2026-07-25 / 0.2.29：修复 DeepSeek 下线旧模型名导致的 400，加入 v4 allowlist 与显式 thinking；本地/CosyVoice 将不足 18 字的相邻短句合并后再 voice-clone，CosyVoice 通话固定 neutral rate/instruction；Whisper 关闭跨窗口前文并拒绝超长/长周期重复幻觉。均有无账号确定性测试；音色、TTFA 与 ASR 召回仍待真实设备试听。
 - 2026-07-25 / 0.2.27：VAD 纯状态新增显式、有硬上限的 candidate frame budget；confirmed/rejected 在截止 frame 优先，悬空候选产生独立内部 timeout 并清状态。新增未接 Session 的有界流式离线 evaluator，case 事务聚合且报告只含固定计数、整数 ppm 与延迟桶；合成/fake scorer 测试不依赖账号、麦克风、ORT 或模型。Silero 仍为 shadow，96-frame 值只是机械保护；录音 schema v1 继续 fail closed，许可素材、live watchdog、阈值与 p95 仍待实验。
 - 2026-07-24 / 0.2.26：固定分发 Silero VAD v6.2.1 `16k/op15` 模型、MIT 许可与严格 manifest；用户显式开启 shadow 并运行设置页安装器后，受支持的 macOS/Windows + CPython 3.10–3.14 组合会安装 hash-locked、ABI 精确的可选 ORT runtime，并在发布前做真实 recurrent inference。进程级 worker 使用 tokenized 单 Session lease，warming/busy/unavailable 均安全回退 RMS；诊断 schema v3 只暴露固定枚举，不导出概率/PCM/文本/路径。Silero 仍不驱动 candidate、endpoint 或 ASR，许可声学回放与 live takeover 待后续验证。
 - 2026-07-24 / 0.2.25：新增 dedicated daemon VAD shadow worker、全进程 admission=1、queue=1、overflow epoch/reset 与迟到结果丢弃；`Session` 只旁路投递，六个合成场景 A/B 证明 RMS 控制事件与 commit PCM 不变。诊断 schema v2 增加固定 `vadShadow` 枚举；默认无 scorer/factory，不含 Silero/ORT，不宣称神经 VAD 上线。

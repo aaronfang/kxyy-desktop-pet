@@ -6,7 +6,7 @@
 
 本工程的火山后端是端到端实时语音模型，本地后端则是 VAD、ASR、LLM、TTS 级联管线。二者不应强行合并成同一种实现，但应通过统一的前端会话事件、播放缓冲和响应代号获得一致的打断体验。
 
-可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 Whisper。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator；0.2.28 把既有有界 shadow 计数接入固定、隐私安全的诊断聚合。Windows/Linux PyTorch、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。CosyVoice 的真实字节序/TTFA/听感与 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性 fake transport、合成 evaluator、shadow 聚合或真实模型能够执行就宣称体验改善。
+可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 Whisper。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator；0.2.28 把既有有界 shadow 计数接入固定、隐私安全的诊断聚合；0.2.29 再针对实测回归合并过短 TTS 稳定块、固定 CosyVoice 通话基线风格，并为 Whisper 增加跨窗口与重复幻觉护栏。Windows/Linux PyTorch、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。CosyVoice 的真实字节序/TTFA/听感与 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性 fake transport、合成 evaluator、shadow 聚合或真实模型能够执行就宣称体验改善。
 
 情绪语音不能只靠增加一个 `emotion` 字段解决。当前能力应按后端区分：
 
@@ -252,6 +252,16 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **设计占位 / 待实验**：本版没有 live 单调时钟 candidate watchdog、threshold sweep、许可录音 schema v2、真人/回声回放、30 分钟误打断验收或 live takeover。下一步仍须先取得逐素材权利与声音同意证据，再用诊断中的 config revision 和 aggregate 证明实验可复现；没有该证据时不得调 live 阈值或让神经结果接管。
 
+### 2.23 P2 对话质量回归修复（已实现，0.2.29）
+
+**已实现——TTS 一致性**：问题设备使用 macOS MLX Qwen；该公开生成接口默认进行随机采样，而 0.2.16 起每个稳定句都会独立启动一次 voice-clone，因此相邻短句可能产生不同音色与韵律。实时管线现在只把累计至少 18 个 Unicode 字符（计入标点与神态 cue）的强句末提前提交；更短的相邻句会合并到下一强句，单个短回复则在 SSE done 时 flush。40 字 soft 阈值、60 字 buffer ceiling、4 项 TTS 队列、64 句段 ledger、60 秒音频上限与取消域均不变；无弱断点时为给尾段保留 18 字，当前 hard fallback 最早可在 42 字切分。代价是少于 18 字的单句不再保证在文字流结束前发声，而且合并块只有整体播完才进入可听 history，中途打断会保守排除整块；这是字符有界条件，不宣称固定毫秒 TTFA。Qwen 的 temperature/top-k/top-p 仍保持官方默认，未用未验证采样值换取表面稳定。CosyVoice 实时 adapter（原生 PCM 与 buffered fallback）固定使用参考音的 neutral 基线 rate 且不逐块下发情绪 instruction，避免同一回复分块时主动变速/变风格；HTTP 文字朗读仍保留情绪映射。
+
+**已实现——ASR 幻觉护栏**：MLX Whisper 与 openai-whisper 都显式使用 `condition_on_previous_text:false`，避免内部长窗口继续条件化上一窗口的错误重复。final 文本在进入 WebSocket、LLM、history 前执行纯文本、有界校验：超过 512 字整段拒绝；去标点后至少 16 字时，拒绝单字符达到至少 16 次且占比不低于 80%，或长度 1–8 的单元连续至少 6 次且重复 span 至少 16 字。日志只保留固定原因与字符数。短“好好好”、普通强调与正常中文继续允许；RMS candidate、endpoint、Whisper 提交时机和 Silero shadow 权限均未改变。
+
+**已验证**：确定性测试覆盖旧/新 DeepSeek 模型归一化与 current `thinking.type`、两种 Whisper adapter 参数、几十个单字/带标点单字/双字/短语循环、正常短重复、512 字边界、短句合并/强边界/flush、CosyVoice 原生 PCM 与 buffered fallback 的 neutral realtime 参数、HTTP 情绪朗读隔离，以及既有有序播放、取消、回执与隐私门禁。测试不需要账号、麦克风或模型；另用当前账户做了不输出正文的最小状态探针，旧模型返回 400、两个 v4 模型返回 200。
+
+**设计占位 / 待实验**：本版不宣称 Qwen 角色相似度、语速方差、TTFA 或 ASR 召回已经达标，也不对 PCM 做变速。下一步使用固定短语 corpus 对官方默认、较低 temperature 与 greedy 三档做多次真人盲听和时长方差比较；只有同一采样 profile 在 MLX/PyTorch 都通过后才考虑改默认。ASR 阈值与 neural live takeover 仍等待有权利/同意证据的声学回放及真实设备 p95，不因本次文本后处理而提前启用。
+
 ## 3. 外部工程对比
 
 调研基线：
@@ -390,7 +400,7 @@ assistant 风格来源优先级：结构化 LLM 元数据 > 现有表情标记 >
 | 后端 | 音色一致性 | 动态情绪 | 当前状态 | 后续方案 |
 |---|---|---|---|---|
 | 火山文字 TTS | 复刻音色 | emotion + rate/pitch/volume | 已实现 emotion 映射和失败时中性回退 | 纳入统一 `SpeechStyle` adapter |
-| CosyVoice 云 | 复刻音色 | 自然语言 instruction + rate | 0.2.21 已实现可协商 PCM24k 单路流式；真实账号指标待测 | 保持逐句 style；实测字节序、TTFA、取消计费后再考虑多句预取 |
+| CosyVoice 云 | 复刻音色 | 自然语言 instruction + rate | 0.2.21 已实现可协商 PCM24k 单路流式；0.2.29 通话固定 neutral 基线以避免逐块漂移；真实账号指标待测 | 实测字节序、TTFA、取消计费与基线一致性后，再设计有明确 turn 边界的动态 style |
 | Qwen3 Base | 复刻音色最佳 | 无官方 instruction | 当前默认；macOS MLX 0.2.22 可协商单路真流式，PyTorch 仍整段 | 实测 MLX TTFA/接缝；多情绪参考 prompt 实验；等待 PyTorch 公开流式 API |
 | Qwen3 CustomVoice | 九种预设音色 | 1.7B 支持 instruction | 未接入 | 作为高表现力可选项，不冒充复刻音色 |
 | Qwen3 VoiceDesign | 设计新音色 | 1.7B 支持 instruction | 未接入 | 用于离线设计参考音，不作为每句实时模型 |
