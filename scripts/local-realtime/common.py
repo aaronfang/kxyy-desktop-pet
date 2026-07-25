@@ -31,6 +31,7 @@ REPO = ROOT.parent.parent
 VOICE_AB = REPO / "scripts" / "voice-ab"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+import asr_adapter
 from vad_adapter import (
     SHADOW_COUNTER_MAX,
     SHADOW_LATENCY_SAMPLES,
@@ -1095,33 +1096,112 @@ def load_llm_settings() -> None:
     log("文字 LLM 使用桌面统一代理")
 
 
-_asr_backend = "none"  # mlx | openai | none
+_asr_backend = "none"  # compatibility/debug enum: mlx | openai | sensevoice | none
 _openai_whisper_model = None
+_asr_adapter_instance = None
+_asr_runtime = {
+    "requested": "whisper",
+    "active": "none",
+    "status": "unavailable",
+}
+_asr_slots = threading.BoundedSemaphore(1)
+ASR_RUNTIME_REQUESTED = frozenset({"whisper", "sensevoice"})
+ASR_RUNTIME_ACTIVE = frozenset(
+    {"none", "whisper-mlx", "whisper-openai", "sensevoice-sherpa-onnx"}
+)
+ASR_RUNTIME_STATUS = frozenset({"active", "fallback", "unavailable"})
+ASR_FAILURE_MESSAGE = "语音识别失败，请稍后重试"
 
 
 def load_whisper_on_mlx_thread() -> None:
-    """优先 mlx-whisper（Apple Silicon）；否则回退 openai-whisper（CUDA/CPU）。"""
-    global _asr_backend, _openai_whisper_model
+    """Load one process-lifetime final-ASR adapter; name kept for old entrypoints."""
+    global _asr_backend, _openai_whisper_model, _asr_adapter_instance, _asr_runtime
+    whisper = None
+    whisper_backend = "none"
+    requested = (os.environ.get("KXYY_ASR_PROVIDER") or "whisper").strip().lower()
+    selection = None
+    if requested == "sensevoice":
+        selection = asr_adapter.select_asr_adapter(asr_adapter.UnavailableAdapter())
+        if selection.active_provider == "sensevoice":
+            _asr_adapter_instance = selection.adapter
+            _asr_backend = "sensevoice"
+            _asr_runtime = {
+                "requested": "sensevoice",
+                "active": "sensevoice-sherpa-onnx",
+                "status": "active",
+            }
+            log("ASR 就绪 active=sensevoice-sherpa-onnx status=active")
+            return
     try:
-        import mlx_whisper  # noqa: F401
+        import mlx_whisper
 
-        _asr_backend = "mlx"
-        log("Whisper 依赖就绪 (mlx)")
-        return
+        whisper = asr_adapter.WhisperAdapter("mlx", mlx_module=mlx_whisper)
+        whisper_backend = "mlx"
     except ImportError:
         pass
-    try:
-        import whisper
+    if whisper is None:
+        try:
+            import whisper as openai_whisper
 
-        _openai_whisper_model = whisper.load_model("small")
+            _openai_whisper_model = openai_whisper.load_model("small")
+            whisper = asr_adapter.WhisperAdapter(
+                "openai", openai_model=_openai_whisper_model
+            )
+            whisper_backend = "openai"
+        except (ImportError, RuntimeError):
+            whisper = asr_adapter.UnavailableAdapter()
+
+    selection = asr_adapter.select_asr_adapter(whisper)
+    _asr_adapter_instance = selection.adapter
+    if selection.active_provider == "sensevoice":
+        _asr_backend = "sensevoice"
+        active = "sensevoice-sherpa-onnx"
+    elif whisper_backend == "mlx":
+        _asr_backend = "mlx"
+        active = "whisper-mlx"
+    elif whisper_backend == "openai":
         _asr_backend = "openai"
-        log("Whisper 依赖就绪 (openai-whisper small)")
-        return
-    except ImportError as e:
+        active = "whisper-openai"
+    else:
         _asr_backend = "none"
-        raise RuntimeError(
-            "未安装 mlx-whisper 或 openai-whisper，通话 ASR 不可用"
-        ) from e
+        active = "none"
+    status = "active"
+    if active == "none":
+        status = "unavailable"
+    elif selection.fallback_reason is not None:
+        status = "fallback"
+    _asr_runtime = {
+        "requested": selection.requested_provider
+        if selection.requested_provider in ("whisper", "sensevoice")
+        else "whisper",
+        "active": active,
+        "status": status,
+    }
+    if status == "fallback":
+        log(f"ASR 回退 Whisper reason={selection.fallback_reason}")
+    log(f"ASR 就绪 active={active} status={status}")
+
+
+def asr_runtime_summary() -> dict:
+    """Return a fixed-shape, fixed-enum capability summary.
+
+    The process state may be changed by startup/fallback code, but provider
+    exceptions, paths, and arbitrary environment values must never cross the
+    private session wire.
+    """
+
+    requested = str(_asr_runtime.get("requested") or "")
+    active = str(_asr_runtime.get("active") or "")
+    status = str(_asr_runtime.get("status") or "")
+    if requested not in ASR_RUNTIME_REQUESTED:
+        requested = "whisper"
+    if active not in ASR_RUNTIME_ACTIVE:
+        active = "none"
+    if status not in ASR_RUNTIME_STATUS:
+        status = "unavailable"
+    if active == "none":
+        status = "unavailable"
+    return {"requested": requested, "active": active, "status": status}
 
 
 def pcm16_rms(pcm: bytes) -> float:
@@ -1354,43 +1434,19 @@ def pcm16_to_float32(pcm16: bytes):
     return np.frombuffer(usable, dtype="<i2").astype(np.float32) / 32768.0
 
 
-def transcribe(pcm16: bytes) -> tuple[str, float]:
-    # mlx-whisper 与 openai-whisper 都原生接受 16k float32 ndarray；
-    # 直接走内存，避免每轮创建、写入、重新读取并删除临时 WAV。
-    audio = pcm16_to_float32(pcm16)
-    if _asr_backend == "mlx":
-        import mlx_whisper
-
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=WHISPER_MODEL,
-            language="zh",
-            initial_prompt=WHISPER_PROMPT,
-            condition_on_previous_text=False,
-            verbose=False,
-        )
-        text = (result.get("text") or "").strip()
-        nsp = float(result.get("no_speech_prob") or 0.0)
-        for seg in result.get("segments") or []:
-            nsp = max(nsp, float(seg.get("no_speech_prob") or 0.0))
-        return text, nsp
-    if _asr_backend == "openai" and _openai_whisper_model is not None:
-        result = _openai_whisper_model.transcribe(
-            audio,
-            language="zh",
-            initial_prompt=WHISPER_PROMPT,
-            condition_on_previous_text=False,
-            verbose=False,
-        )
-        text = (result.get("text") or "").strip()
-        # openai-whisper 无统一 no_speech_prob，用片段平均近似
-        segs = result.get("segments") or []
-        if segs:
-            nsp = sum(float(s.get("no_speech_prob") or 0.0) for s in segs) / len(segs)
+def transcribe(pcm16: bytes) -> asr_adapter.AsrResult:
+    adapter = _asr_adapter_instance
+    if adapter is None:
+        # Compatibility for tests that directly set the legacy backend globals.
+        if _asr_backend == "mlx":
+            adapter = asr_adapter.WhisperAdapter("mlx")
+        elif _asr_backend == "openai" and _openai_whisper_model is not None:
+            adapter = asr_adapter.WhisperAdapter(
+                "openai", openai_model=_openai_whisper_model
+            )
         else:
-            nsp = 0.0
-        return text, nsp
-    raise RuntimeError("ASR 未就绪")
+            adapter = asr_adapter.UnavailableAdapter()
+    return adapter.transcribe(pcm16)
 
 
 def warmup_asr() -> None:
@@ -1412,7 +1468,29 @@ def warmup_asr() -> None:
         transcribe(silence)
         log(f"ASR 预热完成 ({time.perf_counter()-t0:.1f}s, backend={_asr_backend})")
     except Exception as e:
-        log(f"ASR 预热跳过：{e}")
+        reason = e.reason if isinstance(e, asr_adapter.AsrAdapterError) else "unknown"
+        log(f"ASR 预热跳过 reason={reason}")
+
+
+def submit_asr(loop, pcm: bytes, *, slots=None):
+    """Submit one ASR call without releasing admission on wrapper cancellation.
+
+    ``run_in_executor`` exposes only an asyncio Future. Cancelling that wrapper
+    can mark it done while the native inference thread is still running, which
+    would release a done-callback semaphore too early. Keep the actual
+    concurrent Future and release admission only when that Future really exits.
+    """
+
+    admission = slots if slots is not None else _asr_slots
+    if not admission.acquire(blocking=False):
+        return None
+    try:
+        worker = _mlx_pool.submit(transcribe, pcm)
+    except BaseException:
+        admission.release()
+        raise
+    worker.add_done_callback(lambda _done: admission.release())
+    return asyncio.wrap_future(worker, loop=loop)
 
 
 def has_pathological_asr_repetition(text: str) -> bool:
@@ -1446,8 +1524,8 @@ def has_pathological_asr_repetition(text: str) -> bool:
     return False
 
 
-def is_valid_asr(text: str, no_speech_prob: float, pcm: bytes) -> str | None:
-    if no_speech_prob >= NO_SPEECH_PROB_MAX:
+def is_valid_asr(text: str, no_speech_prob: float | None, pcm: bytes) -> str | None:
+    if no_speech_prob is not None and no_speech_prob >= NO_SPEECH_PROB_MAX:
         log(f"过滤: no_speech_prob={no_speech_prob:.2f}")
         return None
     text = (text or "").strip()
@@ -2402,6 +2480,7 @@ class Session:
                 "interruptionHint": self.interruption_hint,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
+                "asrRuntime": asr_runtime_summary(),
             }
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
@@ -2723,12 +2802,26 @@ class Session:
     ) -> None:
         try:
             t0 = time.perf_counter()
-            text, nsp = await self.loop.run_in_executor(_mlx_pool, transcribe, pcm)
+            future = submit_asr(self.loop, pcm)
+            if future is None:
+                log("ASR busy，拒绝候选")
+                await self._emit_asr_end_only(scope)
+                await self._emit_speech_rejected(scope)
+                await self._resume_play_if_paused()
+                scope.complete()
+                return
+            result = await future
             if not scope.active:
                 log(f"丢弃过期 ASR 结果 gen={scope.generation}")
                 return
-            log(f"ASR {time.perf_counter()-t0:.2f}s nsp={nsp:.2f} chars={len(text)}")
-            cleaned = is_valid_asr(text, nsp, pcm)
+            nsp = result.no_speech_prob
+            nsp_log = f"{nsp:.2f}" if nsp is not None else "none"
+            log(
+                f"ASR {time.perf_counter()-t0:.2f}s nsp={nsp_log} "
+                f"chars={len(result.text)} lang={result.language} "
+                f"emotion={result.emotion} event={result.event}"
+            )
+            cleaned = is_valid_asr(result.text, nsp, pcm)
             if not cleaned:
                 log("无效人声，忽略" + ("（播报未中断）" if from_play_barge else ""))
                 await self._emit_asr_end_only(scope)
@@ -2782,12 +2875,17 @@ class Session:
             raise
         except Exception as e:
             if scope.active:
-                log(f"ASR 失败: {e}")
+                reason = (
+                    e.reason
+                    if isinstance(e, asr_adapter.AsrAdapterError)
+                    else "asr_inference_failed"
+                )
+                log(f"ASR 失败 reason={reason}")
                 await self._emit_asr_end_only(scope)
                 await self._emit_speech_rejected(scope)
                 await self._resume_play_if_paused()
                 await self.send_json(
-                    {"type": "error", "message": str(e)},
+                    {"type": "error", "message": ASR_FAILURE_MESSAGE},
                     scope=scope,
                 )
                 scope.cancel("asr_error")

@@ -18,21 +18,25 @@ const expectedMappings = new Map([
   ["../scripts/local-realtime/install_vad_runtime.py", "scripts/local-realtime/install_vad_runtime.py"],
   ["../scripts/local-realtime/vad-runtime-lock.json", "scripts/local-realtime/vad-runtime-lock.json"],
   ["../scripts/local-realtime/models/silero-v6.2.1", "scripts/local-realtime/models/silero-v6.2.1"],
+  ["../scripts/local-realtime/asr_adapter.py", "scripts/local-realtime/asr_adapter.py"],
+  ["../scripts/local-realtime/install_sensevoice_runtime.py", "scripts/local-realtime/install_sensevoice_runtime.py"],
+  ["../scripts/local-realtime/sensevoice-runtime-lock.json", "scripts/local-realtime/sensevoice-runtime-lock.json"],
+  ["../scripts/local-realtime/SENSEVOICE-NOTICE.md", "scripts/local-realtime/SENSEVOICE-NOTICE.md"],
 ]);
 
 for (const [source, target] of expectedMappings) {
   if (resources[source] !== target) {
-    throw new Error(`missing fixed VAD resource mapping: ${source}`);
+    throw new Error(`missing fixed realtime resource mapping: ${source}`);
   }
   const sourcePath = resolve(TAURI_DIR, source);
   const stat = lstatSync(sourcePath);
   if (source.endsWith("silero-v6.2.1") ? !stat.isDirectory() : !stat.isFile()) {
-    throw new Error(`VAD resource mapping must resolve to the expected type: ${source}`);
+    throw new Error(`realtime resource mapping must resolve to the expected type: ${source}`);
   }
 }
 
 const forbiddenBundlePath =
-  /(^|\/)(?:persona-assets\.js|\.persona-assets\.js\.bak|settings\.json|\.env(?:\.[^/]*)?|\.venv[^/]*|__pycache__|[^/]*\.whl|\.vad-staging-[^/]*|downloads?|\.ready)(?:\/|$)/i;
+  /(^|\/)(?:persona-assets\.js|\.persona-assets\.js\.bak|settings\.json|\.env(?:\.[^/]*)?|\.venv[^/]*|__pycache__|[^/]*\.whl|\.vad-staging-[^/]*|\.sensevoice-staging-[^/]*|\.asr-staging-[^/]*|sensevoice-asr-runtime|sensevoice-runtime|sherpa-onnx-sense-voice-[^/]*|huggingface|modelscope|\.cache|downloads?|\.ready|\.kxyy-sensevoice-ready)(?:\/|$)/i;
 
 function relativeBundlePath(path) {
   return relative(ROOT, path).split(sep).join("/");
@@ -117,4 +121,134 @@ if (
   throw new Error("Silero third-party notice integrity mismatch");
 }
 
-console.log("VAD bundle resource contract verified");
+function assertExactKeys(value, expected, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
+    throw new Error(`${label} has an unexpected schema`);
+  }
+}
+
+function assertLockedArtifact(entry, label, expectedHost) {
+  if (
+    !Array.isArray(entry) ||
+    entry.length !== 4 ||
+    typeof entry[0] !== "string" ||
+    typeof entry[1] !== "string" ||
+    !Number.isSafeInteger(entry[2]) ||
+    entry[2] <= 0 ||
+    typeof entry[3] !== "string" ||
+    !/^[0-9a-f]{64}$/.test(entry[3])
+  ) {
+    throw new Error(`${label} must be a fixed filename, URL, size and SHA-256 tuple`);
+  }
+  const url = new URL(entry[1]);
+  if (url.protocol !== "https:" || url.hostname !== expectedHost) {
+    throw new Error(`${label} must use the audited HTTPS host`);
+  }
+}
+
+const senseVoiceRoot = join(ROOT, "scripts", "local-realtime");
+const senseVoiceLock = JSON.parse(
+  readFileSync(join(senseVoiceRoot, "sensevoice-runtime-lock.json"), "utf8"),
+);
+assertExactKeys(
+  senseVoiceLock,
+  ["schemaVersion", "runtimeVersion", "artifacts", "model"],
+  "SenseVoice runtime lock",
+);
+if (senseVoiceLock.schemaVersion !== 1 || senseVoiceLock.runtimeVersion !== "1.13.4") {
+  throw new Error("SenseVoice runtime lock identity mismatch");
+}
+assertExactKeys(
+  senseVoiceLock.artifacts,
+  ["sherpa-onnx", "sherpa-onnx-core"],
+  "SenseVoice artifact lock",
+);
+
+const expectedWrappers = [];
+for (const minor of [10, 11, 12, 13, 14]) {
+  expectedWrappers.push(
+    `cp3${minor}-macos-arm64`,
+    `cp3${minor}-macos-x64`,
+    `cp3${minor}-windows-x64`,
+  );
+}
+const expectedCores = ["macos-arm64", "macos-x64", "windows-x64"];
+assertExactKeys(
+  senseVoiceLock.artifacts["sherpa-onnx"],
+  expectedWrappers,
+  "SenseVoice wrapper matrix",
+);
+assertExactKeys(
+  senseVoiceLock.artifacts["sherpa-onnx-core"],
+  expectedCores,
+  "SenseVoice core matrix",
+);
+for (const [identity, entry] of Object.entries(senseVoiceLock.artifacts["sherpa-onnx"])) {
+  assertLockedArtifact(entry, `SenseVoice wrapper ${identity}`, "files.pythonhosted.org");
+  if (!entry[0].endsWith(".whl")) throw new Error(`SenseVoice wrapper filename mismatch: ${identity}`);
+}
+for (const [identity, entry] of Object.entries(senseVoiceLock.artifacts["sherpa-onnx-core"])) {
+  assertLockedArtifact(entry, `SenseVoice core ${identity}`, "files.pythonhosted.org");
+  if (!entry[0].endsWith(".whl")) throw new Error(`SenseVoice core filename mismatch: ${identity}`);
+}
+
+assertExactKeys(
+  senseVoiceLock.model,
+  ["archive", "root", "files", "smoke"],
+  "SenseVoice model lock",
+);
+assertLockedArtifact(
+  senseVoiceLock.model.archive,
+  "SenseVoice model archive",
+  "github.com",
+);
+if (
+  senseVoiceLock.model.archive[0] !==
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2" ||
+  senseVoiceLock.model.root !==
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+) {
+  throw new Error("SenseVoice model identity mismatch");
+}
+assertExactKeys(
+  senseVoiceLock.model.files,
+  ["model.int8.onnx", "tokens.txt", "LICENSE", "README.md"],
+  "SenseVoice installed model file set",
+);
+for (const [filename, entry] of Object.entries(senseVoiceLock.model.files)) {
+  if (
+    !Array.isArray(entry) ||
+    entry.length !== 2 ||
+    !Number.isSafeInteger(entry[0]) ||
+    entry[0] <= 0 ||
+    typeof entry[1] !== "string" ||
+    !/^[0-9a-f]{64}$/.test(entry[1])
+  ) {
+    throw new Error(`SenseVoice model file lock mismatch: ${filename}`);
+  }
+}
+if (
+  !Array.isArray(senseVoiceLock.model.smoke) ||
+  senseVoiceLock.model.smoke.length !== 3 ||
+  senseVoiceLock.model.smoke[0] !== "test_wavs/zh.wav" ||
+  !Number.isSafeInteger(senseVoiceLock.model.smoke[1]) ||
+  senseVoiceLock.model.smoke[1] <= 0 ||
+  !/^[0-9a-f]{64}$/.test(senseVoiceLock.model.smoke[2])
+) {
+  throw new Error("SenseVoice smoke artifact lock mismatch");
+}
+
+const senseVoiceNotice = readFileSync(join(senseVoiceRoot, "SENSEVOICE-NOTICE.md"));
+if (
+  createHash("sha256").update(senseVoiceNotice).digest("hex") !==
+  "1a9edf11074749674b0676d9bbe058a6acbc33d219ffd760ef1ecab455ba988c"
+) {
+  throw new Error("SenseVoice third-party notice integrity mismatch");
+}
+
+console.log("Realtime bundle resource contract verified");

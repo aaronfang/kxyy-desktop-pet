@@ -111,6 +111,9 @@ struct Settings {
     /// 实验性 Silero/ONNX Runtime VAD shadow；只观测，不参与实时打断决策。
     #[serde(default)]
     vad_shadow_enabled: bool,
+    /// 本地级联通话的 final ASR：`whisper`（默认）或显式可选的 `sensevoice`。
+    #[serde(default = "default_asr_provider")]
+    asr_provider: String,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
     #[serde(default)]
     text_model: String,
@@ -195,6 +198,10 @@ fn default_realtime_backend() -> String {
     "volc".into()
 }
 
+fn default_asr_provider() -> String {
+    "whisper".into()
+}
+
 fn default_text_provider() -> String {
     "deepseek".into()
 }
@@ -257,6 +264,7 @@ impl Settings {
             voice_volume: default_voice_volume(),
             show_chat_debug: false,
             vad_shadow_enabled: false,
+            asr_provider: default_asr_provider(),
             text_model: String::new(),
             text_provider: default_text_provider(),
             local_text_model: String::new(),
@@ -354,6 +362,7 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
     let mut hasher = DefaultHasher::new();
     backend.hash(&mut hasher);
     settings.vad_shadow_enabled.hash(&mut hasher);
+    normalize_asr_provider(&settings.asr_provider).hash(&mut hasher);
     match backend.as_str() {
         "local" => {
             settings.persona_card_id.trim().hash(&mut hasher);
@@ -369,6 +378,13 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
         _ => {}
     }
     format!("{:016x}", hasher.finish())
+}
+
+fn normalize_asr_provider(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "sensevoice" => "sensevoice",
+        _ => "whisper",
+    }
 }
 
 /// 本地语音后端的朗读 HTTP 端口（WS 端口 + 100）。
@@ -1237,6 +1253,8 @@ struct AiSettingsInput {
     show_chat_debug: bool,
     #[serde(default)]
     vad_shadow_enabled: bool,
+    #[serde(default = "default_asr_provider")]
+    asr_provider: String,
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
@@ -1323,6 +1341,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.voice_volume = settings.voice_volume.min(200);
         s.show_chat_debug = settings.show_chat_debug;
         s.vad_shadow_enabled = settings.vad_shadow_enabled;
+        s.asr_provider = normalize_asr_provider(&settings.asr_provider).into();
         s.text_model = settings.text_model.trim().to_string();
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
@@ -1406,6 +1425,12 @@ fn pull_local_text_model(app: AppHandle, model: String) {
 #[tauri::command]
 fn install_vad_shadow_runtime(app: AppHandle, backend: String) -> Result<(), String> {
     voice_service::install_vad_shadow_runtime(&app, &backend)
+}
+
+/// 显式安装可选 SenseVoice final ASR runtime；进度由事件推送。
+#[tauri::command]
+fn install_sensevoice_runtime(app: AppHandle, backend: String) -> Result<(), String> {
+    voice_service::install_sensevoice_runtime(&app, &backend)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1625,7 +1650,8 @@ pub fn run() {
             probe_local_text_backend,
             list_local_text_models,
             pull_local_text_model,
-            install_vad_shadow_runtime
+            install_vad_shadow_runtime,
+            install_sensevoice_runtime
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1641,7 +1667,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{voice_config_fingerprint, Settings};
+    use super::{normalize_asr_provider, voice_config_fingerprint, Settings};
 
     #[test]
     fn vad_shadow_is_opt_in_and_changes_voice_fingerprint() {
@@ -1652,5 +1678,23 @@ mod tests {
         settings.vad_shadow_enabled = true;
         let enabled = voice_config_fingerprint(&settings);
         assert_ne!(disabled, enabled);
+    }
+
+    #[test]
+    fn asr_provider_is_allowlisted_and_changes_voice_fingerprint() {
+        assert_eq!(normalize_asr_provider("whisper"), "whisper");
+        assert_eq!(normalize_asr_provider(" SENSEVOICE "), "sensevoice");
+        for value in ["", "future-provider", "sensevoice/custom"] {
+            assert_eq!(normalize_asr_provider(value), "whisper");
+        }
+
+        let mut settings = Settings::defaults();
+        let whisper = voice_config_fingerprint(&settings);
+        settings.asr_provider = "sensevoice".into();
+        let sensevoice = voice_config_fingerprint(&settings);
+        assert_ne!(whisper, sensevoice);
+
+        settings.asr_provider = "unknown".into();
+        assert_eq!(whisper, voice_config_fingerprint(&settings));
     }
 }

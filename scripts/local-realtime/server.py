@@ -257,9 +257,9 @@ def _run_torch() -> None:
         # 通话 ASR：Windows/Linux 用 openai-whisper（无 mlx-whisper）。缺失不阻断朗读。
         try:
             common._mlx_pool.submit(common.load_whisper_on_mlx_thread).result()
-        except Exception as e:
-            common.log(f"警告：Whisper 加载失败，实时通话 ASR 不可用：{e}")
-            common.log("朗读 HTTP 仍可用（如需通话请安装 openai-whisper）。")
+        except Exception:
+            common.log("警告：ASR 加载失败 reason=asr_startup_failed")
+            common.log("朗读 HTTP 仍可用；实时通话 ASR 当前不可用。")
         common.log("Qwen3-TTS 本地服务就绪 (pytorch)")
 
     vad_capability = silero_shadow.capability_from_environment()

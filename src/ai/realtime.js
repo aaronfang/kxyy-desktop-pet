@@ -54,6 +54,23 @@ function usesManagedCascade(provider) {
   return provider === "local" || provider === "cosyvoice";
 }
 
+function sanitizeAsrRuntime(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    requested: ["whisper", "sensevoice"].includes(raw.requested)
+      ? raw.requested
+      : "whisper",
+    active: ["whisper-mlx", "whisper-openai", "sensevoice-sherpa-onnx", "none"].includes(
+      raw.active,
+    )
+      ? raw.active
+      : "none",
+    status: ["active", "fallback", "unavailable"].includes(raw.status)
+      ? raw.status
+      : "not-reported",
+  };
+}
+
 function recoverablePlaybackEnabled() {
   try {
     return globalThis.localStorage?.getItem("kxyy.realtime.playback") !== "legacy";
@@ -172,6 +189,7 @@ export class RealtimeSession {
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
     this._vadShadowMode = "disabled";
+    this._asrRuntime = sanitizeAsrRuntime();
     this._vadShadowSummary = sanitizeVadShadowSummary();
     this._resolveVadShadowFinal = null;
     this._candidateId = null;
@@ -344,6 +362,7 @@ export class RealtimeSession {
                 ].includes(msg.vadShadow)
                 ? msg.vadShadow
                 : "unavailable";
+          this._asrRuntime = sanitizeAsrRuntime(msg.asrRuntime);
         }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
@@ -1350,6 +1369,7 @@ export class RealtimeSession {
         ttsStream: this._ttsStreamingMode,
         interruptionHint: this._interruptionHintMode,
         vadShadow: this._vadShadowMode,
+        asr: { ...this._asrRuntime },
       },
       vadShadowSummary: { ...this._vadShadowSummary },
     };

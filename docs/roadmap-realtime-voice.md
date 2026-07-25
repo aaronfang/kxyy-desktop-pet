@@ -6,7 +6,7 @@
 
 本工程的火山后端是端到端实时语音模型，本地后端则是 VAD、ASR、LLM、TTS 级联管线。二者不应强行合并成同一种实现，但应通过统一的前端会话事件、播放缓冲和响应代号获得一致的打断体验。
 
-可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 Whisper。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator；0.2.28 把既有有界 shadow 计数接入固定、隐私安全的诊断聚合；0.2.29 再针对实测回归合并过短 TTS 稳定块、固定 CosyVoice 通话基线风格，并为 Whisper 增加跨窗口与重复幻觉护栏。Windows/Linux PyTorch、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。CosyVoice 的真实字节序/TTFA/听感与 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性 fake transport、合成 evaluator、shadow 聚合或真实模型能够执行就宣称体验改善。
+可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 final ASR。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator；0.2.28 把既有有界 shadow 计数接入固定、隐私安全的诊断聚合；0.2.29 针对实测回归合并过短 TTS 稳定块、固定 CosyVoice 通话基线风格，并为 Whisper 增加跨窗口与重复幻觉护栏；0.2.30 再为本地/CosyVoice 加入显式安装、启动期固定选择且可回退的 SenseVoiceSmall INT8 句尾 ASR 实验。Whisper 仍为默认，Windows/Linux Qwen TTS、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。SenseVoice 与 Whisper 的召回/幻觉对比、CosyVoice 的真实字节序/TTFA/听感，以及 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性测试、合成 evaluator、shadow 聚合或真实模型能够执行就宣称体验改善。
 
 情绪语音不能只靠增加一个 `emotion` 字段解决。当前能力应按后端区分：
 
@@ -26,13 +26,13 @@
 |---|---|---|---|
 | 文字朗读 | `tts.js` -> Rust `/api/tts` -> 火山 / 本地服务 / CosyVoice | 文本情绪推断、火山 emotion、CosyVoice instruction/rate、缓存和计费信息 | 一次性合成，无法中途取消上游生成；Qwen Base 情绪控制弱 |
 | 火山实时语音 | WebView PCM -> Rust WS 桥 -> 火山 RealtimeDialog -> PCM | 双向音频、AEC、二遍 ASR、热词、人设、复刻音色、服务端打断事件 | 模型版本固定；缺少可配置判停/说话风格；响应无 generation 标记 |
-| 本地实时语音 | WebView PCM -> Python -> RMS VAD -> Whisper -> 桌面文字代理 -> TTS | 旁路采集、ASR 验证后打断、Qwen/CosyVoice、generation 取消、DeepSeek/Ollama 复用、LLM SSE、有界句级队列、有序播放、句级可听历史、`managed-v1` 下行身份、Worklet-only interrupted hint、CosyVoice 与 macOS MLX Qwen 原生 PCM 流式 adapter；另有默认关闭、显式安装 runtime 后可运行真实 Silero 的 512-sample bounded VAD shadow worker | ASR 仍为整段；Windows/Linux Qwen 仍按稳定句整段合成；线上仍由 RMS 独占决策，Silero 只旁路；字/音素级恢复未实现；两种流式 adapter 与 neural threshold 的真实指标待实验 |
+| 本地实时语音 | WebView PCM -> Python -> RMS VAD -> Whisper / 可选 SenseVoice final ASR -> 桌面文字代理 -> TTS | 旁路采集、ASR 验证后打断、Qwen/CosyVoice、generation 取消、DeepSeek/Ollama 复用、LLM SSE、有界句级队列、有序播放、句级可听历史、`managed-v1` 下行身份、Worklet-only interrupted hint、CosyVoice 与 macOS MLX Qwen 原生 PCM 流式 adapter；另有默认关闭、显式安装 runtime 后可运行真实 Silero 的 512-sample bounded VAD shadow worker，以及显式安装、启动期固定回退的 SenseVoiceSmall INT8 final ASR 实验 | ASR 仍为整段且 SenseVoice 未完成许可语料 A/B；Windows/Linux Qwen 仍按稳定句整段合成；线上仍由 RMS 独占决策，Silero 只旁路；字/音素级恢复未实现；两种流式 adapter 与 neural threshold 的真实指标待实验 |
 
 本地语音服务的 WebSocket 端口当前为 `19876`，HTTP TTS 为 `19976`；CosyVoice 是通义云 TTS，由本机 Python 服务桥接，并非本地 CosyVoice 推理。
 
 ### 2.2 当前打断时序
 
-本地链路在播报中使用较高 RMS 门槛和约 360ms 连续响声建立 candidate；candidate 会立即通知前端 duck/暂停，但不会清空可恢复缓冲。随后继续录到 soft endpoint，整段 Whisper 通过文本长度、幻觉和静音概率校验后才 confirmed、清空旧播放并取消旧 generation；无效 ASR 则 rejected 并恢复。
+本地链路在播报中使用较高 RMS 门槛和约 360ms 连续响声建立 candidate；candidate 会立即通知前端 duck/暂停，但不会清空可恢复缓冲。随后继续录到 soft endpoint，整段 final ASR 通过文本长度、幻觉和可用静音概率校验后才 confirmed、清空旧播放并取消旧 generation；无效 ASR 则 rejected 并恢复。0.2.30 的 SenseVoice 只替换这次句尾识别，不改变上述时序。
 
 这已解决“用户开口时助手完全不让声”，但 confirmed 仍受句尾提交和整段 Whisper 延迟约束。后续不能只降低 RMS 阈值，需用真实声学回放验证神经 VAD/快速确认，并在此后收紧 3 秒暂停容量。
 
@@ -188,9 +188,9 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 ### 2.17 P2 真实设备诊断入口（已实现，0.2.23）
 
-0.2.23 把既有内存 trace 变成用户可取回的验证材料：开启设置中的“显示聊天界面调试信息”后，可在聊天 debug 区复制当前通话或最近一次已挂断通话的诊断 JSON。挂断路径会先等待 `RealtimeSession.stop()` 完成，再保存最终快照；只保留最近一份且不写磁盘。报告重新经过严格白名单构造，而不是直接序列化任意运行时对象。0.2.25 因新增固定枚举 `runtime.vadShadow` 将 `diagnosticSchemaVersion` 升为 2；0.2.26 为区分真实 scorer 的 `warming|busy|unavailable|silero-onnx-shadow-v1` 将其升为 3；0.2.28 因新增固定 `aggregate.vadShadow` 聚合将其升为 4。事件 schema 仍为 v1，旧后端未返回聚合时安全归为 `status:not-reported`。
+0.2.23 把既有内存 trace 变成用户可取回的验证材料：开启设置中的“显示聊天界面调试信息”后，可在聊天 debug 区复制当前通话或最近一次已挂断通话的诊断 JSON。挂断路径会先等待 `RealtimeSession.stop()` 完成，再保存最终快照；只保留最近一份且不写磁盘。报告重新经过严格白名单构造，而不是直接序列化任意运行时对象。0.2.25 因新增固定枚举 `runtime.vadShadow` 将 `diagnosticSchemaVersion` 升为 2；0.2.26 为区分真实 scorer 的 `warming|busy|unavailable|silero-onnx-shadow-v1` 将其升为 3；0.2.28 因新增固定 `aggregate.vadShadow` 聚合将其升为 4；0.2.30 因新增固定 `runtime.asr` 请求/生效/状态枚举将其升为 5。事件 schema 仍为 v1，旧后端未返回聚合或 ASR 能力时分别安全归为 `not-reported` / 默认未报告状态。
 
-**已实现**：报告固定枚举实际协商结果：provider、`worklet|legacy|none`、`managed-v1|raw`、`provider-pcm-v1|none` 与 `candidate-snapshot-v1|none`。事件最多 256 条，独立延迟摘要最多 8 个 generation；连续 playback stats 会合并但保留 500ms 采样点中的 `queuedMs` 最高值及合并计数，避免长会话的统计挤掉 TTFA 生命周期边界。报告同时给出这些轮次的 p50/p95、candidate 到 confirmed/rejected、soft-end 到 reopen/commit、App 可观测 TTFA、采样队列最高值和丢样统计。所有阶段时间继续来自单调相对时钟。
+**已实现**：报告固定枚举实际协商结果：provider、`worklet|legacy|none`、`managed-v1|raw`、`provider-pcm-v1|none`、`candidate-snapshot-v1|none`，以及 `runtime.asr` 的 `requested`、`active`、`status`。事件最多 256 条，独立延迟摘要最多 8 个 generation；连续 playback stats 会合并但保留 500ms 采样点中的 `queuedMs` 最高值及合并计数，避免长会话的统计挤掉 TTFA 生命周期边界。报告同时给出这些轮次的 p50/p95、candidate 到 confirmed/rejected、soft-end 到 reopen/commit、App 可观测 TTFA、采样队列最高值和丢样统计。所有阶段时间继续来自单调相对时钟。
 
 **隐私边界**：导出不含设置对象、Key、persona、用户/助手文本、URL、文件/设备路径或 PCM；只含固定枚举、按报告重新编号的 session/turn/response ID、相对时间和允许列表数值。来源丢弃、导出截断、非法项拒绝与 stats 合并分别计数。`underruns` 仍包含自然 drain，报告明确标为 `includes-natural-drain`，不能把它当成 provider 流式断粮、Python queue depth 或 MLX model gate 精确释放时刻。`maxSampledQueuedMs` 也只是 500ms 观测点的最高值，不是每个音频 chunk 的精确 ring 峰值。
 
@@ -262,6 +262,18 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **设计占位 / 待实验**：本版不宣称 Qwen 角色相似度、语速方差、TTFA 或 ASR 召回已经达标，也不对 PCM 做变速。下一步使用固定短语 corpus 对官方默认、较低 temperature 与 greedy 三档做多次真人盲听和时长方差比较；只有同一采样 profile 在 MLX/PyTorch 都通过后才考虑改默认。ASR 阈值与 neural live takeover 仍等待有权利/同意证据的声学回放及真实设备 p95，不因本次文本后处理而提前启用。
 
+### 2.24 P2 SenseVoice final ASR 实验后端（已实现，0.2.30；默认 Whisper）
+
+**已实现——选择与回退**：本地 Qwen/CosyVoice 增加 `whisper|sensevoice` 固定设置枚举；火山端到端链路不变。服务进程只在启动时选择一次 final ASR，不双跑、不按轮切换。SenseVoice runtime 可用时直接从内存 PCM16LE 做整句识别；缺失、marker/布局校验失败、平台不支持或启动加载失败时，本次进程固定回退既有 Whisper。两条路径共用 512 字和长周期重复护栏。ASR admission 为 1，第二个请求不会进入无界 executor 队列；取消后的阻塞结果必须在 Future 真正结束后才释放 slot，且迟到 generation 不得写回会话。
+
+**已实现——显式、可审计安装**：用户必须先选择 SenseVoice 并保存，再点击安装。安装器锁定 `sherpa-onnx 1.13.4`/core 的 CPython 3.10–3.14、macOS arm64/x64 与 Windows x64 wheel 文件名、大小和 SHA-256；SenseVoiceSmall INT8 archive 及内部 `model.int8.onnx`、`tokens.txt`、license/readme 也逐项锁定。下载有界，拒绝 tar traversal/symlink，使用 ABI fingerprint 版本目录、staging、installer lock、marker-last 和可恢复 sibling swap，发布前执行真实模型推理。安装包只携带安装器、lock 与 notice，不携带 wheel、模型、cache、staging 或 ready marker。macOS wheel tag 不是系统版本兼容承诺；目标机 smoke 失败即保持 Whisper。
+
+**已实现——诊断与隐私**：诊断 schema v5 只导出 `runtime.asr.requested=whisper|sensevoice`、`active=whisper-mlx|whisper-openai|sensevoice-sherpa-onnx|none` 和 `status=active|fallback|unavailable|not-reported`。不导出 runtime/model 路径、转写文本、原始 PCM、标签概率、异常或设备信息。所有队列/admission 继续有界。`sherpa-onnx` runtime 采用 Apache-2.0；转换后的 SenseVoiceSmall 权重仍受 FunASR Model Open Source License Agreement 1.1 约束，不能把模型许可写成 Apache-2.0。
+
+**真实 smoke / 非准确率结论**：当前 Apple Silicon + CPython 3.14 实测加载约 0.386s、官方中文样例 decode 约 0.088s，得到“开放时间早上9点至下午5点。”；从零安装并 smoke 约 39.5s。这里只证明锁定产物可安装、可加载、可推理，不证明真实房间、回声、方言或重复幻觉场景优于 Whisper，也不是端到端延迟承诺。
+
+**设计占位 / 待实验**：SenseVoice 仍没有 partial、伪流式、VAD/endpoint 或打断决策权；识别出的 language/emotion/event 目前只经过固定 allowlist 清洗，尚未注入 LLM、history、诊断或 `UserAffect`。下一步用逐素材具备权利与声音同意证据的固定录音集，对普通中文、“乖/乱”幻觉、合法短重复、AI 外放回声和粤语做 Whisper/SenseVoice 人工 A/B，再决定是否扩大默认范围。没有该证据前 Whisper 保持默认。
+
 ## 3. 外部工程对比
 
 调研基线：
@@ -276,7 +288,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 | 维度 | 本工程本地链路 | `speech-to-speech` | 借鉴结论 |
 |---|---|---|---|
 | VAD | RMS 固定阈值 | Silero VAD、短静音、soft-end/reopen | 借鉴状态机，不直接照搬 64ms 参数 |
-| ASR | 句尾后整段 Whisper | 可替换 STT、partial transcript、内存音频 | 增加 adapter 和阶段事件 |
+| ASR | 句尾后整段 Whisper，或显式可选 SenseVoiceSmall INT8；启动期固定回退 | 可替换 STT、partial transcript、内存音频 | adapter 已落地；继续做许可语料 A/B，不把 final ASR 冒充 partial |
 | LLM | DeepSeek/Ollama SSE；4 项句队列饱和时有界反压 | OpenAI-compatible、本地/云端、流式 | 已复用现有 provider 并分离有界 consumer；继续用 trace 验证反压 |
 | TTS | CosyVoice 与 macOS MLX Qwen 可协商单路原生 PCM 流式；Windows/Linux Qwen 为串行整句；全部严格有序 | 句子合并、流式 chunk、TTFA/RTF | 先实测两种 adapter；等待 PyTorch 官方公开流式 API |
 | 取消 | generation CancelScope 覆盖 SSE event、逐句 TTS 与 PCM checkpoint；managed binary 携带同一 generation；阻塞线程不可强杀 | generation-tagged `CancelScope` | 继续保持 raw fallback/audio gate，火山另行核验 |
@@ -421,6 +433,8 @@ Qwen3-TTS Base 的官方能力表中 `Instruction Control` 为空，不能把 Cu
 
 SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语、韩语，以及情绪和音频事件标签。官方基准描述为同参数量下快于 Whisper-Small 5 倍以上、快于 Whisper-Large 15 倍以上；不能把研究范围中的 50+ 语种当成已发布 Small checkpoint 的能力。
 
+0.2.30 已把 sherpa-onnx 转换的 SenseVoiceSmall INT8 接为本地/CosyVoice 的可选句尾 final ASR，并保留启动期 Whisper 固定回退；这只是实验后端落地，不是默认替换或精度结论。当前 language/emotion/event 标签会被固定 allowlist 清洗，但尚未进入 LLM 或产品情绪闭环。
+
 它适合：
 
 - 句尾 final ASR。
@@ -465,13 +479,15 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - **已实现（0.2.25 shadow 基础）**：dedicated single worker、queue=1、全进程 admission=1、overflow epoch/reset、迟到丢弃和 Session 生命周期旁路；默认无 factory，RMS 行为不变。
 - **已实现（0.2.26 真实 shadow）**：显式 opt-in、固定 Silero v6.2.1 模型、ABI 精确且 hash-locked 的可选 ORT runtime、真实 recurrent scorer、tokenized 单 Session lease 和固定 capability enum；模型仍不参与线上决策。
 - **已实现（0.2.27 deadline/evaluator 基础）**：纯 frame candidate budget、独立内部 timeout event、有界流式 case evaluator、事务 aggregate、固定延迟桶与 synthetic/fake-scorer 隐私测试；96-frame Silero 值仅为 shadow 机械保护，不是 live 数值结论。
+- **已实现（0.2.30 实验后端）**：本地/CosyVoice 可显式选择并安装 SenseVoiceSmall INT8 final ASR；ABI/hash/marker 锁定、真实 smoke、单 admission、启动期固定 Whisper 回退和诊断 schema v5 已落地。它仍是整句识别，不驱动 VAD/endpoint/partial；默认值和火山链路不变。
 - **待实现**：许可声学回放、live 单调时钟候选上限、阈值/超时实验、噪声自适应和满足 p95 600ms 目标的 adaptive endpoint；当前不能把真实 shadow 或合成 evaluator 称为神经 VAD 完整方案或 live takeover。
-- **待实验**：实测 CosyVoice PCM 字节序/TTFA 与 macOS MLX Qwen TTFA/接缝/取消资源恢复；Windows/Linux 继续等待官方音频 iterator。不得把整段音频再切块冒充真 streaming。
+- **待实验**：用有权利/同意证据的固定录音集比较 Whisper/SenseVoice；实测 CosyVoice PCM 字节序/TTFA 与 macOS MLX Qwen TTFA/接缝/取消资源恢复。Windows/Linux 继续等待官方音频 iterator。不得把整段音频再切块冒充真 streaming。
 
 ### P3：情绪闭环
 
 - 落地 `SpeechStyle` 和统一情绪映射。
-- SenseVoice final ASR/SER 作为可选后端，先 A/B 再替换默认 Whisper。
+- **已实现（0.2.30 实验）**：SenseVoice final ASR 作为可选后端，显式安装且可回退；Whisper 保持默认。
+- **待实验/待实现**：完成许可录音 A/B 后再讨论默认替换；SER/AED 只完成适配器清洗，尚未接入 `UserAffect` 或任何线上决策。
 - CosyVoice 逐句 instruction；Qwen Base 多参考 prompt 实验；CustomVoice 可选模式。
 - 将 assistant style 同步给桌宠动作和表情，但保持一个权威映射源。
 
@@ -518,5 +534,5 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 1. 播放 Worklet、两阶段打断测试版、candidate-bound interrupted UX、VAD adapter、bounded worker、capability-gated Silero/ORT 真实 shadow、纯 frame deadline 与 aggregate evaluator 已完成；下一步建立许可声学回放并决定 live 单调时钟上限、概率阈值与超时，unsupported/fault 继续明确回退，不能直接替换 RMS。
 2. 固定 2 秒判停、LLM SSE、句级 audible history、有界有序 TTS consumer、本地/CosyVoice managed identity、一次性 interrupted hint、CosyVoice PCM、macOS MLX Qwen 真流式 adapter 与诊断导出入口已完成测试切片；继续按 2.17 runbook 用真实 CosyVoice 账号和 Apple Silicon runtime 分别验证 PCM/TTFA/接缝/取消恢复。Windows/Linux Qwen 在官方公开音频 iterator 前保持整句，3 秒 ring 在快速确认实测前不收紧。
 3. 情绪路线默认保证复刻音色；CosyVoice 作为“复刻 + instruction”的表现力基准，Qwen CustomVoice 作为可选模式。
-4. SenseVoice 先作为 final ASR/SER 实验后端，不直接承担快速打断或 partial transcript。
+4. SenseVoice final ASR 实验后端已在 0.2.30 以显式安装、启动期固定回退落地；下一步是许可录音 A/B 与 SER/AED 产品语义设计，仍不承担快速打断或 partial transcript。
 5. 所有后续实现以本文件的指标和回放集为验收依据，不能只凭主观单次试听上线。

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "runtimeVersion": "1.13.4",
+  "artifacts": {
+    "sherpa-onnx": {
+      "cp310-macos-arm64": ["sherpa_onnx-1.13.4-cp310-cp310-macosx_11_0_arm64.whl", "https://files.pythonhosted.org/packages/64/24/f22d1d8be2edbca36e8246ce1c6ebc44a7bf26b06150b805060a19d9d32d/sherpa_onnx-1.13.4-cp310-cp310-macosx_11_0_arm64.whl", 2098891, "56b5a45c0858cab70826f28445009f86bf49862a77baaeb5f1ae672fe87bf463"],
+      "cp310-macos-x64": ["sherpa_onnx-1.13.4-cp310-cp310-macosx_10_15_x86_64.whl", "https://files.pythonhosted.org/packages/11/c9/5b895cddb81b86462dca08498bfdd29692957df0e02b2eb1f8baf5fff829/sherpa_onnx-1.13.4-cp310-cp310-macosx_10_15_x86_64.whl", 2287072, "6c1a4ec6dba6f5274b8b2233580c8e376d98c1292a2939a17d6cc7d8f36fd25e"],
+      "cp310-windows-x64": ["sherpa_onnx-1.13.4-cp310-cp310-win_amd64.whl", "https://files.pythonhosted.org/packages/65/78/ed40a21e7062df970493e13730dc311cb0eac636552bb21552380786ff96/sherpa_onnx-1.13.4-cp310-cp310-win_amd64.whl", 2236762, "a65ce46181639d8a8273a56f4865b0b5103000ad1e68d7fcafc8ff7c1ba596a5"],
+      "cp311-macos-arm64": ["sherpa_onnx-1.13.4-cp311-cp311-macosx_11_0_arm64.whl", "https://files.pythonhosted.org/packages/e8/93/4385fcdb1f197521fe13fa887893cc200d27569d3cbcccf0d7b92d6a9e62/sherpa_onnx-1.13.4-cp311-cp311-macosx_11_0_arm64.whl", 2100029, "c2d4337b80b54dd68f566cab941a2ad47ab6cfabb68e88002ee0c920493c16d3"],
+      "cp311-macos-x64": ["sherpa_onnx-1.13.4-cp311-cp311-macosx_10_15_x86_64.whl", "https://files.pythonhosted.org/packages/41/c8/a2ff828ce9a2702b607c25f6303b21d7d41b6ad1520f660b95a0113f4051/sherpa_onnx-1.13.4-cp311-cp311-macosx_10_15_x86_64.whl", 2288314, "c3e9f96a07570faefca8e3aabcfb78690e680d188d5d44d06fd8711185fe37d6"],
+      "cp311-windows-x64": ["sherpa_onnx-1.13.4-cp311-cp311-win_amd64.whl", "https://files.pythonhosted.org/packages/7e/b1/ae1c113ac9c67dcabbed559f50950c7220a62e49e6b5acb4c2219ab22409/sherpa_onnx-1.13.4-cp311-cp311-win_amd64.whl", 2239901, "04a82d79c13a4ce2bd9ccf51de93e83cbfc7bc50520c53e5e967565100d0724d"],
+      "cp312-macos-arm64": ["sherpa_onnx-1.13.4-cp312-cp312-macosx_11_0_arm64.whl", "https://files.pythonhosted.org/packages/fc/79/ee999f0c3b7789077d0939716a38234573d139f851a31409aa028fe2c610/sherpa_onnx-1.13.4-cp312-cp312-macosx_11_0_arm64.whl", 2105219, "84e58b5a074b97c5307c9b6221d1d20fbf412a1a5dff4960ca9c32bb5184219f"],
+      "cp312-macos-x64": ["sherpa_onnx-1.13.4-cp312-cp312-macosx_10_15_x86_64.whl", "https://files.pythonhosted.org/packages/82/37/07f03e97f157b206f6e62d722ec7c5ff41c7e9dc6aa2dc7de69b57e39b5a/sherpa_onnx-1.13.4-cp312-cp312-macosx_10_15_x86_64.whl", 2345135, "02b57dc2c829976eb842e6aee6a0e4ac3b9991aeb5afa89fd44eb71d848a4ecd"],
+      "cp312-windows-x64": ["sherpa_onnx-1.13.4-cp312-cp312-win_amd64.whl", "https://files.pythonhosted.org/packages/bb/bb/1e723ab703a1e354f390de19981ec0c347576f87be01915d826dc6fc9f41/sherpa_onnx-1.13.4-cp312-cp312-win_amd64.whl", 2244142, "b8436ffe2763b3fd522fbac8fe53f47d611721c84819c241acfb65d122403d7d"],
+      "cp313-macos-arm64": ["sherpa_onnx-1.13.4-cp313-cp313-macosx_11_0_arm64.whl", "https://files.pythonhosted.org/packages/21/ed/d07787dd4be4119e6587c840f6b417c2d57c14d694d334af609d68cb5a41/sherpa_onnx-1.13.4-cp313-cp313-macosx_11_0_arm64.whl", 2115586, "8ec5394b4ea73bf01e6883cf078348f87350f4eb3567d51d92cae77ea2582403"],
+      "cp313-macos-x64": ["sherpa_onnx-1.13.4-cp313-cp313-macosx_10_15_x86_64.whl", "https://files.pythonhosted.org/packages/62/28/09aa9461e8bdf894ba8466e047e40fb5da8aaa6d68c19cf1e2aabe01e706/sherpa_onnx-1.13.4-cp313-cp313-macosx_10_15_x86_64.whl", 2307539, "b4f54363b264b16148a724b4442f00cda97fcd4e9beeda3d75637753910e8557"],
+      "cp313-windows-x64": ["sherpa_onnx-1.13.4-cp313-cp313-win_amd64.whl", "https://files.pythonhosted.org/packages/82/40/ee8a0a8c83fc6d7f5245a5a031e471d3b115e20cce867e7abb2f9d4185c9/sherpa_onnx-1.13.4-cp313-cp313-win_amd64.whl", 2244504, "17050fdfb48d37ae996364f697c554a1399740d18e5a56b143c011d00cfed3e0"],
+      "cp314-macos-arm64": ["sherpa_onnx-1.13.4-cp314-cp314-macosx_11_0_arm64.whl", "https://files.pythonhosted.org/packages/1f/b5/29997d7de29cae8e3f54e8a993fcf14d48d5a7960deab10df479fcbc7d64/sherpa_onnx-1.13.4-cp314-cp314-macosx_11_0_arm64.whl", 2118562, "ff38ac153527fda0f6158e7c097b66e980a6840455d908e037ce09a4a4c1ce14"],
+      "cp314-macos-x64": ["sherpa_onnx-1.13.4-cp314-cp314-macosx_10_15_x86_64.whl", "https://files.pythonhosted.org/packages/9a/90/191b3b73af1b54584f9f96e256d9ca9f6f3781cacdb4287c7efea6b25094/sherpa_onnx-1.13.4-cp314-cp314-macosx_10_15_x86_64.whl", 2345420, "972137cbf19d501ea6a51857528b340ce1c3d204571e3d56dcc72eded5827418"],
+      "cp314-windows-x64": ["sherpa_onnx-1.13.4-cp314-cp314-win_amd64.whl", "https://files.pythonhosted.org/packages/89/02/1e10f71be635a3f9ef793b07ab88ddb7afa82ab722f3ea275a4877da1bcb/sherpa_onnx-1.13.4-cp314-cp314-win_amd64.whl", 2308592, "cb1834182c4047b8edb1dceeed8d5cf7d6e10295a4079e5e0fea674b4314db06"]
+    },
+    "sherpa-onnx-core": {
+      "macos-arm64": ["sherpa_onnx_core-1.13.4-py3-none-macosx_11_0_arm64.whl", "https://files.pythonhosted.org/packages/a2/26/d0d6bebea4ef8b7de6eed1a335235d1acce9197425c08eecb57ef107904d/sherpa_onnx_core-1.13.4-py3-none-macosx_11_0_arm64.whl", 16897650, "7820183581b711a68e30281a4fb36c0af8ef5615bfc789234fb259439824a014"],
+      "macos-x64": ["sherpa_onnx_core-1.13.4-py3-none-macosx_10_15_x86_64.whl", "https://files.pythonhosted.org/packages/2a/8c/a1336beab226d228f62bdbe1cacf1439a2f6cf8714baac98f1f031dd2f60/sherpa_onnx_core-1.13.4-py3-none-macosx_10_15_x86_64.whl", 19325474, "674ea57eb6458002dab4e39749d21a7364b2f962f4a4958a3ee4c351b093cafd"],
+      "windows-x64": ["sherpa_onnx_core-1.13.4-py3-none-win_amd64.whl", "https://files.pythonhosted.org/packages/95/b0/c3d59ac76f3db873e41bd0cb4fc30b352a278da3289217985aaae3650211/sherpa_onnx_core-1.13.4-py3-none-win_amd64.whl", 16450053, "0a6949cf0fd83adb9fbcfdf5c27b8907a57f7b48626db703c7f6037be9b61764"]
+    }
+  },
+  "model": {
+    "archive": ["sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2", "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2", 163002883, "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e"],
+    "root": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+    "files": {
+      "model.int8.onnx": [239233841, "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"],
+      "tokens.txt": [315894, "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc"],
+      "LICENSE": [71, "221c6df10b0931a5629adad671ea48fb7747e034c414b6d2bfa275bc3dd4ea17"],
+      "README.md": [104, "763991a00edaea534ab36bf1b7cf89e61e911666dcfabbba71f91f9f7c593a63"]
+    },
+    "smoke": ["test_wavs/zh.wav", 178988, "b77f1794fe374a0ba1ee1dc458bfaf9349496cbbfc32780c50ba3c5a7ad8e373"]
+  }
+}
