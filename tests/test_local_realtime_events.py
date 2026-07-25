@@ -2649,6 +2649,69 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ws.messages, [])
         self.assertIsNone(self.session.response_scope)
 
+    async def test_unplayed_response_is_discarded_only_before_tts_admission(self):
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        self.session._response_generated = True
+        self.session._response_tts_admitted = False
+        self.session._response_started_at = common.time.perf_counter()
+
+        self.assertTrue(await self.session.cancel_reply("turn_detected"))
+        self.assertIn(
+            {
+                "type": "assistant_discarded",
+                "generation": scope.generation,
+            },
+            self.ws.json_messages(),
+        )
+
+        admitted = self.session._new_scope("response")
+        self.session.response_scope = admitted
+        self.session._response_generated = True
+        self.session._response_tts_admitted = True
+        self.session._response_started_at = common.time.perf_counter()
+        before = len(self.ws.json_messages())
+        self.assertFalse(await self.session.cancel_reply("turn_detected"))
+        self.assertEqual(len(self.ws.json_messages()), before)
+
+        expired = self.session._new_scope("response")
+        self.session.response_scope = expired
+        self.session._response_generated = True
+        self.session._response_tts_admitted = False
+        self.session._response_started_at = (
+            common.time.perf_counter() - common.CONTINUATION_WINDOW_SECONDS - 0.1
+        )
+        self.assertFalse(await self.session.cancel_reply("turn_detected"))
+        self.assertEqual(len(self.ws.json_messages()), before)
+
+    async def test_continuation_hint_is_one_request_only_and_not_history(self):
+        captured = []
+
+        def capture(_role, history, _text, _scope, out):
+            captured.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        common._synth_tts = lambda _text: b"unused"
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        await self.session._reply_pipeline(
+            "继续补充",
+            scope,
+            continuation_hint=True,
+        )
+
+        self.assertEqual(
+            captured,
+            [[{"role": "system", "content": common.CONTINUATION_HINT_TEXT}]],
+        )
+        self.assertFalse(
+            any(
+                message.get("content") == common.CONTINUATION_HINT_TEXT
+                for message in self.session.history
+            )
+        )
+
     async def test_cancelled_tts_scope_drops_late_audio_and_usage(self):
         common._synth_tts = lambda _text: b"unused"
         loop = asyncio.get_running_loop()

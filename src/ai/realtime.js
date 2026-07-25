@@ -123,6 +123,7 @@ export class RealtimeSession {
     onAsrEnd,
     onAssistant,
     onAssistantEnd,
+    onAssistantDiscarded,
     onAudibleAssistant,
     onSpeaking,
     onUsage,
@@ -142,6 +143,7 @@ export class RealtimeSession {
       onAsrEnd,
       onAssistant,
       onAssistantEnd,
+      onAssistantDiscarded,
       onAudibleAssistant,
       onSpeaking,
       onUsage,
@@ -448,6 +450,11 @@ export class RealtimeSession {
           this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
         }
         this.cb.onAssistantEnd?.();
+        break;
+      case "assistant_discarded":
+        if (!usesManagedCascade(this.trace.provider)) break;
+        this._assistantActive = false;
+        this.cb.onAssistantDiscarded?.({ generation: msg.generation });
         break;
       case "tts_start":
         this._backendAudioPending = true;
