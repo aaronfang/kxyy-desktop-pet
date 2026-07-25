@@ -36,7 +36,9 @@ pub fn tts_secret() -> &'static str {
             }
         }
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         // 仅用于同机进程隔离，无需密码学强随机：纳秒时钟 + pid 混合即足够。
         let secret = format!(
             "{:x}-{:x}-{:x}",
@@ -126,11 +128,7 @@ fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
 
 /// 逐行读取子进程输出并缓存。按字节 `read_until('\n')` + lossy 解码，
 /// 兼容非 UTF-8 输出（Windows GBK 等）——避免中文报错行被整行丢弃。
-fn read_child_lines<R: std::io::Read>(
-    reader: R,
-    tag: &str,
-    logs: &Arc<Mutex<VecDeque<String>>>,
-) {
+fn read_child_lines<R: std::io::Read>(reader: R, tag: &str, logs: &Arc<Mutex<VecDeque<String>>>) {
     let mut br = BufReader::new(reader);
     let mut buf: Vec<u8> = Vec::new();
     loop {
@@ -168,9 +166,22 @@ fn take_log_summary(logs: &Arc<Mutex<VecDeque<String>>>) -> String {
         })
         .collect();
     let lines: Vec<&String> = if !important.is_empty() {
-        important.into_iter().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect()
+        important
+            .into_iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     } else {
-        q.iter().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect()
+        q.iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     };
     let mut msg = lines
         .iter()
@@ -234,6 +245,14 @@ pub fn normalize_asr_provider(provider: &str) -> String {
     }
 }
 
+fn normalize_turn_pause_tolerance(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fast" => "fast",
+        "long" => "long",
+        _ => "standard",
+    }
+}
+
 fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> bool {
     matches!(backend, "local" | "cosyvoice") && !next.is_empty() && previous != next
 }
@@ -243,9 +262,10 @@ mod fingerprint_tests {
     use super::{
         backend_still_selected, begin_sensevoice_runtime_install, begin_vad_runtime_install,
         finish_sensevoice_runtime_install, finish_vad_runtime_install, normalize_asr_provider,
-        record_desired_voice_config, should_defer_for_vad_install,
-        sensevoice_install_matches_target, should_restart_for_fingerprint,
-        supports_vad_runtime_install, voice_target_still_selected, VoiceServiceManager,
+        normalize_turn_pause_tolerance, record_desired_voice_config,
+        sensevoice_install_matches_target, should_defer_for_vad_install,
+        should_restart_for_fingerprint, supports_vad_runtime_install, voice_target_still_selected,
+        VoiceServiceManager,
     };
 
     #[test]
@@ -257,6 +277,15 @@ mod fingerprint_tests {
         }
         assert!(!should_restart_for_fingerprint("volc", "old", "new"));
         assert!(!should_restart_for_fingerprint("", "old", "new"));
+    }
+
+    #[test]
+    fn turn_pause_tolerance_accepts_only_fixed_presets() {
+        assert_eq!(normalize_turn_pause_tolerance("fast"), "fast");
+        assert_eq!(normalize_turn_pause_tolerance(" LONG "), "long");
+        for value in ["", "standard", "custom", "2250"] {
+            assert_eq!(normalize_turn_pause_tolerance(value), "standard");
+        }
     }
 
     #[test]
@@ -329,10 +358,7 @@ mod fingerprint_tests {
             "fp-1"
         ));
         assert!(!sensevoice_install_matches_target(
-            &inner,
-            "local",
-            "whisper",
-            "fp-1"
+            &inner, "local", "whisper", "fp-1"
         ));
         assert!(voice_target_still_selected(
             &inner,
@@ -341,10 +367,7 @@ mod fingerprint_tests {
             "fp-1"
         ));
         assert!(!voice_target_still_selected(
-            &inner,
-            "local",
-            "whisper",
-            "fp-1"
+            &inner, "local", "whisper", "fp-1"
         ));
         record_desired_voice_config(&mut inner, "local", "sensevoice", "fp-2");
         assert!(!voice_target_still_selected(
@@ -430,10 +453,7 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
     // Address already in use。
     let selector = format!("-tiTCP:{port}");
     for bin in ["/usr/sbin/lsof", "/usr/bin/lsof", "lsof"] {
-        let Ok(output) = Command::new(bin)
-            .args([&selector, "-sTCP:LISTEN"])
-            .output()
-        else {
+        let Ok(output) = Command::new(bin).args([&selector, "-sTCP:LISTEN"]).output() else {
             continue;
         };
         let text = String::from_utf8_lossy(&output.stdout);
@@ -466,7 +486,11 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
         if !line.contains("LISTENING") || !line.contains(&needle) {
             continue;
         }
-        let Some(pid) = line.split_whitespace().last().and_then(|s| s.parse::<u32>().ok()) else {
+        let Some(pid) = line
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid != 0 && pid != self_pid {
@@ -481,9 +505,7 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
 #[cfg(unix)]
 fn kill_process(pid: u32, force: bool) {
     if force {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     } else {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
@@ -530,9 +552,7 @@ fn reclaim_voice_ports_if_stale(ws_port: u16) -> bool {
     if !port_listener_busy(ws_port) && !port_listener_busy(ws_port.saturating_add(100)) {
         return false;
     }
-    eprintln!(
-        "[voice-service] :{ws_port} 被占用但健康检查未通过，清理残留进程后重试…"
-    );
+    eprintln!("[voice-service] :{ws_port} 被占用但健康检查未通过，清理残留进程后重试…");
     clear_stale_voice_listeners(ws_port)
 }
 
@@ -584,9 +604,7 @@ pub fn builtin_ref_stamp(persona_card_id: &str) -> String {
             t
         }
     };
-    let dir = repo
-        .join("scripts/local-realtime/assets")
-        .join(card);
+    let dir = repo.join("scripts/local-realtime/assets").join(card);
     for name in ["ref.wav", "ref.mp3", "ref.m4a", "ref.flac", "ref.ogg"] {
         let p = dir.join(name);
         if let Ok(meta) = p.metadata() {
@@ -672,23 +690,18 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
             // 用户级 Python 安装（python.org 安装器默认位置）
             for ver in &["314", "313", "312", "311", "310", "39"] {
                 list.push(
-                    PathBuf::from(&local)
-                        .join(format!("Programs/Python/Python{ver}/python.exe")),
+                    PathBuf::from(&local).join(format!("Programs/Python/Python{ver}/python.exe")),
                 );
             }
         }
         if let Ok(pf) = std::env::var("PROGRAMFILES") {
             for ver in &["314", "313", "312", "311", "310", "39"] {
-                list.push(
-                    PathBuf::from(&pf).join(format!("Python{ver}/python.exe")),
-                );
+                list.push(PathBuf::from(&pf).join(format!("Python{ver}/python.exe")));
             }
         }
         if let Ok(pf86) = std::env::var("PROGRAMFILES(x86)") {
             for ver in &["314", "313", "312", "311", "310", "39"] {
-                list.push(
-                    PathBuf::from(&pf86).join(format!("Python{ver}/python.exe")),
-                );
+                list.push(PathBuf::from(&pf86).join(format!("Python{ver}/python.exe")));
             }
         }
     }
@@ -708,10 +721,8 @@ pub(crate) fn which_in_path(name: &Path) -> Option<PathBuf> {
     for dir in std::env::split_paths(&paths) {
         // 先尝试原名（含 .exe / 无后缀），再尝试 Windows 下追加 .exe
         #[cfg(windows)]
-        let candidates: [PathBuf; 2] = [
-            dir.join(name),
-            dir.join(format!("{}.exe", name.display())),
-        ];
+        let candidates: [PathBuf; 2] =
+            [dir.join(name), dir.join(format!("{}.exe", name.display()))];
         #[cfg(not(windows))]
         let candidates: [PathBuf; 2] = [dir.join(name), dir.join(name)];
         for cand in &candidates {
@@ -783,10 +794,7 @@ fn dirs_settings_path() -> Option<PathBuf> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".config/com.aaronfang.kxyydesktoppet/settings.json"),
-        )
+        Some(PathBuf::from(home).join(".config/com.aaronfang.kxyydesktoppet/settings.json"))
     }
 }
 
@@ -851,7 +859,10 @@ fn pick_active_root(repo: &Path, configured: &str, sub: &str) -> PathBuf {
     // <root>/scripts/local-realtime/pretrained_models/<...>。是的话回溯到 root。
     let mut cur: Option<&Path> = Some(path.as_path());
     while let Some(c) = cur {
-        if c.file_name().map(|n| n == "local-realtime").unwrap_or(false) {
+        if c.file_name()
+            .map(|n| n == "local-realtime")
+            .unwrap_or(false)
+        {
             if let Some(scripts) = c.parent() {
                 if scripts.file_name().map(|n| n == "scripts").unwrap_or(false) {
                     if let Some(root) = scripts.parent() {
@@ -1013,10 +1024,7 @@ pub fn install_vad_shadow_runtime(app: &AppHandle, backend_raw: &str) -> Result<
     let runtime_root = vad_runtime_root().ok_or_else(|| "无法定位 App 数据目录".to_string())?;
 
     let manager = app.state::<VoiceServiceManager>();
-    let lifecycle = manager
-        .lifecycle
-        .lock()
-        .map_err(|_| "语音服务状态不可用")?;
+    let lifecycle = manager.lifecycle.lock().map_err(|_| "语音服务状态不可用")?;
     let should_stop = {
         let mut inner = manager.inner.lock().map_err(|_| "语音服务状态不可用")?;
         if !begin_vad_runtime_install(&mut inner, &backend) {
@@ -1125,19 +1133,11 @@ pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<
         sensevoice_runtime_root().ok_or_else(|| "无法定位 App 数据目录".to_string())?;
 
     let manager = app.state::<VoiceServiceManager>();
-    let lifecycle = manager
-        .lifecycle
-        .lock()
-        .map_err(|_| "语音服务状态不可用")?;
+    let lifecycle = manager.lifecycle.lock().map_err(|_| "语音服务状态不可用")?;
     let install_fingerprint = {
         let mut inner = manager.inner.lock().map_err(|_| "语音服务状态不可用")?;
         let fingerprint = inner.desired_fingerprint.clone();
-        if !begin_sensevoice_runtime_install(
-            &mut inner,
-            &backend,
-            &asr_provider,
-            &fingerprint,
-        ) {
+        if !begin_sensevoice_runtime_install(&mut inner, &backend, &asr_provider, &fingerprint) {
             return Err("已有语音运行时安装任务正在进行".into());
         }
         fingerprint
@@ -1190,9 +1190,18 @@ pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<
         };
         let (state, message) = match (success, still_selected) {
             (true, true) => ("ready", "SenseVoice runtime 已就绪，正在重启当前语音服务…"),
-            (true, false) => ("ready", "SenseVoice runtime 已就绪；当前语音设置已改变，未重启服务"),
-            (false, true) => ("failed", "SenseVoice runtime 安装失败；正在恢复当前语音服务"),
-            (false, false) => ("failed", "SenseVoice runtime 安装失败；当前语音设置已改变，未重启服务"),
+            (true, false) => (
+                "ready",
+                "SenseVoice runtime 已就绪；当前语音设置已改变，未重启服务",
+            ),
+            (false, true) => (
+                "failed",
+                "SenseVoice runtime 安装失败；正在恢复当前语音服务",
+            ),
+            (false, false) => (
+                "failed",
+                "SenseVoice runtime 安装失败；当前语音设置已改变，未重启服务",
+            ),
         };
         let _ = app2.emit(
             "sensevoice-runtime-install-progress",
@@ -1212,8 +1221,7 @@ fn hf_mirror() -> String {
         return custom;
     }
     // 检查环境变量 HOSTNAME / 网络
-    std::env::var("HF_ENDPOINT")
-        .unwrap_or_else(|_| "https://hf-mirror.com".into())
+    std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://hf-mirror.com".into())
 }
 
 fn emit_setup_progress(
@@ -1258,7 +1266,9 @@ fn format_setup_line(raw: &str) -> Option<String> {
             while i < chars.len() && !chars[i].is_alphabetic() {
                 i += 1;
             }
-            if i < chars.len() { i += 1; } // 跳过结尾字母
+            if i < chars.len() {
+                i += 1;
+            } // 跳过结尾字母
             continue;
         }
         cleaned.push(chars[i]);
@@ -1269,7 +1279,10 @@ fn format_setup_line(raw: &str) -> Option<String> {
         return None;
     }
     // 纯控制字符行跳过
-    if line.chars().all(|c| c.is_whitespace() || c == '[' || c == ']') {
+    if line
+        .chars()
+        .all(|c| c.is_whitespace() || c == '[' || c == ']')
+    {
         return None;
     }
     Some(line.to_string())
@@ -1332,9 +1345,7 @@ fn run_macos_qwen3_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result
         }));
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("等待配置脚本失败：{e}"))?;
+    let status = child.wait().map_err(|e| format!("等待配置脚本失败：{e}"))?;
     for h in handles {
         let _ = h.join();
     }
@@ -1413,12 +1424,7 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
         .map(|inner| {
             (
                 inner.vad_install_backend.clone(),
-                sensevoice_install_matches_target(
-                    &inner,
-                    &backend,
-                    &current_asr_provider,
-                    &fp,
-                ),
+                sensevoice_install_matches_target(&inner, &backend, &current_asr_provider, &fp),
             )
         })
         .unwrap_or_default();
@@ -1440,12 +1446,15 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     // 关闭语音：停服务、不启动
     if backend.is_empty() {
         stop(app);
-        emit(app, VoiceServiceStatus {
-            backend: String::new(),
-            state: "stopped".into(),
-            message: "语音已关闭".into(),
-            port: 0,
-        });
+        emit(
+            app,
+            VoiceServiceStatus {
+                backend: String::new(),
+                state: "stopped".into(),
+                message: "语音已关闭".into(),
+                port: 0,
+            },
+        );
         return;
     }
 
@@ -1553,11 +1562,7 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
                 match child.try_wait() {
                     Ok(None) => {
                         // 启动期保存新配置也必须立即重拉，不能等旧进程健康后继续使用旧 Key/音色。
-                        if should_restart_for_fingerprint(
-                            &backend,
-                            &inner.voice_fingerprint,
-                            &fp,
-                        ) {
+                        if should_restart_for_fingerprint(&backend, &inner.voice_fingerprint, &fp) {
                             eprintln!("[voice-service] 启动期间语音配置已变更，重启当前 TTS 服务");
                             stop_inner(&mut inner);
                             // 进程还在，但端口被占且不健康 → 冲突/僵尸，停掉后重拉。
@@ -1593,7 +1598,9 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
             VoiceServiceStatus {
                 backend: backend.clone(),
                 state: "failed".into(),
-                message: "找不到 scripts/local-realtime。开发模式请从仓库运行；或设置 KXYY_REPO_ROOT。".into(),
+                message:
+                    "找不到 scripts/local-realtime。开发模式请从仓库运行；或设置 KXYY_REPO_ROOT。"
+                        .into(),
                 port,
             },
         );
@@ -1715,7 +1722,8 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
                 backend: backend.clone(),
                 state: "failed".into(),
                 message: if cfg!(target_os = "macos") {
-                    "找不到 Python。请安装 Python 3.10+（Apple Silicon），将自动创建语音运行时。".into()
+                    "找不到 Python。请安装 Python 3.10+（Apple Silicon），将自动创建语音运行时。"
+                        .into()
                 } else if backend == "local" {
                     "找不到本地 Qwen3-TTS 运行环境。请运行 scripts/windows/setup-qwen3-tts.cmd 自动配置（创建 .venv-qwen3 并安装 qwen-tts）。".into()
                 } else {
@@ -1773,6 +1781,9 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     // 不把模型或第三方依赖写入 Qwen/CosyVoice 自身环境。
     let asr_provider = normalize_asr_provider(&read_setting_str("asrProvider"));
     cmd.env("KXYY_ASR_PROVIDER", asr_provider);
+    let turn_pause_tolerance =
+        normalize_turn_pause_tolerance(&read_setting_str("turnPauseTolerance"));
+    cmd.env("KXYY_TURN_PAUSE_TOLERANCE", turn_pause_tolerance);
     if let Some(root) = sensevoice_runtime_root() {
         cmd.env("KXYY_ASR_RUNTIME_ROOT", root);
     }

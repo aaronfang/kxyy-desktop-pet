@@ -262,7 +262,8 @@ pub fn ensure(app: &AppHandle, provider: &str, preferred_model: &str) {
 fn warmup_system_prompt() -> String {
     match crate::persona_assets::decrypted_json() {
         Ok(raw) => {
-            let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
             if let Some(s) = v
                 .get("systemPrompt")
                 .and_then(|x| x.as_str())

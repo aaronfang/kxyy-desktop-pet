@@ -6,7 +6,7 @@
 
 本工程的火山后端是端到端实时语音模型，本地后端则是 VAD、ASR、LLM、TTS 级联管线。二者不应强行合并成同一种实现，但应通过统一的前端会话事件、播放缓冲和响应代号获得一致的打断体验。
 
-可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，约 1.05 秒 soft-end/reopen 后才提交整段 final ASR。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator；0.2.28 把既有有界 shadow 计数接入固定、隐私安全的诊断聚合；0.2.29 针对实测回归合并过短 TTS 稳定块、固定 CosyVoice 通话基线风格，并为 Whisper 增加跨窗口与重复幻觉护栏；0.2.30 再为本地/CosyVoice 加入显式安装、启动期固定选择且可回退的 SenseVoiceSmall INT8 句尾 ASR 实验。Whisper 仍为默认，Windows/Linux Qwen TTS、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。SenseVoice 与 Whisper 的召回/幻觉对比、CosyVoice 的真实字节序/TTFA/听感，以及 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性测试、合成 evaluator、shadow 聚合或真实模型能够执行就宣称体验改善。
+可恢复播放与候选让声已经有测试版：本地链路检测到疑似人声会立即发 candidate 并由前端 duck/暂停，soft-end/reopen 后才提交整段 final ASR。0.2.17–0.2.20 依次补齐可听历史、有界句级管线、`managed-v1` 下行身份与 candidate-bound 临时打断提示；0.2.21 又让 CosyVoice + Worklet 在独立协商后直接请求 24k raw PCM。0.2.22 为 macOS Apple Silicon 的 MLX Qwen 接入官方生成期 chunk，并复用同一单路有界 sender；0.2.23 提供有界、隐私安全的通话诊断导出与实测 runbook；0.2.24–0.2.25 依次补齐 VAD 纯状态基础和 bounded shadow worker；0.2.26 则在显式开关与显式、hash-locked 可选 runtime 安装后，让固定的 Silero VAD v6.2.1 模型真实运行于 shadow；0.2.27 又补上纯 frame candidate deadline 与 aggregate-only 离线 evaluator；0.2.28 把既有有界 shadow 计数接入固定、隐私安全的诊断聚合；0.2.29 针对实测回归合并过短 TTS 稳定块、固定 CosyVoice 通话基线风格，并为 Whisper 增加跨窗口与重复幻觉护栏；0.2.30 再为本地/CosyVoice 加入显式安装、启动期固定选择且可回退的 SenseVoiceSmall INT8 句尾 ASR 实验；0.2.31 将本地/CosyVoice 的 reopen 窗口收敛为固定三档，默认约 1.65 秒总 commit，并把实时 TTS 稳定块下限提升到 30 字以减少同轮重复 voice-clone。Whisper 仍为默认，Windows/Linux Qwen TTS、legacy、旧服务与火山保持原路径。当前主要瓶颈仍是 confirmed 等待句尾与整段 ASR；Silero 尚无线上决策权，公开许可录音、live 单调时钟 deadline、阈值/超时验收和字/音素级恢复仍是后续工作。SenseVoice 与 Whisper 的召回/幻觉对比、CosyVoice 的真实字节序/TTFA/听感，以及 Qwen MLX 的真实 TTFA/接缝/取消资源恢复都需设备实测，不能只凭确定性测试、合成 evaluator、shadow 聚合或真实模型能够执行就宣称体验改善。
 
 情绪语音不能只靠增加一个 `emotion` 字段解决。当前能力应按后端区分：
 
@@ -88,9 +88,9 @@ P0 落地时的设计占位 `speech_candidate`、`speech_rejected`、`response_c
 
 ### 2.6 P2 soft endpoint 测试版（已实现，0.2.12）
 
-本地级联链路已把固定 2000ms 句尾静音改为纯状态 `SoftEndpoint`：连续静音 480ms 时记录 `endpoint_soft_end`，随后保留 570ms reopen 窗口；窗口内重新检测到有效能量会记录 `endpoint_reopened`，保留同一段 PCM 和同一用户轮次。无续说时约 1050ms 记录 `endpoint_committed` 并提交现有整段 Whisper，比旧固定等待缩短约 950ms。三个事件只携带 `silenceMs` 数值并进入有界 provider-neutral trace，不含 PCM 或识别文本。
+本地级联链路已把固定 2000ms 句尾静音改为纯状态 `SoftEndpoint`：连续静音 480ms 时记录 `endpoint_soft_end`，随后按固定档位保留 reopen 窗口。`fast` 总计约 1050ms、默认 `standard` 约 1650ms、`long` 约 2250ms；窗口内重新检测到有效能量会记录 `endpoint_reopened`，保留同一段 PCM 和同一用户轮次。Rust 与 Python 都只接受这三个枚举，所有值均按 30ms 帧对齐；设置变化重启本地/CosyVoice 服务，火山不受影响。三个事件只携带 `silenceMs` 数值并进入有界 provider-neutral trace，不含 PCM 或识别文本。
 
-这是 **P2 的测试切片**，不是完整 adaptive endpoint：当前 voiced/quiet 仍使用既有 RMS 门槛，没有神经 VAD、噪声底自适应、推测式 ASR 或 partial transcript；提交后仍需等待整段 Whisper，因此不能宣称已达到 600ms 句尾目标。480/570ms 也是待实测参数，验证中文 300–900ms 句中停顿后再决定是否收紧。
+这是 **P2 的测试切片**，不是完整 adaptive endpoint：当前 voiced/quiet 仍使用既有 RMS 门槛，没有神经 VAD、噪声底自适应、推测式 ASR 或 partial transcript；提交后仍需等待整段 Whisper，因此不能宣称已达到 600ms 句尾目标。固定停顿档位只降低长停顿误拆轮风险，不是声学阈值结论；是否收紧仍需真实设备与许可录音验证。
 
 手测重点：本地通话说完一句后，回复应比 0.2.11 约早 1 秒开始进入识别；说到一半停顿 300–900ms 再继续，应该仍形成一个用户气泡和一次回复，不应被拆成两个轮次。确定性测试用合成帧序列覆盖 soft-end、900ms reopen、再次 soft-end 和单次 commit，不依赖真实麦克风或模型。
 
@@ -254,7 +254,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 ### 2.23 P2 对话质量回归修复（已实现，0.2.29）
 
-**已实现——TTS 一致性**：问题设备使用 macOS MLX Qwen；该公开生成接口默认进行随机采样，而 0.2.16 起每个稳定句都会独立启动一次 voice-clone，因此相邻短句可能产生不同音色与韵律。实时管线现在只把累计至少 18 个 Unicode 字符（计入标点与神态 cue）的强句末提前提交；更短的相邻句会合并到下一强句，单个短回复则在 SSE done 时 flush。40 字 soft 阈值、60 字 buffer ceiling、4 项 TTS 队列、64 句段 ledger、60 秒音频上限与取消域均不变；无弱断点时为给尾段保留 18 字，当前 hard fallback 最早可在 42 字切分。代价是少于 18 字的单句不再保证在文字流结束前发声，而且合并块只有整体播完才进入可听 history，中途打断会保守排除整块；这是字符有界条件，不宣称固定毫秒 TTFA。Qwen 的 temperature/top-k/top-p 仍保持官方默认，未用未验证采样值换取表面稳定。CosyVoice 实时 adapter（原生 PCM 与 buffered fallback）固定使用参考音的 neutral 基线 rate 且不逐块下发情绪 instruction，避免同一回复分块时主动变速/变风格；HTTP 文字朗读仍保留情绪映射。
+**已实现——TTS 一致性**：问题设备使用 macOS MLX Qwen；该公开生成接口默认进行随机采样，而 0.2.16 起每个稳定句都会独立启动一次 voice-clone，因此相邻短句可能产生不同音色与韵律。0.2.31 的 provider-neutral 实时管线只把累计至少 30 个 Unicode 字符（计入标点与神态 cue）的强句末提前提交；更短的相邻句会合并到下一强句，单个短回复则在 SSE done 时 flush。40 字 soft 阈值、60 字 buffer ceiling、4 项 TTS 队列、64 句段 ledger、60 秒音频上限与取消域均不变；无弱断点时为给尾段保留 30 字，当前 hard fallback 最早可在 30 字切分。代价是少于 30 字的单句不再保证在文字流结束前发声，而且合并块只有整体播完才进入可听 history，中途打断会保守排除整块；这是字符有界条件，不宣称固定毫秒 TTFA。相同 delta 序列不因 DeepSeek/Ollama metadata 产生不同 chunk 序列；本地 Qwen 的改善来自减少其较碎输出导致的重复采样，而不是假设文字 provider 改变 TTS 声学参数。Qwen 的 temperature/top-k/top-p 仍保持官方默认，未用未验证采样值换取表面稳定。CosyVoice 实时 adapter（原生 PCM 与 buffered fallback）固定使用参考音的 neutral 基线 rate 且不逐块下发情绪 instruction，避免同一回复分块时主动变速/变风格；HTTP 文字朗读仍保留情绪映射。
 
 **已实现——ASR 幻觉护栏**：MLX Whisper 与 openai-whisper 都显式使用 `condition_on_previous_text:false`，避免内部长窗口继续条件化上一窗口的错误重复。final 文本在进入 WebSocket、LLM、history 前执行纯文本、有界校验：超过 512 字整段拒绝；去标点后至少 16 字时，拒绝单字符达到至少 16 次且占比不低于 80%，或长度 1–8 的单元连续至少 6 次且重复 span 至少 16 字。日志只保留固定原因与字符数。短“好好好”、普通强调与正常中文继续允许；RMS candidate、endpoint、Whisper 提交时机和 Silero shadow 权限均未改变。
 
@@ -463,7 +463,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 
 ### P2：本地低延迟管线
 
-- **已实现（0.2.12 测试切片）**：基于现有 RMS 的 480ms soft-end + 570ms reopen，纯状态回放覆盖 900ms 中文停顿和单次 commit。
+- **已实现（0.2.12/0.2.31 测试切片）**：基于现有 RMS 的 480ms soft-end 与固定 `fast`/`standard`/`long` reopen 档位；默认总 commit 1650ms，纯状态回放覆盖 reopen 与每档 deadline。它不是 adaptive endpoint。
 - **已实现（0.2.13 基础补齐）**：MLX/OpenAI Whisper 共用 16k float32 内存输入，移除每轮临时 WAV；macOS 预热也不再写临时音频。
 - **已实现（0.2.14 基础补齐）**：generation-tagged `CancelScope` 覆盖本地 ASR、LLM、TTS、控制事件和 PCM sender；确定性回放证明迟到结果不会越代写入。
 - **已实现（0.2.15 基础补齐）**：本地实时语音通过桌面 `/api/chat` 代理复用 DeepSeek/Ollama、模型与 thinking 设置；Python 不再持有 DeepSeek Key。
@@ -480,6 +480,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - **已实现（0.2.26 真实 shadow）**：显式 opt-in、固定 Silero v6.2.1 模型、ABI 精确且 hash-locked 的可选 ORT runtime、真实 recurrent scorer、tokenized 单 Session lease 和固定 capability enum；模型仍不参与线上决策。
 - **已实现（0.2.27 deadline/evaluator 基础）**：纯 frame candidate budget、独立内部 timeout event、有界流式 case evaluator、事务 aggregate、固定延迟桶与 synthetic/fake-scorer 隐私测试；96-frame Silero 值仅为 shadow 机械保护，不是 live 数值结论。
 - **已实现（0.2.30 实验后端）**：本地/CosyVoice 可显式选择并安装 SenseVoiceSmall INT8 final ASR；ABI/hash/marker 锁定、真实 smoke、单 admission、启动期固定 Whisper 回退和诊断 schema v5 已落地。它仍是整句识别，不驱动 VAD/endpoint/partial；默认值和火山链路不变。
+- **已实现（0.2.31 体验修复）**：本地/CosyVoice 的句中续说改为固定三档 reopen，默认总 1650ms；实时 TTS 最小稳定块提升为 30 字，并用 provider metadata 无关的 chunk-sequence 测试锁定。它不合并已经 committed 的两次 ASR，也不撤回已显示/已播放的回复；超出所选窗口仍是新轮。
 - **待实现**：许可声学回放、live 单调时钟候选上限、阈值/超时实验、噪声自适应和满足 p95 600ms 目标的 adaptive endpoint；当前不能把真实 shadow 或合成 evaluator 称为神经 VAD 完整方案或 live takeover。
 - **待实验**：用有权利/同意证据的固定录音集比较 Whisper/SenseVoice；实测 CosyVoice PCM 字节序/TTFA 与 macOS MLX Qwen TTFA/接缝/取消资源恢复。Windows/Linux 继续等待官方音频 iterator。不得把整段音频再切块冒充真 streaming。
 

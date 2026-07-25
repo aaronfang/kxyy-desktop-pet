@@ -7,7 +7,7 @@
       "kind": "synthetic-spec",
       "relativePath": "tests/fixtures/realtime-pcm-replay.json",
       "byteLength": 2648,
-      "sha256": "0867964b9f3e0515fcfdac5e14ed01668b325bf5e5b9faca06472fc5661ddc2a",
+      "sha256": "aaff79004eb5f574cfd9dc6b4d91ecc72dc4c145d99110361b8503fe7dc68757",
       "containsRecordedAudio": false,
       "materialization": "runtime-generated",
       "license": {

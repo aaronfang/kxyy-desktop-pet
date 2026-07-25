@@ -66,10 +66,7 @@ fn extract_jsonish_u64(hay: &str, key: &str) -> Option<u64> {
     let after = &hay[i + needle.len()..];
     let colon = after.find(':')?;
     let rest = after[colon + 1..].trim_start();
-    let num: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse().ok()
 }
 
@@ -85,11 +82,7 @@ const VOLC_RETRIABLE: [i64; 6] = [3003, 3005, 3030, 3031, 3032, 3040];
 pub fn start(app: AppHandle) -> std::io::Result<u16> {
     let server = Server::http("127.0.0.1:0")
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    let port = server
-        .server_addr()
-        .to_ip()
-        .map(|a| a.port())
-        .unwrap_or(0);
+    let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
 
     std::thread::spawn(move || {
         // 关键：禁用空闲连接池复用（pool_max_idle_per_host=0）。
@@ -149,7 +142,13 @@ fn respond_json(request: tiny_http::Request, status: u16, body: String) {
     let mut headers = cors_headers();
     headers.push(header("Content-Type", "application/json; charset=utf-8"));
     headers.push(header("Cache-Control", "no-store"));
-    let resp = Response::new(StatusCode(status), headers, body.as_bytes(), Some(body.len()), None);
+    let resp = Response::new(
+        StatusCode(status),
+        headers,
+        body.as_bytes(),
+        Some(body.len()),
+        None,
+    );
     let _ = request.respond(resp);
 }
 
@@ -192,8 +191,7 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         (Method::Get, "/api/chat") => {
             let cfg = crate::ai_config(app);
             // 本地 Ollama 无需 Key；仅 DeepSeek 分支需要检查是否已配置。
-            let has_server_key =
-                cfg.text_provider == "local" || !cfg.deepseek_key.is_empty();
+            let has_server_key = cfg.text_provider == "local" || !cfg.deepseek_key.is_empty();
             let body = serde_json::json!({
                 "ok": true,
                 "hasServerKey": has_server_key
@@ -212,12 +210,10 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         (Method::Post, "/api/tts") => {
             proxy_tts(app, client, request);
         }
-        (Method::Get, "/api/assets") => {
-            match crate::persona_assets::decrypted_json() {
-                Ok(body) => respond_json(request, 200, body),
-                Err(e) => error_json(request, 500, &e),
-            }
-        }
+        (Method::Get, "/api/assets") => match crate::persona_assets::decrypted_json() {
+            Ok(body) => respond_json(request, 200, body),
+            Err(e) => error_json(request, 500, &e),
+        },
         _ => {
             error_json(request, 404, "Not Found");
         }
@@ -282,9 +278,9 @@ fn messages_have_image(messages: &serde_json::Value) -> bool {
                 m.get("content")
                     .and_then(|c| c.as_array())
                     .map(|parts| {
-                        parts.iter().any(|p| {
-                            p.get("type").and_then(|t| t.as_str()) == Some("image_url")
-                        })
+                        parts
+                            .iter()
+                            .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image_url"))
                     })
                     .unwrap_or(false)
             })
@@ -292,7 +288,11 @@ fn messages_have_image(messages: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: tiny_http::Request) {
+fn proxy_chat(
+    app: &AppHandle,
+    client: &reqwest::blocking::Client,
+    mut request: tiny_http::Request,
+) {
     let trusted_internal_request = internal_secret_matches(
         req_header(&request, INTERNAL_SECRET_HEADER),
         crate::voice_service::tts_secret(),
@@ -306,7 +306,10 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         Err(_) => return error_json(request, 400, "请求体不是合法 JSON"),
     };
 
-    let messages = body.get("messages").cloned().unwrap_or(serde_json::Value::Null);
+    let messages = body
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     if !messages.is_array() || messages.as_array().map(|a| a.is_empty()).unwrap_or(true) {
         return error_json(request, 400, "messages 不能为空");
     }
@@ -333,7 +336,12 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         } else {
             "minicpm-v:8b".to_string()
         };
-        (OLLAMA_CHAT_BASE_URL.to_string(), model, "ollama".to_string(), "本地看图")
+        (
+            OLLAMA_CHAT_BASE_URL.to_string(),
+            model,
+            "ollama".to_string(),
+            "本地看图",
+        )
     } else if use_vision {
         (
             VL_BASE_URL.to_string(),
@@ -348,10 +356,20 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
             crate::local_text::DEFAULT_MODEL.to_string()
         };
         // Ollama 忽略 Authorization 头，占位值即可，避免下面的空 Key 检查误判。
-        (OLLAMA_CHAT_BASE_URL.to_string(), model, "ollama".to_string(), "本地模型")
+        (
+            OLLAMA_CHAT_BASE_URL.to_string(),
+            model,
+            "ollama".to_string(),
+            "本地模型",
+        )
     } else {
         let model = normalize_deepseek_model(&cfg.text_model, thinking).to_string();
-        (TEXT_BASE_URL.to_string(), model, cfg.deepseek_key.clone(), "DeepSeek")
+        (
+            TEXT_BASE_URL.to_string(),
+            model,
+            cfg.deepseek_key.clone(),
+            "DeepSeek",
+        )
     };
 
     if api_key.is_empty() && !is_local_vl {
@@ -385,12 +403,8 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
         max_tokens_in
     };
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
-    let passthrough_internal_sse = should_passthrough_internal_sse(
-        stream,
-        force,
-        use_vision,
-        trusted_internal_request,
-    );
+    let passthrough_internal_sse =
+        should_passthrough_internal_sse(stream, force, use_vision, trusted_internal_request);
 
     let mut payload = serde_json::json!({
         "model": model,
@@ -458,7 +472,11 @@ fn proxy_chat(app: &AppHandle, client: &reqwest::blocking::Client, mut request: 
     let upstream = match upstream_opt {
         Some(r) => r,
         None => {
-            return error_json(request, 502, &format!("连接{provider_name}失败：{last_err}"));
+            return error_json(
+                request,
+                502,
+                &format!("连接{provider_name}失败：{last_err}"),
+            );
         }
     };
 
@@ -576,7 +594,8 @@ fn rewrite_reasoning_to_content(sse: &str) -> String {
             Ok(mut v) => {
                 if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
                     for choice in choices {
-                        if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                        if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut())
+                        {
                             let content_empty = delta
                                 .get("content")
                                 .map(|v| v.is_null() || v.as_str().map_or(false, |s| s.is_empty()))
@@ -646,7 +665,10 @@ mod tests {
 
     #[test]
     fn internal_stream_secret_requires_an_exact_non_empty_match() {
-        assert!(internal_secret_matches(Some("managed-secret"), "managed-secret"));
+        assert!(internal_secret_matches(
+            Some("managed-secret"),
+            "managed-secret"
+        ));
         assert!(!internal_secret_matches(Some("wrong"), "managed-secret"));
         assert!(!internal_secret_matches(None, "managed-secret"));
         assert!(!internal_secret_matches(Some(""), ""));
@@ -654,23 +676,61 @@ mod tests {
 
     #[test]
     fn internal_sse_gate_requires_every_trusted_text_stream_condition() {
-        assert!(should_passthrough_internal_sse(true, Some("text"), false, true));
-        assert!(!should_passthrough_internal_sse(false, Some("text"), false, true));
+        assert!(should_passthrough_internal_sse(
+            true,
+            Some("text"),
+            false,
+            true
+        ));
+        assert!(!should_passthrough_internal_sse(
+            false,
+            Some("text"),
+            false,
+            true
+        ));
         assert!(!should_passthrough_internal_sse(true, None, false, true));
-        assert!(!should_passthrough_internal_sse(true, Some("vl"), true, true));
-        assert!(!should_passthrough_internal_sse(true, Some("text"), false, false));
+        assert!(!should_passthrough_internal_sse(
+            true,
+            Some("vl"),
+            true,
+            true
+        ));
+        assert!(!should_passthrough_internal_sse(
+            true,
+            Some("text"),
+            false,
+            false
+        ));
     }
 
     #[test]
     fn deepseek_models_are_allowlisted_and_legacy_values_migrate() {
-        assert_eq!(normalize_deepseek_model("deepseek-v4-flash", true), DEEPSEEK_FLASH_MODEL);
-        assert_eq!(normalize_deepseek_model("deepseek-v4-pro", false), DEEPSEEK_PRO_MODEL);
-        assert_eq!(normalize_deepseek_model("deepseek-chat", true), DEEPSEEK_FLASH_MODEL);
-        assert_eq!(normalize_deepseek_model("deepseek-reasoner", false), DEEPSEEK_PRO_MODEL);
+        assert_eq!(
+            normalize_deepseek_model("deepseek-v4-flash", true),
+            DEEPSEEK_FLASH_MODEL
+        );
+        assert_eq!(
+            normalize_deepseek_model("deepseek-v4-pro", false),
+            DEEPSEEK_PRO_MODEL
+        );
+        assert_eq!(
+            normalize_deepseek_model("deepseek-chat", true),
+            DEEPSEEK_FLASH_MODEL
+        );
+        assert_eq!(
+            normalize_deepseek_model("deepseek-reasoner", false),
+            DEEPSEEK_PRO_MODEL
+        );
         assert_eq!(normalize_deepseek_model("", false), DEEPSEEK_FLASH_MODEL);
         assert_eq!(normalize_deepseek_model("", true), DEEPSEEK_PRO_MODEL);
-        assert_eq!(normalize_deepseek_model("qwen3:8b", false), DEEPSEEK_FLASH_MODEL);
-        assert_eq!(normalize_deepseek_model("unreviewed", true), DEEPSEEK_PRO_MODEL);
+        assert_eq!(
+            normalize_deepseek_model("qwen3:8b", false),
+            DEEPSEEK_FLASH_MODEL
+        );
+        assert_eq!(
+            normalize_deepseek_model("unreviewed", true),
+            DEEPSEEK_PRO_MODEL
+        );
     }
 
     #[test]
@@ -691,19 +751,16 @@ mod tests {
         let request = TestRequest::new()
             .with_header(header("x-kXyY-iNtErNaL-sEcReT", "managed-secret"))
             .into();
-        assert_eq!(req_header(&request, "X-Kxyy-Internal-Secret"), Some("managed-secret"));
+        assert_eq!(
+            req_header(&request, "X-Kxyy-Internal-Secret"),
+            Some("managed-secret")
+        );
     }
 
     fn raw_headers(response: Response<Cursor<Vec<u8>>>) -> String {
         let mut output = Vec::new();
         response
-            .raw_print(
-                &mut output,
-                HTTPVersion(1, 1),
-                &[],
-                true,
-                None,
-            )
+            .raw_print(&mut output, HTTPVersion(1, 1), &[], true, None)
             .expect("response should serialize");
         String::from_utf8(output).expect("headers should be utf-8")
     }
@@ -723,14 +780,8 @@ mod tests {
 
         let len = body.len();
         let buffered = raw_headers(
-            Response::new(
-                StatusCode(200),
-                vec![],
-                Cursor::new(body),
-                Some(len),
-                None,
-            )
-            .with_chunked_threshold(usize::MAX),
+            Response::new(StatusCode(200), vec![], Cursor::new(body), Some(len), None)
+                .with_chunked_threshold(usize::MAX),
         );
         assert!(buffered.contains(&format!("Content-Length: {len}\r\n")));
         assert!(!buffered.contains("Transfer-Encoding:"));
@@ -773,7 +824,11 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
 fn tts_timeout_from_text(body: &str) -> std::time::Duration {
     let char_count: usize = serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.chars().count()))
+        .and_then(|v| {
+            v.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.chars().count())
+        })
         .unwrap_or(0);
     let seconds = (char_count as u64).saturating_mul(15).max(300);
     std::time::Duration::from_secs(seconds)
@@ -859,9 +914,12 @@ fn volc_tts_once(
         .map_err(|e| (None, e.to_string()))?;
 
     let status = resp.status();
-    let data: serde_json::Value = resp
-        .json()
-        .map_err(|e| (None, format!("火山返回非 JSON（HTTP {}）：{e}", status.as_u16())))?;
+    let data: serde_json::Value = resp.json().map_err(|e| {
+        (
+            None,
+            format!("火山返回非 JSON（HTTP {}）：{e}", status.as_u16()),
+        )
+    })?;
 
     let code = data.get("code").and_then(|v| v.as_i64());
     let audio_b64 = data.get("data").and_then(|v| v.as_str());
@@ -871,7 +929,12 @@ fn volc_tts_once(
             .or_else(|| data.get("Message"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        return Err((code, format!("code={} {msg}", code.unwrap_or(0)).trim().to_string()));
+        return Err((
+            code,
+            format!("code={} {msg}", code.unwrap_or(0))
+                .trim()
+                .to_string(),
+        ));
     }
 
     let bytes = b64_decode(audio_b64.unwrap()).ok_or((code, "base64 解码失败".to_string()))?;
@@ -893,15 +956,18 @@ fn respond_audio(
     headers.push(header("Cache-Control", "no-store"));
     if let Some(u) = usage {
         if u.characters > 0 {
-            headers.push(header(
-                "X-Tts-Usage-Characters",
-                &u.characters.to_string(),
-            ));
+            headers.push(header("X-Tts-Usage-Characters", &u.characters.to_string()));
             headers.push(header("X-Tts-Usage-Provider", u.provider));
         }
     }
     let len = bytes.len();
-    let resp = Response::new(StatusCode(200), headers, std::io::Cursor::new(bytes), Some(len), None);
+    let resp = Response::new(
+        StatusCode(200),
+        headers,
+        std::io::Cursor::new(bytes),
+        Some(len),
+        None,
+    );
     let _ = request.respond(resp);
 }
 
@@ -1008,20 +1074,32 @@ fn proxy_volc_tts(
     body: &serde_json::Value,
 ) {
     // 音色：前端传入的合法火山音色（S_ 开头）> 设置里的默认音色。
-    let body_voice = body.get("voice").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let body_voice = body
+        .get("voice")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let voice = if body_voice.starts_with("S_") {
         body_voice.to_string()
     } else {
         cfg.tts_voice.trim().to_string()
     };
     if voice.is_empty() {
-        return error_json(request, 400, "未配置朗读音色（voice_id），请在设置里填写 S_ 开头的火山音色");
+        return error_json(
+            request,
+            400,
+            "未配置朗读音色（voice_id），请在设置里填写 S_ 开头的火山音色",
+        );
     }
     if !voice.starts_with("S_") {
         return error_json(request, 400, "火山后端需 S_ 开头的复刻音色");
     }
 
-    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if text.is_empty() {
         return error_json(request, 400, "text 不能为空");
     }
@@ -1062,7 +1140,16 @@ fn proxy_volc_tts(
     let mut result: Result<(Vec<u8>, u64), (Option<i64>, String)> =
         Err((None, "未执行".to_string()));
     for i in 0..3 {
-        match volc_tts_once(client, &volc_key, cluster, &voice, &text_trunc, speed, pitch, emotion) {
+        match volc_tts_once(
+            client,
+            &volc_key,
+            cluster,
+            &voice,
+            &text_trunc,
+            speed,
+            pitch,
+            emotion,
+        ) {
             Ok(ok) => {
                 result = Ok(ok);
                 break;
@@ -1078,7 +1165,16 @@ fn proxy_volc_tts(
         }
     }
     if result.is_err() && !emotion.is_empty() {
-        if let Ok(ok) = volc_tts_once(client, &volc_key, cluster, &voice, &text_trunc, speed, pitch, "") {
+        if let Ok(ok) = volc_tts_once(
+            client,
+            &volc_key,
+            cluster,
+            &voice,
+            &text_trunc,
+            speed,
+            pitch,
+            "",
+        ) {
             result = Ok(ok);
         }
     }

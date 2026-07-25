@@ -508,10 +508,25 @@ FRAME_MS = 30
 FRAME_SAMPLES = INPUT_RATE * FRAME_MS // 1000
 
 SPEECH_RMS = 0.018
-# 测试期 soft endpoint：先标记可能句尾，再保留 reopen 窗口兼容中文思考停顿。
-# 两者均为 30ms 帧的整数倍；约 1.05s 无续说后提交，替代原固定 2s 判停。
+# Soft endpoint 先标记可能句尾，再按固定档位保留 reopen 窗口兼容思考停顿。
+# 所有时长均为 30ms 帧的整数倍；环境变量只接受固定枚举，不接受任意阈值。
 SOFT_END_MS = 480
-SOFT_REOPEN_MS = 570
+TURN_PAUSE_REOPEN_MS = {
+    "fast": 570,
+    "standard": 1170,
+    "long": 1770,
+}
+
+
+def normalize_turn_pause_tolerance(value) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in TURN_PAUSE_REOPEN_MS else "standard"
+
+
+TURN_PAUSE_TOLERANCE = normalize_turn_pause_tolerance(
+    os.environ.get("KXYY_TURN_PAUSE_TOLERANCE")
+)
+SOFT_REOPEN_MS = TURN_PAUSE_REOPEN_MS[TURN_PAUSE_TOLERANCE]
 ENDPOINT_COMMIT_MS = SOFT_END_MS + SOFT_REOPEN_MS
 MIN_SPEECH_MS = 500
 # 单句最长录音（安全阀，防异常一直录）。日常聊天够用；真要长独白可再加大。
@@ -530,9 +545,10 @@ LLM_STREAM_MAX_PRODUCERS = 2
 TTS_STREAM_MAX_TASKS = 2
 TTS_SENTENCE_QUEUE_MAX = 4
 TTS_PARALLELISM_MAX = 2
-# 实时回复把相邻短句合并到同一次 voice-clone，减少每句重新随机采样造成的音色漂移。
-# soft/hard 上限保持不变；不足此长度的单句在 SSE done 时立即 flush。
-REALTIME_TTS_MIN_CHARS = 18
+# 实时回复把相邻中短句合并到同一次 voice-clone，减少文字模型分句风格
+# 放大的逐句随机音色漂移。30 字仍低于 40 字 soft boundary；不足此长度的
+# 短回复在 SSE done 时立即 flush，不增加固定等待时间。
+REALTIME_TTS_MIN_CHARS = 30
 # 单个稳定句最多保留 60 秒 24kHz mono s16le；数量有界之外也限制 PCM 字节。
 TTS_SENTENCE_MAX_SAMPLES = OUTPUT_RATE * 60
 MANAGED_AUDIO_CAPABILITY = "managed-v1"

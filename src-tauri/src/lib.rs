@@ -19,7 +19,7 @@ use tauri::{
     window::Monitor,
     AppHandle, Emitter, Manager, WindowEvent, Wry,
 };
-use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 // 角色清单在编译期嵌入，主进程托盘与前端共用同一份数据。
@@ -114,6 +114,9 @@ struct Settings {
     /// 本地级联通话的 final ASR：`whisper`（默认）或显式可选的 `sensevoice`。
     #[serde(default = "default_asr_provider")]
     asr_provider: String,
+    /// 本地级联通话的用户停顿容忍度：`fast` / `standard` / `long`。
+    #[serde(default = "default_turn_pause_tolerance")]
+    turn_pause_tolerance: String,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
     #[serde(default)]
     text_model: String,
@@ -202,6 +205,10 @@ fn default_asr_provider() -> String {
     "whisper".into()
 }
 
+fn default_turn_pause_tolerance() -> String {
+    "standard".into()
+}
+
 fn default_text_provider() -> String {
     "deepseek".into()
 }
@@ -265,6 +272,7 @@ impl Settings {
             show_chat_debug: false,
             vad_shadow_enabled: false,
             asr_provider: default_asr_provider(),
+            turn_pause_tolerance: default_turn_pause_tolerance(),
             text_model: String::new(),
             text_provider: default_text_provider(),
             local_text_model: String::new(),
@@ -363,6 +371,7 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
     backend.hash(&mut hasher);
     settings.vad_shadow_enabled.hash(&mut hasher);
     normalize_asr_provider(&settings.asr_provider).hash(&mut hasher);
+    normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).hash(&mut hasher);
     match backend.as_str() {
         "local" => {
             settings.persona_card_id.trim().hash(&mut hasher);
@@ -384,6 +393,14 @@ fn normalize_asr_provider(provider: &str) -> &'static str {
     match provider.trim().to_ascii_lowercase().as_str() {
         "sensevoice" => "sensevoice",
         _ => "whisper",
+    }
+}
+
+fn normalize_turn_pause_tolerance(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fast" => "fast",
+        "long" => "long",
+        _ => "standard",
     }
 }
 
@@ -437,7 +454,11 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let toggle = MenuItem::with_id(
         app,
         "toggle_hidden",
-        if s.hidden { "显示桌宠" } else { "隐藏桌宠" },
+        if s.hidden {
+            "显示桌宠"
+        } else {
+            "隐藏桌宠"
+        },
         true,
         None::<&str>,
     )?;
@@ -647,9 +668,11 @@ fn work_area_logical(monitor: &Monitor) -> (f64, f64, f64, f64) {
 /// 对照可一眼看出 1/4 area / 偏位之类问题的根因）。
 fn debug_log_stage(monitor: &Monitor, lw: f64, lh: f64, sf: f64) {
     #[cfg(windows)]
-    let path = std::env::var("APPDATA")
-        .ok()
-        .map(|p| std::path::PathBuf::from(p).join("com.aaronfang.kxyydesktoppet").join("stage.log"));
+    let path = std::env::var("APPDATA").ok().map(|p| {
+        std::path::PathBuf::from(p)
+            .join("com.aaronfang.kxyydesktoppet")
+            .join("stage.log")
+    });
     #[cfg(not(windows))]
     let path: Option<std::path::PathBuf> = None;
     let Some(path) = path else { return };
@@ -700,9 +723,15 @@ fn apply_monitor_to_window(app: &AppHandle, monitor_id: &Option<String>) {
             {
                 let wa = monitor.work_area();
                 // Windows: work_area 已是物理像素，直接 set。
-                let _ = win.set_position(tauri::PhysicalPosition::new(wa.position.x, wa.position.y));
+                let _ =
+                    win.set_position(tauri::PhysicalPosition::new(wa.position.x, wa.position.y));
                 let _ = win.set_size(tauri::PhysicalSize::new(wa.size.width, wa.size.height));
-                debug_log_stage(&monitor, wa.size.width as f64 / sf, wa.size.height as f64 / sf, sf);
+                debug_log_stage(
+                    &monitor,
+                    wa.size.width as f64 / sf,
+                    wa.size.height as f64 / sf,
+                    sf,
+                );
             }
             #[cfg(not(windows))]
             {
@@ -781,7 +810,13 @@ fn open_settings_window(app: &AppHandle) {
 
 /// 按当前设置里的快捷键重新注册全局热键（先全部注销再注册）。
 fn re_register_hotkey(app: &AppHandle) {
-    let hotkey = app.state::<AppState>().settings.lock().unwrap().hotkey.clone();
+    let hotkey = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .hotkey
+        .clone();
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
     if let Ok(sc) = Shortcut::from_str(&hotkey) {
@@ -934,7 +969,11 @@ fn export_persona_card(app: AppHandle, card_id: String) -> Result<String, String
 
 /// 导入人格卡（card_id + JSON 内容）。
 #[tauri::command]
-fn import_persona_card(app: AppHandle, card_id: String, json_content: String) -> Result<String, String> {
+fn import_persona_card(
+    app: AppHandle,
+    card_id: String,
+    json_content: String,
+) -> Result<String, String> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -1154,7 +1193,9 @@ fn probe_voice_backend(backend: String) -> serde_json::Value {
             });
         }
         // 检查通义 Key 是否已配置（从持久化 settings 读取）
-        let has_key = !voice_service::read_setting_str("qwenVlKey").trim().is_empty();
+        let has_key = !voice_service::read_setting_str("qwenVlKey")
+            .trim()
+            .is_empty();
         return serde_json::json!({
             "backend": "cosyvoice",
             "state": if has_key { "ready" } else { "warning" },
@@ -1173,7 +1214,6 @@ fn probe_voice_backend(backend: String) -> serde_json::Value {
             "port": port,
         });
     }
-
 
     serde_json::json!({
         "backend": backend,
@@ -1255,6 +1295,8 @@ struct AiSettingsInput {
     vad_shadow_enabled: bool,
     #[serde(default = "default_asr_provider")]
     asr_provider: String,
+    #[serde(default = "default_turn_pause_tolerance")]
+    turn_pause_tolerance: String,
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
@@ -1342,6 +1384,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.show_chat_debug = settings.show_chat_debug;
         s.vad_shadow_enabled = settings.vad_shadow_enabled;
         s.asr_provider = normalize_asr_provider(&settings.asr_provider).into();
+        s.turn_pause_tolerance =
+            normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).into();
         s.text_model = settings.text_model.trim().to_string();
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
@@ -1366,7 +1410,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.user_avatar = settings.user_avatar;
         s.chat_font_size = settings.chat_font_size.clamp(12, 22);
         let hk = settings.hotkey.trim();
-        s.hotkey = if hk.is_empty() { default_hotkey() } else { hk.to_string() };
+        s.hotkey = if hk.is_empty() {
+            default_hotkey()
+        } else {
+            hk.to_string()
+        };
         s.chat_width = settings.chat_width.clamp(240, 900);
         s.chat_height = settings.chat_height.clamp(200, 900);
         s.chat_bottom_offset = settings.chat_bottom_offset.min(1200);
@@ -1478,19 +1526,13 @@ pub fn run() {
                 eprintln!("[setup] persona_card_id 为空，使用编译期默认人设");
             } else {
                 eprintln!("[setup] 加载人设卡 '{}'", settings.persona_card_id);
-                let resource_dir = app
-                    .path()
-                    .resource_dir()
-                    .unwrap_or_default();
+                let resource_dir = app.path().resource_dir().unwrap_or_default();
                 eprintln!("[setup] resource_dir: {:?}", resource_dir);
                 match crate::persona_assets::load_card_from_file(
                     &settings.persona_card_id,
                     &resource_dir,
                 ) {
-                    Ok(()) => eprintln!(
-                        "[setup] 人格卡 '{}' 加载成功",
-                        settings.persona_card_id
-                    ),
+                    Ok(()) => eprintln!("[setup] 人格卡 '{}' 加载成功", settings.persona_card_id),
                     Err(e) => {
                         eprintln!(
                             "[setup] 人格卡 '{}' 加载失败: {e}（resource_dir={:?}）",
@@ -1507,19 +1549,13 @@ pub fn run() {
                                         "[setup] Windows 备选 resource_dir 尝试: {:?}",
                                         fallback
                                     );
-                                    if let Err(e2) =
-                                        crate::persona_assets::load_card_from_file(
-                                            &settings.persona_card_id,
-                                            &fallback,
-                                        )
-                                    {
-                                        eprintln!(
-                                            "[setup] Windows 备选路径也失败: {e2}"
-                                        );
+                                    if let Err(e2) = crate::persona_assets::load_card_from_file(
+                                        &settings.persona_card_id,
+                                        &fallback,
+                                    ) {
+                                        eprintln!("[setup] Windows 备选路径也失败: {e2}");
                                     } else {
-                                        eprintln!(
-                                            "[setup] Windows 备选路径加载成功"
-                                        );
+                                        eprintln!("[setup] Windows 备选路径加载成功");
                                     }
                                 }
                             }
@@ -1532,29 +1568,28 @@ pub fn run() {
             let api_port = api::start(handle.clone()).unwrap_or(0);
             // 启动本地实时语音 WS 桥接：只提供密钥/音色，人设 system_role 由前端 start 消息带入。
             // 非火山后端时直接 Err，拒绝建连，确保不会消耗火山 token。
-            let realtime_provider: realtime::ConfigProvider = std::sync::Arc::new(|app: &AppHandle| {
-                let s = app.state::<AppState>().settings.lock().unwrap().clone();
-                let backend = s.realtime_backend.trim().to_ascii_lowercase();
-                if backend != "volc" {
-                    return Err(
-                        "当前语音后端为本地服务，不会连接火山（无 token 消耗）".into(),
-                    );
-                }
-                // 朗读与通话共用 tts_voice。
-                let speaker = s.tts_voice.trim().to_string();
-                let app_id = s.realtime_app_id.trim().to_string();
-                let access_key = s.realtime_access_key.trim().to_string();
-                if app_id.is_empty() || access_key.is_empty() || !speaker.starts_with("S_") {
-                    return Err(
-                        "未配置火山语音（需 App ID、Access Key 与 S_ 开头的复刻音色）".into(),
-                    );
-                }
-                Ok(realtime::RealtimeConfig {
-                    app_id,
-                    access_key,
-                    speaker,
-                })
-            });
+            let realtime_provider: realtime::ConfigProvider =
+                std::sync::Arc::new(|app: &AppHandle| {
+                    let s = app.state::<AppState>().settings.lock().unwrap().clone();
+                    let backend = s.realtime_backend.trim().to_ascii_lowercase();
+                    if backend != "volc" {
+                        return Err("当前语音后端为本地服务，不会连接火山（无 token 消耗）".into());
+                    }
+                    // 朗读与通话共用 tts_voice。
+                    let speaker = s.tts_voice.trim().to_string();
+                    let app_id = s.realtime_app_id.trim().to_string();
+                    let access_key = s.realtime_access_key.trim().to_string();
+                    if app_id.is_empty() || access_key.is_empty() || !speaker.starts_with("S_") {
+                        return Err(
+                            "未配置火山语音（需 App ID、Access Key 与 S_ 开头的复刻音色）".into(),
+                        );
+                    }
+                    Ok(realtime::RealtimeConfig {
+                        app_id,
+                        access_key,
+                        speaker,
+                    })
+                });
             let realtime_port = realtime::start(handle.clone(), realtime_provider).unwrap_or(0);
             app.manage(voice_service::VoiceServiceManager::new());
             app.manage(AppState {
@@ -1655,19 +1690,19 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            match event {
-                tauri::RunEvent::Exit => voice_service::stop(app),
-                #[cfg(all(target_os = "macos", debug_assertions))]
-                tauri::RunEvent::Reopen { .. } => handle_macos_dock_reopen(app),
-                _ => {}
-            }
+        .run(|app, event| match event {
+            tauri::RunEvent::Exit => voice_service::stop(app),
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            tauri::RunEvent::Reopen { .. } => handle_macos_dock_reopen(app),
+            _ => {}
         });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_asr_provider, voice_config_fingerprint, Settings};
+    use super::{
+        normalize_asr_provider, normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
+    };
 
     #[test]
     fn vad_shadow_is_opt_in_and_changes_voice_fingerprint() {
@@ -1696,5 +1731,21 @@ mod tests {
 
         settings.asr_provider = "unknown".into();
         assert_eq!(whisper, voice_config_fingerprint(&settings));
+    }
+
+    #[test]
+    fn turn_pause_tolerance_is_allowlisted_and_changes_voice_fingerprint() {
+        assert_eq!(normalize_turn_pause_tolerance(" fast "), "fast");
+        assert_eq!(normalize_turn_pause_tolerance("long"), "long");
+        for value in ["", "custom", "2250"] {
+            assert_eq!(normalize_turn_pause_tolerance(value), "standard");
+        }
+
+        let mut settings = Settings::defaults();
+        let standard = voice_config_fingerprint(&settings);
+        settings.turn_pause_tolerance = "fast".into();
+        assert_ne!(standard, voice_config_fingerprint(&settings));
+        settings.turn_pause_tolerance = "unknown".into();
+        assert_eq!(standard, voice_config_fingerprint(&settings));
     }
 }
