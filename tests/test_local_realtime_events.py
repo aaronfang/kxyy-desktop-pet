@@ -1096,6 +1096,8 @@ class InMemoryAsrTests(unittest.TestCase):
         self.original_mlx = sys.modules.get("mlx_whisper")
         self.original_backend = common._asr_backend
         self.original_openai_model = common._openai_whisper_model
+        self.original_adapter = common._asr_adapter_instance
+        common._asr_adapter_instance = None
 
         fake_numpy = types.SimpleNamespace(
             float32="float32",
@@ -1116,6 +1118,7 @@ class InMemoryAsrTests(unittest.TestCase):
             sys.modules["mlx_whisper"] = self.original_mlx
         common._asr_backend = self.original_backend
         common._openai_whisper_model = self.original_openai_model
+        common._asr_adapter_instance = self.original_adapter
 
     def test_mlx_receives_normalized_memory_audio_without_path(self):
         captured = {}
@@ -1132,10 +1135,10 @@ class InMemoryAsrTests(unittest.TestCase):
         common._asr_backend = "mlx"
         pcm = struct.pack("<hhh", -32768, 0, 32767) + b"\xff"
 
-        text, no_speech_prob = common.transcribe(pcm)
+        result = common.transcribe(pcm)
 
-        self.assertEqual(text, "内存识别")
-        self.assertEqual(no_speech_prob, 0.2)
+        self.assertEqual(result.text, "内存识别")
+        self.assertEqual(result.no_speech_prob, 0.2)
         self.assertFalse(isinstance(captured["audio"], (str, Path)))
         self.assertEqual(len(captured["audio"]), 3)
         self.assertAlmostEqual(captured["audio"][0], -1.0)
@@ -1161,13 +1164,46 @@ class InMemoryAsrTests(unittest.TestCase):
         common._asr_backend = "openai"
         common._openai_whisper_model = FakeModel()
 
-        text, no_speech_prob = common.transcribe(struct.pack("<hh", 1000, -1000))
+        result = common.transcribe(struct.pack("<hh", 1000, -1000))
 
-        self.assertEqual(text, "本地数组")
-        self.assertAlmostEqual(no_speech_prob, 0.2)
+        self.assertEqual(result.text, "本地数组")
+        self.assertAlmostEqual(result.no_speech_prob, 0.2)
         self.assertFalse(isinstance(captured["audio"], (str, Path)))
         self.assertEqual(captured["kwargs"]["initial_prompt"], common.WHISPER_PROMPT)
         self.assertIs(captured["kwargs"]["condition_on_previous_text"], False)
+
+    def test_asr_runtime_summary_is_fixed_shape_and_fixed_enums(self):
+        original = common._asr_runtime
+        try:
+            common._asr_runtime = {
+                "requested": "/private/provider",
+                "active": "secret-provider-error",
+                "status": "raw exception /Users/private",
+                "extra": "must-not-cross-wire",
+            }
+            self.assertEqual(
+                common.asr_runtime_summary(),
+                {
+                    "requested": "whisper",
+                    "active": "none",
+                    "status": "unavailable",
+                },
+            )
+            common._asr_runtime = {
+                "requested": "sensevoice",
+                "active": "whisper-mlx",
+                "status": "fallback",
+            }
+            self.assertEqual(
+                common.asr_runtime_summary(),
+                {
+                    "requested": "sensevoice",
+                    "active": "whisper-mlx",
+                    "status": "fallback",
+                },
+            )
+        finally:
+            common._asr_runtime = original
 
     def test_long_repetition_hallucinations_are_rejected_without_harming_short_emphasis(self):
         voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
@@ -2176,6 +2212,32 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(no_adapter.tts_streaming, "none")
 
+    async def test_session_asr_runtime_never_exports_paths_or_raw_state(self):
+        original = common._asr_runtime
+        common._asr_runtime = {
+            "requested": "sensevoice",
+            "active": "/Users/private/model.onnx",
+            "status": "provider secret exception",
+            "rawError": "credential",
+        }
+        try:
+            await self.session.on_start({})
+        finally:
+            common._asr_runtime = original
+
+        session = last_json_of_type(self.ws, "session")
+        self.assertEqual(
+            session["asrRuntime"],
+            {
+                "requested": "sensevoice",
+                "active": "none",
+                "status": "unavailable",
+            },
+        )
+        serialized = json.dumps(session, ensure_ascii=False)
+        self.assertNotIn("/Users/private", serialized)
+        self.assertNotIn("credential", serialized)
+
     async def test_candidate_ids_bind_thresholded_one_shot_interruption_receipts(self):
         await self.session.on_start(
             {"interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY]}
@@ -2344,7 +2406,9 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_candidate_is_confirmed_before_asr_payload(self):
         original_transcribe = common.transcribe
         original_validate = common.is_valid_asr
-        common.transcribe = lambda _pcm: ("确认插话", 0.01)
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "确认插话", 0.01, language="zh"
+        )
         common.is_valid_asr = lambda text, _nsp, _pcm: text
 
         async def no_reply(_text, _generation):
@@ -2379,7 +2443,9 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_candidate_is_rejected_without_user_text(self):
         original_transcribe = common.transcribe
         original_validate = common.is_valid_asr
-        common.transcribe = lambda _pcm: ("幻觉文本", 0.9)
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "幻觉文本", 0.9, language="zh"
+        )
         common.is_valid_asr = lambda _text, _nsp, _pcm: None
         self.session.candidate_emitted = True
         scope = self.session._new_scope("asr")
@@ -2409,7 +2475,8 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_asr_scope_drops_late_result(self):
         future = asyncio.get_running_loop().create_future()
-        self.session.loop = ControlledLoop([future])
+        original_submit = common.submit_asr
+        common.submit_asr = lambda _loop, _pcm: future
         self.session.candidate_emitted = True
         scope = self.session._new_scope("asr")
         self.session.asr_scope = scope
@@ -2418,14 +2485,99 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         self.session.asr_task = task
 
-        await asyncio.sleep(0)
-        scope.cancel("superseded")
-        future.set_result(("迟到识别", 0.01))
-        await task
+        try:
+            await asyncio.sleep(0)
+            scope.cancel("superseded")
+            future.set_result(
+                common.asr_adapter.AsrResult("迟到识别", 0.01, language="zh")
+            )
+            await task
+        finally:
+            common.submit_asr = original_submit
 
         self.assertEqual(self.ws.messages, [])
         self.assertIsNone(self.session.reply_task)
         self.assertIsNone(self.session.asr_scope)
+
+    async def test_submit_asr_releases_admission_only_after_worker_really_finishes(self):
+        original_pool = common._mlx_pool
+        original_transcribe = common.transcribe
+        pool = common.ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-test")
+        slots = threading.BoundedSemaphore(1)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_transcribe(_pcm):
+            started.set()
+            release.wait(2)
+            return common.asr_adapter.AsrResult("完成", 0.01, language="zh")
+
+        common._mlx_pool = pool
+        common.transcribe = blocking_transcribe
+        first = None
+        second = None
+        try:
+            loop = asyncio.get_running_loop()
+            first = common.submit_asr(loop, b"first", slots=slots)
+            self.assertIsNotNone(first)
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            first.cancel()
+            await asyncio.sleep(0)
+            self.assertIsNone(
+                common.submit_asr(loop, b"must-not-queue", slots=slots),
+                "async wrapper cancellation must not release native admission",
+            )
+
+            release.set()
+            for _ in range(100):
+                second = common.submit_asr(loop, b"second", slots=slots)
+                if second is not None:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(second)
+            result = await second
+            self.assertEqual(result.text, "完成")
+        finally:
+            release.set()
+            if first is not None:
+                await asyncio.gather(first, return_exceptions=True)
+            if second is not None and not second.done():
+                await asyncio.gather(second, return_exceptions=True)
+            pool.shutdown(wait=True)
+            common._mlx_pool = original_pool
+            common.transcribe = original_transcribe
+
+    async def test_asr_exception_is_replaced_by_fixed_log_and_wire_error(self):
+        original_submit = common.submit_asr
+        original_log = common.log
+        future = asyncio.get_running_loop().create_future()
+        private_error = "provider secret /Users/private/model.onnx 完整用户文本"
+        future.set_exception(RuntimeError(private_error))
+        common.submit_asr = lambda _loop, _pcm: future
+        logs = []
+        common.log = logs.append
+        self.session.candidate_emitted = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        try:
+            await self.session._asr_then_maybe_reply(b"\x01\x00" * 1000, scope)
+        finally:
+            common.submit_asr = original_submit
+            common.log = original_log
+
+        messages = self.ws.json_messages()
+        self.assertIn(
+            {
+                "type": "error",
+                "message": common.ASR_FAILURE_MESSAGE,
+                "generation": scope.generation,
+            },
+            messages,
+        )
+        exported = json.dumps({"logs": logs, "messages": messages}, ensure_ascii=False)
+        self.assertNotIn(private_error, exported)
+        self.assertNotIn("/Users/private", exported)
+        self.assertNotIn("完整用户文本", exported)
 
     async def test_cancelled_llm_scope_drops_late_text_and_history(self):
         common._synth_tts = lambda _text: b"unused"

@@ -5,7 +5,7 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 4;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 5;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
@@ -601,6 +601,7 @@ export function sanitizeVadShadowSummary(raw) {
 
 function sanitizeRuntimeSummary(runtime) {
   const value = runtime && typeof runtime === "object" ? runtime : {};
+  const asr = value.asr && typeof value.asr === "object" ? value.asr : {};
   return {
     provider: normalizeProvider(value.provider),
     playbackMode: safeEnum(value.playbackMode, ["worklet", "legacy", "none"], "none"),
@@ -623,6 +624,19 @@ function sanitizeRuntimeSummary(runtime) {
       ],
       "disabled",
     ),
+    asr: {
+      requested: safeEnum(asr.requested, ["whisper", "sensevoice"], "whisper"),
+      active: safeEnum(
+        asr.active,
+        ["whisper-mlx", "whisper-openai", "sensevoice-sherpa-onnx", "none"],
+        "none",
+      ),
+      status: safeEnum(
+        asr.status,
+        ["active", "fallback", "unavailable", "not-reported"],
+        "not-reported",
+      ),
+    },
   };
 }
 

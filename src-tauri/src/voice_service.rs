@@ -81,8 +81,13 @@ struct Inner {
     qwen_setup_running: bool,
     /// VAD runtime 安装目标；同后端 ensure 必须等待，避免重新占用 ORT DLL。
     vad_install_backend: String,
+    /// SenseVoice runtime 安装目标；与 Qwen/VAD 安装共享 lifecycle admission。
+    sensevoice_install_backend: String,
+    sensevoice_install_provider: String,
+    sensevoice_install_fingerprint: String,
     /// 最近一次 settings-driven ensure 的目标；后台完成回调只能服从它。
     desired_backend: String,
+    desired_asr_provider: String,
     desired_fingerprint: String,
     desired_epoch: u64,
 }
@@ -97,7 +102,11 @@ impl VoiceServiceManager {
                 recent_logs: Arc::new(Mutex::new(VecDeque::new())),
                 qwen_setup_running: false,
                 vad_install_backend: String::new(),
+                sensevoice_install_backend: String::new(),
+                sensevoice_install_provider: String::new(),
+                sensevoice_install_fingerprint: String::new(),
                 desired_backend: String::new(),
+                desired_asr_provider: "whisper".into(),
                 desired_fingerprint: String::new(),
                 desired_epoch: 0,
             }),
@@ -218,6 +227,13 @@ pub fn normalize_backend(backend: &str) -> String {
     }
 }
 
+pub fn normalize_asr_provider(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "sensevoice" => "sensevoice".into(),
+        _ => "whisper".into(),
+    }
+}
+
 fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> bool {
     matches!(backend, "local" | "cosyvoice") && !next.is_empty() && previous != next
 }
@@ -225,9 +241,11 @@ fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> 
 #[cfg(test)]
 mod fingerprint_tests {
     use super::{
-        backend_still_selected, begin_vad_runtime_install, finish_vad_runtime_install,
-        record_desired_voice_config, should_defer_for_vad_install, should_restart_for_fingerprint,
-        supports_vad_runtime_install, VoiceServiceManager,
+        backend_still_selected, begin_sensevoice_runtime_install, begin_vad_runtime_install,
+        finish_sensevoice_runtime_install, finish_vad_runtime_install, normalize_asr_provider,
+        record_desired_voice_config, should_defer_for_vad_install,
+        sensevoice_install_matches_target, should_restart_for_fingerprint,
+        supports_vad_runtime_install, voice_target_still_selected, VoiceServiceManager,
     };
 
     #[test]
@@ -278,14 +296,66 @@ mod fingerprint_tests {
 
         let manager = VoiceServiceManager::new();
         let mut inner = manager.inner.lock().unwrap();
-        record_desired_voice_config(&mut inner, "local", "fp-1");
+        record_desired_voice_config(&mut inner, "local", "whisper", "fp-1");
         assert!(backend_still_selected(&inner, "local"));
         let first_epoch = inner.desired_epoch;
-        record_desired_voice_config(&mut inner, "cosyvoice", "fp-2");
+        record_desired_voice_config(&mut inner, "cosyvoice", "sensevoice", "fp-2");
         assert!(!backend_still_selected(&inner, "local"));
         assert_eq!(inner.desired_backend, "cosyvoice");
+        assert_eq!(inner.desired_asr_provider, "sensevoice");
         assert_eq!(inner.desired_fingerprint, "fp-2");
         assert!(inner.desired_epoch > first_epoch);
+    }
+
+    #[test]
+    fn sensevoice_install_is_serialized_and_completion_matches_full_target() {
+        assert_eq!(normalize_asr_provider("sensevoice"), "sensevoice");
+        assert_eq!(normalize_asr_provider("unknown"), "whisper");
+
+        let manager = VoiceServiceManager::new();
+        let mut inner = manager.inner.lock().unwrap();
+        record_desired_voice_config(&mut inner, "local", "sensevoice", "fp-1");
+        assert!(begin_sensevoice_runtime_install(
+            &mut inner,
+            "local",
+            "sensevoice",
+            "fp-1"
+        ));
+        assert!(!begin_vad_runtime_install(&mut inner, "local"));
+        assert!(sensevoice_install_matches_target(
+            &inner,
+            "local",
+            "sensevoice",
+            "fp-1"
+        ));
+        assert!(!sensevoice_install_matches_target(
+            &inner,
+            "local",
+            "whisper",
+            "fp-1"
+        ));
+        assert!(voice_target_still_selected(
+            &inner,
+            "local",
+            "sensevoice",
+            "fp-1"
+        ));
+        assert!(!voice_target_still_selected(
+            &inner,
+            "local",
+            "whisper",
+            "fp-1"
+        ));
+        record_desired_voice_config(&mut inner, "local", "sensevoice", "fp-2");
+        assert!(!voice_target_still_selected(
+            &inner,
+            "local",
+            "sensevoice",
+            "fp-1"
+        ));
+        finish_sensevoice_runtime_install(&mut inner, "local");
+        assert!(inner.sensevoice_install_backend.is_empty());
+        assert!(begin_vad_runtime_install(&mut inner, "local"));
     }
 }
 
@@ -829,16 +899,64 @@ fn vad_runtime_root() -> Option<PathBuf> {
     Some(dirs_settings_path()?.parent()?.join("vad-runtime"))
 }
 
+fn sensevoice_runtime_root() -> Option<PathBuf> {
+    Some(
+        dirs_settings_path()?
+            .parent()?
+            .join("sensevoice-asr-runtime"),
+    )
+}
+
 fn supports_vad_runtime_install(backend: &str) -> bool {
     matches!(backend, "local" | "cosyvoice")
 }
 
 fn begin_vad_runtime_install(inner: &mut Inner, backend: &str) -> bool {
-    if inner.qwen_setup_running || !inner.vad_install_backend.is_empty() {
+    if inner.qwen_setup_running
+        || !inner.vad_install_backend.is_empty()
+        || !inner.sensevoice_install_backend.is_empty()
+    {
         return false;
     }
     inner.vad_install_backend = backend.to_string();
     true
+}
+
+fn begin_sensevoice_runtime_install(
+    inner: &mut Inner,
+    backend: &str,
+    asr_provider: &str,
+    fingerprint: &str,
+) -> bool {
+    if inner.qwen_setup_running
+        || !inner.vad_install_backend.is_empty()
+        || !inner.sensevoice_install_backend.is_empty()
+    {
+        return false;
+    }
+    inner.sensevoice_install_backend = backend.to_string();
+    inner.sensevoice_install_provider = normalize_asr_provider(asr_provider);
+    inner.sensevoice_install_fingerprint = fingerprint.to_string();
+    true
+}
+
+fn finish_sensevoice_runtime_install(inner: &mut Inner, backend: &str) {
+    if inner.sensevoice_install_backend == backend {
+        inner.sensevoice_install_backend.clear();
+        inner.sensevoice_install_provider.clear();
+        inner.sensevoice_install_fingerprint.clear();
+    }
+}
+
+fn sensevoice_install_matches_target(
+    inner: &Inner,
+    backend: &str,
+    asr_provider: &str,
+    fingerprint: &str,
+) -> bool {
+    inner.sensevoice_install_backend == backend
+        && inner.sensevoice_install_provider == normalize_asr_provider(asr_provider)
+        && inner.sensevoice_install_fingerprint == fingerprint
 }
 
 fn finish_vad_runtime_install(inner: &mut Inner, backend: &str) {
@@ -851,10 +969,27 @@ fn should_defer_for_vad_install(requested_backend: &str, installing_backend: &st
     !installing_backend.is_empty() && requested_backend == installing_backend
 }
 
-fn record_desired_voice_config(inner: &mut Inner, backend: &str, fingerprint: &str) {
+fn record_desired_voice_config(
+    inner: &mut Inner,
+    backend: &str,
+    asr_provider: &str,
+    fingerprint: &str,
+) {
     inner.desired_backend = backend.to_string();
+    inner.desired_asr_provider = normalize_asr_provider(asr_provider);
     inner.desired_fingerprint = fingerprint.to_string();
     inner.desired_epoch = inner.desired_epoch.saturating_add(1);
+}
+
+fn voice_target_still_selected(
+    inner: &Inner,
+    backend: &str,
+    asr_provider: &str,
+    fingerprint: &str,
+) -> bool {
+    inner.desired_backend == backend
+        && inner.desired_asr_provider == normalize_asr_provider(asr_provider)
+        && inner.desired_fingerprint == fingerprint
 }
 
 fn backend_still_selected(inner: &Inner, completed_backend: &str) -> bool {
@@ -961,6 +1096,110 @@ pub fn install_vad_shadow_runtime(app: &AppHandle, backend_raw: &str) -> Result<
                     serde_json::json!({"state":"failed","message":"VAD runtime 安装失败；当前语音后端已改变，未重启服务"}),
                 );
             }
+        }
+    });
+    Ok(())
+}
+
+/// 显式安装可选 SenseVoice final ASR runtime。安装器只接收独立 App-data 根目录；
+/// 完成回调必须仍匹配 backend + provider + fingerprint，避免旧任务复活新设置。
+pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<(), String> {
+    let backend = normalize_backend(backend_raw);
+    if !supports_vad_runtime_install(&backend) {
+        return Err("请先选择本地 Qwen3-TTS 或 CosyVoice 后端".into());
+    }
+    let asr_provider = normalize_asr_provider(&read_setting_str("asrProvider"));
+    if asr_provider != "sensevoice" {
+        return Err("请先选择 SenseVoice 并保存设置".into());
+    }
+    let repo = scripts_root(app).ok_or_else(|| "找不到随包语音资源".to_string())?;
+    let script = repo
+        .join("scripts/local-realtime")
+        .join("install_sensevoice_runtime.py");
+    if !script.is_file() {
+        return Err("SenseVoice 安装脚本未随应用提供".into());
+    }
+    let python = resolve_python(&repo, &backend)
+        .ok_or_else(|| "当前语音后端的 Python 运行时尚未就绪".to_string())?;
+    let runtime_root =
+        sensevoice_runtime_root().ok_or_else(|| "无法定位 App 数据目录".to_string())?;
+
+    let manager = app.state::<VoiceServiceManager>();
+    let lifecycle = manager
+        .lifecycle
+        .lock()
+        .map_err(|_| "语音服务状态不可用")?;
+    let install_fingerprint = {
+        let mut inner = manager.inner.lock().map_err(|_| "语音服务状态不可用")?;
+        let fingerprint = inner.desired_fingerprint.clone();
+        if !begin_sensevoice_runtime_install(
+            &mut inner,
+            &backend,
+            &asr_provider,
+            &fingerprint,
+        ) {
+            return Err("已有语音运行时安装任务正在进行".into());
+        }
+        fingerprint
+    };
+    stop(app);
+    drop(lifecycle);
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let _ = app2.emit(
+            "sensevoice-runtime-install-progress",
+            serde_json::json!({"state":"installing","message":"正在安装可选 SenseVoice runtime…"}),
+        );
+        let mut cmd = Command::new(&python);
+        cmd.arg(&script)
+            .current_dir(script.parent().unwrap_or(Path::new(".")))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("KXYY_ASR_RUNTIME_ROOT", &runtime_root)
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PATH", augmented_tool_path());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let success = cmd.status().map(|status| status.success()).unwrap_or(false);
+        let manager = app2.state::<VoiceServiceManager>();
+        let Ok(_lifecycle) = manager.lifecycle.lock() else {
+            return;
+        };
+        let (still_selected, current_backend, current_fp) = match manager.inner.lock() {
+            Ok(mut inner) => {
+                finish_sensevoice_runtime_install(&mut inner, &backend);
+                (
+                    voice_target_still_selected(
+                        &inner,
+                        &backend,
+                        &asr_provider,
+                        &install_fingerprint,
+                    ),
+                    inner.desired_backend.clone(),
+                    inner.desired_fingerprint.clone(),
+                )
+            }
+            Err(_) => return,
+        };
+        let (state, message) = match (success, still_selected) {
+            (true, true) => ("ready", "SenseVoice runtime 已就绪，正在重启当前语音服务…"),
+            (true, false) => ("ready", "SenseVoice runtime 已就绪；当前语音设置已改变，未重启服务"),
+            (false, true) => ("failed", "SenseVoice runtime 安装失败；正在恢复当前语音服务"),
+            (false, false) => ("failed", "SenseVoice runtime 安装失败；当前语音设置已改变，未重启服务"),
+        };
+        let _ = app2.emit(
+            "sensevoice-runtime-install-progress",
+            serde_json::json!({"state":state,"message":message}),
+        );
+        if still_selected {
+            ensure_impl(&app2, current_backend, current_fp);
         }
     });
     Ok(())
@@ -1150,13 +1389,14 @@ pub fn stop(app: &AppHandle) {
 /// `voice_fingerprint`：调用方生成的不透明配置指纹；不得包含可供日志展开的原值。
 pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
     let backend = normalize_backend(backend_raw);
+    let asr_provider = normalize_asr_provider(&read_setting_str("asrProvider"));
     let fp = voice_fingerprint.trim().to_string();
     let manager = app.state::<VoiceServiceManager>();
     let Ok(_lifecycle) = manager.lifecycle.lock() else {
         return;
     };
     if let Ok(mut inner) = manager.inner.lock() {
-        record_desired_voice_config(&mut inner, &backend, &fp);
+        record_desired_voice_config(&mut inner, &backend, &asr_provider, &fp);
     }
     ensure_impl(app, backend, fp);
 }
@@ -1164,20 +1404,33 @@ pub fn ensure(app: &AppHandle, backend_raw: &str, voice_fingerprint: &str) {
 fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     let port = port_for(&backend);
 
-    let installing_backend = app
+    let current_asr_provider = normalize_asr_provider(&read_setting_str("asrProvider"));
+    let (vad_installing_backend, defer_for_sensevoice_install) = app
         .state::<VoiceServiceManager>()
         .inner
         .lock()
         .ok()
-        .map(|inner| inner.vad_install_backend.clone())
+        .map(|inner| {
+            (
+                inner.vad_install_backend.clone(),
+                sensevoice_install_matches_target(
+                    &inner,
+                    &backend,
+                    &current_asr_provider,
+                    &fp,
+                ),
+            )
+        })
         .unwrap_or_default();
-    if should_defer_for_vad_install(&backend, &installing_backend) {
+    if should_defer_for_vad_install(&backend, &vad_installing_backend)
+        || defer_for_sensevoice_install
+    {
         emit(
             app,
             VoiceServiceStatus {
                 backend,
                 state: "starting".into(),
-                message: "正在安装实验性 VAD runtime；语音服务将在完成后恢复".into(),
+                message: "正在安装可选语音运行时；语音服务将在完成后恢复".into(),
                 port,
             },
         );
@@ -1515,6 +1768,13 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);
+    }
+    // Final ASR provider 只接受固定枚举；SenseVoice 使用独立 App-data runtime，
+    // 不把模型或第三方依赖写入 Qwen/CosyVoice 自身环境。
+    let asr_provider = normalize_asr_provider(&read_setting_str("asrProvider"));
+    cmd.env("KXYY_ASR_PROVIDER", asr_provider);
+    if let Some(root) = sensevoice_runtime_root() {
+        cmd.env("KXYY_ASR_RUNTIME_ROOT", root);
     }
     if read_setting_bool("vadShadowEnabled") {
         if let Some(root) = vad_runtime_root() {

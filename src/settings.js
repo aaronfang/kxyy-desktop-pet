@@ -19,6 +19,7 @@ const FIELDS = [
   "cosyvoiceModel",
   "localRefWav",
   "localRefText",
+  "asrProvider",
   "voiceVolume",
   "textProvider",
   "textModel",
@@ -68,6 +69,12 @@ function currentBackend() {
   return normalizeBackend(el("realtimeBackend").value);
 }
 
+function currentAsrProvider() {
+  return (el("asrProvider")?.value || "whisper").toLowerCase() === "sensevoice"
+    ? "sensevoice"
+    : "whisper";
+}
+
 /** 按所选语音后端只展示对应设置项。 */
 function syncVoiceFields() {
   const backend = currentBackend();
@@ -82,6 +89,14 @@ function syncVoiceFields() {
   const vadBox = el("vadShadowFields");
   if (vadBox) {
     vadBox.hidden = backend !== "local" && backend !== "cosyvoice";
+  }
+  const asrBox = el("asrFields");
+  if (asrBox) {
+    asrBox.hidden = backend !== "local" && backend !== "cosyvoice";
+  }
+  const installSenseVoice = el("installSenseVoiceRuntime");
+  if (installSenseVoice) {
+    installSenseVoice.disabled = currentAsrProvider() !== "sensevoice";
   }
 }
 
@@ -133,6 +148,7 @@ function fill(s) {
   el("cosyvoiceModel").value = s.cosyvoiceModel || "";
   el("localRefWav").value = s.localRefWav || "";
   el("localRefText").value = s.localRefText || "";
+  el("asrProvider").value = s.asrProvider === "sensevoice" ? "sensevoice" : "whisper";
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
   const vol = Number(s.voiceVolume);
   el("voiceVolume").value = Number.isFinite(vol)
@@ -502,6 +518,7 @@ function collect() {
     cosyvoiceModel: el("cosyvoiceModel").value.trim(),
     localRefWav: el("localRefWav").value.trim(),
     localRefText: el("localRefText").value.trim(),
+    asrProvider: currentAsrProvider(),
     voiceVolume: Math.max(
       0,
       Math.min(200, parseInt(el("voiceVolume").value, 10) || 100),
@@ -814,6 +831,7 @@ el("realtimeBackend").addEventListener("change", () => {
   syncVoiceFields();
   probeBackendStatus();
 });
+el("asrProvider")?.addEventListener("change", syncVoiceFields);
 el("textProvider").addEventListener("change", () => {
   syncTextFields();
   probeLocalTextStatus();
@@ -831,6 +849,21 @@ el("installVadShadow")?.addEventListener("click", async () => {
     await invoke("install_vad_shadow_runtime", { backend: currentBackend() });
   } catch (e) {
     btn.disabled = false;
+    status.style.color = "#dc2626";
+    status.textContent = `无法安装：${e}`;
+  }
+});
+
+el("installSenseVoiceRuntime")?.addEventListener("click", async () => {
+  const btn = el("installSenseVoiceRuntime");
+  const status = el("sensevoiceRuntimeInstallStatus");
+  btn.disabled = true;
+  status.style.color = "";
+  status.textContent = "正在启动安装…";
+  try {
+    await invoke("install_sensevoice_runtime", { backend: currentBackend() });
+  } catch (e) {
+    btn.disabled = currentAsrProvider() !== "sensevoice";
     status.style.color = "#dc2626";
     status.textContent = `无法安装：${e}`;
   }
@@ -873,6 +906,16 @@ listen("vad-shadow-install-status", ({ payload }) => {
   status.style.color = payload?.state === "failed" ? "#dc2626" : payload?.state === "ready" ? "#16a34a" : "";
   if (payload?.state === "failed" || payload?.state === "ready") {
     if (btn) btn.disabled = false;
+  }
+});
+listen("sensevoice-runtime-install-progress", ({ payload }) => {
+  const btn = el("installSenseVoiceRuntime");
+  const status = el("sensevoiceRuntimeInstallStatus");
+  if (!status) return;
+  status.textContent = payload?.message || "";
+  status.style.color = payload?.state === "failed" ? "#dc2626" : payload?.state === "ready" ? "#16a34a" : "";
+  if (payload?.state === "failed" || payload?.state === "ready") {
+    if (btn) btn.disabled = currentAsrProvider() !== "sensevoice";
   }
 });
 

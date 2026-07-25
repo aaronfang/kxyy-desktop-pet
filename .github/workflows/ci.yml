@@ -135,6 +135,23 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/test_silero_shadow.py
 
+      # The installer itself performs a locked real-model inference before
+      # publishing marker-last. Run it on both supported CI platforms, then
+      # run it again to verify the published ABI target and ready-marker path.
+      - name: Install optional SenseVoice final-ASR runtime
+        env:
+          KXYY_ASR_RUNTIME_ROOT: ${{ runner.temp }}/kxyy-sensevoice-runtime
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: python scripts/local-realtime/install_sensevoice_runtime.py
+
+      - name: Revalidate optional SenseVoice final-ASR runtime
+        env:
+          KXYY_ASR_RUNTIME_ROOT: ${{ runner.temp }}/kxyy-sensevoice-runtime
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: utf-8
+        run: python scripts/local-realtime/install_sensevoice_runtime.py
+
       - name: Strip plaintext persona assets
         run: node scripts/bundle-assets.mjs strip
 

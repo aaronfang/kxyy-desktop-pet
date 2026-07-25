@@ -362,6 +362,12 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
       vadShadow: "silero-onnx-shadow-v1",
+      asr: {
+        requested: "sensevoice",
+        active: "sensevoice-sherpa-onnx",
+        status: "active",
+        modelPath: "forbidden-model-path",
+      },
       url: "forbidden-url",
     },
     vadShadowSummary: fixtureVadShadowSummary({
@@ -374,7 +380,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 4);
+  assert.equal(report.diagnosticSchemaVersion, 5);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -383,6 +389,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
     vadShadow: "silero-onnx-shadow-v1",
+    asr: {
+      requested: "sensevoice",
+      active: "sensevoice-sherpa-onnx",
+      status: "active",
+    },
   });
   assert.deepEqual(report.exportStats, {
     sourceDroppedEvents: 17,
@@ -418,6 +429,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "forbidden-shadow-secret",
     "forbidden-shadow-transcript",
     "rawProbability",
+    "forbidden-model-path",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -432,6 +444,11 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
       ttsStream: "future-stream",
       interruptionHint: "future-hint",
       vadShadow: "future-shadow",
+      asr: {
+        requested: "future-asr",
+        active: "future-runtime",
+        status: "future-status",
+      },
     },
   });
   assert.deepEqual(report.runtime, {
@@ -441,6 +458,11 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     ttsStream: "none",
     interruptionHint: "none",
     vadShadow: "disabled",
+    asr: {
+      requested: "whisper",
+      active: "none",
+      status: "not-reported",
+    },
   });
   assert.deepEqual(report.aggregate.vadShadow, sanitizeVadShadowSummary());
 });
@@ -704,6 +726,11 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
     vadShadow: "disabled",
+    asr: {
+      requested: "whisper",
+      active: "none",
+      status: "not-reported",
+    },
   });
 
   const cosy = new RealtimeSession({ provider: "cosyvoice" });

@@ -233,6 +233,21 @@
             <p class="hint">保存后自动启动 <code>server_cosyvoice.py</code>（通话 :19877，朗读 :19977）。本机 Whisper + DeepSeek，TTS 走通义云端（上方通义 Key），不消耗火山 token。</p>
           </div>
 
+          <div id="asrFields" hidden>
+            <label>
+              <span>用户语音识别（final ASR）<small>仅本地 Qwen3 / CosyVoice 通话</small></span>
+              <select id="asrProvider">
+                <option value="whisper">Whisper（默认）</option>
+                <option value="sensevoice">SenseVoice（实验，可选安装）</option>
+              </select>
+            </label>
+            <div class="row-actions">
+              <button id="installSenseVoiceRuntime" type="button" class="ghost">安装 / 检查 SenseVoice runtime</button>
+              <span id="sensevoiceRuntimeInstallStatus" class="hint"></span>
+            </div>
+            <p class="hint">SenseVoice 只替换整句最终识别，不改变 RMS/VAD、句尾判定或打断流程。安装的是 <a href="https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models" target="_blank" rel="noreferrer">sherpa-onnx 转换版 SenseVoiceSmall INT8</a>；runtime 为 Apache-2.0，模型权重仍受 <a href="https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE" target="_blank" rel="noreferrer">FunASR Model License 1.1</a> 约束。依赖与模型仅在你点击后下载到 App 独立数据目录；不会上传录音，也不会自动启用。设备听测和识别召回仍需实验验证；安装前请先选择 SenseVoice 并保存。</p>
+          </div>
+
           <label class="row-inline">
             <input id="autoSpeak" type="checkbox" />
             <span id="autoSpeakLabel">自动朗读元元的回复</span>

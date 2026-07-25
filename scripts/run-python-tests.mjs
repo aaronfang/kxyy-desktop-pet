@@ -17,6 +17,8 @@ const testFiles = [
   "tests/test_vad_adapter.py",
   "tests/test_vad_evaluator.py",
   "tests/test_silero_shadow.py",
+  "tests/test_asr_adapter.py",
+  "tests/test_sensevoice_runtime.py",
 ];
 
 for (const [command, prefixArgs] of candidates) {
