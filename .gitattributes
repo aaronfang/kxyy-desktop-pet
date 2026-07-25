@@ -4,3 +4,4 @@ scripts/local-realtime/models/silero-v6.2.1/LICENSE text eol=lf
 scripts/local-realtime/models/silero-v6.2.1/THIRD_PARTY_NOTICES.md text eol=lf
 scripts/local-realtime/models/silero-v6.2.1/manifest.json text eol=lf
 scripts/local-realtime/models/silero-v6.2.1/silero_vad_16k_op15.onnx binary
+scripts/local-realtime/SENSEVOICE-NOTICE.md text eol=lf
