@@ -1731,6 +1731,7 @@ let callUserBubble = null;
 let callUserText = "";
 let callAsstBubble = null;
 let callAsstText = "";
+let callAsstGeneration = null;
 let callLastUserMessageId = "";
 let callAudibleTurns = new Map();
 let callWaveSpeaking = false;
@@ -1943,6 +1944,7 @@ function finalizeCallAsstBubble() {
   row?.classList.remove("streaming");
   callAsstBubble = null;
   callAsstText = "";
+  callAsstGeneration = null;
   callWaveSpeaking = false;
   callWaveEl?.classList.remove("speaking");
   // 气泡展示 generatedText；对话/长期记忆只由实际播完的句段回执写入。
@@ -1995,6 +1997,7 @@ function appendCallAsstBubble(delta, { generation } = {}) {
     });
   }
   callAsstText += d;
+  callAsstGeneration = Number.isSafeInteger(generation) ? generation : null;
   if (!callAsstBubble) {
     callAsstBubble = addBubble("assistant", callAsstText, { mid: genMsgId() });
     const turn = callAudibleTurns.get(generation);
@@ -2005,6 +2008,20 @@ function appendCallAsstBubble(delta, { generation } = {}) {
     callAsstBubble.textContent = callAsstText;
     scrollBottom();
   }
+}
+
+function discardCallAsstBubble({ generation } = {}) {
+  if (
+    !callAsstBubble ||
+    !Number.isSafeInteger(generation) ||
+    generation !== callAsstGeneration
+  ) return;
+  callAsstBubble.closest(".row")?.remove();
+  callAsstBubble = null;
+  callAsstText = "";
+  callAsstGeneration = null;
+  callAudibleTurns.delete(generation);
+  scrollBottom();
 }
 
 function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
@@ -2050,6 +2067,7 @@ async function startCall() {
   callUserText = "";
   callAsstBubble = null;
   callAsstText = "";
+  callAsstGeneration = null;
   callLastUserMessageId = "";
   callAudibleTurns = new Map();
   lastCallTraceSnapshot = null;
@@ -2081,6 +2099,7 @@ async function startCall() {
     onAsrEnd: () => finalizeCallUserBubble(),
     onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
     onAssistantEnd: () => finalizeCallAsstBubble(),
+    onAssistantDiscarded: (meta) => discardCallAsstBubble(meta),
     onAudibleAssistant: (text, meta) => commitCallAudibleSegment(text, meta),
     onSpeechCandidate: () => {
       callWaveEl?.classList.add("candidate");

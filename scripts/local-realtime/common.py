@@ -566,6 +566,11 @@ INTERRUPTION_HINT_TEXT = (
     "上一轮语音在句中被用户打断。不要假设未播完的尾句已被用户听到；"
     "按当前人设自然承接即可，不要机械道歉、抱怨或复述未播内容。"
 )
+CONTINUATION_HINT_TEXT = (
+    "用户刚才是在停顿后继续补充同一轮内容。结合上一条用户消息理解完整意图，"
+    "只回答一次，不要分别回答或提及系统取消了上一版回复。"
+)
+CONTINUATION_WINDOW_SECONDS = 8.0
 LLM_REPLY_MAX_CHARS = 4096
 STABLE_SENTENCE_MIN_CHARS = 6
 STABLE_SENTENCE_SOFT_CHARS = 40
@@ -2150,6 +2155,9 @@ class Session:
         self.asr_scope: GenerationCancelScope | None = None
         self.response_scope: GenerationCancelScope | None = None
         self.reply_task: asyncio.Task | None = None
+        self._response_generated = False
+        self._response_tts_admitted = False
+        self._response_started_at = 0.0
         self.play_enabled = False
         self.playing = False
         # 播报中正在旁路采集候选打断（后端不停播；前端会 duck 并暂停消费）
@@ -2418,12 +2426,28 @@ class Session:
     def _invalidate_play(self) -> None:
         self.play_enabled = False
 
-    async def cancel_reply(self, reason: str = "superseded") -> None:
+    async def cancel_reply(self, reason: str = "superseded") -> bool:
         scope = self.response_scope
         self.response_scope = None
+        continuation = bool(
+            reason == "turn_detected"
+            and scope is not None
+            and not self._response_tts_admitted
+            and self._response_started_at > 0
+            and time.perf_counter() - self._response_started_at
+            <= CONTINUATION_WINDOW_SECONDS
+        )
+        discard_generated = bool(continuation and self._response_generated)
         if scope is not None:
             self._audible_history.cancel_turn(scope.generation)
             scope.cancel(reason)
+            if discard_generated:
+                await self.send_json(
+                    {"type": "assistant_discarded", "generation": scope.generation}
+                )
+        self._response_generated = False
+        self._response_tts_admitted = False
+        self._response_started_at = 0.0
         self.play_enabled = False
         self.playing = False
         t = self.reply_task
@@ -2434,6 +2458,7 @@ class Session:
                 await t
             except asyncio.CancelledError:
                 pass
+        return continuation
 
     async def cancel_asr(self, reason: str = "superseded") -> None:
         scope = self.asr_scope
@@ -2865,22 +2890,25 @@ class Session:
             if not scope.active:
                 return
 
-            await self.cancel_reply("turn_detected")
+            continuation_hint = await self.cancel_reply("turn_detected")
             if not scope.active:
                 return
             scope.promote("response")
             if self.asr_scope is scope:
                 self.asr_scope = None
             self.response_scope = scope
-            reply_coro = (
-                self._reply_pipeline(
+            self._response_generated = False
+            self._response_tts_admitted = False
+            self._response_started_at = time.perf_counter()
+            if interruption_hint or continuation_hint:
+                reply_coro = self._reply_pipeline(
                     cleaned,
                     scope,
-                    interruption_hint=True,
+                    interruption_hint=interruption_hint,
+                    continuation_hint=continuation_hint,
                 )
-                if interruption_hint
-                else self._reply_pipeline(cleaned, scope)
-            )
+            else:
+                reply_coro = self._reply_pipeline(cleaned, scope)
             self.reply_task = asyncio.create_task(reply_coro)
         except asyncio.CancelledError:
             if scope.active:
@@ -2917,6 +2945,7 @@ class Session:
         scope: GenerationCancelScope,
         *,
         interruption_hint: bool = False,
+        continuation_hint: bool = False,
     ) -> None:
         sentences = StableSentenceBuffer(min_chars=REALTIME_TTS_MIN_CHARS)
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
@@ -2927,6 +2956,10 @@ class Session:
             if interruption_hint:
                 history_snapshot.append(
                     {"role": "system", "content": INTERRUPTION_HINT_TEXT}
+                )
+            if continuation_hint:
+                history_snapshot.append(
+                    {"role": "system", "content": CONTINUATION_HINT_TEXT}
                 )
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
             start_llm_stream_producer(
@@ -3221,6 +3254,7 @@ class Session:
                 if not sentence or not scope.active:
                     return
                 if not tts_started:
+                    self._response_tts_admitted = True
                     if not await self.send_json({"type": "tts_start"}, scope=scope):
                         return
                     tts_started = True
@@ -3271,6 +3305,7 @@ class Session:
                         scope=scope,
                     ):
                         return
+                    self._response_generated = True
                     for sentence in sentences.feed(delta):
                         await enqueue_sentence(sentence)
                 elif event_type == "error":

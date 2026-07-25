@@ -1313,6 +1313,33 @@ test("desktop session maps local cascade events without retaining transcript tex
   assert.equal(JSON.stringify(snapshot).includes("完整助手文本"), false);
 });
 
+test("local session exposes text-free unplayed assistant discard only to the UI", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const discarded = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAssistantDiscarded: (meta) => discarded.push(meta),
+  });
+  session.trace.startSession();
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant_discarded", generation: 7 }),
+  });
+
+  assert.deepEqual(discarded, [{ generation: 7 }]);
+  assert.equal(JSON.stringify(session.getTraceSnapshot()).includes("discarded"), false);
+
+  const volcanoDiscarded = [];
+  const volcano = new RealtimeSession({
+    provider: "volcano",
+    onAssistantDiscarded: (meta) => volcanoDiscarded.push(meta),
+  });
+  volcano._onMessage({
+    data: JSON.stringify({ type: "assistant_discarded", generation: 7 }),
+  });
+  assert.deepEqual(volcanoDiscarded, []);
+});
+
 test("desktop session ducks candidates, resumes rejection and gates stale audio", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
