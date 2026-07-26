@@ -6,7 +6,7 @@
 
 ### 版本与里程碑约定
 
-- 应用安装包使用独立的 SemVer（当前基线为 `0.2.34`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- 应用安装包使用独立的 SemVer（当前基线为 `0.2.35`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
 - Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
 - 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
 - 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
@@ -177,6 +177,10 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 **Memory v3.1-E / App 0.2.34** 已完成第一步：通话开始前以 120ms 有界预算调用现有 `memory_recall`，最多注入 3 条、约 250 token 的置顶/待兑现/当前话题线索；没有当前话题时只允许置顶和 pending commitment，超时、数据库锁定或 IPC 失败均回退到原始 `systemRole`。本步不修改火山协议、ASR、打断或音频状态机，也不把 ASR interim 写入长期记忆。
 
 本步门槛：前端实时记忆纯函数和 Rust 记忆回归测试通过；现有 `{type:"start", systemRole, botName}` 私有启动协议保持不变。逐轮 ASR final 动态 context 仍待协议能力门和后续 M2 实现。
+
+**Memory v3.1-F / App 0.2.35** 已完成协议能力门：前端、Rust 火山桥和本地 Python 语音服务统一声明并回显 `memoryContext=session-start-v1`；动态逐轮 context 没有官方文档和真实请求证据时不宣称支持，未回显则诊断为 `none`。实时诊断 schema 升为 v6。该能力门只记录协商结果，尚未改变 ASR、音频和打断状态机。
+
+本步门槛：三条实时路径的 handshake 回归测试通过；未知能力值在诊断导出中 fail-closed；后续只有拿到官方协议证据后才能新增 `dynamic-context-v1`。
 
 ### M3：Memory Graph 管理工具
 

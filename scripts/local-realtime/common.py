@@ -560,6 +560,7 @@ MANAGED_AUDIO_CHUNK_MAX_SAMPLES = OUTPUT_RATE * 80 // 1000
 MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750
 TTS_STREAMING_CAPABILITY = "provider-pcm-v1"
 INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1"
+MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
 INTERRUPTION_HINT_MIN_SAMPLES = OUTPUT_RATE
 INTERRUPTION_RECEIPT_WAIT_SECONDS = 0.05
 INTERRUPTION_HINT_TEXT = (
@@ -2173,6 +2174,7 @@ class Session:
         self.downlink_audio = "raw"
         self.tts_streaming = "none"
         self.interruption_hint = "none"
+        self.memory_context = "none"
         self._candidate_sequence = 0
         self._candidate_id: int | None = None
         self._candidate_confirmed = False
@@ -2510,6 +2512,15 @@ class Session:
             and INTERRUPTION_HINT_CAPABILITY in offered_interruption
             else "none"
         )
+        offered_memory_context = msg.get("memoryContext")
+        # 只确认 session-start-v1；没有动态 context 的协议回显时保持 none，
+        # 让前端诊断明确知道逐轮记忆尚未启用。
+        self.memory_context = (
+            MEMORY_CONTEXT_CAPABILITY
+            if isinstance(offered_memory_context, list)
+            and MEMORY_CONTEXT_CAPABILITY in offered_memory_context
+            else "none"
+        )
         self._clear_interruption_candidate()
         vad_shadow = await self._start_or_reset_vad_shadow()
         await self.send_json(
@@ -2519,6 +2530,7 @@ class Session:
                 "downlinkAudio": self.downlink_audio,
                 "ttsStream": self.tts_streaming,
                 "interruptionHint": self.interruption_hint,
+                "memoryContext": self.memory_context,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
                 "asrRuntime": asr_runtime_summary(),

@@ -361,6 +361,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
+      memoryContext: "session-start-v1",
       vadShadow: "silero-onnx-shadow-v1",
       asr: {
         requested: "sensevoice",
@@ -380,7 +381,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 5);
+  assert.equal(report.diagnosticSchemaVersion, 6);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -388,6 +389,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    memoryContext: "session-start-v1",
     vadShadow: "silero-onnx-shadow-v1",
     asr: {
       requested: "sensevoice",
@@ -457,6 +459,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     downlinkAudio: "raw",
     ttsStream: "none",
     interruptionHint: "none",
+    memoryContext: "none",
     vadShadow: "disabled",
     asr: {
       requested: "whisper",
@@ -707,6 +710,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[0].onopen();
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
   local.trace.startSession();
@@ -715,6 +719,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
       type: "session",
       state: "started",
       downlinkAudio: "managed-v1",
+      memoryContext: "session-start-v1",
       interruptionHint: "candidate-snapshot-v1",
       ttsStream: "provider-pcm-v1",
     }),
@@ -725,6 +730,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    memoryContext: "session-start-v1",
     vadShadow: "disabled",
     asr: {
       requested: "whisper",
@@ -740,6 +746,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[1].onopen();
   await cosyOpen;
   assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
 
@@ -752,6 +759,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[2].onopen();
   await legacyOpen;
   assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
 
@@ -765,6 +773,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
   assert.equal("ttsStream" in sockets[3].sent[0], false);
+  assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
 });
 
 test("streamed managed segments require explicit negotiation and exact final totals", async () => {

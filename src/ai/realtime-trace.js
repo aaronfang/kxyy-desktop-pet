@@ -5,7 +5,7 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 5;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 6;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
@@ -610,6 +610,11 @@ function sanitizeRuntimeSummary(runtime) {
     interruptionHint: safeEnum(
       value.interruptionHint,
       ["candidate-snapshot-v1", "none"],
+      "none",
+    ),
+    memoryContext: safeEnum(
+      value.memoryContext,
+      ["session-start-v1", "none"],
       "none",
     ),
     vadShadow: safeEnum(

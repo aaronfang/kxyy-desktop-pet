@@ -2203,6 +2203,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
                 "ttsStream": [common.TTS_STREAMING_CAPABILITY],
                 "interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY],
+                "memoryContext": [common.MEMORY_CONTEXT_CAPABILITY],
             }
         )
         self.assertEqual(self.session.downlink_audio, common.MANAGED_AUDIO_CAPABILITY)
@@ -2223,6 +2224,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             last_json_of_type(self.ws, "session")["interruptionHint"],
             common.INTERRUPTION_HINT_CAPABILITY,
         )
+        self.assertEqual(self.session.memory_context, common.MEMORY_CONTEXT_CAPABILITY)
+        self.assertEqual(
+            last_json_of_type(self.ws, "session")["memoryContext"],
+            common.MEMORY_CONTEXT_CAPABILITY,
+        )
 
         old_ws = FakeWebSocket()
         old_session = common.Session(old_ws)
@@ -2230,10 +2236,12 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_session.downlink_audio, "raw")
         self.assertEqual(old_session.tts_streaming, "none")
         self.assertEqual(old_session.interruption_hint, "none")
+        self.assertEqual(old_session.memory_context, "none")
         old_started = last_json_of_type(old_ws, "session")
         self.assertEqual(old_started["downlinkAudio"], "raw")
         self.assertEqual(old_started["ttsStream"], "none")
         self.assertEqual(old_started["interruptionHint"], "none")
+        self.assertEqual(old_started["memoryContext"], "none")
         old_scope = old_session._new_scope("response")
         self.assertTrue(
             await old_session.send_downlink_pcm(

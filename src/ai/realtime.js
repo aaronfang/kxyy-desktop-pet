@@ -17,6 +17,8 @@
 //     本地级联控制事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //     上行 text 可含 {type:"playback_segment",generation,segmentId,state:"completed"}；
 //     只回执句段标识，不回传文本或 PCM。
+//     memoryContext 目前只协商 session-start-v1；服务端未明确回显时视为 none，
+//     不把 ASR final 误当作支持动态 context。
 //   挂断发 {type:"hangup"}。
 //
 // 音频采集/播放放前端而非 Rust 的原因：getUserMedia 自带回声消除(AEC)/降噪/AGC，
@@ -46,6 +48,7 @@ const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
+const MEMORY_CONTEXT_CAPABILITY = "session-start-v1";
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 const VAD_SHADOW_FINAL_WAIT_MS = 50;
@@ -190,6 +193,7 @@ export class RealtimeSession {
     this._downlinkAudioMode = "raw";
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
+    this._memoryContextMode = "none";
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
     this._vadShadowSummary = sanitizeVadShadowSummary();
@@ -268,6 +272,9 @@ export class RealtimeSession {
         const cascadeCapabilities = usesManagedCascade(this.trace.provider)
           ? { downlinkAudio: [MANAGED_AUDIO_CAPABILITY] }
           : {};
+        // 明确声明当前只支持会话开始时注入记忆；动态逐轮 context 必须由后端
+        // 显式回显新能力后才能启用，不能因为收到 ASR final 就默认支持。
+        cascadeCapabilities.memoryContext = [MEMORY_CONTEXT_CAPABILITY];
         if (
           usesManagedCascade(this.trace.provider) &&
           this._playbackMode === "worklet" &&
@@ -337,6 +344,12 @@ export class RealtimeSession {
     }
     switch (msg.type) {
       case "session":
+        if (msg.state === "started") {
+          this._memoryContextMode =
+            msg.memoryContext === MEMORY_CONTEXT_CAPABILITY
+              ? MEMORY_CONTEXT_CAPABILITY
+              : "none";
+        }
         if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
           this._downlinkAudioMode =
             msg.downlinkAudio === MANAGED_AUDIO_CAPABILITY
@@ -1375,6 +1388,7 @@ export class RealtimeSession {
         downlinkAudio: this._downlinkAudioMode,
         ttsStream: this._ttsStreamingMode,
         interruptionHint: this._interruptionHintMode,
+        memoryContext: this._memoryContextMode,
         vadShadow: this._vadShadowMode,
         asr: { ...this._asrRuntime },
       },
