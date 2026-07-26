@@ -474,6 +474,77 @@ button.danger:disabled {
 #clearMemoryStatus {
   margin: 0;
 }
+.memory-intro { margin-bottom: 12px; }
+.memory-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.memory-stats span {
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: #f3f4f6;
+  color: #6b7280;
+  font-size: 12px;
+}
+.memory-filters {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr 105px 105px 1.2fr auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.memory-filters input,
+.memory-filters select { min-width: 0; }
+.memory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-height: 160px;
+}
+.memory-card {
+  padding: 11px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
+}
+.memory-card-head,
+.memory-card-actions,
+.memory-page-row,
+.memory-danger-zone {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.memory-card-head { margin-bottom: 7px; }
+.memory-kind {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #fff0f5;
+  color: #be567a;
+  font-size: 11px;
+  font-weight: 600;
+}
+.memory-card-meta { color: #9ca3af; font-size: 11px; }
+.memory-card-text { margin: 0 0 7px; color: #374151; font-size: 13px; white-space: pre-wrap; }
+.memory-source {
+  margin: 0 0 8px;
+  padding: 7px 8px;
+  border-left: 3px solid #e5e7eb;
+  background: #f9fafb;
+  color: #6b7280;
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+.memory-card-actions { justify-content: flex-end; }
+.memory-card-actions button { height: 27px; padding: 0 9px; font-size: 12px; }
+.memory-page-row { justify-content: center; margin-top: 12px; }
+.memory-danger-zone { margin-top: 18px; padding-top: 14px; border-top: 1px solid #fee2e2; }
+.memory-empty { color: #9ca3af; text-align: center; margin: 48px 0; }
+@media (max-width: 760px) {
+  .memory-filters { grid-template-columns: 1fr 1fr; }
+}
 code {
   background: #eef0f3;
   padding: 1px 5px;

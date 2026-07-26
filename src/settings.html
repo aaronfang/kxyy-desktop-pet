@@ -21,6 +21,10 @@
         <span class="tab-icon">👤</span>
         <span class="tab-label">人设</span>
       </button>
+      <button class="tab-btn" data-tab="memory">
+        <span class="tab-icon">🗂</span>
+        <span class="tab-label">记忆</span>
+      </button>
       <button class="tab-btn" data-tab="appearance">
         <span class="tab-icon">🎨</span>
         <span class="tab-label">外观</span>
@@ -346,7 +350,55 @@
         </section>
       </div>
 
-      <!-- ========== 页签 4：外观 ========== -->
+      <!-- ========== 页签 4：记忆 ========== -->
+      <div class="tab-panel" id="tab-memory">
+        <section>
+          <h2>长期记忆</h2>
+          <p class="hint memory-intro">记忆只保存在本机。元元会按当前话题选择性想起相关内容，不会把整份档案发进每次对话。</p>
+          <div class="memory-stats" id="memoryStats">
+            <span>正在读取…</span>
+          </div>
+          <div class="memory-filters">
+            <select id="memoryCardId" aria-label="记忆所属人设卡">
+              <option value="">开心元元（默认）</option>
+            </select>
+            <input id="memoryNickname" type="text" placeholder="昵称（留空=全部）" />
+            <select id="memoryKind">
+              <option value="">全部类型</option>
+              <option value="fact">事实</option>
+              <option value="episode">经历</option>
+              <option value="commitment">约定</option>
+            </select>
+            <select id="memoryStatus">
+              <option value="">全部状态</option>
+              <option value="active">有效</option>
+              <option value="disputed">待确认</option>
+              <option value="pending">待兑现</option>
+              <option value="fulfilled">已兑现</option>
+              <option value="cancelled">已取消</option>
+              <option value="expired">已过期</option>
+              <option value="superseded">已被替代</option>
+              <option value="forgotten">已遗忘</option>
+            </select>
+            <input id="memorySearch" type="search" placeholder="搜索记忆…" />
+            <button id="memoryRefresh" type="button" class="ghost">刷新</button>
+          </div>
+          <div id="memoryList" class="memory-list">
+            <p class="memory-empty">暂无记忆</p>
+          </div>
+          <div class="memory-page-row">
+            <button id="memoryPrev" type="button" class="ghost">上一页</button>
+            <span id="memoryPageInfo" class="hint">第 1 页</span>
+            <button id="memoryNext" type="button" class="ghost">下一页</button>
+          </div>
+          <div class="memory-danger-zone">
+            <button id="memoryClearAll" type="button" class="danger">清空当前人设全部记忆</button>
+            <span id="memoryManageStatus" class="hint"></span>
+          </div>
+        </section>
+      </div>
+
+      <!-- ========== 页签 5：外观 ========== -->
       <div class="tab-panel" id="tab-appearance">
 
         <!-- 头像与外观 -->

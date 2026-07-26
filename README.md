@@ -2,7 +2,7 @@
 
 基于 [webmeji](https://github.com/lars-rooij/webmeji) 动画逻辑改造的 **macOS / Windows 跨平台桌面宠物**，用 **[Tauri](https://tauri.app) 2** 封装（前端 Web 动画 + Rust 主进程）。桌宠会在屏幕上走动、坐下、跳舞、攀爬屏幕边缘，可拖拽、可抚摸，右键或托盘可切换形象。
 
-除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型，也可切换本地 Ollama 模型离线使用），支持发图看图（通义千问 VL）、语音朗读与**实时语音通话**（可切换火山云端 / 本地模型 / CosyVoice）、表情包回复与自定义人设。朗读与通话共用一套语音后端，并支持 **0–200% 播放音量**。所有 AI 服务 Key 只保存在本机，请求经内置本地代理直连服务商或本机模型，不经第三方。
+除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型，也可切换本地 Ollama 模型离线使用），支持发图看图（通义千问 VL）、语音朗读与**实时语音通话**（可切换火山云端 / 本地模型 / CosyVoice）、表情包回复、自定义人设，以及本地 SQLite **Memory v3 长期记忆**。朗读与通话共用一套语音后端，并支持 **0–200% 播放音量**。所有 AI 服务 Key 和长期记忆只保存在本机，请求经内置本地代理直连服务商或本机模型，不经第三方。
 
 当前内置两套形象：**赛博元元**（`kxyy-cyber`）与 **苗疆元元**（`kxyy-miaojiang`，默认）。应用图标为苗疆元元头部特写，缩小后仍可辨认。macOS 上为菜单栏托盘应用，**不占用 Dock**。
 
@@ -69,14 +69,16 @@ npm run dev        # 开发模式（tauri dev）
 - **未播音续说（0.2.32）**：本地/CosyVoice 在第一版回复仍处于 LLM 出字、尚未取得任何 TTS admission 时，若 8 秒内确认用户继续补充，会取消旧 generation、撤回未播的临时助手气泡，并让下一次 LLM 结合上一条用户消息只回答一次。一旦旧回复已开始 TTS admission、超时或不是确认人声，就严格走原有新轮/打断路径；不会撤回已播放内容，也不把提示写入历史、摘要或诊断。
 - **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话按 LLM 稳定句进入 4 项有界队列并严格按句序播放。CosyVoice 自 0.2.21、macOS Apple Silicon 的 MLX Qwen 自 0.2.22 起，可在播放 Worklet + `managed-v1` 上双向协商 `provider-pcm-v1`：provider 生成期音频按最多 80ms 下发，首版固定单路且不预取下一句。Windows/Linux 的官方 `qwen-tts` 当前没有公开音频 iterator，仍按句整段合成；未协商、legacy、旧服务与火山也继续原路径。流式句段只在结束时声明最终 samples/chunks，前端精确校验；失败、取消、错序、超限或总量不符不会产生“已完整播完”回执。0.2.20 的 `candidate-snapshot-v1` 仍只在 Worklet 本地/CosyVoice 上启用：同一 candidate 确认打断且当前句已播放至少 1 秒时，下一轮仅注入一次固定临时提示；它不进入 history、聊天摘要、长期记忆或日志，也不恢复字、音素或部分文本。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
 - **实时语音优化路线**：自然打断、流式管线、Qwen3-TTS/CosyVoice/火山情绪能力和 SenseVoice 评估见 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md)；其中尚未实现的目标不会作为当前功能承诺。
+- **Memory v3（当前开发版本）**：长期记忆由 Rust + SQLite 保存为事实、共同经历和约定；聊天前只选择性召回与当前话题相关的少量内容，后台异步巩固，不再把全部历史塞进 prompt。设置页可搜索、筛选、编辑、置顶、兑现或永久删除记忆；数据库或模型不可用时会回退，不阻塞正常聊天。
+- **Memory Brain 路线**：发布验证、实时通话逐轮记忆、Obsidian 式 Memory Graph、Global Workspace/J-Space 类实验和外部工程接入，统一见 [`docs/roadmap-memory-brain.md`](docs/roadmap-memory-brain.md)。未标记为 released 的阶段不作为当前正式版能力承诺。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。
 
-> **隐私**：所有 Key、观众画像、头像、参考音频路径仅写入本机配置目录的 `settings.json`（Windows 为 `%APPDATA%\<应用ID>\`），**不进仓库、不上传**；请求由内置本地代理（Rust `api.rs` / `realtime.rs` / `voice_service.rs`）直连各服务商或本机模型，不经任何第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
+> **隐私**：所有 Key、观众画像、头像、参考音频路径仅写入本机配置目录的 `settings.json`，长期记忆数据库写入同目录的 `memory-v3.sqlite3`（Windows 为 `%APPDATA%\<应用ID>\`），均不进仓库。Memory v3 当前与 `settings.json` 一样是本机明文存储，尚未引入 SQLCipher；数据库、召回结果和统计不作为遥测上传，但在线文字模式会把允许记忆的会话批次直发给当前配置的 DeepSeek 做巩固，本地 Ollama 模式则留在本机。其它聊天、识图和语音请求也由内置本地代理（Rust `api.rs` / `realtime.rs` / `voice_service.rs`）直连相应服务商或本机模型，不经额外第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
 
 ### 配置
 
-托盘菜单选 **设置…** 打开设置窗口，按分区填写：AI 服务 Key、语音服务（后端 / 参考音频 / 音量）、模型与人格、观众画像、头像与外观、快捷键与气泡尺寸。保存后即时生效（快捷键会重注册、聊天窗口按新尺寸重定位；切换本地语音后端，或修改 CosyVoice Key / 音色 / 模型，会自动启动或重启本机语音服务）。
+托盘菜单选 **设置…** 打开设置窗口，按分区填写：AI 服务 Key、语音服务（后端 / 参考音频 / 音量）、模型与人格、观众画像、头像与外观、快捷键与气泡尺寸；“记忆”页可管理当前人设/用户的长期记忆。保存后即时生效（快捷键会重注册、聊天窗口按新尺寸重定位；切换本地语音后端，或修改 CosyVoice Key / 音色 / 模型，会自动启动或重启本机语音服务）。
 
 ### 本地语音说明
 
@@ -139,6 +141,7 @@ src/                  前端（渲染层，随前端一起打包）
 src-tauri/            Rust 主进程
   src/lib.rs          透明置顶穿透窗口、托盘菜单、开机自启、设置持久化、全局快捷键、聊天/设置窗口管理、IPC 命令；macOS 隐藏 Dock
   src/api.rs          本地 AI 代理：聊天 / TTS / 语料下发（/api/assets）
+  src/memory.rs       Memory v3：SQLite schema、巩固队列、事实演化、召回、管理 IPC 与测试
   src/realtime.rs     本地实时语音 WS 桥接（前端 ↔ 火山或本机语音服务）
   src/voice_service.rs 本地 Python 语音服务生命周期（启动 / 重启 / 日志）
   src/persona_assets.rs 人设语料 XOR 解密（编译期嵌入 persona-assets.enc）

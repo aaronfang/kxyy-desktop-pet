@@ -288,6 +288,105 @@ fn messages_have_image(messages: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Memory v3 后台巩固使用的非流式文字补全。
+/// 在线复用当前规范化后的 DeepSeek 非思考模型；本地复用当前 Ollama 模型并关闭思考，
+/// 避免维护任务抢占过多 token。该函数不开放新的 HTTP 路由，只供 Rust 内部调用。
+pub(crate) fn complete_memory_json(
+    app: &AppHandle,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
+    let cfg = crate::ai_config(app);
+    let is_local = cfg.text_provider == "local";
+    let (url, model, api_key, provider) = if is_local {
+        let model = if cfg.local_text_model.trim().is_empty() {
+            crate::local_text::DEFAULT_MODEL.to_string()
+        } else {
+            cfg.local_text_model.clone()
+        };
+        (
+            format!("{OLLAMA_CHAT_BASE_URL}/chat/completions"),
+            model,
+            "ollama".to_string(),
+            "本地模型",
+        )
+    } else {
+        if cfg.deepseek_key.trim().is_empty() {
+            return Err("未配置 DeepSeek API Key，记忆已留在待处理队列".into());
+        }
+        (
+            format!("{TEXT_BASE_URL}/chat/completions"),
+            normalize_deepseek_model("", false).to_string(),
+            cfg.deepseek_key.clone(),
+            "DeepSeek",
+        )
+    };
+    let mut payload = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role":"system","content":system},
+            {"role":"user","content":user}
+        ],
+        "stream": false,
+        "temperature": 0.1,
+        "max_tokens": if is_local { 1800 } else { 1400 }
+    });
+    if is_local {
+        payload["reasoning_effort"] = serde_json::json!("none");
+        payload["think"] = serde_json::json!(false);
+    } else {
+        apply_deepseek_generation_options(&mut payload, false, 0.1);
+    }
+    payload["response_format"] = serde_json::json!({"type":"json_object"});
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        let client = reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(180))
+            .tcp_nodelay(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&payload)
+            .send()
+        {
+            Ok(response) => {
+                let status = response.status();
+                let raw = response.text().unwrap_or_default();
+                if !status.is_success() {
+                    return Err(if is_local {
+                        local_ollama_error_message(status.as_u16(), &raw)
+                    } else {
+                        format!("{provider} 错误 {}", status.as_u16())
+                    });
+                }
+                if is_local {
+                    crate::local_text::touch_keep_alive(&model);
+                }
+                let data: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|e| format!("{provider} 返回非 JSON：{e}"))?;
+                return data
+                    .get("choices")
+                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.get("message"))
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| format!("{provider} 返回了空的记忆整理结果"));
+            }
+            Err(e) => {
+                last_error = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(200 * (attempt + 1)));
+            }
+        }
+    }
+    Err(format!("连接{provider}失败：{last_error}"))
+}
+
 fn proxy_chat(
     app: &AppHandle,
     client: &reqwest::blocking::Client,

@@ -1,5 +1,6 @@
 mod api;
 mod local_text;
+mod memory;
 mod persona_assets;
 mod realtime;
 
@@ -838,8 +839,8 @@ fn commit_settings<F: FnOnce(&mut Settings)>(app: &AppHandle, f: F) {
     rebuild_tray(app);
 }
 
-/// 托盘「退出」：先通知 chat 窗口把未落盘的对话总结进长期记忆，再退出。
-/// chat 完成后会 invoke `memory_flushed`；超时兜底，避免总结卡住导致退不出。
+/// 托盘「退出」：先通知 chat 窗口把未落盘消息写入持久化队列，再退出。
+/// 后台 LLM 巩固不在退出路径上；超时只兜底前端或数据库 IPC 异常。
 fn request_quit_with_memory_flush(app: &AppHandle) {
     let state = app.state::<AppState>();
     if state.quitting.swap(true, Ordering::SeqCst) {
@@ -848,7 +849,7 @@ fn request_quit_with_memory_flush(app: &AppHandle) {
     let _ = app.emit("flush-memory-before-quit", ());
     let app2 = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(12));
+        std::thread::sleep(Duration::from_secs(6));
         app2.exit(0);
     });
 }
@@ -1442,6 +1443,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         local_text_model = guard.local_text_model.clone();
     }
     local_text::ensure(&app, &text_provider, &local_text_model);
+    // Key、服务商或本地模型恢复可用后，立即唤醒之前退避中的记忆任务。
+    memory::retry_pending_now(&app);
 }
 
 /// 只读探测本地文字模型（Ollama）状态，不改变系统状态。
@@ -1592,6 +1595,8 @@ pub fn run() {
                 });
             let realtime_port = realtime::start(handle.clone(), realtime_provider).unwrap_or(0);
             app.manage(voice_service::VoiceServiceManager::new());
+            let memory_state = memory::MemoryState::open(&handle);
+            app.manage(memory_state);
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
@@ -1621,6 +1626,7 @@ pub fn run() {
             voice_service::ensure(&handle, &settings.realtime_backend, &voice_fp);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
+            memory::trigger_worker(&handle);
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
@@ -1686,7 +1692,15 @@ pub fn run() {
             list_local_text_models,
             pull_local_text_model,
             install_vad_shadow_runtime,
-            install_sensevoice_runtime
+            install_sensevoice_runtime,
+            memory::memory_status,
+            memory::memory_recall,
+            memory::memory_enqueue_session,
+            memory::memory_list,
+            memory::memory_update,
+            memory::memory_delete,
+            memory::memory_clear_scope,
+            memory::memory_import_legacy
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -28,7 +28,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-There is no linter configured. Realtime voice has deterministic JS/Python/Rust tests that do not require an account, microphone, or model. Build artifacts land in `src-tauri/target/release/bundle/`.
+There is no linter configured. Realtime voice has deterministic JS/Python/Rust tests that do not require an account, microphone, or model; Memory v3 has Rust coverage in `src-tauri/src/memory.rs`. Build artifacts land in `src-tauri/target/release/bundle/`.
 
 ## Architecture
 
@@ -48,6 +48,8 @@ There is no linter configured. Realtime voice has deterministic JS/Python/Rust t
 - `GET /api/assets` — decrypted persona corpus.
 
 For `/api/chat`, ordinary WebView `stream:true` responses are deliberately buffered and returned with `Content-Length` for Windows WebView2 compatibility. Only the managed local realtime Python service may request direct SSE, using the App-managed internal secret and `provider:"text"`; do not add that secret header to the browser CORS allow-list or log/forward it.
+
+**Memory Brain** (`src-tauri/src/memory.rs` + `src/chat.js` + settings UI): Memory v3 stores long-term facts, episodes, commitments, source snippets, revisions, and asynchronous consolidation jobs in a local bundled-SQLite database named `memory-v3.sqlite3`. Text chat performs selective recall before each normal response and falls back to recent turns plus the rolling digest if memory is unavailable. The settings window provides list-based search/edit/pin/fulfill/delete/clear controls. All future schema, realtime-call memory, Memory Graph, Global Workspace/J-Space-inspired research, and external integration work must follow [`docs/roadmap-memory-brain.md`](docs/roadmap-memory-brain.md); do not reintroduce full `localStorage` memory injection or learn changes to persona/system/skill rules.
 
 **Realtime voice call** (`src-tauri/src/realtime.rs` + `src/ai/realtime.js`): full-duplex voice chat with Volcano's 端到端实时语音大模型 (RealtimeDialog). A phone button (`#call-btn`) at the left of the chat composer starts/ends a call; it turns red (`.in-call`) while active. Settings fields: `realtimeAppId`, `realtimeAccessKey`, optional `realtimeVoice` (empty → reuse TTS `ttsVoice`). Architecture:
 - **Rust side** runs a second loopback server — a `tokio`/`tokio-tungstenite` WebSocket bridge on its own random port (`invoke("get_realtime_base")` → `ws://127.0.0.1:<port>`). It's needed because browser WebSockets can't set the `X-Api-*` auth headers Volcano requires; keys, the binary frame protocol, and gzip all stay in Rust. **All Volcano protocol constants (endpoint, resource id, event codes, frame layout) live in the `protocol` submodule and must be verified against your account's official docs** — they couldn't be fetched during implementation.

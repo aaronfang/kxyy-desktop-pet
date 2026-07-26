@@ -1,6 +1,6 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
-import { clearAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
+import { clearAllMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -174,6 +174,7 @@ function fill(s) {
   el("showChatDebug").checked = s.showChatDebug === true;
   el("vadShadowEnabled").checked = s.vadShadowEnabled === true;
   el("personaCardId").value = s.personaCardId || "";
+  if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
@@ -232,12 +233,21 @@ async function loadCardList() {
     opt.dataset.desc = card.description || "";
     sel.appendChild(opt);
   }
+  const memorySel = el("memoryCardId");
+  if (memorySel) {
+    const selected = memorySel.value;
+    memorySel.replaceChildren(...Array.from(sel.options, (option) => option.cloneNode(true)));
+    memorySel.value = Array.from(memorySel.options).some((option) => option.value === selected)
+      ? selected
+      : sel.value;
+  }
   updateCardInfoDisplay();
 }
 
 async function onCardChanged() {
   const sel = el("personaCardId");
   const cardId = sel.value.trim();
+  if (el("memoryCardId")) el("memoryCardId").value = cardId;
 
   _lastCardId = cardId;
   updateCardInfoDisplay();
@@ -263,6 +273,10 @@ async function onCardChanged() {
   syncVoiceFields();
   probeBackendStatus();
   updateCardLabels();
+  if (el("tab-memory")?.classList.contains("active")) {
+    await migrateSelectedCardMemory();
+    await loadMemoryPage({ resetPage: true });
+  }
 }
 
 /** 有仓库内置参考音的人设（assets/<cardId>/）；空 cardId = 默认开心元元。 */
@@ -934,6 +948,193 @@ listen("sensevoice-runtime-install-progress", ({ payload }) => {
   }
 });
 
+let memoryPage = 1;
+let memoryTotal = 0;
+let memoryCounts = { facts: 0, episodes: 0, commitments: 0 };
+const MEMORY_PAGE_SIZE = 30;
+
+function memoryKindLabel(kind) {
+  return { fact: "事实", episode: "经历", commitment: "约定" }[kind] || kind;
+}
+
+function memoryStatusLabel(status) {
+  return {
+    active: "有效", disputed: "待确认", superseded: "已被替代", forgotten: "已遗忘",
+    pending: "待兑现", fulfilled: "已兑现", cancelled: "已取消", expired: "已过期",
+  }[status] || status;
+}
+
+function formatMemoryDate(ts) {
+  if (!ts) return "";
+  try { return new Date(ts * 1000).toLocaleDateString("zh-CN"); } catch (_) { return ""; }
+}
+
+async function migrateSelectedCardMemory() {
+  const cardId = selectedMemoryCardId();
+  try {
+    await invoke("memory_import_legacy", { request: { cardId, memories: loadAllMemory(cardId) } });
+  } catch (_) {}
+}
+
+function selectedMemoryCardId() {
+  return (el("memoryCardId")?.value ?? el("personaCardId").value).trim();
+}
+
+async function refreshMemoryStats() {
+  const box = el("memoryStats");
+  if (!box) return;
+  try {
+    const status = await invoke("memory_status");
+    const kb = Math.max(0, Math.round((status.databaseBytes || 0) / 1024));
+    box.replaceChildren();
+    for (const text of [
+      status.available ? "Memory v3 已就绪" : "记忆数据库不可用",
+      `事实 ${memoryCounts.facts || 0}`,
+      `经历 ${memoryCounts.episodes || 0}`,
+      `约定 ${memoryCounts.commitments || 0}`,
+      `待巩固 ${status.pendingJobs || 0}`,
+      `跳过 ${status.skippedJobs || 0}`,
+      `数据库 ${kb} KB`,
+    ]) {
+      const span = document.createElement("span");
+      span.textContent = text;
+      box.appendChild(span);
+    }
+    if (status.lastError) box.title = status.lastError;
+  } catch (e) {
+    box.textContent = `读取状态失败：${e.message || e}`;
+  }
+}
+
+function memoryActionButton(label, action, className = "ghost") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", action);
+  return button;
+}
+
+function renderMemoryItems(items) {
+  const list = el("memoryList");
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "memory-empty";
+    empty.textContent = "暂无符合条件的记忆";
+    list.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = "memory-card";
+    const head = document.createElement("div");
+    head.className = "memory-card-head";
+    const kind = document.createElement("span");
+    kind.className = "memory-kind";
+    kind.textContent = memoryKindLabel(item.kind);
+    const meta = document.createElement("span");
+    meta.className = "memory-card-meta";
+    const confidence = item.kind === "fact" ? ` · 置信度 ${Math.round((item.confidence || 0) * 100)}%` : "";
+    meta.textContent = `${item.nickname || "匿名"} · ${memoryStatusLabel(item.status)}${confidence}${item.occurredAt ? ` · ${formatMemoryDate(item.occurredAt)}` : ""}`;
+    head.append(kind, meta);
+    const text = document.createElement("p");
+    text.className = "memory-card-text";
+    text.textContent = item.text;
+    card.append(head, text);
+    if (item.sourceExcerpt) {
+      const source = document.createElement("p");
+      source.className = "memory-source";
+      source.textContent = `来源片段\n${item.sourceExcerpt}`;
+      card.appendChild(source);
+    }
+    const actions = document.createElement("div");
+    actions.className = "memory-card-actions";
+    actions.appendChild(memoryActionButton(item.pinned ? "取消置顶" : "置顶", async () => {
+      await invoke("memory_update", { request: { kind: item.kind, id: item.id, pinned: !item.pinned } });
+      await loadMemoryPage();
+    }));
+    actions.appendChild(memoryActionButton("编辑", async () => {
+      const next = window.prompt("修改这条记忆：", item.text);
+      if (next == null || !next.trim() || next.trim() === item.text) return;
+      await invoke("memory_update", { request: { kind: item.kind, id: item.id, text: next.trim() } });
+      await loadMemoryPage();
+    }));
+    if (item.kind === "commitment" && item.status === "pending") {
+      actions.appendChild(memoryActionButton("标记已兑现", async () => {
+        await invoke("memory_update", { request: { kind: item.kind, id: item.id, status: "fulfilled" } });
+        await loadMemoryPage();
+      }));
+    }
+    actions.appendChild(memoryActionButton("删除", async () => {
+      if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
+      await invoke("memory_delete", { request: { items: [{ kind: item.kind, id: item.id }] } });
+      await loadMemoryPage();
+    }, "danger"));
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+}
+
+async function loadMemoryPage({ resetPage = false } = {}) {
+  if (!el("memoryList")) return;
+  if (resetPage) memoryPage = 1;
+  const cardId = selectedMemoryCardId();
+  try {
+    const result = await invoke("memory_list", {
+      query: {
+        cardId,
+        nickname: el("memoryNickname").value.trim(),
+        kind: el("memoryKind").value,
+        status: el("memoryStatus").value,
+        search: el("memorySearch").value.trim(),
+        page: memoryPage,
+        pageSize: MEMORY_PAGE_SIZE,
+      },
+    });
+    memoryTotal = result.total || 0;
+    memoryCounts = result.counts || { facts: 0, episodes: 0, commitments: 0 };
+    renderMemoryItems(result.items || []);
+    const pages = Math.max(1, Math.ceil(memoryTotal / MEMORY_PAGE_SIZE));
+    el("memoryPageInfo").textContent = `第 ${memoryPage} / ${pages} 页 · 共 ${memoryTotal} 条`;
+    el("memoryPrev").disabled = memoryPage <= 1;
+    el("memoryNext").disabled = memoryPage >= pages;
+    await refreshMemoryStats();
+  } catch (e) {
+    el("memoryList").textContent = `读取记忆失败：${e.message || e}`;
+  }
+}
+
+el("memoryRefresh")?.addEventListener("click", () => loadMemoryPage({ resetPage: true }));
+for (const id of ["memoryNickname", "memoryKind", "memoryStatus"]) {
+  el(id)?.addEventListener("change", () => loadMemoryPage({ resetPage: true }));
+}
+el("memoryCardId")?.addEventListener("change", async () => {
+  await migrateSelectedCardMemory();
+  await loadMemoryPage({ resetPage: true });
+});
+let memorySearchTimer = null;
+el("memorySearch")?.addEventListener("input", () => {
+  clearTimeout(memorySearchTimer);
+  memorySearchTimer = setTimeout(() => loadMemoryPage({ resetPage: true }), 250);
+});
+el("memoryPrev")?.addEventListener("click", () => { if (memoryPage > 1) { memoryPage--; void loadMemoryPage(); } });
+el("memoryNext")?.addEventListener("click", () => {
+  if (memoryPage * MEMORY_PAGE_SIZE < memoryTotal) { memoryPage++; void loadMemoryPage(); }
+});
+document.querySelector('.tab-btn[data-tab="memory"]')?.addEventListener("click", async () => {
+  await migrateSelectedCardMemory();
+  await loadMemoryPage({ resetPage: true });
+});
+
+async function clearCurrentCardMemory(statusNode, cardId = selectedMemoryCardId()) {
+  await invoke("memory_clear_scope", { request: { cardId, nickname: "" } });
+  clearAllMemory(cardId);
+  await emit("memory-cleared", { cardId });
+  if (statusNode) statusNode.textContent = "已清空";
+  await loadMemoryPage({ resetPage: true });
+}
+
 el("clearMemory").addEventListener("click", async () => {
   const ok = window.confirm(
     "确定清空当前人设卡的长期记忆？\n\n此操作只清当前人设卡下的记忆，不影响其他人设卡的记忆。此操作不可撤销。",
@@ -943,10 +1144,8 @@ el("clearMemory").addEventListener("click", async () => {
   const st = el("clearMemoryStatus");
   btn.disabled = true;
   try {
-    clearAllMemory(el("personaCardId").value.trim());
-    await emit("memory-cleared", {});
+    await clearCurrentCardMemory(st, el("personaCardId").value.trim());
     st.style.color = "#16a34a";
-    st.textContent = "已清空";
   } catch (e) {
     st.style.color = "#dc2626";
     st.textContent = `失败：${e.message || e}`;
@@ -956,6 +1155,22 @@ el("clearMemory").addEventListener("click", async () => {
       st.textContent = "";
       st.style.color = "";
     }, 2500);
+  }
+});
+
+el("memoryClearAll")?.addEventListener("click", async () => {
+  if (!window.confirm("确定永久清空当前人设卡下全部长期记忆？\n\n数据库记录、来源片段和待巩固会话都会删除，此操作不可撤销。")) return;
+  const btn = el("memoryClearAll");
+  const st = el("memoryManageStatus");
+  btn.disabled = true;
+  try {
+    await clearCurrentCardMemory(st);
+    st.style.color = "#16a34a";
+  } catch (e) {
+    st.style.color = "#dc2626";
+    st.textContent = `失败：${e.message || e}`;
+  } finally {
+    btn.disabled = false;
   }
 });
 
@@ -970,6 +1185,7 @@ async function init() {
   // 人设卡回退到默认 kxyy-yuanyuan。
   await loadCardList();
   await load();
+  await migrateSelectedCardMemory();
   _lastCardId = el("personaCardId").value.trim();
   updateCardInfoDisplay();
   if (_lastCardId) {

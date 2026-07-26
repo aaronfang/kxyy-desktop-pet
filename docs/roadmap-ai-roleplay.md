@@ -3,6 +3,8 @@
 > 本文档基于对仓库当前代码（`src/`、`src-tauri/`、`shared/`、`scripts/`）的通读式评审产出，**不包含任何代码改动**，仅供后续立项决策参考。所有诊断与建议均标注了对应的代码位置，避免空泛建议。
 >
 > 实时语音、自然打断、流式管线和情绪语音的深入调研已拆分到 [《实时语音与情绪语音优化路线图》](./roadmap-realtime-voice.md)。本文件只保留角色扮演视角下的摘要，避免两份技术方案漂移。
+>
+> **记忆系统说明（2026-07-26）**：本文早期提出的 `localStorage` 记忆改造方案已被 Memory v3 取代。长期记忆、实时通话记忆、Memory Graph、Global Workspace/J-Space 类实验和外部接入的架构与优先级，统一以 [《Memory Brain 开发路线图》](./roadmap-memory-brain.md) 为准；本文只保留角色体验依赖，不再定义记忆 schema。
 
 ---
 
@@ -80,8 +82,8 @@ graph TD
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
 | 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR 与诊断 schema v5，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Windows/Linux Qwen TTS/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
-| 长期记忆 | — | `localStorage`（按昵称分档） | `persona.js` | 仅浏览器本地，无跨设备同步 |
-| 会话摘要 | 复用文字模型 | 同上 | `persona.js::updateRollingDigest` | 滚动摘要覆盖超窗口旧对话 |
+| 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3 | `memory.rs` + Tauri IPC | 事实/经历/约定、异步巩固、选择性召回和管理页；当前工作树 locally verified，尚未正式发布 |
+| 会话摘要 | 复用文字模型 | 同上 | `chat.js` + Memory v3 | 最近对话与滚动摘要保留为工作记忆，跨会话不再全量注入 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |
 
 ### 1.3 三窗口与联动机制
@@ -108,8 +110,7 @@ graph TD
 | AI 只会等用户先说话 | `src/ai/persona.js` 的 `PROACTIVE_HINT` 常量已经写好 `welcome`（观众刚来）、`comeback`（离开又回来）、`idle`（沉默主动搭话）三套完整 prompt 模板，`buildMessages()` 支持 `proactiveKind` 参数；但**全仓搜索确认 `src/chat.js` 仅在两处传入 `proactiveKind`：`"followup"`（1406行）与 `"pat"`（1464行）**，`welcome`/`comeback`/`idle` 从未被调度过。 | AI 角色扮演最有代入感的"主动找你聊天"能力已经在逻辑层写好，只差桌面端一个触发调度器，是全项目**性价比最高的技术债**。 |
 | **直播场景"下班感"过重——对话被直播间框死** | `computeLiveContext()`（第 399-497 行）每轮对话都向 system prompt 注入详细的直播状态机：周一休息日、20:30 开播时间表、PK/打野/梳妆/唱歌/回家段等环节阶段、"距开播还有 X 小时"倒计时等。虽然 `OFF_AIR_NOTE`（第 394 行）已在下播时段禁止播报直播状态，但 system prompt 仍以直播为核心场景构建上下文——AI 每轮都能"看到"这些状态，倾向于用"刚开播呢""一会要下播了""还没开播呢""今天周一休息"作为话头或回应的一部分。用户期望以主播**身份**像朋友日常唠嗑，而非每轮都被提醒"你现在在直播间里"。<br><br>**更新（2026-07-12）**：`computeLiveContext()` 已重构——硬编码的 `20:30` 开播时间和固定阶段流程（PK→打野→唠嗑→跳舞→梳妆→唱歌→回家段）均改为由 `lore.open_time` / `lore.live_stages` 驱动，抽取 `guessStage()` 独立函数。主播侧行为已参数化，但"淡化直播场景、切换为日常聊天模式"的整体体验目标仍需在 P0 中完成 system prompt 层面的语境调整。 | 体验是"在直播间里跟主播聊天"，而非"跟主播像朋友一样聊天"。直播间状态作为默认上下文过于强势，深层原因是 `computeLiveContext` 的逻辑设计之初就是为了给 AI 提供"现在该干什么"的直播脚本，而非"现在跟朋友聊什么"的日常话题提示。**已参数化但未淡化——仍待 P0 工作。** |
 | 单一固定人设 | 语料链路：`persona-assets.js`(明文) → `encrypt-assets.mjs`(XOR) → `persona-assets.enc`(编译期 `include_bytes!` 嵌入) → `persona_assets.rs`(运行时解密) → `/api/assets` 一次性下发。整条链路**只支撑一份人设**，没有"人设 ID"概念，也没有存储多份语料的数据结构。<br><br>**更新（2026-07-12）**：`persona_assets.rs` 已重构为"编译期默认 + 运行时动态覆盖"双通道架构——通过 `load_card_from_file()` 从 `persona-cards/<card_id>/persona-card.json` 动态加载人格卡覆盖编译期嵌入的默认值。`Settings.persona_card_id` + `set_persona_card` IPC 命令已在 Rust 侧就绪，**但前端（设置页）尚缺人格卡选择/切换 UI**，暂无法让最终用户直接操作。 | 无法做"多角色切换"（例如同时提供温柔系/毒舌系/职场系人设供用户选），扩展新角色卡需要改代码重新编译，而非配置文件级操作。**后端已支持动态加载，前端 UI 待补齐。** |
-| 长期记忆仅"事实/承诺/话题"三类，无结构化元数据 | `persona.js` 的 `memory` 结构只有 `facts`（纯字符串数组）/`promises`/`topics_recent`/`sessions`，无情感状态（好感度、亲密度、当前心情）字段；每条 `fact` 没有时间戳、重要性、提及次数等元数据，无法实现"最近提过就暂时跳过"的冷却逻辑。 | 记忆是"知道什么"，不是"关系如何"；也无法区分"刚记住的事"和"半年前的事"。 |
-| **记忆重复提起——同一件事被反复唠叨** | `renderMemoryBlock()`（第 305-328 行）每次将全部 `facts` 注入 system prompt，没有"最近 N 轮已提过"的冷却机制；`SUMMARIZE_SYSTEM`（第 797 行）抽取新事实时也没有"避免与已有事实语义重复"的约束。典型表现：用户说过"去看电影"后，AI 在多轮对话中反复问"你去看电影了没有"——那条 fact 一直在 prompt 里，LLM 每次都想"关心一下"。 | 用户产生"这 AI 怎么老提同一件事"的厌烦感，严重破坏真人唠嗑的真实感。 |
+| Memory v3 已解决旧版全量注入与纯字符串事实问题，但关系和联想能力仍有限 | 当前工作树已使用带来源、置信度、有效期和状态的事实/经历/约定，并按当前消息最多召回 6 条；尚缺统一事件日志、claim/evidence、规范化实体关系、实时通话逐轮召回和图形化关系管理。 | 当前发布重点是把已实现基线验证完整；后续能力严格按 [Memory Brain M0–M6](./roadmap-memory-brain.md#4-分阶段路线与硬门槛) 推进，避免在角色 prompt 内另造记忆机制。 |
 | 观众画像三档但无法自主创建新角色关系模板 | `resolveUserProfile()` 只处理"本人 ππ 完整画像 / 自填字段 / 默认元宝"三种，`persona_relationship`/`persona_facts` 等字段是**扁平文本框**，非结构化数据。 | 关系设定难以复用/导出/分享。 |
 | 深聊模式已有但触发面窄 | `detectDeepIntent()` 靠正则匹配"你觉得/展开说"等固定句式，非语义理解。 | 用户换种问法（比如"哎我最近很烦"这种没有疑问词的话）大概率不会触发深聊，体验不稳定。 |
 
@@ -149,8 +150,8 @@ graph TD
 | 现状 | 具体缺口 | 影响 |
 |---|---|---|
 | `chat.js` 单文件过重 | 1300+ 行涵盖 UI、请求编排、TTS 队列、通话状态机、debug 面板、记忆落盘等职责，无拆分模块边界。 | 后续新增"主动性调度""好感度系统"等功能会进一步堆积到这一个文件，可维护性下降。 |
-| persona 纯函数缺少自动化测试，且无 lint | 实时语音已有不依赖账户/麦克风/模型的 JS、Python、Rust 确定性测试，但 `persona.js` 的拆条、记忆和主动性判定仍缺少专门单测；仓库也没有 lint。 | 实时语音基础有回归保护；后续角色扮演改动仍应先补 persona 纯函数测试。 |
-| 设置页是长表单，无人设/角色管理视图 | `settings.html` 六个 `<section>` 平铺，没有"角色卡管理""记忆浏览器"这类可视化管理入口；清空记忆只有一个按钮，无法查看/编辑具体记忆条目。 | 用户对 AI"记住了什么"缺乏可见性和可控性，信任感打折扣。 |
+| persona 纯函数缺少自动化测试，且无 lint | 实时语音已有不依赖账户/麦克风/模型的 JS、Python、Rust 确定性测试，Memory v3 已有 16 个 Rust 单测；但 `persona.js` 的拆条和主动性判定仍缺少专门单测，仓库也没有 lint。 | 实时语音与记忆内核已有回归保护；后续角色扮演改动仍应先补 persona 纯函数测试。 |
+| 设置页已有列表式记忆管理，但没有关系图 | Memory v3 管理页支持搜索、筛选、编辑、置顶、兑现、删除和按人设清空；人格卡管理和 Obsidian 式 Memory Graph 仍未完成。 | 用户已能精确管理记忆；关系理解、来源探索和批量图形操作留到 Memory Brain M3。 |
 | 本地模型跨平台维护成本高但已有良好抽象 | `voice_service.rs`/`local_text.rs` 已经做了较完善的探测/拉起/日志回传，是本项目工程质量较高的部分，值得复用其模式（状态机 + `-status` 事件推送）扩展到新功能。 | 非缺口，是可复用的**正向资产**，新功能应尽量复用这套"本地服务生命周期管理"范式而非另起一套。 |
 
 ---
@@ -164,19 +165,18 @@ graph TD
 | 特性 | 说明 | 价值 | 涉及文件 | 复杂度 |
 |---|---|---|---|---|
 | **接入 idle/welcome/comeback 主动性调度** | 在 `chat.js` 新增一个轻量计时器/状态机：窗口打开时判定是"首次打开(welcome)"还是"隔了一段时间再打开(comeback)"；聊天窗口保持打开且用户静默超过阈值（如 90s）触发一次 `idle`。复用已有的 `getProactiveUserTrigger()` / `PROACTIVE_HINT` / `buildMessages({proactiveKind})`，无需改 `persona.js`。 | 直接激活已经写好但沉睡的"AI主动找你聊天"能力，是投入产出比最高的一项，能立刻让互动感从"你问我答"变成"她也会主动搭话"。 | `src/chat.js`（新增调度逻辑）；只读依赖 `src/ai/persona.js` | 中 |
-| **人设情感状态（好感度/心情）字段** | 在 `memory` 结构追加 `affinity`（数值好感度）与 `mood`（当前心情枚举），由 `updateMemoryAfterSession()` 的总结 LLM 调用顺带产出，渲染到设置页或聊天窗口一个小指示器。 | 把"记忆"从"知道什么事"升级为"关系状态"，为后续好感度玩法（3.2）打基础。 | `src/ai/persona.js`（扩展 `memory` schema 与总结 prompt）、`src/chat.js`（读取展示） | 中 |
+| **人设关系状态（好感度/心情）** | 在 Memory Brain M1 的 `persona-relationship` scope 稳定后，单独设计可解释的关系状态；输入来自有来源的互动事件，用户可查看/纠正，不让一次 LLM 总结直接改写人格或关系等级。 | 把“知道什么事”和“关系如何”分开，既支撑长期玩法，也避免隐藏数值漂移。 | Memory Core 关系状态 + `src/chat.js` 展示；不得直接扩展旧 `persona.js` memory schema | 大 |
 | **多人设配置化（人设包）** | 设计一个"人设包"JSON 格式（system prompt + few-shot + 直播场境规则等，结构对齐现有 `assets` 形状），支持用户在设置页导入/切换；默认仍保留内置加密人设为"官方默认包"，新增人设包以**明文本地文件**形式存放（不加密，因为是用户自制内容，无版权顾虑）。 | 从"单一人设"跃升到"可切换人设"，是长期生态价值最大的一项，但需要设计新的存储/加载/切换机制，改动面较大。 | `src-tauri/src/lib.rs`(新 `Settings.persona_pack_id` 字段+IPC)、`src/ai/persona.js`(`loadAssets()` 增加来源分支)、`src/settings.html/js`(管理 UI) | 大 |
 | **结构化关系画像编辑器** | 把 `personaFacts`/`personaJokes` 等自由文本框升级为"标签式"结构化输入（类似待办列表：facts 逐条可增删而非一个 textarea），复用现有 `renderUserBlock()` 渲染逻辑，只改前端输入方式。 | 降低用户填写门槛，减少格式错误（当前多行文本框容易出现空行/格式不一致）。 | `src/settings.html/js` | 小 |
 | **语义化深聊触发（补充正则方案）** | 在现有 `detectDeepIntent()` 正则基础上，增加一个轻量判定：若上一条 AI 回复已经很短且用户新消息字数明显长（如 >40 字且无明显情绪词），也判定为深聊倾向，作为正则的补充而非替换。 | 提升深聊模式触发的召回率，成本很低。 | `src/ai/persona.js::detectDeepIntent` | 小 |
 | **淡化直播场景、切换为"主播日常聊天"模式** | 修改 `computeLiveContext()`：**仅保留时间/星期/日期等纯时间信息**，去掉全部直播状态机（开播时间表、环节阶段、PK/打野/梳妆/唱歌进度、周一休息提醒、"距离开播还有X小时"等）。改为注入一个"日常状态提示"：告知 AI 现在是几点、星期几，不用主动聊直播——但被问起时可以自然地聊直播相关话题。同时在 system prompt 中强调：**你是主播，但你现在是以朋友身份聊天，不是在工作**。这一调整可以直接让 AI 从"直播打工人"视角切换到"日常闲聊的朋友"视角。 | 解决用户最核心的体验痛点——AI 不再每轮围绕直播间状态说话，聊天更自然、更松弛。"主播"身份作为背景保留，但日常以朋友唠嗑为主。改动集中在单一函数内，副作用可控。 | `src/ai/persona.js::computeLiveContext` | 中 |
-| **记忆元数据化 + 冷却 + 去重** | 三步改进：① **Fact 元数据化**：将 `facts` 从 `string[]` 升级为 `{text, first_seen, last_mentioned, mention_count}[]`，在 `renderMemoryBlock` 中实现冷却逻辑——`mention_count >= 2` 且最后一次提及在最近 3 轮内的 fact 自动跳过不注入 prompt。② **抽取去重**：在 `SUMMARIZE_SYSTEM` 中增加"若新事实与已有事实语义重复/高度相近，请写 clear、不要重复抽取"的约束。③ **prompt 注入策略优化**：`renderMemoryBlock` 不再全量注入，改为优先级排序：最近 3 次会话内新增的 + 从未在对话中被提及过的 fact 排前面；已被反复提及的事实排后面或暂不注入。 | 解决"AI 老提同一件事"的厌烦问题，同时保持记忆的有效性——AI 仍然记得，但不会每轮都拿出来说。P0 级别体验问题，改动仅在 `persona.js` 内部，且向后兼容（读取旧格式 `string[]` 自动升级为带元数据格式）。 | `src/ai/persona.js`（`memory` schema、`renderMemoryBlock`、`updateMemoryAfterSession`、`SUMMARIZE_SYSTEM`） | 中 |
-| **扩展记忆层级：事实/承诺/观点/偏好** | 在现有 `facts`/`promises`/`topics_recent` 之外，增加 `opinions`（用户对某些事物的看法）和 `preferences`（从对话中抽取的用户偏好/习惯，区别于手动填写的 `userProfile.preferences`）。这两类信息来自对话自然抽取，不需要用户主动填写。同时重构 `SUMMARIZE_SYSTEM` 的 JSON schema 使其产出更结构化的分类。 | 让 AI 从"知道用户几件事"升级为"了解用户是个什么样的人"——这是角色扮演是否像"熟人"的关键区别。 | `src/ai/persona.js`（`memory` schema、`SUMMARIZE_SYSTEM`） | 中 |
+| **Memory Brain 分层演进** | Memory v3 已完成事实/经历/约定、元数据、冲突演化、异步巩固和选择性召回；事件、证据、scope、关系图、实时语音与外部 connector 不在本文件继续拆方案。 | 保持角色体验和记忆内核边界清晰，防止通过修改 `persona.js` 或堆叠 prompt 绕过数据正确性。 | 统一见 [Memory Brain 路线图](./roadmap-memory-brain.md) | 按 M0–M6 |
 
 ### 3.2 互动玩法
 
 | 特性 | 说明 | 价值 | 涉及文件 | 复杂度 |
 |---|---|---|---|---|
-| **好感度系统（轻量版）** | 基于 3.1 的 `affinity` 字段，设定几个阈值（如 0-100 分 5 档：初识/熟悉/朋友/挚友/知己），不同档位解锁不同 few-shot 语气或专属表情/称呼变化，通过 `renderMemoryBlock()` 注入 system prompt 告知模型当前关系档位。 | 给长期互动一个"看得见的进展"，是角色扮演类产品最经典且验证有效的粘性机制。 | `src/ai/persona.js`（好感度计算与渲染）、`src/chat.js`（UI 展示，如气泡区角标） | 中 |
+| **好感度系统（轻量版）** | 基于 3.1 的可解释关系状态设定若干等级，解锁称呼、表情或动作；变化原因可查看、可纠正，不能自动改写 system prompt 或程序性人设。 | 给长期互动一个“看得见的进展”，同时保留用户控制和人格稳定性。 | Memory Core 关系状态 + `src/chat.js`/`src/app.js` 展示与玩法 | 大 |
 | **每日签到 / 每日一句** | 每天首次打开聊天窗口时，AI 主动发一条"今日签到"话术（可复用 welcome 主动性调度的触发点，见 3.1 第一条），签到累计天数存本地，达到里程碑（7/30/100天）触发特殊台词。 | 低成本、高频的召回钩子，实现上直接搭在"welcome 主动性"这个基建之上，几乎是零增量成本的延伸功能。 | `src/chat.js`（签到计数逻辑，`localStorage`） | 小 |
 | **摸头/投喂互动扩展拍一拍机制** | 桌宠动画已有 `pet`（抚摸触发）动作，`app.js` 已监听鼠标悬停触发抚摸动画；可扩展"投喂"手势（比如往桌宠拖拽一个食物图标触发进食动画+专属台词），复用现有 `drag`/`pet` 动作与 `triggerPat()` 的"主动回复"模式。 | 利用已有动画资源做低成本的新互动形式，不需要新美术资源。 | `src/app.js`（新增手势判定）、`src/chat.js`（对应台词触发，仿 `triggerPat`） | 中 |
 | **记住用户生日/纪念日并主动庆祝** | 对称于现有 `birthdayHint()`（AI 单方面生日提示），在观众画像里加"用户生日"字段，到期时通过主动性调度（3.1）触发专属祝福话术。 | 用已验证的"时间驱动叙事"模式（`computeLiveContext` 同款思路）反过来服务用户关系，实现成本低。 | `src/ai/persona.js`（新 hint 函数）、`src/settings.html`（画像新增字段） | 小 |
@@ -211,7 +211,7 @@ graph TD
 |---|---|---|---|---|
 | **`chat.js` 按职责拆分模块** | 将通话状态机（`callSession`相关约200行）、debug 面板逻辑（`apiDebug`/`textGenDebug`/`ttsUsageDebug`相关约300行）拆成 `src/ai/call-ui.js`、`src/ai/debug-panel.js` 等独立模块，`chat.js` 仅保留编排逻辑。 | 降低后续新增功能（主动性调度、好感度系统等都会往 `chat.js` 堆）带来的维护成本，是承接本报告其它建议的**地基工作**。 | `src/chat.js` 拆分为多文件 | 中 |
 | **引入最小化测试覆盖** | 为 `src/ai/persona.js` 里的纯函数（`splitReply`/`shouldDoFollowup`/`isBadFollowupReply`/`computeLiveContext`/`detectDeepIntent` 等）补充轻量单测（如 Vitest），这些函数无副作用、纯输入输出，测试成本低但回归保护价值高。 | 本报告建议的多数功能（好感度、主动性调度、深聊判定优化）都会修改这些纯函数，测试可以显著降低"改一处、坏三处"的风险。 | 新增 `package.json` devDependency + `src/ai/*.test.js` | 中 |
-| **记忆浏览器（设置页新增视图）** | 设置页新增一个只读面板，展示当前 `localStorage` 里各昵称的 `facts`/`promises`/`topics_recent`，支持单条删除（而非现有"清空长期记忆"一刀切）。 | 直接提升用户对"AI 记住了什么"的信任感与可控性，对应 2.5 诊断中的可见性缺口。 | `src/settings.html/js`（新增 UI，直接读写 `persona.js` 已导出的 `loadAllMemory`/`saveAllMemory`） | 小 |
+| **Memory Graph（管理页增强）** | 保留现有精确列表，在 Memory v3.1 的 entity/edge/evidence 基础上增加可视化关系图和来源检查器。 | 让用户理解关系与来源，同时避免从关键词相似度绘制语义虚假的边。 | 统一见 [Memory Brain M3](./roadmap-memory-brain.md#m3memory-graph-管理工具) | 大 |
 | **错误提示分级与自诊断面板增强** | 现有 `checkApiReady()`/`svcState` 启动状态栏已有一定的健康检查雏形，可扩展为更详细的"上一次失败原因"持久化展示（比如 API 超时 vs Key 无效 vs 网络问题分开提示），复用 `voice_service.rs` 已经很成熟的"状态+日志回传"模式。 | 复用项目内已验证有效的工程模式（`voice_service.rs` 状态机），减少用户排障时打开开发者工具的需求。 | `src/chat.js`（`updateStartupStatus` 逻辑增强） | 小 |
 
 ---
@@ -224,11 +224,11 @@ graph TD
 |---|---|---|---|---|---|
 | 接入 idle/welcome/comeback 主动性调度 | 3.1 | 逻辑已在 `persona.js` 写好，只缺 `chat.js` 侧调度，投入产出比最高 | **低** | `- [ ]` |
 | **淡化直播场景、切换为"主播日常聊天"模式** | 3.1 | 用户最核心的体验痛点——AI 不再每轮说"开播/下播/还没开播"，聊天更自然。`computeLiveContext()` 已参数化解耦（开播时间/阶段流程由 lore 驱动），**剩余工作：system prompt 层面淡化直播语境** | **中** | `- [~]` 🔧 进行中（2026-07-12 已参数化） |
-| **记忆元数据化 + 冷却 + 去重** | 3.1 | 解决"AI 老提同一件事"的厌烦问题，P0 体验优先级 | **中** | `- [ ]` |
+| **Memory v3 发布闭环** | Memory Brain M0 | 元数据、冲突、异步巩固、选择性召回和管理页已实现；剩余真实 provider/E2E、跨平台构建与发布验证 | **高** | `- [~]` 🔧 locally verified，尚未发布 |
 | 每日签到 / 每日一句 | 3.2 | 直接搭在主动性调度基建之上，几乎零增量成本 | 低 | `- [ ]` |
 | **桌宠待机动作多样性扩展** | 3.2 | 不增加新素材也能丰富桌宠"活物感"，纯前端改动 | 低 | `- [ ]` |
 | 记住用户生日并主动庆祝 | 3.2 | 复用已验证的时间驱动叙事模式，成本低 | **中** | `- [ ]` |
-| 记忆浏览器（设置页） | 3.5 | 纯 UI 层，直接提升信任感 | 低 | `- [ ]` |
+| 列表式记忆管理页 | 3.5 | 已支持搜索、编辑、置顶、兑现、删除和按人设清空；Memory Graph 另列 M3 | 低 | `- [x]` ✅ 当前工作树已实现 |
 | 点歌/小彩蛋指令 | 3.2 | 纯 prompt 层彩蛋，无需新架构 | 中 | `- [ ]` |
 | 社区形象素材规范化文档 | 3.4 | 纯文档工作，零代码风险 | 无 | `- [ ]` |
 | **人设蒸馏验证**（阶段 1） | 新增 | 从 5 条直播回放 WAV 蒸馏元元人格模式，对照当前 system prompt 的差距。框架已就绪 `scripts/persona-distill/`，只需放入测试 WAV 即可跑 | 无（新增工具） | `- [x]` ✅ 2026-07-11 |
@@ -239,8 +239,8 @@ graph TD
 
 | 特性 | 来源 | 依赖关系 | 兼容 | 状态 |
 |---|---|---|---|---|---|
-| 人设情感状态（好感度/心情）字段 | 3.1 | 无前置依赖 | **中** | `- [ ]` |
-| 扩展记忆层级：事实/承诺/观点/偏好 | 3.1 | 可与情感状态字段合并实施 | 中 | `- [ ]` |
+| 人设关系状态（好感度/心情） | 3.1 | 依赖 Memory Brain M1 的 event/evidence 与 `persona-relationship` scope | **高** | `- [ ]` |
+| Memory v3.1 事件/证据/scope/关系内核 | Memory Brain M1 | Memory Graph、实时通话和外部接入的共同前置，不在角色 prompt 中实现 | 高 | `- [ ]` |
 | 好感度系统（轻量版） | 3.2 | 依赖上一条 | 中 | `- [ ]` |
 | 统一情绪→动作/语音映射表 | 3.3 | 无前置依赖，建议尽早做以避免情绪词表继续分裂 | 低 | `- [ ]` |
 | **两阶段自然打断与播放缓冲** | 3.3 | AudioWorklet ring、candidate/confirmed/rejected 已有测试版；0.2.24–0.2.28 已补 VAD adapter、synthetic provenance、bounded worker、真实 Silero shadow、纯 frame deadline、aggregate evaluator 与固定诊断聚合，仍待许可声学回放、live 单调时钟 candidate 上限与调参 | 中 | `- [~]` 🔧 测试版（0.2.11+） |
@@ -252,7 +252,7 @@ graph TD
 | 表情包自定义目录 | 3.4 | 无 | 低 | `- [ ]` |
 | 摸头/投喂互动扩展 | 3.2 | 建议在情绪映射表统一后做 | 低 | `- [ ]` |
 | 猜拳/骰子小游戏 | 3.2 | 依赖好感度系统的基础设施 | 低 | `- [ ]` |
-| 引入最小化测试覆盖 | 3.5 | 建议尽早引入，越晚补测试成本越高 | 无 | `- [ ]` |
+| 补齐最小化测试覆盖 | 3.5 | Memory v3 已有 16 个 Rust 测试；仍需前端纯函数、通话状态机和 E2E 覆盖 | 无 | `- [~]` 🔧 局部完成 |
 
 ### P2（长期探索，架构级改动，需先做技术验证）
 
@@ -270,12 +270,12 @@ graph TD
 ## 5. 风险与注意事项
 
 1. **上游同步契约风险（贯穿全项目最大的结构性约束）**
-   `src/ai/persona.js`/`stickers.js`/`tts.js`/`persona-assets.js` 由 `scripts/sync-ai.mjs` 从上游 `kxyy_ai_clone` 单向同步。任何在这些文件里新增的**导出函数签名变化**或**数据结构变化**（如 `memory` 增加 `affinity` 字段），下次执行 `npm run sync-ai` 时都可能被上游版本覆盖或产生冲突。建议：
+   `src/ai/persona.js`/`stickers.js`/`tts.js`/`persona-assets.js` 由 `scripts/sync-ai.mjs` 从上游 `kxyy_ai_clone` 单向同步。任何在这些文件里新增的**导出函数签名变化**或**数据结构变化**，下次执行 `npm run sync-ai` 时都可能被上游版本覆盖或产生冲突。建议：
    - 若改动必须发生在这些文件内，优先采用"新增字段/新增导出函数"而非"修改已有签名"，降低合并冲突概率；
    - 涉及深度改动（如 P2 的多人设架构）时，应评估是否要将该部分逻辑**移出同步范围**（放进桌面端专属文件，参照 `realtime.js`/`pcm-worklet.js` 的先例），从架构上避免被下次同步覆盖。
 
 2. **隐私原则的一致性**
-   当前所有 Key、画像、记忆、参考音频路径均只存本机，不上传第三方。本报告所有建议（包括"人设包导入/导出"）均设计为**本地文件级操作**，未引入云同步/账号体系，以保持项目现有隐私承诺。若未来确实需要云端能力（如跨设备记忆同步），应作为**显式可选项**单独评审，不应默认开启。
+   当前所有 Key、画像、记忆、参考音频路径均只存本机：设置写入 `settings.json`，Memory v3 写入 `memory-v3.sqlite3`。本报告所有建议（包括"人设包导入/导出"）均设计为**本地文件级操作**，未引入云同步/账号体系，以保持项目现有隐私承诺。若未来确实需要云端能力（如跨设备记忆同步），应作为**显式可选项**单独评审，不应默认开启。
 
 3. **跨平台本地模型维护成本**
    `voice_service.rs`/`local_text.rs` 已经为本地语音/文字模型建立了较完善的"探测→拉起→健康检查→日志回传"范式，是项目工程质量较高的部分。**任何新增本地能力（如本地 TTS 情绪化参数）都应复用这套范式**，而不是另起一套生命周期管理逻辑，避免维护成本线性叠加。
@@ -284,10 +284,10 @@ graph TD
    `src-tauri/src/lib.rs` 的 `Settings` 是唯一配置源，新增任何设置项（如 `custom_sticker_dir`、`persona_pack_id`）都需要同步改动三处：Rust `Settings` struct（含 `#[serde(default)]`）、`AiSettingsInput`（保存入口结构体）、以及前端 `settings.html`+`settings.js`（表单渲染与保存逻辑）。建议在排期时把这类改动的"三处联动"计入工作量，而非只计算前端部分。
 
 5. **`chat.js` 持续膨胀的风险**
-   本报告 P0/P1 中多项功能（主动性调度、签到、好感度展示、记忆浏览器触发）自然的实现落点都是 `chat.js`。若不先做 3.5 的模块拆分，`chat.js` 会在多轮迭代后进一步失控。**建议将"`chat.js` 拆分"提前到 P0 之后立即执行**，作为后续功能开发的地基，而不是放在 P1 靠后位置"有空再做"。
+   本报告 P0/P1 中多项功能（主动性调度、签到、好感度展示）自然的实现落点都是 `chat.js`。若不先做 3.5 的模块拆分，`chat.js` 会在多轮迭代后进一步失控。**建议将"`chat.js` 拆分"提前到 P0 之后立即执行**，作为后续功能开发的地基，而不是放在 P1 靠后位置"有空再做"。
 
-6. **persona 测试覆盖不足的回归风险**
-   实时语音已具备 JS/Python/Rust 确定性测试，但 `persona.js` 里的纯函数（`splitReply`/`shouldDoFollowup`/`detectDeepIntent` 等）仍是本报告多项角色扮演功能的共同修改目标。多人协作或多轮迭代仍可能出现“改好感度逻辑时不小心破坏拆条逻辑”这类隐性回归；建议至少覆盖这批纯函数的单测后，再推进相应 P1/P2 功能。
+6. **测试覆盖不完整的回归风险**
+   实时语音已有 JS/Python/Rust 确定性测试，Memory v3 内核已有 Rust 单测；但 `persona.js` 里的纯函数（`splitReply`/`shouldDoFollowup`/`detectDeepIntent` 等）仍是本报告多项功能的共同修改目标。多人协作或多轮迭代仍可能出现“改好感度逻辑时不小心破坏拆条逻辑”这类隐性回归，建议至少覆盖这批纯函数后再推进对应 P1/P2 功能。
 
 7. **形象与人设解耦的产品定位问题（非技术风险，但影响决策）**
    若推进"多人设配置化"（P2），需要提前想清楚产品定位：人设切换是否要与形象切换绑定（比如"选了赛博元元形象就必须用赛博人设"），还是保持当前"形象与人设正交"的设计（任意形象搭配任意人设）。这是一个产品设计决策，会直接影响 P2 的数据结构设计，建议在启动该项前先与用户对齐一次。
@@ -327,7 +327,7 @@ graph TD
 
 | 建议 | 说明 | 价值 |
 |---|---|---|
-| **"今天的心情"日记** | 每天首次聊天时，AI 主动问一句"今天心情咋样？"，用户回复后 AI 简短回应并记录下来（存入 memory 的 `daily_mood` 字段）。一周/一个月后可以生成一份"心情曲线"小结。 | 极低实现成本的"情感陪伴"功能，也是吸引用户每天回来聊天的日常锚点。 |
+| **"今天的心情"日记** | 每天首次聊天时，AI 主动问一句"今天心情咋样？"，用户回复后以有来源的 episode/event 记录；一周或一个月后再从事件生成可追溯的小结，不另造 `daily_mood` 私有 schema。 | 情感陪伴功能，也能验证 Memory Brain 对时间序列、来源和用户纠错的支持。 |
 | **"怼一下"模式** | 偶尔触发一个"元元毒舌模式"：用户主动开启（或好感度超过某个阈值后自动解锁），AI 用更调侃、更损的语气聊天（如"你今天穿这啥啊"、"又在摸鱼是吧"），但保持在幽默/朋友互损范围内。技术上就是在 system prompt 中切换一套更毒舌的 few-shot 示例。 | 增加角色扮演的"多面性"，让长期用户不会觉得 AI 永远是一种语气，新鲜感更持久。 |
 | **"深夜电台"模式** | 晚间（22:00-2:00）AI 自动进入更温柔/催眠的语气模式，可以主动提议"我给你唱首歌吧"或"我给你讲个故事"，并发起一段纯语音通话。通过 `computeLiveContext` 的时间感知即可实现，不需要额外硬件能力。 | 利用"深夜"这个天然的高情感密度时段，打造差异化的陪伴体验。 |
 
@@ -533,6 +533,7 @@ graph TD
 | 2026-07-12 | 人格卡后端基础设施 | `persona_assets.rs` 重构为双通道架构（编译期默认 + 运行时动态覆盖），新增 `load_card_from_file()` / `list_cards()` / `reset_to_default()`；`lib.rs` 新增 `persona_card_id` 设置项 + `list_persona_cards` / `set_persona_card` IPC 命令；启动时自动加载已保存人格卡 | `src-tauri/src/persona_assets.rs`、`src-tauri/src/lib.rs`、`src-tauri/Cargo.toml` |
 | 2026-07-12 | 人格维度注入 system prompt | `persona.js` 新增 `renderPersonalityDimensions()`，将蒸馏管道的 9 维度数据（口头禅/句式/情绪/方言等）自然语言化后注入 system prompt；`loadAssets()` 新增 `personalityDimensions` 字段 | `src/ai/persona.js` |
 | 2026-07-12 | `computeLiveContext` 参数化 | 硬编码 `20:30` → `lore.open_time` 可配置；硬编码阶段流程（PK/打野/唠嗑/跳舞/梳妆/唱歌/回家段）→ `lore.live_stages` 驱动 + `guessStage()` 独立函数；周日特殊活动逻辑保留 | `src/ai/persona.js` |
+| 2026-07-26 | Memory Brain 路线收口 | Memory v3 现状、内核演进、实时记忆、Memory Graph、Global Workspace/J-Space 类实验、外部接入和独立项目决策统一迁移到权威路线图；本文件移除重复 schema 和过时 `localStorage` 方案 | `docs/roadmap-memory-brain.md`、本文件、`docs/roadmap-realtime-voice.md` |
 | 2026-07-12 | 构建脚本更新 | `encrypt-assets` 改为指向 `scripts/build-persona-enc.mjs`；新增 `distill` / `validate-card` / `update-persona` npm 脚本；`.gitignore` 新增 persona-distill 本地产物忽略规则 | `package.json`、`.gitignore` |
 | 2026-07-21 | 实时语音专项调研 | 新增实时语音与情绪语音专项路线图；修正 CosyVoice/火山 TTS 情绪能力、SenseVoice 已发布范围和本地打断时序结论；补充两阶段打断、流式管线、`SpeechStyle` 与验证指标 | `docs/roadmap-realtime-voice.md`、本文件 |
 | 2026-07-12 | Roadmap 更新 | 同步最近修改到 roadmap：更新 2.1 诊断（人设链路/直播场景）、P0 新增完成项、P2 状态更新、7.2 变更日志 | 同文件 |
