@@ -1695,6 +1695,7 @@ pub fn run() {
             install_sensevoice_runtime,
             memory::memory_status,
             memory::memory_timeline,
+            memory::memory_edges,
             memory::memory_recall,
             memory::memory_enqueue_session,
             memory::memory_list,

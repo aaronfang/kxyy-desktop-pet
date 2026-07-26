@@ -604,6 +604,19 @@ button.danger:disabled {
   color: #64748b;
   white-space: pre-wrap;
 }
+.memory-relations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 7px;
+  color: #64748b;
+}
+.memory-relations strong { width: 100%; color: #4b5563; }
+.memory-relations span {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #f1f5f9;
+}
 .memory-page-row { justify-content: center; margin-top: 12px; }
 .memory-danger-zone { margin-top: 18px; padding-top: 14px; border-top: 1px solid #fee2e2; }
 .memory-empty { color: #9ca3af; text-align: center; margin: 48px 0; }

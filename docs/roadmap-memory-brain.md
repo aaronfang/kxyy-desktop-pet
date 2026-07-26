@@ -134,13 +134,13 @@ flowchart TB
 - [x] 增加 append-only `memory_events`，保存来源、模态、观察时间、敏感等级、信任度、consent 和 idempotency key（schema v4，当前写入路径已接入）。
 - [x] 增加 subject/scope 模型的第一阶段：建立 `persona-relationship:<user_id>` scope，并由外键保证 card/user 隔离；global/project/connector/private-session 留待后续阶段。
 - [x] 为 facts/episodes/commitments 增加 evidence 记录和 90 天来源片段清理；valid time 仍由事实表维护，transaction time 由事件记录维护。
-- [ ] 规范化 entity/topic，增加 `memory_edges`：`derived_from`、`supports`、`contradicts`、`supersedes`、`mentions`、`related_to`、`promised_during`。
+- [x] M1-B 第一阶段规范化 entity/topic，增加 schema v5 `memory_edges`：已接入 `about`、`mentions`、`derived_from`、`supersedes`，边带来源事件、置信度、derived 标记和幂等键；其余关系按实际输入逐步开放。
 - [ ] 当前 facts/episodes/commitments 作为事件日志的物化视图；支持从事件重建索引和关系。
 - [ ] 抽出 provider-neutral Rust trait，Memory Core 不依赖 Tauri `AppHandle`、窗口或具体 DeepSeek/Ollama 设置结构。
 - [ ] 增加导出、备份、完整性检查和 schema 回滚测试。
 - [ ] 定义 prompt-injection 边界：外部内容只能是 observation，不能成为系统指令。
 
-M1-A（事件与证据时间线）已完成：schema v4 迁移/backfill、巩固与 legacy import 事件、用户编辑/置顶/状态变化事件、时间线 IPC 与设置页逐条检查器、事件幂等/append-only/card 隔离/证据过期/删除级联测试均已落地。当前仍未实现规范化 entity/topic、`memory_edges`、从事件完整重建派生表、provider-neutral core、导出/备份和完整性检查；这些保持为 M1 后续门槛。
+M1-A（事件与证据时间线）已完成。M1-B（关系边基础）已完成第一阶段：schema v5 迁移/backfill、规范化 topics/entities、巩固关系写入、关系边 IPC、时间线关系摘要、幂等/隔离/删除级联测试均已落地。当前仍未实现从事件完整重建派生表、provider-neutral core、导出/备份和完整性检查；这些保持为 M1 后续门槛。
 
 门槛：现有 Memory v3 行为测试全部保持通过；任意派生表删除后可以从事件重建；删除一个 scope 后事件、索引、边和物化视图均无残留。
 

@@ -14,7 +14,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SOURCE_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const RECALL_CHAR_BUDGET: usize = 600;
@@ -241,6 +241,50 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
          CREATE TRIGGER IF NOT EXISTS memory_events_no_update
             BEFORE UPDATE ON memory_events
             BEGIN SELECT RAISE(ABORT, 'memory_events are append-only'); END;
+         CREATE TABLE IF NOT EXISTS memory_entities (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
+            entity_type TEXT NOT NULL DEFAULT 'entity',
+            canonical_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(user_id, entity_type, normalized_name)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_entities_user
+            ON memory_entities(user_id, normalized_name);
+         CREATE TABLE IF NOT EXISTS memory_topics (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(user_id, normalized_name)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_topics_user
+            ON memory_topics(user_id, normalized_name);
+         CREATE TABLE IF NOT EXISTS memory_edges (
+            id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL REFERENCES memory_scopes(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
+            from_kind TEXT NOT NULL,
+            from_id TEXT NOT NULL,
+            to_kind TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            source_event_id TEXT REFERENCES memory_events(id) ON DELETE SET NULL,
+            confidence REAL NOT NULL DEFAULT 0.7,
+            derived INTEGER NOT NULL DEFAULT 1,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_edges_from
+            ON memory_edges(from_kind, from_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_memory_edges_to
+            ON memory_edges(to_kind, to_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_memory_edges_scope
+            ON memory_edges(scope_id, created_at DESC);
          CREATE TABLE IF NOT EXISTS memory_jobs (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
@@ -296,6 +340,9 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     }
     if existing_version < 4 {
         backfill_v4_events(&tx)?;
+    }
+    if existing_version < 5 {
+        backfill_v5_graph(&tx)?;
     }
     tx.execute(
         "INSERT INTO memory_meta(key, value) VALUES('schema_version', ?1)
@@ -497,6 +544,289 @@ fn append_evidence(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct MemoryEdgeInput<'a> {
+    user_id: &'a str,
+    card_id: &'a str,
+    from_kind: &'a str,
+    from_id: &'a str,
+    to_kind: &'a str,
+    to_id: &'a str,
+    relation: &'a str,
+    source_event_id: Option<&'a str>,
+    confidence: f64,
+    derived: bool,
+    idempotency_key: &'a str,
+}
+
+fn normalize_node_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn ensure_topic(
+    conn: &Connection,
+    user_id: &str,
+    name: &str,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    let display = truncate_chars(name, 80);
+    let normalized = normalize_node_name(&display);
+    if display.is_empty() || normalized.is_empty() || is_sensitive(&display) {
+        return Ok(None);
+    }
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_topics(id,user_id,name,normalized_name,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?5)",
+        params![id, user_id, display, normalized, now],
+    )?;
+    conn.query_row(
+        "SELECT id FROM memory_topics WHERE user_id=?1 AND normalized_name=?2",
+        params![user_id, normalized],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn ensure_entity(
+    conn: &Connection,
+    user_id: &str,
+    name: &str,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    let display = truncate_chars(name, 80);
+    let normalized = normalize_node_name(&display);
+    if display.is_empty() || normalized.is_empty() || is_sensitive(&display) {
+        return Ok(None);
+    }
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_entities(id,user_id,entity_type,canonical_name,normalized_name,created_at,updated_at)
+         VALUES(?1,?2,'entity',?3,?4,?5,?5)",
+        params![id, user_id, display, normalized, now],
+    )?;
+    conn.query_row(
+        "SELECT id FROM memory_entities WHERE user_id=?1 AND entity_type='entity' AND normalized_name=?2",
+        params![user_id, normalized],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn append_edge(conn: &Connection, input: &MemoryEdgeInput<'_>) -> rusqlite::Result<String> {
+    let now = now_ts();
+    let scope_id = ensure_persona_scope(conn, input.user_id, input.card_id, now)?;
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_edges(
+            id,scope_id,user_id,from_kind,from_id,to_kind,to_id,relation,source_event_id,
+            confidence,derived,idempotency_key,created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            id,
+            scope_id,
+            input.user_id,
+            input.from_kind,
+            input.from_id,
+            input.to_kind,
+            input.to_id,
+            input.relation,
+            input.source_event_id,
+            clamp01(input.confidence),
+            input.derived as i64,
+            input.idempotency_key,
+            now,
+        ],
+    )?;
+    conn.query_row(
+        "SELECT id FROM memory_edges WHERE idempotency_key=?1",
+        [input.idempotency_key],
+        |row| row.get(0),
+    )
+}
+
+fn link_episode_nodes(
+    conn: &Connection,
+    user_id: &str,
+    card_id: &str,
+    episode_id: &str,
+    topics: &[String],
+    entities: &[String],
+    source_event_id: Option<&str>,
+    confidence: f64,
+) -> rusqlite::Result<()> {
+    for topic in topics {
+        let Some(topic_id) = ensure_topic(conn, user_id, topic, now_ts())? else {
+            continue;
+        };
+        let normalized = normalize_node_name(topic);
+        append_edge(
+            conn,
+            &MemoryEdgeInput {
+                user_id,
+                card_id,
+                from_kind: "episode",
+                from_id: episode_id,
+                to_kind: "topic",
+                to_id: &topic_id,
+                relation: "about",
+                source_event_id,
+                confidence,
+                derived: true,
+                idempotency_key: &format!("episode:{episode_id}:topic:{normalized}"),
+            },
+        )?;
+    }
+    for entity in entities {
+        let Some(entity_id) = ensure_entity(conn, user_id, entity, now_ts())? else {
+            continue;
+        };
+        let normalized = normalize_node_name(entity);
+        append_edge(
+            conn,
+            &MemoryEdgeInput {
+                user_id,
+                card_id,
+                from_kind: "episode",
+                from_id: episode_id,
+                to_kind: "entity",
+                to_id: &entity_id,
+                relation: "mentions",
+                source_event_id,
+                confidence,
+                derived: true,
+                idempotency_key: &format!("episode:{episode_id}:entity:{normalized}"),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn link_source_episode(
+    conn: &Connection,
+    user_id: &str,
+    card_id: &str,
+    item_kind: &str,
+    item_id: &str,
+    episode_id: Option<&str>,
+    source_event_id: Option<&str>,
+    confidence: f64,
+) -> rusqlite::Result<()> {
+    let Some(episode_id) = episode_id else {
+        return Ok(());
+    };
+    append_edge(
+        conn,
+        &MemoryEdgeInput {
+            user_id,
+            card_id,
+            from_kind: item_kind,
+            from_id: item_id,
+            to_kind: "episode",
+            to_id: episode_id,
+            relation: "derived_from",
+            source_event_id,
+            confidence,
+            derived: true,
+            idempotency_key: &format!("{item_kind}:{item_id}:episode:{episode_id}"),
+        },
+    )?;
+    Ok(())
+}
+
+fn backfill_v5_graph(conn: &Transaction<'_>) -> rusqlite::Result<()> {
+    let users: Vec<(String, String)> = conn
+        .prepare("SELECT id,card_id FROM memory_users ORDER BY created_at")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(Result::ok)
+        .collect();
+    for (user_id, card_id) in users {
+        let episodes: Vec<(String, String, String)> = conn
+            .prepare("SELECT id,topics_json,entities_json FROM memory_episodes WHERE user_id=?1")?
+            .query_map([&user_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        for (episode_id, topics_json, entities_json) in episodes {
+            let topics: Vec<String> = serde_json::from_str(&topics_json).unwrap_or_default();
+            let entities: Vec<String> = serde_json::from_str(&entities_json).unwrap_or_default();
+            let event_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM memory_events WHERE user_id=?1 AND item_kind='episode' AND item_id=?2 ORDER BY created_at DESC LIMIT 1",
+                    params![user_id, episode_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            link_episode_nodes(
+                &conn,
+                &user_id,
+                &card_id,
+                &episode_id,
+                &topics,
+                &entities,
+                event_id.as_deref(),
+                0.7,
+            )?;
+        }
+        let facts: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id,source_episode_id FROM memory_facts WHERE user_id=?1")?
+            .query_map([&user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect();
+        for (fact_id, episode_id) in facts {
+            let event_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM memory_events WHERE user_id=?1 AND item_kind='fact' AND item_id=?2 ORDER BY created_at DESC LIMIT 1",
+                    params![user_id, fact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            link_source_episode(
+                &conn,
+                &user_id,
+                &card_id,
+                "fact",
+                &fact_id,
+                episode_id.as_deref(),
+                event_id.as_deref(),
+                0.7,
+            )?;
+        }
+        let commitments: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id,source_episode_id FROM memory_commitments WHERE user_id=?1")?
+            .query_map([&user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect();
+        for (commitment_id, episode_id) in commitments {
+            let event_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM memory_events WHERE user_id=?1 AND item_kind='commitment' AND item_id=?2 ORDER BY created_at DESC LIMIT 1",
+                    params![user_id, commitment_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            link_source_episode(
+                &conn,
+                &user_id,
+                &card_id,
+                "commitment",
+                &commitment_id,
+                episode_id.as_deref(),
+                event_id.as_deref(),
+                0.7,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn backfill_v4_events(conn: &Transaction<'_>) -> rusqlite::Result<()> {
     let users: Vec<(String, String)> = conn
         .prepare("SELECT id,card_id FROM memory_users ORDER BY created_at")?
@@ -665,10 +995,37 @@ pub struct MemoryTimelineItem {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryEdgeItem {
+    pub id: String,
+    pub from_kind: String,
+    pub from_id: String,
+    pub from_label: String,
+    pub to_kind: String,
+    pub to_id: String,
+    pub to_label: String,
+    pub relation: String,
+    pub source_event_id: Option<String>,
+    pub confidence: f64,
+    pub derived: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEdgesQuery {
+    pub card_id: String,
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryTimelineResponse {
     pub item_kind: String,
     pub item_id: String,
     pub events: Vec<MemoryTimelineItem>,
+    pub edges: Vec<MemoryEdgeItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -830,7 +1187,12 @@ fn timeline(
     conn: &Connection,
     query: &MemoryTimelineQuery,
 ) -> Result<MemoryTimelineResponse, String> {
-    kind_table(&query.kind)?;
+    if !matches!(
+        query.kind.as_str(),
+        "fact" | "episode" | "commitment" | "entity" | "topic"
+    ) {
+        return Err("不支持的图节点类型".into());
+    }
     let limit = query.limit.unwrap_or(20).clamp(1, 50) as i64;
     let mut stmt = conn
         .prepare(
@@ -901,11 +1263,86 @@ fn timeline(
             evidence,
         });
     }
+    let edges = query_edges(conn, &query.card_id, &query.kind, &query.id, limit as usize)?;
     Ok(MemoryTimelineResponse {
         item_kind: query.kind.clone(),
         item_id: query.id.clone(),
         events,
+        edges,
     })
+}
+
+fn query_edges(
+    conn: &Connection,
+    card_id: &str,
+    kind: &str,
+    id: &str,
+    limit: usize,
+) -> Result<Vec<MemoryEdgeItem>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id,e.from_kind,e.from_id,
+                    COALESCE(CASE e.from_kind
+                        WHEN 'topic' THEN (SELECT t.name FROM memory_topics t WHERE t.id=e.from_id AND t.user_id=e.user_id)
+                        WHEN 'entity' THEN (SELECT n.canonical_name FROM memory_entities n WHERE n.id=e.from_id AND n.user_id=e.user_id)
+                        ELSE e.from_id END,e.from_id) AS from_label,
+                    e.to_kind,e.to_id,
+                    COALESCE(CASE e.to_kind
+                        WHEN 'topic' THEN (SELECT t.name FROM memory_topics t WHERE t.id=e.to_id AND t.user_id=e.user_id)
+                        WHEN 'entity' THEN (SELECT n.canonical_name FROM memory_entities n WHERE n.id=e.to_id AND n.user_id=e.user_id)
+                        ELSE e.to_id END,e.to_id) AS to_label,
+                    e.relation,e.source_event_id,e.confidence,e.derived
+             FROM memory_edges e JOIN memory_users u ON u.id=e.user_id
+             WHERE u.card_id=?1 AND ((e.from_kind=?2 AND e.from_id=?3)
+                OR (e.to_kind=?2 AND e.to_id=?3))
+             ORDER BY e.created_at DESC LIMIT ?4",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![card_id, kind, id, limit.clamp(1, 100) as i64],
+            |row| {
+                Ok(MemoryEdgeItem {
+                    id: row.get(0)?,
+                    from_kind: row.get(1)?,
+                    from_id: row.get(2)?,
+                    from_label: row.get(3)?,
+                    to_kind: row.get(4)?,
+                    to_id: row.get(5)?,
+                    to_label: row.get(6)?,
+                    relation: row.get(7)?,
+                    source_event_id: row.get(8)?,
+                    confidence: row.get(9)?,
+                    derived: row.get::<_, i64>(10)? != 0,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    rows.map(|row| row.map_err(|e| e.to_string())).collect()
+}
+
+#[tauri::command]
+pub fn memory_edges(
+    state: State<'_, MemoryState>,
+    query: MemoryEdgesQuery,
+) -> Result<Vec<MemoryEdgeItem>, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    if !matches!(
+        query.kind.as_str(),
+        "fact" | "episode" | "commitment" | "entity" | "topic"
+    ) {
+        return Err("不支持的图节点类型".into());
+    }
+    query_edges(
+        conn,
+        &query.card_id,
+        &query.kind,
+        &query.id,
+        query.limit.unwrap_or(50),
+    )
 }
 
 fn timeline_summary(event_type: &str, payload: &str) -> String {
@@ -1925,6 +2362,12 @@ fn delete_memory(
     for item in request.items.iter().take(200) {
         let table = kind_table(&item.kind)?;
         tx.execute(
+            "DELETE FROM memory_edges
+             WHERE (from_kind=?1 AND from_id=?2) OR (to_kind=?1 AND to_id=?2)",
+            params![item.kind, item.id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
             "DELETE FROM memory_events WHERE item_kind=?1 AND item_id=?2",
             params![item.kind, item.id],
         )
@@ -2126,6 +2569,17 @@ fn import_legacy(
                     now,
                 )
                 .map_err(|e| e.to_string())?;
+                link_episode_nodes(
+                    &tx,
+                    &user_id,
+                    &request.card_id,
+                    &id,
+                    &topics,
+                    &[],
+                    Some(&event_id),
+                    0.7,
+                )
+                .map_err(|e| e.to_string())?;
                 index_item(
                     &tx,
                     &id,
@@ -2184,6 +2638,17 @@ fn import_legacy(
                     &[],
                     None,
                     now,
+                )
+                .map_err(|e| e.to_string())?;
+                link_episode_nodes(
+                    &tx,
+                    &user_id,
+                    &request.card_id,
+                    &id,
+                    &topics,
+                    &[],
+                    Some(&event_id),
+                    0.7,
                 )
                 .map_err(|e| e.to_string())?;
                 index_item(
@@ -2720,6 +3185,16 @@ fn apply_extraction(
             (!excerpt.is_empty()).then_some(excerpt.as_str()),
             now,
         )?;
+        link_episode_nodes(
+            &tx,
+            &job.user_id,
+            &job.card_id,
+            &id,
+            &topics,
+            &entities,
+            Some(&event_id),
+            extraction.episode.importance,
+        )?;
         index_item(
             &tx,
             &id,
@@ -2817,6 +3292,16 @@ fn apply_extraction(
             "supports"
         };
         append_evidence(&tx, &event_id, "fact", &fact_id, relation, &[], None, now)?;
+        link_source_episode(
+            &tx,
+            &job.user_id,
+            &job.card_id,
+            "fact",
+            &fact_id,
+            episode_id.as_deref(),
+            Some(&event_id),
+            fact.confidence,
+        )?;
         for old_id in superseded_ids {
             let old_payload = serde_json::json!({ "supersededBy": fact_id }).to_string();
             let old_event_id = append_event(
@@ -2849,6 +3334,22 @@ fn apply_extraction(
                 &[],
                 None,
                 now,
+            )?;
+            append_edge(
+                &tx,
+                &MemoryEdgeInput {
+                    user_id: &job.user_id,
+                    card_id: &job.card_id,
+                    from_kind: "fact",
+                    from_id: &fact_id,
+                    to_kind: "fact",
+                    to_id: &old_id,
+                    relation: "supersedes",
+                    source_event_id: Some(&event_id),
+                    confidence: fact.confidence,
+                    derived: true,
+                    idempotency_key: &format!("fact:{fact_id}:supersedes:{old_id}"),
+                },
             )?;
         }
     }
@@ -2903,6 +3404,16 @@ fn apply_extraction(
             &[],
             None,
             now,
+        )?;
+        link_source_episode(
+            &tx,
+            &job.user_id,
+            &job.card_id,
+            "commitment",
+            &commitment_id,
+            episode_id.as_deref(),
+            Some(&event_id),
+            commitment.importance,
         )?;
     }
     let resolved_commitments =
@@ -3382,6 +3893,7 @@ mod tests {
         tx.commit().unwrap();
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS memory_events_no_update;
+             DROP TABLE memory_edges;
              DROP TABLE memory_evidence;
              DROP TABLE memory_events;
              DROP TABLE memory_scopes;
@@ -3396,7 +3908,7 @@ mod tests {
                 |r| r.get::<_, String>(0)
             )
             .unwrap(),
-            "4"
+            "5"
         );
         assert_eq!(
             conn.query_row(
@@ -3416,6 +3928,54 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn v4_to_v5_migration_backfills_topics_entities_and_edges() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        conn.execute(
+            "INSERT INTO memory_episodes(id,user_id,summary,topics_json,entities_json,occurred_at,created_at,updated_at)
+             VALUES('episode-v4',?1,'准备面试','[\"产品经理\"]','[\"小明\"]',100,100,100)",
+            [&user],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE memory_edges;
+             DROP TABLE memory_entities;
+             DROP TABLE memory_topics;
+             UPDATE memory_meta SET value='4' WHERE key='schema_version';",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_topics", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_entities", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_edges WHERE from_kind='episode' AND from_id='episode-v4'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
         );
     }
 
@@ -3499,6 +4059,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(other.events.len(), 1);
+    }
+
+    #[test]
+    fn graph_edges_are_idempotent_scoped_and_explainable() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card-a", "小明").unwrap();
+        let event_id = append_event(
+            &conn,
+            &MemoryEventInput {
+                user_id: &user,
+                card_id: "card-a",
+                item_kind: "episode",
+                item_id: "episode-1",
+                event_type: "episode.created",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: now_ts(),
+                trust: 0.9,
+                consent: "allowed",
+                idempotency_key: "edge-event-1",
+                payload_json: r#"{"summary":"面试准备"}"#,
+            },
+        )
+        .unwrap();
+        link_episode_nodes(
+            &conn,
+            &user,
+            "card-a",
+            "episode-1",
+            &["产品经理面试".into()],
+            &["小明".into()],
+            Some(&event_id),
+            0.8,
+        )
+        .unwrap();
+        let edges = query_edges(&conn, "card-a", "episode", "episode-1", 20).unwrap();
+        assert_eq!(edges.len(), 2);
+        assert!(edges
+            .iter()
+            .any(|edge| edge.relation == "about" && edge.to_kind == "topic"));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.relation == "mentions" && edge.to_kind == "entity"));
+        assert!(edges.iter().any(|edge| edge.to_label == "产品经理面试"));
+        assert!(edges.iter().any(|edge| edge.to_label == "小明"));
+        link_episode_nodes(
+            &conn,
+            &user,
+            "card-a",
+            "episode-1",
+            &["产品经理面试".into()],
+            &["小明".into()],
+            Some(&event_id),
+            0.8,
+        )
+        .unwrap();
+        assert_eq!(
+            query_edges(&conn, "card-a", "episode", "episode-1", 20)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(query_edges(&conn, "card-b", "episode", "episode-1", 20)
+            .unwrap()
+            .is_empty());
+        delete_memory(
+            &mut conn,
+            &MemoryDeleteRequest {
+                items: vec![MemoryItemRef {
+                    kind: "episode".into(),
+                    id: "episode-1".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(query_edges(&conn, "card-a", "episode", "episode-1", 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

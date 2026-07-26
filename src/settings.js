@@ -1086,8 +1086,33 @@ function startMemoryEdit(card, textElement, actions, item) {
 function renderMemoryTimeline(box, result) {
   box.replaceChildren();
   const events = Array.isArray(result?.events) ? result.events : [];
+  const edges = Array.isArray(result?.edges) ? result.edges : [];
   if (!events.length) {
-    box.textContent = "暂无可追溯事件";
+    if (!edges.length) box.textContent = "暂无可追溯事件";
+  }
+  if (edges.length) {
+    const relations = document.createElement("div");
+    relations.className = "memory-relations";
+    const title = document.createElement("strong");
+    title.textContent = "关系";
+    relations.appendChild(title);
+    const relationLabels = {
+      about: "涉及主题",
+      mentions: "提及实体",
+      derived_from: "来源经历",
+      supersedes: "替代事实",
+    };
+    for (const edge of edges) {
+      const row = document.createElement("span");
+      const target = edge.fromKind === result.itemKind && edge.fromId === result.itemId
+        ? `${edge.toKind}:${edge.toLabel || edge.toId.slice(0, 8)}`
+        : `${edge.fromKind}:${edge.fromLabel || edge.fromId.slice(0, 8)}`;
+      row.textContent = `${relationLabels[edge.relation] || edge.relation} → ${target}`;
+      relations.appendChild(row);
+    }
+    box.appendChild(relations);
+  }
+  if (!events.length) {
     return;
   }
   const eventLabels = {
