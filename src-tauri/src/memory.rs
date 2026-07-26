@@ -14,7 +14,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SOURCE_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const RECALL_CHAR_BUDGET: usize = 600;
@@ -191,6 +191,56 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_memory_revisions_item
             ON memory_revisions(kind, item_id, revision_number DESC);
+         CREATE TABLE IF NOT EXISTS memory_scopes (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
+            card_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(kind, scope_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_scopes_user
+            ON memory_scopes(user_id, kind);
+         CREATE TABLE IF NOT EXISTS memory_events (
+            id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL REFERENCES memory_scopes(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
+            item_kind TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT,
+            modality TEXT NOT NULL DEFAULT 'text',
+            observed_at INTEGER NOT NULL,
+            sensitivity TEXT NOT NULL DEFAULT 'normal',
+            trust REAL NOT NULL DEFAULT 0.7,
+            consent TEXT NOT NULL DEFAULT 'allowed',
+            idempotency_key TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_events_item
+            ON memory_events(item_kind, item_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_memory_events_scope
+            ON memory_events(scope_id, created_at DESC);
+         CREATE TABLE IF NOT EXISTS memory_evidence (
+            id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL REFERENCES memory_events(id) ON DELETE CASCADE,
+            item_kind TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+            excerpt TEXT,
+            excerpt_expires_at INTEGER,
+            created_at INTEGER NOT NULL,
+            UNIQUE(event_id, relation, item_kind, item_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_evidence_item
+            ON memory_evidence(item_kind, item_id, created_at DESC);
+         CREATE TRIGGER IF NOT EXISTS memory_events_no_update
+            BEFORE UPDATE ON memory_events
+            BEGIN SELECT RAISE(ABORT, 'memory_events are append-only'); END;
          CREATE TABLE IF NOT EXISTS memory_jobs (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL REFERENCES memory_users(id) ON DELETE CASCADE,
@@ -244,6 +294,9 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
              CREATE INDEX idx_memory_jobs_due ON memory_jobs(status, next_attempt_at);",
         )?;
     }
+    if existing_version < 4 {
+        backfill_v4_events(&tx)?;
+    }
     tx.execute(
         "INSERT INTO memory_meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -263,6 +316,11 @@ fn maintenance(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE memory_episodes SET source_excerpt=NULL
          WHERE source_expires_at IS NOT NULL AND source_expires_at < ?1",
+        [now],
+    )?;
+    conn.execute(
+        "UPDATE memory_evidence SET excerpt=NULL
+         WHERE excerpt_expires_at IS NOT NULL AND excerpt_expires_at < ?1",
         [now],
     )?;
     conn.execute(
@@ -335,6 +393,155 @@ fn get_or_create_user(
         ],
     )?;
     Ok(id)
+}
+
+#[derive(Debug, Clone)]
+struct MemoryEventInput<'a> {
+    user_id: &'a str,
+    card_id: &'a str,
+    item_kind: &'a str,
+    item_id: &'a str,
+    event_type: &'a str,
+    source_type: &'a str,
+    source_id: Option<&'a str>,
+    modality: &'a str,
+    observed_at: i64,
+    trust: f64,
+    consent: &'a str,
+    idempotency_key: &'a str,
+    payload_json: &'a str,
+}
+
+fn ensure_persona_scope(
+    conn: &Connection,
+    user_id: &str,
+    card_id: &str,
+    now: i64,
+) -> rusqlite::Result<String> {
+    let scope_key = format!("persona-relationship:{user_id}");
+    let scope_id = format!("scope-{user_id}");
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_scopes(id,kind,scope_key,user_id,card_id,created_at)
+         VALUES(?1,'persona-relationship',?2,?3,?4,?5)",
+        params![scope_id, scope_key, user_id, card_id, now],
+    )?;
+    conn.query_row(
+        "SELECT id FROM memory_scopes WHERE kind='persona-relationship' AND scope_key=?1",
+        [scope_key],
+        |row| row.get(0),
+    )
+}
+
+fn append_event(conn: &Connection, input: &MemoryEventInput<'_>) -> rusqlite::Result<String> {
+    let now = now_ts();
+    let scope_id = ensure_persona_scope(conn, input.user_id, input.card_id, now)?;
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_events(
+            id,scope_id,user_id,item_kind,item_id,event_type,source_type,source_id,
+            modality,observed_at,sensitivity,trust,consent,idempotency_key,payload_json,created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'normal',?11,?12,?13,?14,?15)",
+        params![
+            id,
+            scope_id,
+            input.user_id,
+            input.item_kind,
+            input.item_id,
+            input.event_type,
+            input.source_type,
+            input.source_id,
+            input.modality,
+            input.observed_at,
+            clamp01(input.trust),
+            input.consent,
+            input.idempotency_key,
+            input.payload_json,
+            now,
+        ],
+    )?;
+    conn.query_row(
+        "SELECT id FROM memory_events WHERE idempotency_key=?1",
+        [input.idempotency_key],
+        |row| row.get(0),
+    )
+}
+
+fn append_evidence(
+    conn: &Connection,
+    event_id: &str,
+    item_kind: &str,
+    item_id: &str,
+    relation: &str,
+    source_message_ids: &[String],
+    excerpt: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let source_ids = serde_json::to_string(source_message_ids).unwrap_or_else(|_| "[]".into());
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_evidence(
+            id,event_id,item_kind,item_id,relation,source_message_ids_json,excerpt,
+            excerpt_expires_at,created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            Uuid::new_v4().to_string(),
+            event_id,
+            item_kind,
+            item_id,
+            relation,
+            source_ids,
+            excerpt.map(|value| truncate_chars(value, 800)),
+            excerpt.map(|_| now + SOURCE_RETENTION_SECS),
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn backfill_v4_events(conn: &Transaction<'_>) -> rusqlite::Result<()> {
+    let users: Vec<(String, String)> = conn
+        .prepare("SELECT id,card_id FROM memory_users ORDER BY created_at")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(Result::ok)
+        .collect();
+    for (user_id, card_id) in users {
+        for kind in ["episode", "fact", "commitment"] {
+            let table = kind_table(kind)
+                .map_err(|_| rusqlite::Error::InvalidParameterName("invalid memory kind".into()))?;
+            let ids: Vec<(String, i64)> = conn
+                .prepare(&format!(
+                    "SELECT id,updated_at FROM {table} WHERE user_id=?1"
+                ))?
+                .query_map([&user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(Result::ok)
+                .collect();
+            for (item_id, observed_at) in ids {
+                let Some((_, _, snapshot)) = load_revision_state(conn, kind, &item_id)? else {
+                    continue;
+                };
+                let event_type = format!("{kind}.backfilled");
+                let idempotency = format!("schema-v4-backfill:{kind}:{item_id}");
+                append_event(
+                    conn,
+                    &MemoryEventInput {
+                        user_id: &user_id,
+                        card_id: &card_id,
+                        item_kind: kind,
+                        item_id: &item_id,
+                        event_type: &event_type,
+                        source_type: "schema-migration",
+                        source_id: None,
+                        modality: "text",
+                        observed_at,
+                        trust: 0.7,
+                        consent: "legacy",
+                        idempotency_key: &idempotency,
+                        payload_json: &snapshot,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_user(conn: &Connection, card_id: &str, nickname: &str) -> rusqlite::Result<Option<String>> {
@@ -419,7 +626,49 @@ pub struct MemoryStatusResponse {
     pub pending_jobs: i64,
     pub skipped_jobs: i64,
     pub database_bytes: u64,
+    pub event_count: i64,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTimelineQuery {
+    pub card_id: String,
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTimelineEvidence {
+    pub relation: String,
+    pub source_message_ids: Vec<String>,
+    pub excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTimelineItem {
+    pub id: String,
+    pub event_type: String,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub modality: String,
+    pub observed_at: i64,
+    pub trust: f64,
+    pub consent: String,
+    pub summary: String,
+    pub evidence: Vec<MemoryTimelineEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTimelineResponse {
+    pub item_kind: String,
+    pub item_id: String,
+    pub events: Vec<MemoryTimelineItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,7 +774,7 @@ pub struct MemoryMutationResponse {
 #[tauri::command]
 pub fn memory_status(state: State<'_, MemoryState>) -> MemoryStatusResponse {
     let guard = state.conn.lock().unwrap();
-    let (pending, skipped) = guard
+    let (pending, skipped, event_count) = guard
         .as_ref()
         .map(|conn| {
             let pending = conn
@@ -542,9 +791,12 @@ pub fn memory_status(state: State<'_, MemoryState>) -> MemoryStatusResponse {
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
-            (pending, skipped)
+            let events = conn
+                .query_row("SELECT COUNT(*) FROM memory_events", [], |r| r.get(0))
+                .unwrap_or(0);
+            (pending, skipped, events)
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, 0));
     let database_bytes = state
         .db_path
         .as_ref()
@@ -557,7 +809,138 @@ pub fn memory_status(state: State<'_, MemoryState>) -> MemoryStatusResponse {
         pending_jobs: pending,
         skipped_jobs: skipped,
         database_bytes,
+        event_count,
         last_error: state.last_error.lock().unwrap().clone(),
+    }
+}
+
+#[tauri::command]
+pub fn memory_timeline(
+    state: State<'_, MemoryState>,
+    query: MemoryTimelineQuery,
+) -> Result<MemoryTimelineResponse, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    timeline(conn, &query)
+}
+
+fn timeline(
+    conn: &Connection,
+    query: &MemoryTimelineQuery,
+) -> Result<MemoryTimelineResponse, String> {
+    kind_table(&query.kind)?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 50) as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id,e.event_type,e.source_type,e.source_id,e.modality,e.observed_at,
+                    e.trust,e.consent,e.payload_json
+             FROM memory_events e JOIN memory_users u ON u.id=e.user_id
+             WHERE u.card_id=?1 AND e.item_kind=?2 AND e.item_id=?3
+             ORDER BY e.created_at DESC LIMIT ?4",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![query.card_id, query.kind, query.id, limit], |row| {
+            let payload: String = row.get(8)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, f64>(6)?,
+                row.get::<_, String>(7)?,
+                payload,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (
+            id,
+            event_type,
+            source_type,
+            source_id,
+            modality,
+            observed_at,
+            trust,
+            consent,
+            payload,
+        ) = row.map_err(|e| e.to_string())?;
+        let evidence = conn
+            .prepare(
+                "SELECT relation,source_message_ids_json,excerpt
+                 FROM memory_evidence WHERE event_id=?1 ORDER BY created_at",
+            )
+            .and_then(|mut evidence_stmt| {
+                evidence_stmt
+                    .query_map([&id], |e| {
+                        let ids: String = e.get(1)?;
+                        Ok(MemoryTimelineEvidence {
+                            relation: e.get(0)?,
+                            source_message_ids: serde_json::from_str(&ids).unwrap_or_default(),
+                            excerpt: e.get(2)?,
+                        })
+                    })
+                    .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+            })
+            .map_err(|e| e.to_string())?;
+        events.push(MemoryTimelineItem {
+            id,
+            event_type: event_type.clone(),
+            source_type,
+            source_id,
+            modality,
+            observed_at,
+            trust,
+            consent,
+            summary: timeline_summary(&event_type, &payload),
+            evidence,
+        });
+    }
+    Ok(MemoryTimelineResponse {
+        item_kind: query.kind.clone(),
+        item_id: query.id.clone(),
+        events,
+    })
+}
+
+fn timeline_summary(event_type: &str, payload: &str) -> String {
+    let value: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let text = value
+        .get("text")
+        .or_else(|| value.get("summary"))
+        .or_else(|| {
+            value
+                .get("snapshot")
+                .and_then(|snapshot| snapshot.get("text"))
+        })
+        .or_else(|| {
+            value
+                .get("snapshot")
+                .and_then(|snapshot| snapshot.get("summary"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let label = match event_type {
+        value if value.ends_with(".backfilled") => "从已有记忆建立事件",
+        value if value.ends_with(".created") => "创建记忆",
+        value if value.ends_with(".confirmed") => "再次确认",
+        value if value.ends_with(".corrected") => "用户纠正",
+        value if value.ends_with(".disputed") => "标记为待确认",
+        value if value.ends_with(".superseded") => "被新事实替代",
+        value if value.ends_with(".edited") => "用户编辑",
+        value if value.ends_with(".status_changed") => "状态变化",
+        value if value.ends_with(".pinned") => "置顶状态变化",
+        _ => "记忆事件",
+    };
+    if text.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}：{}", truncate_chars(text, 240))
     }
 }
 
@@ -1340,6 +1723,60 @@ fn update_memory(
         }
     }
     rebuild_search_item(&tx, &request.kind, &request.id).map_err(|e| e.to_string())?;
+    let card_id: String = tx
+        .query_row(
+            "SELECT card_id FROM memory_users WHERE id=?1",
+            [&user_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let (_, _, after_snapshot) = load_revision_state(&tx, &request.kind, &request.id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "记忆更新后无法读取当前版本".to_string())?;
+    let event_type = if request.text.is_some() {
+        format!("{}.edited", request.kind)
+    } else if request.status.is_some() {
+        format!("{}.status_changed", request.kind)
+    } else {
+        format!("{}.pinned", request.kind)
+    };
+    let event_payload = serde_json::json!({
+        "snapshot": serde_json::from_str::<Value>(&after_snapshot).unwrap_or(Value::Null),
+        "textChanged": request.text.is_some(),
+        "status": request.status.clone(),
+        "pinned": request.pinned,
+    })
+    .to_string();
+    let event_id = append_event(
+        &tx,
+        &MemoryEventInput {
+            user_id: &user_id,
+            card_id: &card_id,
+            item_kind: &request.kind,
+            item_id: &request.id,
+            event_type: &event_type,
+            source_type: "user-edit",
+            source_id: None,
+            modality: "text",
+            observed_at: now,
+            trust: 1.0,
+            consent: "explicit",
+            idempotency_key: &format!("user-edit:{}:{}", request.id, Uuid::new_v4()),
+            payload_json: &event_payload,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    append_evidence(
+        &tx,
+        &event_id,
+        &request.kind,
+        &request.id,
+        "user_override",
+        &[],
+        None,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(MemoryMutationResponse {
         ok: true,
@@ -1487,6 +1924,11 @@ fn delete_memory(
     let mut affected = 0;
     for item in request.items.iter().take(200) {
         let table = kind_table(&item.kind)?;
+        tx.execute(
+            "DELETE FROM memory_events WHERE item_kind=?1 AND item_id=?2",
+            params![item.kind, item.id],
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute(
             "DELETE FROM memory_search WHERE item_id=?1 AND kind=?2",
             params![item.id, item.kind],
@@ -1648,6 +2090,42 @@ fn import_legacy(
                     ],
                 )
                 .map_err(|e| e.to_string())?;
+                let payload = serde_json::json!({
+                    "summary": truncate_chars(summary, 1000),
+                    "topics": topics.clone(),
+                    "occurredAt": occurred_at,
+                })
+                .to_string();
+                let event_id = append_event(
+                    &tx,
+                    &MemoryEventInput {
+                        user_id: &user_id,
+                        card_id: &request.card_id,
+                        item_kind: "episode",
+                        item_id: &id,
+                        event_type: "episode.imported",
+                        source_type: "legacy-import",
+                        source_id: session_id.as_deref(),
+                        modality: "text",
+                        observed_at: occurred_at,
+                        trust: 0.7,
+                        consent: "legacy",
+                        idempotency_key: &format!("legacy-import:episode:{id}"),
+                        payload_json: &payload,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                append_evidence(
+                    &tx,
+                    &event_id,
+                    "episode",
+                    &id,
+                    "legacy_record",
+                    &[],
+                    None,
+                    now,
+                )
+                .map_err(|e| e.to_string())?;
                 index_item(
                     &tx,
                     &id,
@@ -1670,6 +2148,42 @@ fn import_legacy(
                     "INSERT INTO memory_episodes(id,user_id,summary,importance,topics_json,
                      occurred_at,created_at,updated_at) VALUES(?1,?2,?3,0.4,?4,?5,?5,?5)",
                     params![id, user_id, summary, topics_json, occurred_at],
+                )
+                .map_err(|e| e.to_string())?;
+                let payload = serde_json::json!({
+                    "summary": summary.clone(),
+                    "topics": topics.clone(),
+                    "occurredAt": occurred_at,
+                })
+                .to_string();
+                let event_id = append_event(
+                    &tx,
+                    &MemoryEventInput {
+                        user_id: &user_id,
+                        card_id: &request.card_id,
+                        item_kind: "episode",
+                        item_id: &id,
+                        event_type: "episode.imported",
+                        source_type: "legacy-import",
+                        source_id: None,
+                        modality: "text",
+                        observed_at: occurred_at,
+                        trust: 0.7,
+                        consent: "legacy",
+                        idempotency_key: &format!("legacy-import:episode:{id}"),
+                        payload_json: &payload,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                append_evidence(
+                    &tx,
+                    &event_id,
+                    "episode",
+                    &id,
+                    "legacy_record",
+                    &[],
+                    None,
+                    now,
                 )
                 .map_err(|e| e.to_string())?;
                 index_item(
@@ -1697,7 +2211,7 @@ fn import_legacy(
                 if text.trim().is_empty() || is_sensitive(text) {
                     continue;
                 }
-                insert_fact(
+                let fact_id = insert_fact(
                     &tx,
                     &request.card_id,
                     &user_id,
@@ -1715,6 +2229,41 @@ fn import_legacy(
                     now,
                 )
                 .map_err(|e| e.to_string())?;
+                if let Some(fact_id) = fact_id {
+                    let payload =
+                        serde_json::json!({ "text": truncate_chars(text, 600), "confidence": 0.7 })
+                            .to_string();
+                    let event_id = append_event(
+                        &tx,
+                        &MemoryEventInput {
+                            user_id: &user_id,
+                            card_id: &request.card_id,
+                            item_kind: "fact",
+                            item_id: &fact_id,
+                            event_type: "fact.imported",
+                            source_type: "legacy-import",
+                            source_id: None,
+                            modality: "text",
+                            observed_at: now,
+                            trust: 0.7,
+                            consent: "legacy",
+                            idempotency_key: &format!("legacy-import:fact:{fact_id}"),
+                            payload_json: &payload,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
+                    append_evidence(
+                        &tx,
+                        &event_id,
+                        "fact",
+                        &fact_id,
+                        "legacy_record",
+                        &[],
+                        None,
+                        now,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
                 affected += 1;
             }
             for promise in raw
@@ -1730,8 +2279,44 @@ fn import_legacy(
                 if text.trim().is_empty() || is_sensitive(text) {
                     continue;
                 }
-                insert_commitment(&tx, &request.card_id, &user_id, None, text, None, 0.7, now)
+                let commitment_id =
+                    insert_commitment(&tx, &request.card_id, &user_id, None, text, None, 0.7, now)
+                        .map_err(|e| e.to_string())?;
+                if let Some(commitment_id) = commitment_id {
+                    let payload =
+                        serde_json::json!({ "text": truncate_chars(text, 600), "importance": 0.7 })
+                            .to_string();
+                    let event_id = append_event(
+                        &tx,
+                        &MemoryEventInput {
+                            user_id: &user_id,
+                            card_id: &request.card_id,
+                            item_kind: "commitment",
+                            item_id: &commitment_id,
+                            event_type: "commitment.imported",
+                            source_type: "legacy-import",
+                            source_id: None,
+                            modality: "text",
+                            observed_at: now,
+                            trust: 0.7,
+                            consent: "legacy",
+                            idempotency_key: &format!("legacy-import:commitment:{commitment_id}"),
+                            payload_json: &payload,
+                        },
+                    )
                     .map_err(|e| e.to_string())?;
+                    append_evidence(
+                        &tx,
+                        &event_id,
+                        "commitment",
+                        &commitment_id,
+                        "legacy_record",
+                        &[],
+                        None,
+                        now,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
                 affected += 1;
             }
             tx.execute(
@@ -2052,6 +2637,11 @@ fn apply_extraction(
     let summary = truncate_chars(&extraction.episode.summary, 1000);
     if !summary.is_empty() && !is_sensitive(&summary) {
         let ids: HashSet<_> = extraction.episode.source_message_ids.iter().collect();
+        let source_message_ids: Vec<String> = messages
+            .iter()
+            .filter(|message| ids.contains(&message.id) && !is_sensitive(&message.content))
+            .map(|message| message.id.clone())
+            .collect();
         let excerpt = messages
             .iter()
             .filter(|m| ids.contains(&m.id) && !is_sensitive(&m.content))
@@ -2093,6 +2683,43 @@ fn apply_extraction(
                 if excerpt.is_empty() { None } else { Some(truncate_chars(&excerpt, 800)) },
                 now + SOURCE_RETENTION_SECS, now],
         )?;
+        let episode_payload = serde_json::json!({
+            "summary": summary.clone(),
+            "emotion": truncate_chars(&extraction.episode.emotion, 60),
+            "importance": clamp01(extraction.episode.importance),
+            "topics": topics.clone(),
+            "entities": entities.clone(),
+            "sourceMessageIds": source_message_ids.clone(),
+        })
+        .to_string();
+        let event_id = append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &job.user_id,
+                card_id: &job.card_id,
+                item_kind: "episode",
+                item_id: &id,
+                event_type: "episode.created",
+                source_type: "chat-consolidation",
+                source_id: Some(&job.id),
+                modality: "text",
+                observed_at: now,
+                trust: extraction.episode.importance,
+                consent: "allowed",
+                idempotency_key: &format!("consolidation:{}:episode", job.id),
+                payload_json: &episode_payload,
+            },
+        )?;
+        append_evidence(
+            &tx,
+            &event_id,
+            "episode",
+            &id,
+            "derived_from",
+            &source_message_ids,
+            (!excerpt.is_empty()).then_some(excerpt.as_str()),
+            now,
+        )?;
         index_item(
             &tx,
             &id,
@@ -2104,11 +2731,33 @@ fn apply_extraction(
         )?;
         episode_id = Some(id);
     }
-    for fact in extraction.facts.iter().take(30) {
+    for (fact_index, fact) in extraction.facts.iter().take(30).enumerate() {
         if fact.text.trim().is_empty() || is_sensitive(&fact.text) {
             continue;
         }
-        insert_fact(
+        let text = truncate_chars(&fact.text, 600);
+        let (predicate, value) = fact_keys(fact, &text);
+        let same_before: Option<String> = tx
+            .query_row(
+                "SELECT id FROM memory_facts
+                 WHERE user_id=?1 AND predicate=?2 AND value=?3 AND status='active' LIMIT 1",
+                params![job.user_id, predicate, value],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let superseded_ids: Vec<String> =
+            if matches!(fact.evidence.as_str(), "correction" | "preferenceChange") {
+                tx.prepare(
+                    "SELECT id FROM memory_facts
+                 WHERE user_id=?1 AND predicate=?2 AND status='active'",
+                )?
+                .query_map(params![job.user_id, predicate], |row| row.get(0))?
+                .filter_map(Result::ok)
+                .collect()
+            } else {
+                Vec::new()
+            };
+        let fact_id = insert_fact(
             &tx,
             &job.card_id,
             &job.user_id,
@@ -2116,12 +2765,98 @@ fn apply_extraction(
             fact,
             now,
         )?;
+        let Some(fact_id) = fact_id else { continue };
+        let fact_status: String = tx.query_row(
+            "SELECT status FROM memory_facts WHERE id=?1",
+            [&fact_id],
+            |row| row.get(0),
+        )?;
+        let event_type = if matches!(fact.evidence.as_str(), "correction" | "preferenceChange") {
+            "fact.corrected"
+        } else if same_before.is_some() {
+            "fact.confirmed"
+        } else if fact_status == "disputed" {
+            "fact.disputed"
+        } else {
+            "fact.created"
+        };
+        let fact_payload = serde_json::json!({
+            "text": text.clone(),
+            "predicate": predicate.clone(),
+            "value": value.clone(),
+            "durability": fact.durability.clone(),
+            "evidence": fact.evidence.clone(),
+            "confidence": clamp01(fact.confidence),
+            "importance": clamp01(fact.importance),
+            "sourceEpisodeId": episode_id.clone(),
+        })
+        .to_string();
+        let event_id = append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &job.user_id,
+                card_id: &job.card_id,
+                item_kind: "fact",
+                item_id: &fact_id,
+                event_type,
+                source_type: "chat-consolidation",
+                source_id: Some(&job.id),
+                modality: "text",
+                observed_at: now,
+                trust: fact.confidence,
+                consent: "allowed",
+                idempotency_key: &format!("consolidation:{}:fact:{fact_index}", job.id),
+                payload_json: &fact_payload,
+            },
+        )?;
+        let relation = if matches!(fact.evidence.as_str(), "correction" | "preferenceChange") {
+            "supersedes"
+        } else if fact_status == "disputed" {
+            "contradicts"
+        } else {
+            "supports"
+        };
+        append_evidence(&tx, &event_id, "fact", &fact_id, relation, &[], None, now)?;
+        for old_id in superseded_ids {
+            let old_payload = serde_json::json!({ "supersededBy": fact_id }).to_string();
+            let old_event_id = append_event(
+                &tx,
+                &MemoryEventInput {
+                    user_id: &job.user_id,
+                    card_id: &job.card_id,
+                    item_kind: "fact",
+                    item_id: &old_id,
+                    event_type: "fact.superseded",
+                    source_type: "chat-consolidation",
+                    source_id: Some(&job.id),
+                    modality: "text",
+                    observed_at: now,
+                    trust: fact.confidence,
+                    consent: "allowed",
+                    idempotency_key: &format!(
+                        "consolidation:{}:fact:{fact_index}:supersede:{old_id}",
+                        job.id
+                    ),
+                    payload_json: &old_payload,
+                },
+            )?;
+            append_evidence(
+                &tx,
+                &old_event_id,
+                "fact",
+                &old_id,
+                "superseded_by",
+                &[],
+                None,
+                now,
+            )?;
+        }
     }
-    for commitment in extraction.commitments.iter().take(12) {
+    for (commitment_index, commitment) in extraction.commitments.iter().take(12).enumerate() {
         if commitment.text.trim().is_empty() || is_sensitive(&commitment.text) {
             continue;
         }
-        insert_commitment(
+        let commitment_id = insert_commitment(
             &tx,
             &job.card_id,
             &job.user_id,
@@ -2131,8 +2866,81 @@ fn apply_extraction(
             commitment.importance,
             now,
         )?;
+        let Some(commitment_id) = commitment_id else {
+            continue;
+        };
+        let commitment_payload = serde_json::json!({
+            "text": truncate_chars(&commitment.text, 600),
+            "dueAt": commitment.due_at,
+            "importance": clamp01(commitment.importance),
+            "sourceEpisodeId": episode_id.clone(),
+        })
+        .to_string();
+        let event_id = append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &job.user_id,
+                card_id: &job.card_id,
+                item_kind: "commitment",
+                item_id: &commitment_id,
+                event_type: "commitment.created",
+                source_type: "chat-consolidation",
+                source_id: Some(&job.id),
+                modality: "text",
+                observed_at: now,
+                trust: commitment.importance,
+                consent: "allowed",
+                idempotency_key: &format!("consolidation:{}:commitment:{commitment_index}", job.id),
+                payload_json: &commitment_payload,
+            },
+        )?;
+        append_evidence(
+            &tx,
+            &event_id,
+            "commitment",
+            &commitment_id,
+            "promised_during",
+            &[],
+            None,
+            now,
+        )?;
     }
-    resolve_commitments_from_messages(&tx, &job.user_id, &messages, now)?;
+    let resolved_commitments =
+        resolve_commitments_from_messages(&tx, &job.user_id, &messages, now)?;
+    for (resolution_index, (commitment_id, status)) in resolved_commitments.iter().enumerate() {
+        let payload = serde_json::json!({ "status": status }).to_string();
+        let event_id = append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &job.user_id,
+                card_id: &job.card_id,
+                item_kind: "commitment",
+                item_id: commitment_id,
+                event_type: "commitment.status_changed",
+                source_type: "chat-consolidation",
+                source_id: Some(&job.id),
+                modality: "text",
+                observed_at: now,
+                trust: 0.9,
+                consent: "allowed",
+                idempotency_key: &format!(
+                    "consolidation:{}:commitment-resolve:{resolution_index}",
+                    job.id
+                ),
+                payload_json: &payload,
+            },
+        )?;
+        append_evidence(
+            &tx,
+            &event_id,
+            "commitment",
+            commitment_id,
+            "fulfilled_or_cancelled_by",
+            &[],
+            None,
+            now,
+        )?;
+    }
     let session_already_counted: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM memory_jobs WHERE user_id=?1 AND session_id=?2 AND status='done')",
         params![job.user_id, job.session_id], |r| r.get(0),
@@ -2159,28 +2967,11 @@ fn insert_fact(
     episode_id: Option<&str>,
     fact: &ExtractedFact,
     now: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Option<String>> {
     let text = truncate_chars(&fact.text, 600);
-    let predicate = truncate_chars(
-        if fact.predicate.trim().is_empty() {
-            &text
-        } else {
-            &fact.predicate
-        },
-        120,
-    )
-    .to_lowercase();
-    let value = truncate_chars(
-        if fact.value.trim().is_empty() {
-            &text
-        } else {
-            &fact.value
-        },
-        300,
-    )
-    .to_lowercase();
+    let (predicate, value) = fact_keys(fact, &text);
     if text.is_empty() || is_sensitive(&text) || is_sensitive(&predicate) || is_sensitive(&value) {
-        return Ok(());
+        return Ok(None);
     }
     let same: Option<(String, i64, f64)> = tx
         .query_row(
@@ -2203,7 +2994,7 @@ fn insert_fact(
             ],
         )?;
         rebuild_search_item(tx, "fact", &id)?;
-        return Ok(());
+        return Ok(Some(id));
     }
     let change = matches!(fact.evidence.as_str(), "correction" | "preferenceChange");
     let conflict: bool = tx.query_row(
@@ -2249,7 +3040,30 @@ fn insert_fact(
         user_id,
         &text,
         &format!("{} {}", predicate, value),
+    )?;
+    Ok(Some(id))
+}
+
+fn fact_keys(fact: &ExtractedFact, text: &str) -> (String, String) {
+    let predicate = truncate_chars(
+        if fact.predicate.trim().is_empty() {
+            text
+        } else {
+            &fact.predicate
+        },
+        120,
     )
+    .to_lowercase();
+    let value = truncate_chars(
+        if fact.value.trim().is_empty() {
+            text
+        } else {
+            &fact.value
+        },
+        300,
+    )
+    .to_lowercase();
+    (predicate, value)
 }
 
 fn insert_commitment(
@@ -2261,10 +3075,10 @@ fn insert_commitment(
     due_at: Option<i64>,
     importance: f64,
     now: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Option<String>> {
     let text = truncate_chars(text, 600);
     if text.is_empty() || is_sensitive(&text) {
-        return Ok(());
+        return Ok(None);
     }
     let existing: Option<String> = {
         let mut stmt = tx.prepare(
@@ -2289,7 +3103,7 @@ fn insert_commitment(
             params![due_at,clamp01(importance),episode_id,now,id],
         )?;
         rebuild_search_item(tx, "commitment", &id)?;
-        return Ok(());
+        return Ok(Some(id));
     }
     let id = Uuid::new_v4().to_string();
     tx.execute(
@@ -2313,7 +3127,8 @@ fn insert_commitment(
         user_id,
         &text,
         "约定 承诺 待办",
-    )
+    )?;
+    Ok(Some(id))
 }
 
 fn resolve_commitments_from_messages(
@@ -2321,7 +3136,7 @@ fn resolve_commitments_from_messages(
     user_id: &str,
     messages: &[MemoryMessage],
     now: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Vec<(String, String)>> {
     let mut resolutions = Vec::new();
     for message in messages.iter().filter(|message| message.role == "user") {
         let text = message.content.trim();
@@ -2343,7 +3158,7 @@ fn resolve_commitments_from_messages(
         }
     }
     if resolutions.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let pending: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
@@ -2356,20 +3171,24 @@ fn resolve_commitments_from_messages(
             .collect();
         pending
     };
+    let mut changed = Vec::new();
     for (message, status) in resolutions {
         let message_grams = grams(&message);
         for (id, commitment) in &pending {
             if jaccard(&message_grams, &grams(commitment)) < 0.08 {
                 continue;
             }
-            conn.execute(
+            let affected = conn.execute(
                 "UPDATE memory_commitments SET status=?1,resolved_at=?2,updated_at=?2
                  WHERE id=?3 AND status='pending'",
                 params![status, now, id],
             )?;
+            if affected > 0 {
+                changed.push((id.clone(), status.to_string()));
+            }
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn index_item(
@@ -2500,6 +3319,186 @@ mod tests {
         let found = search_candidates(&conn, "card", &user, "产品经理面试").unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].text.contains("面试"));
+    }
+
+    #[test]
+    fn v4_events_are_append_only_and_idempotent() {
+        let conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        let payload = r#"{"text":"用户下周面试"}"#;
+        let input = MemoryEventInput {
+            user_id: &user,
+            card_id: "card",
+            item_kind: "fact",
+            item_id: "fact-1",
+            event_type: "fact.created",
+            source_type: "test",
+            source_id: Some("job-1"),
+            modality: "text",
+            observed_at: 100,
+            trust: 2.0,
+            consent: "allowed",
+            idempotency_key: "test-event-1",
+            payload_json: payload,
+        };
+        let first = append_event(&conn, &input).unwrap();
+        let second = append_event(&conn, &input).unwrap();
+        assert_eq!(first, second);
+        let trust: f64 = conn
+            .query_row(
+                "SELECT trust FROM memory_events WHERE id=?1",
+                [&first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trust, 1.0);
+        let update = conn.execute(
+            "UPDATE memory_events SET payload_json='{}' WHERE id=?1",
+            [&first],
+        );
+        assert!(update.is_err());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v3_migration_backfills_existing_items_once() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_fact(
+            &tx,
+            "card",
+            &user,
+            None,
+            &fact("用户下周参加面试", "近期安排", "参加面试", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS memory_events_no_update;
+             DROP TABLE memory_evidence;
+             DROP TABLE memory_events;
+             DROP TABLE memory_scopes;
+             UPDATE memory_meta SET value='3' WHERE key='schema_version';",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM memory_meta WHERE key='schema_version'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "4"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE source_type='schema-migration'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE source_type='schema-migration'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn timeline_is_card_scoped_and_excerpts_expire_without_removing_events() {
+        let conn = test_db();
+        let alice = get_or_create_user(&conn, "card-a", "小明").unwrap();
+        let bob = get_or_create_user(&conn, "card-b", "小明").unwrap();
+        let payload = r#"{"summary":"一起准备面试"}"#;
+        let alice_event = append_event(
+            &conn,
+            &MemoryEventInput {
+                user_id: &alice,
+                card_id: "card-a",
+                item_kind: "episode",
+                item_id: "episode-a",
+                event_type: "episode.created",
+                source_type: "chat-consolidation",
+                source_id: Some("job-a"),
+                modality: "text",
+                observed_at: 100,
+                trust: 0.8,
+                consent: "allowed",
+                idempotency_key: "timeline-a",
+                payload_json: payload,
+            },
+        )
+        .unwrap();
+        let _bob_event = append_event(
+            &conn,
+            &MemoryEventInput {
+                user_id: &bob,
+                card_id: "card-b",
+                item_kind: "episode",
+                item_id: "episode-a",
+                event_type: "episode.created",
+                source_type: "chat-consolidation",
+                source_id: Some("job-b"),
+                modality: "text",
+                observed_at: 100,
+                trust: 0.8,
+                consent: "allowed",
+                idempotency_key: "timeline-b",
+                payload_json: payload,
+            },
+        )
+        .unwrap();
+        append_evidence(
+            &conn,
+            &alice_event,
+            "episode",
+            "episode-a",
+            "derived_from",
+            &["m1".into()],
+            Some("面试原话"),
+            now_ts() - SOURCE_RETENTION_SECS - 1,
+        )
+        .unwrap();
+        maintenance(&conn).unwrap();
+        let alice_timeline = timeline(
+            &conn,
+            &MemoryTimelineQuery {
+                card_id: "card-a".into(),
+                kind: "episode".into(),
+                id: "episode-a".into(),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(alice_timeline.events.len(), 1);
+        assert_eq!(alice_timeline.events[0].source_type, "chat-consolidation");
+        assert!(alice_timeline.events[0].evidence[0].excerpt.is_none());
+        let other = timeline(
+            &conn,
+            &MemoryTimelineQuery {
+                card_id: "card-b".into(),
+                kind: "episode".into(),
+                id: "episode-a".into(),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(other.events.len(), 1);
     }
 
     #[test]
@@ -2687,6 +3686,14 @@ mod tests {
             },
         )
         .unwrap();
+        let events_before_delete: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE item_kind='fact' AND item_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(events_before_delete >= 1);
         let (text, confidence): (String, f64) = conn
             .query_row(
                 "SELECT text,confidence FROM memory_facts WHERE id=?1",
@@ -3046,11 +4053,29 @@ mod tests {
             &MemoryDeleteRequest {
                 items: vec![MemoryItemRef {
                     kind: "fact".into(),
-                    id: fact_id,
+                    id: fact_id.clone(),
                 }],
             },
         )
         .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE item_kind='fact' AND item_id=?1",
+                [&fact_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_evidence WHERE item_kind='fact' AND item_id=?1",
+                [&fact_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
         let fact_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_facts", [], |row| row.get(0))
             .unwrap();
@@ -3154,10 +4179,8 @@ mod tests {
 
     #[test]
     fn locked_database_job_remains_pending_and_recovers_after_unlock() {
-        let db_path = std::env::temp_dir().join(format!(
-            "kxyy-memory-lock-test-{}.sqlite3",
-            Uuid::new_v4()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("kxyy-memory-lock-test-{}.sqlite3", Uuid::new_v4()));
         let mut worker_conn = Connection::open(&db_path).unwrap();
         configure(&worker_conn).unwrap();
         migrate(&mut worker_conn).unwrap();

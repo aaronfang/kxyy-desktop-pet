@@ -1694,6 +1694,7 @@ pub fn run() {
             install_vad_shadow_runtime,
             install_sensevoice_runtime,
             memory::memory_status,
+            memory::memory_timeline,
             memory::memory_recall,
             memory::memory_enqueue_session,
             memory::memory_list,

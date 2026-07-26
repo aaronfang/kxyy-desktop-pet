@@ -566,6 +566,31 @@ button.danger:disabled {
 }
 .memory-card-actions { justify-content: flex-end; }
 .memory-card-actions button { height: 27px; padding: 0 9px; font-size: 12px; }
+.memory-timeline {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border-top: 1px solid #eef0f3;
+  color: #6b7280;
+  font-size: 11px;
+}
+.memory-event {
+  padding: 8px 0;
+  border-bottom: 1px dashed #e5e7eb;
+}
+.memory-event:last-child { border-bottom: 0; }
+.memory-event-head,
+.memory-event-meta { display: flex; justify-content: space-between; gap: 8px; }
+.memory-event-head strong { color: #4b5563; font-size: 11px; }
+.memory-event-head time { color: #9ca3af; white-space: nowrap; }
+.memory-event-summary { margin: 4px 0; color: #374151; white-space: pre-wrap; }
+.memory-event-meta { margin: 0; color: #9ca3af; }
+.memory-event-evidence {
+  margin: 5px 0 0;
+  padding-left: 8px;
+  border-left: 2px solid #dbeafe;
+  color: #64748b;
+  white-space: pre-wrap;
+}
 .memory-page-row { justify-content: center; margin-top: 12px; }
 .memory-danger-zone { margin-top: 18px; padding-top: 14px; border-top: 1px solid #fee2e2; }
 .memory-empty { color: #9ca3af; text-align: center; margin: 48px 0; }

@@ -1000,6 +1000,7 @@ async function refreshMemoryStats() {
       `事实 ${memoryCounts.facts || 0}`,
       `经历 ${memoryCounts.episodes || 0}`,
       `约定 ${memoryCounts.commitments || 0}`,
+      `事件 ${status.eventCount || 0}`,
       `待巩固 ${status.pendingJobs || 0}`,
       `跳过 ${status.skippedJobs || 0}`,
       `数据库 ${kb} KB`,
@@ -1031,6 +1032,67 @@ function memoryActionButton(label, action, className = "ghost") {
   button.textContent = label;
   button.addEventListener("click", action);
   return button;
+}
+
+function renderMemoryTimeline(box, result) {
+  box.replaceChildren();
+  const events = Array.isArray(result?.events) ? result.events : [];
+  if (!events.length) {
+    box.textContent = "暂无可追溯事件";
+    return;
+  }
+  const eventLabels = {
+    "episode.created": "创建经历",
+    "episode.imported": "导入经历",
+    "episode.edited": "编辑经历",
+    "fact.created": "建立事实",
+    "fact.imported": "导入事实",
+    "fact.confirmed": "再次确认事实",
+    "fact.corrected": "纠正事实",
+    "fact.disputed": "标记事实冲突",
+    "fact.superseded": "事实被替代",
+    "fact.edited": "编辑事实",
+    "commitment.created": "建立约定",
+    "commitment.imported": "导入约定",
+    "commitment.edited": "编辑约定",
+    "commitment.status_changed": "约定状态变化",
+    "commitment.pinned": "约定置顶变化",
+  };
+  const sourceLabels = {
+    "chat-consolidation": "聊天巩固",
+    "legacy-import": "旧版迁移",
+    "user-edit": "用户操作",
+    "schema-migration": "数据库迁移",
+  };
+  for (const event of events) {
+    const row = document.createElement("div");
+    row.className = "memory-event";
+    const head = document.createElement("div");
+    head.className = "memory-event-head";
+    const type = document.createElement("strong");
+    type.textContent = eventLabels[event.eventType] || event.eventType || "记忆事件";
+    const date = document.createElement("time");
+    date.textContent = event.observedAt
+      ? new Date(event.observedAt * 1000).toLocaleString("zh-CN")
+      : "时间未知";
+    head.append(type, date);
+    row.appendChild(head);
+    const summary = document.createElement("p");
+    summary.className = "memory-event-summary";
+    summary.textContent = event.summary || "无摘要";
+    row.appendChild(summary);
+    const meta = document.createElement("p");
+    meta.className = "memory-event-meta";
+    meta.textContent = `${sourceLabels[event.sourceType] || event.sourceType || "来源未知"} · 信任度 ${Math.round((event.trust || 0) * 100)}% · ${event.consent || "权限未知"}`;
+    row.appendChild(meta);
+    for (const evidence of event.evidence || []) {
+      const source = document.createElement("p");
+      source.className = "memory-event-evidence";
+      source.textContent = `${evidence.relation || "evidence"}${evidence.excerpt ? `：${evidence.excerpt}` : ""}`;
+      row.appendChild(source);
+    }
+    box.appendChild(row);
+  }
 }
 
 function renderMemoryItems(items) {
@@ -1084,12 +1146,37 @@ function renderMemoryItems(items) {
         await loadMemoryPage();
       }));
     }
+    const timeline = document.createElement("div");
+    timeline.className = "memory-timeline";
+    timeline.hidden = true;
+    const timelineButton = memoryActionButton("时间线", async () => {
+      if (!timeline.hidden) {
+        timeline.hidden = true;
+        return;
+      }
+      timeline.hidden = false;
+      timeline.textContent = "读取事件中…";
+      try {
+        const result = await invoke("memory_timeline", {
+          query: {
+            cardId: selectedMemoryCardId(),
+            kind: item.kind,
+            id: item.id,
+            limit: 20,
+          },
+        });
+        renderMemoryTimeline(timeline, result);
+      } catch (e) {
+        timeline.textContent = `读取时间线失败：${e.message || e}`;
+      }
+    });
+    actions.appendChild(timelineButton);
     actions.appendChild(memoryActionButton("删除", async () => {
       if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
       await invoke("memory_delete", { request: { items: [{ kind: item.kind, id: item.id }] } });
       await loadMemoryPage();
     }, "danger"));
-    card.appendChild(actions);
+    card.append(actions, timeline);
     list.appendChild(card);
   }
 }
