@@ -1298,6 +1298,77 @@ el("memoryPrev")?.addEventListener("click", () => { if (memoryPage > 1) { memory
 el("memoryNext")?.addEventListener("click", () => {
   if (memoryPage * MEMORY_PAGE_SIZE < memoryTotal) { memoryPage++; void loadMemoryPage(); }
 });
+
+function setMemoryMaintenanceStatus(text, ok = true) {
+  const node = el("memoryMaintenanceStatus");
+  if (!node) return;
+  node.textContent = text;
+  node.style.color = ok ? "#16a34a" : "#dc2626";
+}
+
+el("memoryIntegrity")?.addEventListener("click", async () => {
+  const button = el("memoryIntegrity");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("检查中…");
+  try {
+    const result = await invoke("memory_integrity_check");
+    const counts = result.counts || {};
+    if (result.ok) {
+      setMemoryMaintenanceStatus(`完整性正常：${counts.events || 0} 个事件、${counts.edges || 0} 条关系边、${counts.searchRows || 0} 条搜索索引。`);
+    } else {
+      const details = (result.errors || []).slice(0, 2).join("；") || "发现未知问题";
+      setMemoryMaintenanceStatus(`检查发现问题：${details}`, false);
+    }
+  } catch (e) {
+    setMemoryMaintenanceStatus(`检查失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryExport")?.addEventListener("click", async () => {
+  const button = el("memoryExport");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("准备脱敏导出…");
+  try {
+    const result = await invoke("memory_export", {
+      request: {
+        cardId: selectedMemoryCardId(),
+        nickname: el("memoryNickname").value.trim(),
+      },
+    });
+    const blob = new Blob([result.json || "{}"], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = result.fileName || "memory-export.json";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setMemoryMaintenanceStatus(`已导出 ${result.itemCount || 0} 条记忆、${result.edgeCount || 0} 条关系边。`);
+  } catch (e) {
+    setMemoryMaintenanceStatus(`导出失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryBackup")?.addEventListener("click", async () => {
+  const button = el("memoryBackup");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("创建一致性备份…");
+  try {
+    const result = await invoke("memory_backup");
+    const name = String(result.path || "").split(/[\\/]/).pop() || "memory backup";
+    setMemoryMaintenanceStatus(`备份已创建：${name}（${Math.round((result.bytes || 0) / 1024)} KB，完整性 ${result.integrityResult}）。`);
+  } catch (e) {
+    setMemoryMaintenanceStatus(`备份失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 document.querySelector('.tab-btn[data-tab="memory"]')?.addEventListener("click", async () => {
   await migrateSelectedCardMemory();
   await loadMemoryPage({ resetPage: true });

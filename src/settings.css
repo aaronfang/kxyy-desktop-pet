@@ -618,6 +618,14 @@ button.danger:disabled {
   background: #f1f5f9;
 }
 .memory-page-row { justify-content: center; margin-top: 12px; }
+.memory-maintenance {
+  margin-top: 16px;
+  padding: 10px 0;
+  border-top: 1px solid #eef0f3;
+}
+.memory-maintenance-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.memory-maintenance-actions button { height: 29px; padding: 0 10px; font-size: 12px; }
+.memory-maintenance p { margin: 7px 0 0; }
 .memory-danger-zone { margin-top: 18px; padding-top: 14px; border-top: 1px solid #fee2e2; }
 .memory-empty { color: #9ca3af; text-align: center; margin: 48px 0; }
 @media (max-width: 760px) {

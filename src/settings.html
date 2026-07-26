@@ -393,6 +393,15 @@
             <span id="memoryPageInfo" class="hint">第 1 页</span>
             <button id="memoryNext" type="button" class="ghost">下一页</button>
           </div>
+          <div class="memory-maintenance">
+            <div class="memory-maintenance-actions">
+              <button id="memoryIntegrity" type="button" class="ghost">检查完整性</button>
+              <button id="memoryExport" type="button" class="ghost">导出脱敏记忆</button>
+              <button id="memoryBackup" type="button" class="ghost">创建数据库备份</button>
+            </div>
+            <p id="memoryMaintenanceStatus" class="hint" role="status"></p>
+            <p class="hint">导出文件不包含来源原文、事件 payload 或证据片段；数据库备份保留在本机应用数据目录。</p>
+          </div>
           <div class="memory-danger-zone">
             <button id="memoryClearAll" type="button" class="danger">清空当前人设全部记忆</button>
             <span id="memoryManageStatus" class="hint"></span>

@@ -8,7 +8,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveDateTime;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
@@ -960,6 +960,135 @@ pub struct MemoryStatusResponse {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryIntegrityResponse {
+    pub ok: bool,
+    pub schema_version: i64,
+    pub checked_at: i64,
+    pub foreign_key_errors: usize,
+    pub integrity_result: String,
+    pub counts: MemoryIntegrityCounts,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryIntegrityCounts {
+    pub users: i64,
+    pub episodes: i64,
+    pub facts: i64,
+    pub commitments: i64,
+    pub events: i64,
+    pub evidence: i64,
+    pub edges: i64,
+    pub topics: i64,
+    pub entities: i64,
+    pub search_rows: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryExportRequest {
+    pub card_id: String,
+    #[serde(default)]
+    pub nickname: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryExportResponse {
+    pub format_version: i64,
+    pub exported_at: i64,
+    pub file_name: String,
+    pub card_id: String,
+    pub user_count: usize,
+    pub item_count: usize,
+    pub event_count: usize,
+    pub edge_count: usize,
+    pub json: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryBackupRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryBackupResponse {
+    pub path: String,
+    pub bytes: u64,
+    pub schema_version: i64,
+    pub integrity_result: String,
+    pub foreign_key_errors: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExportUser {
+    id: String,
+    nickname: String,
+    total_sessions: i64,
+    last_seen_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExportItem {
+    id: String,
+    kind: String,
+    user_id: String,
+    text: String,
+    status: String,
+    confidence: f64,
+    importance: f64,
+    pinned: bool,
+    occurred_at: Option<i64>,
+    updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExportEvent {
+    id: String,
+    user_id: String,
+    item_kind: String,
+    item_id: String,
+    event_type: String,
+    source_type: String,
+    source_id: Option<String>,
+    observed_at: i64,
+    trust: f64,
+    consent: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExportNode {
+    id: String,
+    kind: String,
+    user_id: String,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExportEdge {
+    id: String,
+    user_id: String,
+    from_kind: String,
+    from_id: String,
+    to_kind: String,
+    to_id: String,
+    relation: String,
+    source_event_id: Option<String>,
+    confidence: f64,
+    derived: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryTimelineQuery {
@@ -1169,6 +1298,436 @@ pub fn memory_status(state: State<'_, MemoryState>) -> MemoryStatusResponse {
         event_count,
         last_error: state.last_error.lock().unwrap().clone(),
     }
+}
+
+fn scalar_count(conn: &Connection, sql: &str) -> rusqlite::Result<i64> {
+    conn.query_row(sql, [], |row| row.get(0))
+}
+
+fn integrity_check(conn: &Connection) -> Result<MemoryIntegrityResponse, String> {
+    let checked_at = now_ts();
+    let schema_version = conn
+        .query_row(
+            "SELECT value FROM memory_meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    if schema_version != SCHEMA_VERSION {
+        errors.push(format!(
+            "schema version {schema_version} 与当前支持版本 {SCHEMA_VERSION} 不一致"
+        ));
+    }
+    let integrity_result = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|error| format!("执行 integrity_check 失败：{error}"));
+    if integrity_result != "ok" {
+        errors.push(format!("SQLite integrity_check：{integrity_result}"));
+    }
+    let foreign_key_errors = conn
+        .prepare("PRAGMA foreign_key_check")
+        .and_then(|mut stmt| stmt.query_map([], |_| Ok(())).map(|rows| rows.count()))
+        .unwrap_or(0);
+    if foreign_key_errors > 0 {
+        errors.push(format!("发现 {foreign_key_errors} 条外键错误"));
+    }
+    let counts = MemoryIntegrityCounts {
+        users: scalar_count(conn, "SELECT COUNT(*) FROM memory_users").unwrap_or(0),
+        episodes: scalar_count(conn, "SELECT COUNT(*) FROM memory_episodes").unwrap_or(0),
+        facts: scalar_count(conn, "SELECT COUNT(*) FROM memory_facts").unwrap_or(0),
+        commitments: scalar_count(conn, "SELECT COUNT(*) FROM memory_commitments").unwrap_or(0),
+        events: scalar_count(conn, "SELECT COUNT(*) FROM memory_events").unwrap_or(0),
+        evidence: scalar_count(conn, "SELECT COUNT(*) FROM memory_evidence").unwrap_or(0),
+        edges: scalar_count(conn, "SELECT COUNT(*) FROM memory_edges").unwrap_or(0),
+        topics: scalar_count(conn, "SELECT COUNT(*) FROM memory_topics").unwrap_or(0),
+        entities: scalar_count(conn, "SELECT COUNT(*) FROM memory_entities").unwrap_or(0),
+        search_rows: scalar_count(conn, "SELECT COUNT(*) FROM memory_search").unwrap_or(0),
+    };
+    let expected_search = counts.episodes + counts.facts + counts.commitments;
+    if expected_search != counts.search_rows {
+        errors.push(format!(
+            "FTS 行数 {search_rows} 与记忆条目数 {expected_search} 不一致",
+            search_rows = counts.search_rows
+        ));
+    }
+    let missing_nodes = scalar_count(
+        conn,
+        "SELECT COUNT(*) FROM memory_edges e
+         WHERE (e.to_kind='topic' AND NOT EXISTS(SELECT 1 FROM memory_topics t WHERE t.id=e.to_id AND t.user_id=e.user_id))
+            OR (e.to_kind='entity' AND NOT EXISTS(SELECT 1 FROM memory_entities n WHERE n.id=e.to_id AND n.user_id=e.user_id))",
+    )
+    .unwrap_or(0);
+    if missing_nodes > 0 {
+        errors.push(format!(
+            "发现 {missing_nodes} 条关系边指向不存在的 topic/entity"
+        ));
+    }
+    let orphan_item_edges = scalar_count(
+        conn,
+        "SELECT COUNT(*) FROM memory_edges e
+         WHERE (e.from_kind IN ('episode','fact','commitment') AND NOT EXISTS(
+             SELECT 1 FROM memory_episodes x WHERE e.from_kind='episode' AND x.id=e.from_id
+             UNION ALL SELECT 1 FROM memory_facts x WHERE e.from_kind='fact' AND x.id=e.from_id
+             UNION ALL SELECT 1 FROM memory_commitments x WHERE e.from_kind='commitment' AND x.id=e.from_id
+         ))",
+    )
+    .unwrap_or(0);
+    if orphan_item_edges > 0 {
+        errors.push(format!("发现 {orphan_item_edges} 条关系边起点不存在"));
+    }
+    if counts.evidence > counts.events {
+        warnings.push("证据记录数超过事件数，请检查是否存在重复来源".into());
+    }
+    Ok(MemoryIntegrityResponse {
+        ok: errors.is_empty(),
+        schema_version,
+        checked_at,
+        foreign_key_errors,
+        integrity_result,
+        counts,
+        errors,
+        warnings,
+    })
+}
+
+#[tauri::command]
+pub fn memory_integrity_check(
+    state: State<'_, MemoryState>,
+) -> Result<MemoryIntegrityResponse, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    integrity_check(conn)
+}
+
+fn export_safe_text(text: &str) -> String {
+    if is_sensitive(text) {
+        "[敏感内容已省略]".into()
+    } else {
+        truncate_chars(text, 1000)
+    }
+}
+
+fn export_memory(
+    conn: &Connection,
+    request: &MemoryExportRequest,
+) -> Result<MemoryExportResponse, String> {
+    let user_filter = if request.nickname.trim().is_empty() {
+        None
+    } else {
+        find_user(conn, &request.card_id, &request.nickname).map_err(|e| e.to_string())?
+    };
+    let include_user = |user_id: &str| user_filter.as_ref().is_none_or(|id| id == user_id);
+    let mut users = Vec::new();
+    let mut user_stmt = conn
+        .prepare(
+            "SELECT id,display_name,total_sessions,last_seen_at FROM memory_users WHERE card_id=?1 ORDER BY created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    for row in user_stmt
+        .query_map([&request.card_id], |row| {
+            Ok(MemoryExportUser {
+                id: row.get(0)?,
+                nickname: export_safe_text(&row.get::<_, String>(1)?),
+                total_sessions: row.get(2)?,
+                last_seen_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+    {
+        let user = row.map_err(|e| e.to_string())?;
+        if include_user(&user.id) {
+            users.push(user);
+        }
+    }
+    let mut items = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id,f.user_id,f.text,f.status,f.confidence,f.importance,f.pinned,f.valid_from,f.updated_at
+                 FROM memory_facts f JOIN memory_users u ON u.id=f.user_id WHERE u.card_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        for row in stmt
+            .query_map([&request.card_id], |row| {
+                Ok(MemoryExportItem {
+                    id: row.get(0)?,
+                    kind: "fact".into(),
+                    user_id: row.get(1)?,
+                    text: export_safe_text(&row.get::<_, String>(2)?),
+                    status: row.get(3)?,
+                    confidence: row.get(4)?,
+                    importance: row.get(5)?,
+                    pinned: row.get::<_, i64>(6)? != 0,
+                    occurred_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+        {
+            let item = row.map_err(|e| e.to_string())?;
+            if include_user(&item.user_id) {
+                items.push(item);
+            }
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.id,e.user_id,e.summary,'active',1.0,e.importance,e.pinned,e.occurred_at,e.updated_at
+                 FROM memory_episodes e JOIN memory_users u ON u.id=e.user_id WHERE u.card_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        for row in stmt
+            .query_map([&request.card_id], |row| {
+                Ok(MemoryExportItem {
+                    id: row.get(0)?,
+                    kind: "episode".into(),
+                    user_id: row.get(1)?,
+                    text: export_safe_text(&row.get::<_, String>(2)?),
+                    status: row.get(3)?,
+                    confidence: row.get(4)?,
+                    importance: row.get(5)?,
+                    pinned: row.get::<_, i64>(6)? != 0,
+                    occurred_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+        {
+            let item = row.map_err(|e| e.to_string())?;
+            if include_user(&item.user_id) {
+                items.push(item);
+            }
+        }
+    }
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id,c.user_id,c.text,c.status,1.0,c.importance,c.pinned,c.due_at,c.updated_at
+                 FROM memory_commitments c JOIN memory_users u ON u.id=c.user_id WHERE u.card_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        for row in stmt
+            .query_map([&request.card_id], |row| {
+                Ok(MemoryExportItem {
+                    id: row.get(0)?,
+                    kind: "commitment".into(),
+                    user_id: row.get(1)?,
+                    text: export_safe_text(&row.get::<_, String>(2)?),
+                    status: row.get(3)?,
+                    confidence: row.get(4)?,
+                    importance: row.get(5)?,
+                    pinned: row.get::<_, i64>(6)? != 0,
+                    occurred_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+        {
+            let item = row.map_err(|e| e.to_string())?;
+            if include_user(&item.user_id) {
+                items.push(item);
+            }
+        }
+    }
+    let mut events = Vec::new();
+    let mut event_stmt = conn
+        .prepare(
+            "SELECT e.id,e.user_id,e.item_kind,e.item_id,e.event_type,e.source_type,e.source_id,
+                    e.observed_at,e.trust,e.consent
+             FROM memory_events e JOIN memory_users u ON u.id=e.user_id WHERE u.card_id=?1 ORDER BY e.created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    for row in event_stmt
+        .query_map([&request.card_id], |row| {
+            Ok(MemoryExportEvent {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                item_kind: row.get(2)?,
+                item_id: row.get(3)?,
+                event_type: row.get(4)?,
+                source_type: row.get(5)?,
+                source_id: row.get(6)?,
+                observed_at: row.get(7)?,
+                trust: row.get(8)?,
+                consent: row.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+    {
+        let event = row.map_err(|e| e.to_string())?;
+        if include_user(&event.user_id) {
+            events.push(event);
+        }
+    }
+    let mut nodes = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id,'topic',user_id,name FROM memory_topics WHERE user_id IN (SELECT id FROM memory_users WHERE card_id=?1)
+             UNION ALL SELECT id,'entity',user_id,canonical_name FROM memory_entities WHERE user_id IN (SELECT id FROM memory_users WHERE card_id=?1)",
+        ).map_err(|e| e.to_string())?;
+        for row in stmt
+            .query_map([&request.card_id], |row| {
+                Ok(MemoryExportNode {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    user_id: row.get(2)?,
+                    name: export_safe_text(&row.get::<_, String>(3)?),
+                })
+            })
+            .map_err(|e| e.to_string())?
+        {
+            let node = row.map_err(|e| e.to_string())?;
+            if include_user(&node.user_id) && node.name != "[敏感内容已省略]" {
+                nodes.push(node);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    let mut edge_stmt = conn.prepare(
+        "SELECT e.id,e.user_id,e.from_kind,e.from_id,e.to_kind,e.to_id,e.relation,e.source_event_id,e.confidence,e.derived
+         FROM memory_edges e JOIN memory_users u ON u.id=e.user_id WHERE u.card_id=?1 ORDER BY e.created_at",
+    ).map_err(|e| e.to_string())?;
+    for row in edge_stmt
+        .query_map([&request.card_id], |row| {
+            Ok(MemoryExportEdge {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                from_kind: row.get(2)?,
+                from_id: row.get(3)?,
+                to_kind: row.get(4)?,
+                to_id: row.get(5)?,
+                relation: row.get(6)?,
+                source_event_id: row.get(7)?,
+                confidence: row.get(8)?,
+                derived: row.get::<_, i64>(9)? != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?
+    {
+        let edge = row.map_err(|e| e.to_string())?;
+        if include_user(&edge.user_id) {
+            edges.push(edge);
+        }
+    }
+    let exported_at = now_ts();
+    let user_count = users.len();
+    let item_count = items.len();
+    let event_count = events.len();
+    let edge_count = edges.len();
+    let payload = serde_json::json!({
+        "formatVersion": 1,
+        "exportedAt": exported_at,
+        "cardId": request.card_id,
+        "users": users,
+        "items": items,
+        "events": events,
+        "nodes": nodes,
+        "edges": edges,
+        "privacy": "来源原文、事件 payload 和证据片段未导出；敏感字段已省略。",
+    });
+    let json = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    let file_name = format!("memory-export-{}-{}.json", request.card_id, exported_at);
+    Ok(MemoryExportResponse {
+        format_version: 1,
+        exported_at,
+        file_name,
+        card_id: request.card_id.clone(),
+        user_count,
+        item_count,
+        event_count,
+        edge_count,
+        json,
+    })
+}
+
+#[tauri::command]
+pub fn memory_export(
+    state: State<'_, MemoryState>,
+    request: MemoryExportRequest,
+) -> Result<MemoryExportResponse, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    export_memory(conn, &request)
+}
+
+fn backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("无法定位记忆备份目录：{e}"))?
+        .join("memory-backups");
+    fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败：{e}"))?;
+    Ok(dir)
+}
+
+fn verify_backup_file(path: &PathBuf) -> Result<MemoryBackupResponse, String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打开备份失败：{e}"))?;
+    let integrity_result = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("备份完整性检查失败：{e}"))?;
+    let foreign_key_errors = conn
+        .prepare("PRAGMA foreign_key_check")
+        .and_then(|mut stmt| stmt.query_map([], |_| Ok(())).map(|rows| rows.count()))
+        .map_err(|e| format!("备份外键检查失败：{e}"))?;
+    let schema_version = conn
+        .query_row(
+            "SELECT value FROM memory_meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    Ok(MemoryBackupResponse {
+        path: path.display().to_string(),
+        bytes,
+        schema_version,
+        integrity_result,
+        foreign_key_errors,
+    })
+}
+
+#[tauri::command]
+pub fn memory_backup(
+    app: AppHandle,
+    state: State<'_, MemoryState>,
+) -> Result<MemoryBackupResponse, String> {
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    maintenance(conn).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| e.to_string())?;
+    let dir = backup_dir(&app)?;
+    let path = dir.join(format!("memory-v5-{}-{}.sqlite3", now_ts(), Uuid::new_v4()));
+    conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+        .map_err(|e| format!("创建备份失败：{e}"))?;
+    verify_backup_file(&path)
+}
+
+#[tauri::command]
+pub fn memory_verify_backup(
+    app: AppHandle,
+    request: MemoryBackupRequest,
+) -> Result<MemoryBackupResponse, String> {
+    let dir = backup_dir(&app)?;
+    let path = PathBuf::from(&request.path);
+    if path.parent() != Some(dir.as_path()) {
+        return Err("只能验证应用记忆备份目录中的文件".into());
+    }
+    verify_backup_file(&path)
 }
 
 #[tauri::command]
@@ -2114,6 +2673,9 @@ fn update_memory(
     if let Some(text) = edited_text.as_ref() {
         if text.is_empty() {
             return Err("记忆内容不能为空".into());
+        }
+        if is_sensitive(text) {
+            return Err("记忆内容包含敏感信息，未保存".into());
         }
         if text != &current_text {
             record_revision(&tx, &request.kind, &request.id, &user_id, &snapshot, now)
@@ -4138,6 +4700,122 @@ mod tests {
         assert!(query_edges(&conn, "card-a", "episode", "episode-1", 20)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn integrity_check_reports_fts_and_foreign_key_corruption() {
+        let conn = test_db();
+        let healthy = integrity_check(&conn).unwrap();
+        assert!(healthy.ok);
+        assert_eq!(healthy.integrity_result, "ok");
+        conn.execute(
+            "INSERT INTO memory_search(item_id,kind,card_id,user_id,text,tags)
+             VALUES('missing','fact','card','missing-user','孤立索引','')",
+            [],
+        )
+        .unwrap();
+        let broken = integrity_check(&conn).unwrap();
+        assert!(!broken.ok);
+        assert!(broken.errors.iter().any(|error| error.contains("FTS")));
+        conn.execute_batch("PRAGMA foreign_keys=OFF;
+            INSERT INTO memory_edges(id,scope_id,user_id,from_kind,from_id,to_kind,to_id,relation,idempotency_key,created_at)
+            VALUES('broken-edge','missing-scope','missing-user','fact','missing','topic','missing-topic','about','broken-edge',1);
+            PRAGMA foreign_keys=ON;").unwrap();
+        let broken_fk = integrity_check(&conn).unwrap();
+        assert!(!broken_fk.ok);
+        assert!(
+            broken_fk.foreign_key_errors > 0
+                || broken_fk
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("关系边"))
+        );
+    }
+
+    #[test]
+    fn export_is_scoped_and_omits_raw_payload_and_sensitive_text() {
+        let conn = test_db();
+        let alice = get_or_create_user(&conn, "card-a", "小明").unwrap();
+        let bob = get_or_create_user(&conn, "card-a", "阿青").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_fact(
+            &tx,
+            "card-a",
+            &alice,
+            None,
+            &fact("小明准备面试", "近期安排", "面试", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        insert_fact(
+            &tx,
+            "card-a",
+            &bob,
+            None,
+            &fact("阿青准备露营", "近期安排", "露营", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let sensitive_id: String = conn
+            .query_row(
+                "SELECT id FROM memory_facts WHERE user_id=?1",
+                [&alice],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE memory_facts SET text='API Key sk-secret-123456789' WHERE id=?1",
+            [&sensitive_id],
+        )
+        .unwrap();
+        let event_id = append_event(
+            &conn,
+            &MemoryEventInput {
+                user_id: &alice,
+                card_id: "card-a",
+                item_kind: "fact",
+                item_id: &sensitive_id,
+                event_type: "fact.created",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: now_ts(),
+                trust: 0.8,
+                consent: "allowed",
+                idempotency_key: "export-event",
+                payload_json: r#"{"text":"raw secret should not export"}"#,
+            },
+        )
+        .unwrap();
+        assert!(!event_id.is_empty());
+        let exported = export_memory(
+            &conn,
+            &MemoryExportRequest {
+                card_id: "card-a".into(),
+                nickname: "小明".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(exported.user_count, 1);
+        assert_eq!(exported.item_count, 1);
+        assert!(exported.json.contains("敏感内容已省略"));
+        assert!(!exported.json.contains("raw secret should not export"));
+        assert!(!exported.json.contains("sk-secret-123456789"));
+    }
+
+    #[test]
+    fn vacuum_backup_round_trip_passes_read_only_verification() {
+        let conn = test_db();
+        let path =
+            std::env::temp_dir().join(format!("kxyy-memory-backup-{}.sqlite3", Uuid::new_v4()));
+        conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+            .unwrap();
+        let verified = verify_backup_file(&path).unwrap();
+        assert_eq!(verified.schema_version, SCHEMA_VERSION);
+        assert_eq!(verified.integrity_result, "ok");
+        assert_eq!(verified.foreign_key_errors, 0);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
