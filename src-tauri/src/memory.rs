@@ -1157,6 +1157,74 @@ pub struct MemoryEdgesQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphQuery {
+    pub card_id: String,
+    #[serde(default)]
+    pub nickname: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub search: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub since: Option<i64>,
+    #[serde(default)]
+    pub until: Option<i64>,
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    #[serde(default)]
+    pub depth: Option<usize>,
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub text: String,
+    pub status: String,
+    pub confidence: f64,
+    pub importance: f64,
+    pub pinned: bool,
+    pub occurred_at: Option<i64>,
+    pub user_id: String,
+    pub source_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphEdge {
+    pub id: String,
+    pub from_kind: String,
+    pub from_id: String,
+    pub to_kind: String,
+    pub to_id: String,
+    pub relation: String,
+    pub explanation: String,
+    pub source_event_id: Option<String>,
+    pub confidence: f64,
+    pub derived: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphResponse {
+    pub nodes: Vec<MemoryGraphNode>,
+    pub edges: Vec<MemoryGraphEdge>,
+    pub truncated: bool,
+    pub depth: usize,
+    pub max_nodes: usize,
+    pub total_candidates: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryTimelineResponse {
@@ -2008,6 +2076,446 @@ pub fn memory_edges(
         &query.id,
         query.limit.unwrap_or(50),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GraphNodeKey {
+    kind: String,
+    id: String,
+}
+
+fn graph_relation_explanation(relation: &str) -> &'static str {
+    match relation {
+        "about" => "该记忆关于这个主题",
+        "mentions" => "该经历提到了这个实体",
+        "derived_from" => "该节点由此事件归纳而来",
+        "supersedes" => "该事实替代了旧事实",
+        _ => "该关系来自记忆来源事件",
+    }
+}
+
+fn graph_event_ids(
+    conn: &Connection,
+    user_id: &str,
+    kind: &str,
+    id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM memory_events
+         WHERE user_id=?1 AND item_kind=?2 AND item_id=?3
+         ORDER BY created_at DESC LIMIT 8",
+    )?;
+    let ids = stmt
+        .query_map(params![user_id, kind, id], |row| row.get(0))?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(ids)
+}
+
+fn graph_user_filter(
+    conn: &Connection,
+    query: &MemoryGraphQuery,
+) -> Result<Vec<(String, String)>, String> {
+    if !query.scope.is_empty() && !matches!(query.scope.as_str(), "card" | "user") {
+        return Err("不支持的记忆图范围".into());
+    }
+    if !query.nickname.trim().is_empty() {
+        let user = find_user(conn, &query.card_id, &query.nickname).map_err(|e| e.to_string())?;
+        return Ok(user
+            .map(|id| vec![(id, query.nickname.trim().to_string())])
+            .unwrap_or_default());
+    }
+    let mut stmt = conn
+        .prepare("SELECT id,display_name FROM memory_users WHERE card_id=?1 ORDER BY created_at")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([&query.card_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn graph_node_matches(node: &MemoryGraphNode, query: &MemoryGraphQuery, now: i64) -> bool {
+    if !query.kind.trim().is_empty() && query.kind != node.kind {
+        return false;
+    }
+    if !query.status.trim().is_empty() && query.status != node.status {
+        return false;
+    }
+    if let Some(min) = query.min_confidence {
+        if node.confidence < min.clamp(0.0, 1.0) {
+            return false;
+        }
+    }
+    if let Some(since) = query.since {
+        if node.occurred_at.unwrap_or(now) < since {
+            return false;
+        }
+    }
+    if let Some(until) = query.until {
+        if node.occurred_at.unwrap_or(now) > until {
+            return false;
+        }
+    }
+    let needle = query.search.trim().to_lowercase();
+    needle.is_empty()
+        || node.label.to_lowercase().contains(&needle)
+        || node.text.to_lowercase().contains(&needle)
+}
+
+fn graph_node_is_live(
+    kind: &str,
+    status: &str,
+    valid_to: Option<i64>,
+    due_at: Option<i64>,
+    now: i64,
+) -> bool {
+    match kind {
+        "fact" => matches!(status, "active" | "disputed") && valid_to.is_none_or(|at| at > now),
+        "commitment" => status == "pending" && due_at.is_none_or(|at| at >= now),
+        "episode" | "user" | "topic" | "entity" => true,
+        _ => false,
+    }
+}
+
+fn graph(conn: &Connection, query: &MemoryGraphQuery) -> Result<MemoryGraphResponse, String> {
+    let depth = query.depth.unwrap_or(1).clamp(1, 2);
+    let max_nodes = query.max_nodes.unwrap_or(200).clamp(1, 200);
+    let users = graph_user_filter(conn, query)?;
+    if users.is_empty() {
+        return Ok(MemoryGraphResponse {
+            nodes: vec![],
+            edges: vec![],
+            truncated: false,
+            depth,
+            max_nodes,
+            total_candidates: 0,
+        });
+    }
+    let user_ids: HashSet<String> = users.iter().map(|(id, _)| id.clone()).collect();
+    let now = now_ts();
+    let mut nodes = HashMap::<GraphNodeKey, MemoryGraphNode>::new();
+    let mut add_node = |node: MemoryGraphNode| {
+        nodes.insert(
+            GraphNodeKey {
+                kind: node.kind.clone(),
+                id: node.id.clone(),
+            },
+            node,
+        );
+    };
+    for (id, name) in &users {
+        add_node(MemoryGraphNode {
+            id: id.clone(),
+            kind: "user".into(),
+            label: name.clone(),
+            text: name.clone(),
+            status: "active".into(),
+            confidence: 1.0,
+            importance: 0.5,
+            pinned: false,
+            occurred_at: None,
+            user_id: id.clone(),
+            source_event_ids: vec![],
+        });
+    }
+    let user_ids_vec: Vec<String> = user_ids.iter().cloned().collect();
+    for user_id in &user_ids_vec {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,summary,importance,occurred_at,pinned,updated_at,source_excerpt
+             FROM memory_episodes WHERE user_id=?1 ORDER BY pinned DESC,updated_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.filter_map(Result::ok) {
+            let (id, summary, importance, occurred_at, pinned, updated_at, source_excerpt) = row;
+            let _ = updated_at;
+            let mut node = MemoryGraphNode {
+                id: id.clone(),
+                kind: "episode".into(),
+                label: summary.clone(),
+                text: source_excerpt.unwrap_or(summary.clone()),
+                status: "active".into(),
+                confidence: 1.0,
+                importance,
+                pinned: pinned != 0,
+                occurred_at: Some(occurred_at),
+                user_id: user_id.clone(),
+                source_event_ids: graph_event_ids(conn, user_id, "episode", &id)
+                    .map_err(|e| e.to_string())?,
+            };
+            if node.text.is_empty() {
+                node.text = node.label.clone();
+            }
+            if graph_node_is_live("episode", &node.status, None, None, now) {
+                add_node(node);
+            }
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,text,status,confidence,importance,pinned,valid_from,valid_to,updated_at
+             FROM memory_facts WHERE user_id=?1 ORDER BY pinned DESC,updated_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.filter_map(Result::ok) {
+            let (id, text, status, confidence, importance, pinned, valid_from, valid_to, _) = row;
+            if !graph_node_is_live("fact", &status, valid_to, None, now) {
+                continue;
+            }
+            add_node(MemoryGraphNode {
+                id: id.clone(),
+                kind: "fact".into(),
+                label: text.clone(),
+                text,
+                status,
+                confidence,
+                importance,
+                pinned: pinned != 0,
+                occurred_at: valid_from,
+                user_id: user_id.clone(),
+                source_event_ids: graph_event_ids(conn, user_id, "fact", &id)
+                    .map_err(|e| e.to_string())?,
+            });
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,text,status,importance,pinned,due_at,updated_at
+             FROM memory_commitments WHERE user_id=?1 ORDER BY pinned DESC,updated_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.filter_map(Result::ok) {
+            let (id, text, status, importance, pinned, due_at, _) = row;
+            if !graph_node_is_live("commitment", &status, None, due_at, now) {
+                continue;
+            }
+            add_node(MemoryGraphNode {
+                id: id.clone(),
+                kind: "commitment".into(),
+                label: text.clone(),
+                text,
+                status,
+                confidence: 1.0,
+                importance,
+                pinned: pinned != 0,
+                occurred_at: due_at,
+                user_id: user_id.clone(),
+                source_event_ids: graph_event_ids(conn, user_id, "commitment", &id)
+                    .map_err(|e| e.to_string())?,
+            });
+        }
+        for (table, kind, label_column) in [
+            ("memory_topics", "topic", "name"),
+            ("memory_entities", "entity", "canonical_name"),
+        ] {
+            let mut stmt = conn.prepare(&format!("SELECT id,{label_column},updated_at FROM {table} WHERE user_id=?1 ORDER BY updated_at DESC")).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([user_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.filter_map(Result::ok) {
+                let (id, label, updated_at) = row;
+                add_node(MemoryGraphNode {
+                    id,
+                    kind: kind.into(),
+                    label: label.clone(),
+                    text: label,
+                    status: "active".into(),
+                    confidence: 1.0,
+                    importance: 0.3,
+                    pinned: false,
+                    occurred_at: Some(updated_at),
+                    user_id: user_id.clone(),
+                    source_event_ids: vec![],
+                });
+            }
+        }
+    }
+    let all_edges = query_graph_edges(conn, &query.card_id, &user_ids)?;
+    let roots: HashSet<GraphNodeKey> = nodes
+        .values()
+        .filter(|n| graph_node_matches(n, query, now))
+        .map(|n| GraphNodeKey {
+            kind: n.kind.clone(),
+            id: n.id.clone(),
+        })
+        .collect();
+    let mut selected = roots.clone();
+    let mut frontier = roots;
+    for _ in 0..depth {
+        let mut next = HashSet::new();
+        for edge in &all_edges {
+            let from = GraphNodeKey {
+                kind: edge.from_kind.clone(),
+                id: edge.from_id.clone(),
+            };
+            let to = GraphNodeKey {
+                kind: edge.to_kind.clone(),
+                id: edge.to_id.clone(),
+            };
+            if frontier.contains(&from) && nodes.contains_key(&to) {
+                next.insert(to.clone());
+            }
+            if frontier.contains(&to) && nodes.contains_key(&from) {
+                next.insert(from);
+            }
+        }
+        next.retain(|key| !selected.contains(key));
+        selected.extend(next.iter().cloned());
+        frontier = next;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+    let total_candidates = selected.len();
+    let mut ordered: Vec<MemoryGraphNode> = selected
+        .into_iter()
+        .filter_map(|key| nodes.remove(&key))
+        .collect();
+    ordered.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then(b.importance.total_cmp(&a.importance))
+            .then(b.occurred_at.cmp(&a.occurred_at))
+    });
+    let truncated = ordered.len() > max_nodes;
+    ordered.truncate(max_nodes);
+    let allowed: HashSet<GraphNodeKey> = ordered
+        .iter()
+        .map(|n| GraphNodeKey {
+            kind: n.kind.clone(),
+            id: n.id.clone(),
+        })
+        .collect();
+    let edges = all_edges
+        .into_iter()
+        .filter(|e| {
+            allowed.contains(&GraphNodeKey {
+                kind: e.from_kind.clone(),
+                id: e.from_id.clone(),
+            }) && allowed.contains(&GraphNodeKey {
+                kind: e.to_kind.clone(),
+                id: e.to_id.clone(),
+            })
+        })
+        .collect();
+    Ok(MemoryGraphResponse {
+        nodes: ordered,
+        edges,
+        truncated,
+        depth,
+        max_nodes,
+        total_candidates,
+    })
+}
+
+fn query_graph_edges(
+    conn: &Connection,
+    card_id: &str,
+    user_ids: &HashSet<String>,
+) -> Result<Vec<MemoryGraphEdge>, String> {
+    let mut stmt = conn.prepare("SELECT e.id,e.user_id,e.from_kind,e.from_id,e.to_kind,e.to_id,e.relation,e.source_event_id,e.confidence,e.derived FROM memory_edges e JOIN memory_users u ON u.id=e.user_id WHERE u.card_id=?1 ORDER BY e.created_at DESC").map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([card_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, f64>(8)?,
+                r.get::<_, i64>(9)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .filter(|(_, user_id, ..)| user_ids.contains(user_id))
+        .map(
+            |(
+                id,
+                _,
+                from_kind,
+                from_id,
+                to_kind,
+                to_id,
+                relation,
+                source_event_id,
+                confidence,
+                derived,
+            )| MemoryGraphEdge {
+                id,
+                from_kind,
+                from_id,
+                to_kind,
+                to_id,
+                explanation: graph_relation_explanation(&relation).into(),
+                relation,
+                source_event_id,
+                confidence,
+                derived: derived != 0,
+            },
+        )
+        .collect())
+}
+
+#[tauri::command]
+pub fn memory_graph(
+    state: State<'_, MemoryState>,
+    query: MemoryGraphQuery,
+) -> Result<MemoryGraphResponse, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    graph(conn, &query)
 }
 
 fn timeline_summary(event_type: &str, payload: &str) -> String {
@@ -4819,6 +5327,153 @@ mod tests {
         assert!(query_edges(&conn, "card-a", "episode", "episode-1", 20)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn memory_graph_is_scoped_filtered_bounded_and_preserves_edge_provenance() {
+        let conn = test_db();
+        let user_a = get_or_create_user(&conn, "card-a", "小明").unwrap();
+        let user_b = get_or_create_user(&conn, "card-b", "小明").unwrap();
+        let now = now_ts();
+        conn.execute(
+            "INSERT INTO memory_episodes(id,user_id,summary,importance,topics_json,entities_json,occurred_at,created_at,updated_at)
+             VALUES('episode-a',?1,'准备产品经理面试',0.9,'[\"面试\"]','[\"小明\"]',?2,?2,?2)",
+            params![user_a, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_episodes(id,user_id,summary,occurred_at,created_at,updated_at)
+             VALUES('episode-b',?1,'另一张卡的面试',?2,?2,?2)",
+            params![user_b, now],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let fact_id = insert_fact(
+            &tx,
+            "card-a",
+            &user_a,
+            Some("episode-a"),
+            &fact("下周参加产品经理面试", "近期安排", "面试", "assertion"),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        insert_fact(
+            &tx,
+            "card-a",
+            &user_a,
+            None,
+            &fact("已经过期的事实", "过期", "旧", "assertion"),
+            now - 8 * 86_400,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        conn.execute(
+            "UPDATE memory_facts SET valid_to=?1 WHERE text='已经过期的事实'",
+            params![now - 1],
+        )
+        .unwrap();
+        let event_id = append_event(
+            &conn,
+            &MemoryEventInput {
+                user_id: &user_a,
+                card_id: "card-a",
+                item_kind: "fact",
+                item_id: &fact_id,
+                event_type: "fact.created",
+                source_type: "test",
+                source_id: Some("test-event"),
+                modality: "text",
+                observed_at: now,
+                trust: 0.9,
+                consent: "allowed",
+                idempotency_key: "graph-fact-event",
+                payload_json: r#"{"text":"面试"}"#,
+            },
+        )
+        .unwrap();
+        append_evidence(
+            &conn,
+            &event_id,
+            "fact",
+            &fact_id,
+            "supports",
+            &[],
+            None,
+            now,
+        )
+        .unwrap();
+
+        let graph_result = graph(
+            &conn,
+            &MemoryGraphQuery {
+                card_id: "card-a".into(),
+                nickname: "小明".into(),
+                scope: "user".into(),
+                search: "面试".into(),
+                kind: "fact".into(),
+                status: String::new(),
+                since: None,
+                until: None,
+                min_confidence: Some(0.7),
+                depth: Some(1),
+                max_nodes: Some(20),
+            },
+        )
+        .unwrap();
+        assert!(graph_result.nodes.iter().any(|node| node.id == fact_id));
+        assert!(!graph_result
+            .nodes
+            .iter()
+            .any(|node| node.text == "已经过期的事实"));
+        assert!(graph_result
+            .nodes
+            .iter()
+            .find(|node| node.id == fact_id)
+            .unwrap()
+            .source_event_ids
+            .contains(&event_id));
+        assert!(graph_result.edges.iter().all(|edge| edge.derived));
+
+        let other_card = graph(
+            &conn,
+            &MemoryGraphQuery {
+                card_id: "card-b".into(),
+                nickname: String::new(),
+                scope: "card".into(),
+                search: String::new(),
+                kind: String::new(),
+                status: String::new(),
+                since: None,
+                until: None,
+                min_confidence: None,
+                depth: Some(2),
+                max_nodes: Some(200),
+            },
+        )
+        .unwrap();
+        assert!(other_card.nodes.iter().all(|node| node.user_id == user_b));
+
+        let bounded = graph(
+            &conn,
+            &MemoryGraphQuery {
+                card_id: "card-a".into(),
+                nickname: String::new(),
+                scope: "card".into(),
+                search: String::new(),
+                kind: String::new(),
+                status: String::new(),
+                since: None,
+                until: None,
+                min_confidence: None,
+                depth: Some(2),
+                max_nodes: Some(2),
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded.nodes.len(), 2);
+        assert!(bounded.truncated);
+        assert!(bounded.total_candidates >= bounded.nodes.len());
     }
 
     #[test]

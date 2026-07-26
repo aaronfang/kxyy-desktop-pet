@@ -190,13 +190,15 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 
 目标：关系图服务于理解和管理，不替代精确列表。
 
-- [ ] 新增 `memory_graph(query)`，返回有来源的 nodes/edges、截断状态和关系解释。
-- [ ] 第一版默认当前 card/user、有效记忆、最多 200 节点。
+- [x] 新增 `memory_graph(query)`，返回有来源的 nodes/edges、截断状态和关系解释（Memory v3.1-H 内核 IPC）。
+- [x] 第一版默认当前 card/user、有效记忆、最多 200 节点；`superseded`、`forgotten`、过期事实和已完成/到期约定不进入图。
 - [ ] 节点类型：user、episode、fact、commitment、topic、entity、hypothesis。
 - [ ] 点击节点使用现有 update/delete/pin/fulfill API；右侧检查器展示来源、置信度、状态和版本。
-- [ ] 支持搜索、类型、时间、scope、置信度、一度/二度展开。
-- [ ] 自动相似边必须标记 `derived`，不能因图上距离自动升级为事实。
+- [x] 支持搜索、类型、时间、scope、置信度、一度/二度展开（查询层）。
+- [x] 自动相似边必须标记 `derived`，不能因图上距离自动升级为事实。
 - [ ] 列表继续作为批量删除、精确搜索和无障碍操作的主入口。
+
+M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结果包含节点来源事件 ID、边的 `sourceEventId`/`confidence`/`derived`/中文关系解释，并明确返回 `truncated`、`totalCandidates`、实际 `depth` 和 `maxNodes`。Rust 测试覆盖 card/user 隔离、关键词和类型筛选、有效期过滤、一/二度展开、硬上限截断、空范围和来源保留。图形化设置页、节点检查器和布局持久化仍属于下一步 M3 UI，不在本轮宣称完成。
 
 建议本地打包 Cytoscape.js 或等价库，不使用 CDN。布局坐标与“长期记忆置顶”分开存储。
 
@@ -299,4 +301,4 @@ src-tauri/src/memory_tauri.rs      AppHandle、IPC、设置和窗口集成
 
 ## 7. 下一步唯一入口
 
-当前下一步固定为 **M0 发布闭环**。M0 完成后进入 **M1 Memory v3.1 内核基础**。在 M1 的 scope、event、evidence 和 edge 契约稳定前，不启动正式 Memory Graph、J-Space 类工作区或外部 Connector 开发。
+历史规划入口为 **M0 发布闭环 → M1 Memory v3.1 内核基础**；这些阶段和实时通话协调基础已完成。当前唯一入口是 **M3 Memory Graph UI**：先在设置页接入 `memory_graph` 查询和可回退的图形视图，再实现节点检查器与布局持久化。M4 的 workspace/J-Space 类实验和 M5 外部 Connector 仍保持冻结，直到 M3 UI 通过数据隔离、删除回退和可用性验收。

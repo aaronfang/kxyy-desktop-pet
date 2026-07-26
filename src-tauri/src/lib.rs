@@ -1701,6 +1701,7 @@ pub fn run() {
             memory::memory_rebuild_derived,
             memory::memory_timeline,
             memory::memory_edges,
+            memory::memory_graph,
             memory::memory_recall,
             memory::memory_enqueue_session,
             memory::memory_list,
