@@ -1326,6 +1326,22 @@ el("memoryIntegrity")?.addEventListener("click", async () => {
   }
 });
 
+el("memoryRebuild")?.addEventListener("click", async () => {
+  if (!window.confirm("重建搜索索引与关系边？\n\n这不会修改事件和长期记忆正文，但会重新生成 topic、entity、FTS 和关系边。")) return;
+  const button = el("memoryRebuild");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("重建中…");
+  try {
+    const result = await invoke("memory_rebuild_derived");
+    setMemoryMaintenanceStatus(`重建完成：${result.rebuiltSearchRows || 0} 条索引、${result.rebuiltEdges || 0} 条关系边。`);
+    await loadMemoryPage();
+  } catch (e) {
+    setMemoryMaintenanceStatus(`重建失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 el("memoryExport")?.addEventListener("click", async () => {
   const button = el("memoryExport");
   button.disabled = true;

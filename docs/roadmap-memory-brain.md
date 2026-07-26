@@ -4,6 +4,13 @@
 >
 > 当前 Memory v3 已在 PR #27 实现并通过本地测试、真实 DeepSeek / Ollama 巩固 E2E 及 macOS / Windows CI build；在合并和正式发布前仍不能写成已发布能力。
 
+### 版本与里程碑约定
+
+- 应用安装包使用独立的 SemVer（当前基线为 `0.2.32`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
+- 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
+- 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
+
 ## 1. 产品判断与开发原则
 
 Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责分开：
@@ -141,6 +148,10 @@ flowchart TB
 - [ ] 定义 prompt-injection 边界：外部内容只能是 observation，不能成为系统指令。
 
 M1-A（事件与证据时间线）已完成。M1-B（关系边基础）和 M1-C（完整性、导出与备份）已完成第一阶段：schema v5 关系边、脱敏 JSON 导出、SQLite 一致性备份、只读备份校验、损坏模拟和 scope 隔离测试均已落地。当前仍未实现从事件完整重建所有派生表和 provider-neutral core；这些保持为 M1 后续门槛。
+
+**Memory v3.1-D / App 0.2.33** 已进入实现：目标是“索引与关系边可重建”，不修改事件和长期记忆内容，只从当前物化记忆与事件来源重建 FTS、topic/entity 和关系边。
+
+M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保持不变、FTS/topic/entity/edge 可恢复，设置页有明确确认和结果反馈，并有损坏派生表回归测试。
 
 门槛：现有 Memory v3 行为测试全部保持通过；任意派生表删除后可以从事件重建；删除一个 scope 后事件、索引、边和物化视图均无残留。
 

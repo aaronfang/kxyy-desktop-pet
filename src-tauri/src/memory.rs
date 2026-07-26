@@ -1028,6 +1028,15 @@ pub struct MemoryBackupResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryRebuildResponse {
+    pub schema_version: i64,
+    pub rebuilt_search_rows: i64,
+    pub rebuilt_edges: i64,
+    pub rebuilt_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MemoryExportUser {
     id: String,
     nickname: String,
@@ -1728,6 +1737,103 @@ pub fn memory_verify_backup(
         return Err("只能验证应用记忆备份目录中的文件".into());
     }
     verify_backup_file(&path)
+}
+
+fn rebuild_search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let facts: Vec<(String, String, String, String, String)> = tx
+        .prepare(
+            "SELECT f.id,f.user_id,u.card_id,f.text,f.predicate||' '||f.value
+             FROM memory_facts f JOIN memory_users u ON u.id=f.user_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    for (id, user_id, card_id, text, tags) in facts {
+        index_item(tx, &id, "fact", &card_id, &user_id, &text, &tags)?;
+    }
+    let episodes: Vec<(String, String, String, String, String)> = tx
+        .prepare(
+            "SELECT e.id,e.user_id,u.card_id,e.summary,e.topics_json||' '||e.entities_json
+             FROM memory_episodes e JOIN memory_users u ON u.id=e.user_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    for (id, user_id, card_id, text, tags) in episodes {
+        index_item(tx, &id, "episode", &card_id, &user_id, &text, &tags)?;
+    }
+    let commitments: Vec<(String, String, String, String)> = tx
+        .prepare(
+            "SELECT c.id,c.user_id,u.card_id,c.text
+             FROM memory_commitments c JOIN memory_users u ON u.id=c.user_id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    for (id, user_id, card_id, text) in commitments {
+        index_item(
+            tx,
+            &id,
+            "commitment",
+            &card_id,
+            &user_id,
+            &text,
+            "约定 承诺 待办",
+        )?;
+    }
+    Ok(())
+}
+
+fn rebuild_derived(conn: &mut Connection) -> Result<MemoryRebuildResponse, String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memory_search", [])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memory_edges", [])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memory_topics", [])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memory_entities", [])
+        .map_err(|e| e.to_string())?;
+    rebuild_search_index(&tx).map_err(|e| e.to_string())?;
+    backfill_v5_graph(&tx).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    let rebuilt_search_rows = scalar_count(conn, "SELECT COUNT(*) FROM memory_search").unwrap_or(0);
+    let rebuilt_edges = scalar_count(conn, "SELECT COUNT(*) FROM memory_edges").unwrap_or(0);
+    Ok(MemoryRebuildResponse {
+        schema_version: SCHEMA_VERSION,
+        rebuilt_search_rows,
+        rebuilt_edges,
+        rebuilt_at: now_ts(),
+    })
+}
+
+#[tauri::command]
+pub fn memory_rebuild_derived(
+    state: State<'_, MemoryState>,
+) -> Result<MemoryRebuildResponse, String> {
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    rebuild_derived(conn)
 }
 
 #[tauri::command]
@@ -4816,6 +4922,71 @@ mod tests {
         assert_eq!(verified.integrity_result, "ok");
         assert_eq!(verified.foreign_key_errors, 0);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rebuild_derived_restores_search_and_graph_without_changing_events() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        conn.execute(
+            "INSERT INTO memory_episodes(id,user_id,summary,topics_json,entities_json,occurred_at,created_at,updated_at)
+             VALUES('episode-rebuild',?1,'准备面试','[\"产品经理\"]','[\"小明\"]',100,100,100)",
+            [&user],
+        )
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_fact(
+            &tx,
+            "card",
+            &user,
+            Some("episode-rebuild"),
+            &fact("面试安排", "近期安排", "面试", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let event_id = append_event(
+            &conn,
+            &MemoryEventInput {
+                user_id: &user,
+                card_id: "card",
+                item_kind: "episode",
+                item_id: "episode-rebuild",
+                event_type: "episode.created",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: now_ts(),
+                trust: 0.8,
+                consent: "allowed",
+                idempotency_key: "rebuild-event",
+                payload_json: r#"{"summary":"准备面试"}"#,
+            },
+        )
+        .unwrap();
+        assert!(!event_id.is_empty());
+        let events_before = scalar_count(&conn, "SELECT COUNT(*) FROM memory_events").unwrap();
+        conn.execute("DELETE FROM memory_search", []).unwrap();
+        conn.execute("DELETE FROM memory_edges", []).unwrap();
+        let result = rebuild_derived(&mut conn).unwrap();
+        assert_eq!(result.rebuilt_search_rows, 2);
+        assert!(result.rebuilt_edges >= 3);
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_events").unwrap(),
+            events_before
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_topics").unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_entities").unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_search").unwrap(),
+            2
+        );
     }
 
     #[test]
