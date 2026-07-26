@@ -70,6 +70,7 @@ npm run dev        # 开发模式（tauri dev）
 - **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话按 LLM 稳定句进入 4 项有界队列并严格按句序播放。CosyVoice 自 0.2.21、macOS Apple Silicon 的 MLX Qwen 自 0.2.22 起，可在播放 Worklet + `managed-v1` 上双向协商 `provider-pcm-v1`：provider 生成期音频按最多 80ms 下发，首版固定单路且不预取下一句。Windows/Linux 的官方 `qwen-tts` 当前没有公开音频 iterator，仍按句整段合成；未协商、legacy、旧服务与火山也继续原路径。流式句段只在结束时声明最终 samples/chunks，前端精确校验；失败、取消、错序、超限或总量不符不会产生“已完整播完”回执。0.2.20 的 `candidate-snapshot-v1` 仍只在 Worklet 本地/CosyVoice 上启用：同一 candidate 确认打断且当前句已播放至少 1 秒时，下一轮仅注入一次固定临时提示；它不进入 history、聊天摘要、长期记忆或日志，也不恢复字、音素或部分文本。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
 - **实时语音优化路线**：自然打断、流式管线、Qwen3-TTS/CosyVoice/火山情绪能力和 SenseVoice 评估见 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md)；其中尚未实现的目标不会作为当前功能承诺。
 - **Memory v3（当前开发版本）**：长期记忆由 Rust + SQLite 保存为事实、共同经历和约定；聊天前只选择性召回与当前话题相关的少量内容，后台异步巩固，不再把全部历史塞进 prompt。设置页可搜索、筛选、编辑、置顶、兑现或永久删除记忆；数据库或模型不可用时会回退，不阻塞正常聊天。
+- **0.2.34 Memory v3.1-E**：实时通话建立前在 120ms 内预加载最多 3 条置顶记忆、未完成约定或当前话题线索；召回失败自动使用原有通话人设提示，不改变音频协议和打断状态机。逐轮 ASR final 记忆仍未开启，见 Memory Brain 路线图 M2。
 - **Memory Brain 路线**：发布验证、实时通话逐轮记忆、Obsidian 式 Memory Graph、Global Workspace/J-Space 类实验和外部工程接入，统一见 [`docs/roadmap-memory-brain.md`](docs/roadmap-memory-brain.md)。未标记为 released 的阶段不作为当前正式版能力承诺。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。

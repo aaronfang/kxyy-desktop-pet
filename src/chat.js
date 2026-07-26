@@ -53,6 +53,10 @@ import { asksNotToRemember } from "./memory-ui.js";
 import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
+import {
+  recallRealtimeMemory,
+  formatRealtimeMemoryHints,
+} from "./realtime-memory.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -1921,7 +1925,7 @@ let callWaveBars = [];
 
 /** 组装实时通话用的人设 system_role：复用文字聊天的 buildSystemPrompt + 实时状态，
  *  再叠加「语音口语化」提示（说人话、简短、不要括号/表情/贴纸标记）。 */
-function buildRealtimeSystemRole() {
+function buildRealtimeSystemRoleBase() {
   if (!assets) return "";
   const name = (settings.userName || "").trim();
   const profile = activeProfile
@@ -1952,6 +1956,26 @@ function buildRealtimeSystemRole() {
       `- 你的名字是**${bot}**。用户叫的就是「${bot}」。语音识别若听错近音字，一律当作「${bot}」理解，不要纠正用户叫错名字。`;
   }
   return sys;
+}
+
+/**
+ * 通话建立前只预加载一小组记忆线索。记忆 IPC 有严格时限，失败时保持原有
+ * system role；音频协议和 realtime session 状态机不依赖这一步。
+ */
+async function buildRealtimeSystemRole() {
+  const base = buildRealtimeSystemRoleBase();
+  if (!base || !activeName) return base;
+  const last = lastRealUserMessage();
+  const query = (last?.content || "").trim();
+  const imageCaption = (last?.imageCaption || "").trim();
+  const items = await recallRealtimeMemory(invoke, {
+    cardId: settings.personaCardId || "",
+    nickname: activeName,
+    query,
+    imageCaption,
+    maxItems: 3,
+  });
+  return base + formatRealtimeMemoryHints(items);
 }
 
 /** 通话 bot_name：短称便于 ASR 热词与人设对齐。 */
@@ -2229,10 +2253,14 @@ async function startCall() {
 
   // 必须在 await 之前、点击同步栈内解锁 Web Audio，否则首句 TTS 会静音。
   callSession.prepareAudio();
+  const session = callSession;
 
   try {
-    await callSession.start({
-      systemRole: buildRealtimeSystemRole(),
+    const systemRole = await buildRealtimeSystemRole();
+    // 记忆召回期间用户可能已经点了挂断；不要让迟到的 start 重新打开已关闭的会话。
+    if (!callActive || callSession !== session) return;
+    await session.start({
+      systemRole,
       botName: callBotName(),
     });
   } catch (e) {

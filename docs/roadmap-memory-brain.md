@@ -6,7 +6,7 @@
 
 ### 版本与里程碑约定
 
-- 应用安装包使用独立的 SemVer（当前基线为 `0.2.32`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- 应用安装包使用独立的 SemVer（当前基线为 `0.2.34`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
 - Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
 - 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
 - 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
@@ -149,7 +149,7 @@ flowchart TB
 
 M1-A（事件与证据时间线）已完成。M1-B（关系边基础）和 M1-C（完整性、导出与备份）已完成第一阶段：schema v5 关系边、脱敏 JSON 导出、SQLite 一致性备份、只读备份校验、损坏模拟和 scope 隔离测试均已落地。当前仍未实现从事件完整重建所有派生表和 provider-neutral core；这些保持为 M1 后续门槛。
 
-**Memory v3.1-D / App 0.2.33** 已进入实现：目标是“索引与关系边可重建”，不修改事件和长期记忆内容，只从当前物化记忆与事件来源重建 FTS、topic/entity 和关系边。
+**Memory v3.1-D / App 0.2.33** 已完成实现：目标是“索引与关系边可重建”，不修改事件和长期记忆内容，只从当前物化记忆与事件来源重建 FTS、topic/entity 和关系边。
 
 M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保持不变、FTS/topic/entity/edge 可恢复，设置页有明确确认和结果反馈，并有损坏派生表回归测试。
 
@@ -173,6 +173,10 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 - ASR → 文字模型 + Memory → TTS：记忆最强，但不再是端到端语音模型。
 
 验收：新增 turn latency P95 < 120ms；过期 turn 召回使用率 0；数据库失败不影响通话；通话完成回合最终入队率 100%。音频与打断指标仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
+
+**Memory v3.1-E / App 0.2.34** 已完成第一步：通话开始前以 120ms 有界预算调用现有 `memory_recall`，最多注入 3 条、约 250 token 的置顶/待兑现/当前话题线索；没有当前话题时只允许置顶和 pending commitment，超时、数据库锁定或 IPC 失败均回退到原始 `systemRole`。本步不修改火山协议、ASR、打断或音频状态机，也不把 ASR interim 写入长期记忆。
+
+本步门槛：前端实时记忆纯函数和 Rust 记忆回归测试通过；现有 `{type:"start", systemRole, botName}` 私有启动协议保持不变。逐轮 ASR final 动态 context 仍待协议能力门和后续 M2 实现。
 
 ### M3：Memory Graph 管理工具
 

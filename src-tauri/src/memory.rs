@@ -2218,7 +2218,7 @@ fn recall_memory(
     let query = format!("{} {}", request.query, request.image_caption)
         .trim()
         .to_string();
-    if request.nickname.trim().is_empty() || query.is_empty() {
+    if request.nickname.trim().is_empty() {
         return Ok(MemoryRecallResponse {
             items: vec![],
             total_chars: 0,
@@ -2235,14 +2235,17 @@ fn recall_memory(
         });
     };
     let mut candidates = load_recent_candidates(conn, &user_id).map_err(|e| e.to_string())?;
-    for candidate in
-        search_candidates(conn, &request.card_id, &user_id, &query).map_err(|e| e.to_string())?
-    {
-        if !candidates
-            .iter()
-            .any(|c| c.kind == candidate.kind && c.id == candidate.id)
+    let has_query = !query.is_empty();
+    if has_query {
+        for candidate in search_candidates(conn, &request.card_id, &user_id, &query)
+            .map_err(|e| e.to_string())?
         {
-            candidates.push(candidate);
+            if !candidates
+                .iter()
+                .any(|c| c.kind == candidate.kind && c.id == candidate.id)
+            {
+                candidates.push(candidate);
+            }
         }
     }
 
@@ -2271,7 +2274,11 @@ fn recall_memory(
             if c.status == "superseded" || c.status == "forgotten" || c.status == "expired" {
                 return None;
             }
-            let lexical = jaccard(&qgrams, &grams(&format!("{} {}", c.text, c.tags)));
+            let lexical = if has_query {
+                jaccard(&qgrams, &grams(&format!("{} {}", c.text, c.tags)))
+            } else {
+                0.0
+            };
             let age_days = (now - c.occurred_at.unwrap_or(c.updated_at)).max(0) as f64 / 86_400.0;
             let half_life = if c.kind == "episode" { 30.0 } else { 180.0 };
             let recency = 0.5_f64.powf(age_days / half_life);
@@ -2286,7 +2293,13 @@ fn recall_memory(
                 + 0.08 * clamp01(c.confidence)
                 + 0.08 * special;
             let is_contextual_fallback = contextual_fallback.as_deref() == Some(c.id.as_str());
-            if lexical < 0.02 && !c.pinned && !is_contextual_fallback {
+            // 无当前话题时，通话启动仍可预加载置顶记忆和未完成约定；
+            // 普通动态事实/经历必须等到有查询词才参与，避免开场注入噪声。
+            if lexical < 0.02
+                && !c.pinned
+                && !(c.kind == "commitment" && !has_query)
+                && !is_contextual_fallback
+            {
                 return None;
             }
             if c.status == "disputed" && lexical < 0.18 {
@@ -5545,6 +5558,65 @@ mod tests {
         .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].id, "latest");
+    }
+
+    #[test]
+    fn empty_query_preloads_only_pinned_items_and_pending_commitments() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "元宝").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let pinned_id = insert_fact(
+            &tx,
+            "card",
+            &user,
+            None,
+            &fact("元宝喜欢热茶", "饮品偏好", "喜欢热茶", "assertion"),
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        tx.execute("UPDATE memory_facts SET pinned=1 WHERE id=?1", [&pinned_id])
+            .unwrap();
+        insert_fact(
+            &tx,
+            "card",
+            &user,
+            None,
+            &fact("元宝最近在准备面试", "近期安排", "准备面试", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        insert_commitment(
+            &tx,
+            "card",
+            &user,
+            None,
+            "下次提醒元宝带伞",
+            None,
+            0.9,
+            now_ts(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let result = recall_memory(
+            &mut conn,
+            &MemoryRecallRequest {
+                card_id: "card".into(),
+                nickname: "元宝".into(),
+                query: String::new(),
+                image_caption: String::new(),
+                max_items: Some(3),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert!(result.items.iter().any(|item| item.pinned));
+        assert!(result.items.iter().any(|item| item.kind == "commitment"));
+        assert!(result
+            .items
+            .iter()
+            .all(|item| !item.text.contains("准备面试")));
     }
 
     #[test]
