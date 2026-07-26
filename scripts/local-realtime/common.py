@@ -2640,6 +2640,9 @@ class Session:
             try:
                 return await asyncio.wait_for(future, timeout=TURN_MEMORY_WAIT_SECONDS)
             except asyncio.TimeoutError:
+                await self.send_json(
+                    {"type": "memory_context_timeout"}, scope=scope
+                )
                 return ""
         finally:
             if self._memory_context_waiter is not None and self._memory_context_waiter[1] is future:

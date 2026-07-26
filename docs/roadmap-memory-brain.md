@@ -182,7 +182,7 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 
 本步门槛：三条实时路径的 handshake 回归测试通过；未知能力值在诊断导出中 fail-closed；后续只有拿到官方协议证据后才能新增 `dynamic-context-v1`。
 
-**Memory v3.1-G / App 0.2.36** 已完成本地/CosyVoice 逐轮协调第一版：ASR final 后服务端发出带 generation 的 `memory_context_request`，前端以 80ms 预算召回并回传最多 3 条、700 字符以内的结构化卡片；服务端最多等待 100ms，将卡片包装成不可执行的 observation 注入该轮文字模型 history。旧 generation、超时、挂断和数据库失败均不阻塞回复；partial ASR 永不触发写入或召回回传。火山端到端没有动态 context 证据，继续使用 session-start-only。
+**Memory v3.1-G / App 0.2.36** 已完成本地/CosyVoice 逐轮协调第一版：ASR final 后服务端发出带 generation 的 `memory_context_request`，前端以 80ms 预算召回并回传最多 3 条、700 字符以内的结构化卡片；服务端最多等待 100ms，将卡片包装成不可执行的 observation 注入该轮文字模型 history。旧 generation、超时、挂断和数据库失败均不阻塞回复；partial ASR 永不触发写入或召回回传。实时 trace 只记录请求/响应计数、接受/超时/过期和 P50/P95 延迟，不记录文本。火山端到端没有动态 context 证据，继续使用 session-start-only。
 
 本步门槛：前端/本地服务覆盖 generation 隔离、超时回退、旧客户端兼容和 prompt-injection 边界；实时音频仍由既有状态机负责。设备实测需关注 ASR final 到首 token 的新增延迟，未达到 p95 < 120ms 前不扩大记忆预算。
 

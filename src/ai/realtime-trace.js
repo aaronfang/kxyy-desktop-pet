@@ -76,6 +76,8 @@ export const TRACE_EVENT = Object.freeze({
   RESPONSE_STARTED: "response_started",
   RESPONSE_COMPLETED: "response_completed",
   RESPONSE_CANCELLED: "response_cancelled",
+  MEMORY_CONTEXT_REQUEST: "memory_context_request",
+  MEMORY_CONTEXT_RESPONSE: "memory_context_response",
 });
 
 const EVENT_TYPES = new Set(Object.values(TRACE_EVENT));
@@ -99,6 +101,12 @@ const SAFE_METRICS = new Set([
   "playedSamples",
   "maxQueuedMs",
   "underruns",
+  "itemCount",
+  "memoryChars",
+  "latencyMs",
+  "accepted",
+  "timedOut",
+  "stale",
 ]);
 
 let fallbackId = 0;
@@ -435,6 +443,23 @@ function summarizeCandidateOutcomes(events) {
   };
 }
 
+/** Privacy-safe memory coordination counters; no query, card, or memory text. */
+export function summarizeMemoryContext(events) {
+  const source = Array.isArray(events) ? events : [];
+  const responses = source.filter((event) => event.eventType === TRACE_EVENT.MEMORY_CONTEXT_RESPONSE);
+  const latencies = responses
+    .map((event) => event.metrics?.latencyMs)
+    .filter((value) => Number.isFinite(value) && value >= 0);
+  return {
+    requested: source.filter((event) => event.eventType === TRACE_EVENT.MEMORY_CONTEXT_REQUEST).length,
+    responded: responses.length,
+    accepted: responses.filter((event) => event.metrics?.accepted === true).length,
+    timedOut: responses.filter((event) => event.metrics?.timedOut === true).length,
+    stale: responses.filter((event) => event.metrics?.stale === true).length,
+    latencyMs: summarizeDistribution(latencies),
+  };
+}
+
 function maxMetric(events, name) {
   let max = 0;
   let seen = false;
@@ -735,6 +760,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
     aggregate: {
       latency,
       interruptions: summarizeCandidateOutcomes(events),
+      memoryContext: summarizeMemoryContext(events),
       vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),
       playback: {
         maxSampledQueuedMs:

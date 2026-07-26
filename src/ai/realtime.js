@@ -199,6 +199,7 @@ export class RealtimeSession {
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
     this._memoryContextMode = "none";
+    this._memoryContextRequestedAt = 0;
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
     this._vadShadowSummary = sanitizeVadShadowSummary();
@@ -463,7 +464,24 @@ export class RealtimeSession {
           Number.isSafeInteger(msg.generation) &&
           msg.generation === this._backendGeneration
         ) {
+          this._memoryContextRequestedAt = performance.now();
+          this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
           this.cb.onMemoryContextRequest?.({ generation: msg.generation });
+        }
+        break;
+      case "memory_context_timeout":
+        if (
+          this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
+          Number.isSafeInteger(msg.generation) &&
+          msg.generation === this._backendGeneration
+        ) {
+          const latencyMs = this._memoryContextRequestedAt
+            ? Math.max(0, performance.now() - this._memoryContextRequestedAt)
+            : 0;
+          this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+            metrics: { accepted: false, timedOut: true, itemCount: 0, memoryChars: 0, latencyMs },
+          });
+          this._memoryContextRequestedAt = 0;
         }
         break;
       case "assistant":
@@ -525,6 +543,16 @@ export class RealtimeSession {
   /** 回传当前 final turn 的有界记忆卡片；旧 generation、旧服务或火山路径拒绝发送。 */
   sendMemoryContext({ generation, items } = {}) {
     if (
+      this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
+      Number.isSafeInteger(generation) &&
+      generation !== this._backendGeneration
+    ) {
+      this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+        metrics: { accepted: false, stale: true, itemCount: 0, memoryChars: 0 },
+      });
+      return false;
+    }
+    if (
       this._memoryContextMode !== TURN_MEMORY_CAPABILITY ||
       !Number.isSafeInteger(generation) ||
       generation !== this._backendGeneration ||
@@ -549,7 +577,26 @@ export class RealtimeSession {
       });
       chars += text.length;
     }
-    this.ws.send(JSON.stringify({ type: "memory_context", generation, items: safe }));
+    try {
+      this.ws.send(JSON.stringify({ type: "memory_context", generation, items: safe }));
+    } catch {
+      this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+        metrics: { accepted: false, itemCount: 0, memoryChars: 0 },
+      });
+      return false;
+    }
+    const latencyMs = this._memoryContextRequestedAt
+      ? Math.max(0, performance.now() - this._memoryContextRequestedAt)
+      : 0;
+    this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+      metrics: {
+        accepted: true,
+        itemCount: safe.length,
+        memoryChars: chars,
+        latencyMs,
+      },
+    });
+    this._memoryContextRequestedAt = 0;
     return true;
   }
 

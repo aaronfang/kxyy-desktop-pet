@@ -8,6 +8,7 @@ import {
   createTraceEvent,
   replayTrace,
   sanitizeVadShadowSummary,
+  summarizeMemoryContext,
   summarizeTraceLatency,
 } from "../src/ai/realtime-trace.js";
 
@@ -435,6 +436,56 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
+});
+
+test("memory context diagnostics expose bounded latency and stale/timeout counts only", () => {
+  const events = [
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_REQUEST,
+      timestampMs: 10,
+      sessionId: "session-memory",
+      generationId: 1,
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_RESPONSE,
+      timestampMs: 24,
+      sessionId: "session-memory",
+      generationId: 1,
+      metrics: { accepted: true, itemCount: 2, memoryChars: 140, latencyMs: 14 },
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_REQUEST,
+      timestampMs: 40,
+      sessionId: "session-memory",
+      generationId: 2,
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_RESPONSE,
+      timestampMs: 142,
+      sessionId: "session-memory",
+      generationId: 2,
+      metrics: { accepted: false, timedOut: true, itemCount: 0, memoryChars: 0, latencyMs: 102 },
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_RESPONSE,
+      timestampMs: 160,
+      sessionId: "session-memory",
+      generationId: 2,
+      metrics: { accepted: false, stale: true, itemCount: 0, memoryChars: 0 },
+    }),
+  ];
+  assert.deepEqual(summarizeMemoryContext(events), {
+    requested: 2,
+    responded: 3,
+    accepted: 1,
+    timedOut: 1,
+    stale: 1,
+    latencyMs: { count: 2, p50: 14, p95: 102 },
+  });
+  const report = buildRealtimeDiagnosticReport({ events });
+  assert.deepEqual(report.aggregate.memoryContext, summarizeMemoryContext(events));
+  assert.equal(JSON.stringify(report).includes("memoryChars"), true);
+  assert.equal(JSON.stringify(report).includes("用户"), false);
 });
 
 test("diagnostic export fails closed on unknown runtime capability values", () => {
