@@ -2,7 +2,7 @@
 
 > 状态基准：2026-07-26。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
 >
-> 当前 Memory v3 已在工作树实现并通过本地测试与 macOS release build，但在合并、跨平台 CI 和正式发布前，只能称为 `locally verified`，不能写成已发布能力。
+> 当前 Memory v3 已在 PR #27 实现并通过本地测试、真实 DeepSeek / Ollama 巩固 E2E 及 macOS / Windows CI build；在合并和正式发布前仍不能写成已发布能力。
 
 ## 1. 产品判断与开发原则
 
@@ -27,7 +27,7 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 
 ## 2. 当前基线：Memory v3
 
-### 2.1 已实现（当前工作树，locally verified）
+### 2.1 已实现（PR #27，cross-platform verified）
 
 - Rust + bundled SQLite，数据库位于应用配置目录 `memory-v3.sqlite3`。
 - WAL、foreign keys、busy timeout、secure delete 和显式 schema version。
@@ -39,7 +39,8 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 - 敏感信息本地过滤；失败时不阻塞聊天。
 - 设置页支持搜索、筛选、编辑、置顶、兑现、删除和按人设清空。
 - 旧 `localStorage` facts/promises/sessions/topics 幂等迁移。
-- 16 个 Rust Memory v3 测试、前端语法检查、Tauri release 构建已在当前 macOS 工作区通过。
+- 16 个 Rust Memory v3 测试、前端语法检查、本地 macOS release build，以及 PR #27 的 macOS / Windows Tauri CI build 已通过。
+- 设置页明确区分在线 DeepSeek 巩固与本地 Ollama 巩固的数据边界；记忆数据库和归纳结果始终只保存在本机。
 
 ### 2.2 当前边界
 
@@ -115,13 +116,15 @@ flowchart TB
 - [x] 本地 Rust 测试、JS 语法检查、macOS release build。
 - [x] 自动覆盖入队幂等、`doNotRemember`/敏感消息过滤、card/user 隔离、无关召回、Top-K/字符预算、删除/清空后的 FTS 与 job 级联。
 - [x] 自动覆盖 processing 崩溃恢复、数据库暂时锁定后的 pending 保留与解锁恢复、retry 退避和 7 天原文清除。
-- [ ] 使用真实 DeepSeek 和真实 Ollama 各跑一轮巩固 E2E。
+- [x] 使用真实 DeepSeek 和真实 Ollama 各跑一轮巩固 E2E。
 - [ ] 运行真实 App 验证重启恢复、无 Key和本地模型离线路径。
 - [ ] 验证“别记这段”、纠错、删除和清空的真实用户路径。
-- [ ] macOS 与 Windows CI/build；确认 packaged SQLite/FTS5。
+- [x] macOS 与 Windows CI/build；确认 packaged SQLite/FTS5。
 - [ ] 合并并进入正式发布；发布前不得把本节标记为 released。
 
 验收指标沿用：召回 P95 < 30ms、长期注入不超过约 500 token、无关误召回 < 5%、明确纠错后旧事实使用率 0、成功入队最终处理率 100%。
+
+2026-07-26 验证证据：PR #27 CI 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。
 
 ### M1：Memory v3.1 内核基础（Graph 和外部接入的前置）
 

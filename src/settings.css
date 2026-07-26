@@ -475,6 +475,16 @@ button.danger:disabled {
   margin: 0;
 }
 .memory-intro { margin-bottom: 12px; }
+.memory-privacy {
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  border: 1px solid #dbeafe;
+  border-radius: 9px;
+  background: #eff6ff;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.55;
+}
 .memory-stats {
   display: flex;
   flex-wrap: wrap;

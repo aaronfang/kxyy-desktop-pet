@@ -126,6 +126,12 @@ function syncTextFields() {
   const provider = currentTextProvider();
   el("textFieldsDeepseek").hidden = provider !== "deepseek";
   el("textFieldsLocal").hidden = provider !== "local";
+  const privacy = el("memoryPrivacy");
+  if (privacy) {
+    privacy.textContent = provider === "local"
+      ? "当前选择本地巩固：允许记忆的会话片段和归纳结果都由 Ollama 在本机处理。敏感内容和“别记这段”会在入队前过滤。"
+      : "当前选择在线巩固：允许记忆的会话片段会直发 DeepSeek 进行后台整理；记忆数据库和归纳结果仍只保存在本机。敏感内容和“别记这段”会在发送前过滤。";
+  }
   // 当切换到 local 时自动探测 Ollama 状态
   if (provider === "local") {
     void probeLocalTextStatus();

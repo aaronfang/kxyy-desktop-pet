@@ -104,7 +104,7 @@
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
             <span id="clearMemoryStatus" class="hint"></span>
           </div>
-          <p id="memoryHint" class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后不再记得过往，当前聊天气泡不会自动消失。</p>
+          <p id="memoryHint" class="hint">元元会按昵称记住偏好、约定与对话概要；记忆数据库仅保存在本机。在线 / 本地巩固的区别请见“记忆”页。清空后不再记得过往，当前聊天气泡不会自动消失。</p>
         </section>
 
         <!-- 视觉模型 -->
@@ -354,7 +354,8 @@
       <div class="tab-panel" id="tab-memory">
         <section>
           <h2>长期记忆</h2>
-          <p class="hint memory-intro">记忆只保存在本机。元元会按当前话题选择性想起相关内容，不会把整份档案发进每次对话。</p>
+          <p class="hint memory-intro">记忆数据库只保存在本机。元元会按当前话题选择性想起相关内容，不会把整份档案发进每次对话。</p>
+          <p id="memoryPrivacy" class="memory-privacy" role="status"></p>
           <div class="memory-stats" id="memoryStats">
             <span>正在读取…</span>
           </div>
