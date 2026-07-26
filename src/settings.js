@@ -1,6 +1,7 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { clearAllMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
+import { memoryHealthState } from "./memory-ui.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -988,6 +989,7 @@ function selectedMemoryCardId() {
 
 async function refreshMemoryStats() {
   const box = el("memoryStats");
+  const health = el("memoryHealth");
   if (!box) return;
   try {
     const status = await invoke("memory_status");
@@ -1006,9 +1008,19 @@ async function refreshMemoryStats() {
       span.textContent = text;
       box.appendChild(span);
     }
-    if (status.lastError) box.title = status.lastError;
+    box.title = status.lastError || "";
+    const healthState = memoryHealthState(status);
+    if (health) {
+      health.hidden = !healthState;
+      health.className = `memory-health${healthState ? ` ${healthState.kind}` : ""}`;
+      health.textContent = healthState?.text || "";
+    }
   } catch (e) {
     box.textContent = `读取状态失败：${e.message || e}`;
+    if (health) {
+      health.hidden = true;
+      health.textContent = "";
+    }
   }
 }
 

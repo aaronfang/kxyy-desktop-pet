@@ -48,6 +48,7 @@ import {
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
 import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
+import { asksNotToRemember } from "./memory-ui.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
@@ -270,10 +271,6 @@ function newMemorySessionId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 let sessionId = newMemorySessionId();
-
-function asksNotToRemember(text) {
-  return /(别|不要|不用)(记|记住|保存)(这段|这个|这件事|刚才|这些)?|别把.{0,12}(记下来|存下来)/u.test(text || "");
-}
 
 function renderRecalledMemory(items) {
   if (!Array.isArray(items) || !items.length) return "";
@@ -1012,7 +1009,7 @@ function appendPatNotice(text, { mid } = {}) {
 }
 
 /** 用户气泡：文字 +（可选）图片缩略图 +（可选）表情贴纸。 */
-function addUserBubble(text, imageDataUrl, sticker, { mid } = {}) {
+function addUserBubble(text, imageDataUrl, sticker, { mid, doNotRemember = false } = {}) {
   const row = document.createElement("div");
   row.className = "row user";
   const bubble = document.createElement("div");
@@ -1040,6 +1037,13 @@ function addUserBubble(text, imageDataUrl, sticker, { mid } = {}) {
       img.alt = sticker.emotion || "表情";
       bubble.appendChild(img);
     }
+  }
+  if (doNotRemember) {
+    const badge = document.createElement("span");
+    badge.className = "memory-private-badge";
+    badge.textContent = "🔒 此回合不写入长期记忆";
+    badge.title = "当前用户消息和元元回复都不会进入长期记忆巩固";
+    bubble.appendChild(badge);
   }
   row.appendChild(createAvatar("user"));
   row.appendChild(bubble);
@@ -1698,7 +1702,10 @@ async function send(text, opts = {}) {
 
   const userId = genMsgId();
   const replyId = genMsgId();
-  addUserBubble(text, image?.dataUrl, sticker, { mid: userId });
+  addUserBubble(text, image?.dataUrl, sticker, {
+    mid: userId,
+    doNotRemember: currentTurnDoNotRemember,
+  });
   petSignal("user");
 
   const streamBubble = addBubble("assistant", "", { mid: replyId });

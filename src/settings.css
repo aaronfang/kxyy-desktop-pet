@@ -498,6 +498,23 @@ button.danger:disabled {
   color: #6b7280;
   font-size: 12px;
 }
+.memory-health {
+  margin: -4px 0 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.memory-health.pending {
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+.memory-health.error {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
 .memory-filters {
   display: grid;
   grid-template-columns: 1.15fr 1fr 105px 105px 1.2fr auto;

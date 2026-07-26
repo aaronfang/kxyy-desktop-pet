@@ -38,8 +38,9 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 - 每轮文字回复前选择性召回：最多 2 条置顶 + 4 条动态，总字符预算 600。
 - 敏感信息本地过滤；失败时不阻塞聊天。
 - 设置页支持搜索、筛选、编辑、置顶、兑现、删除和按人设清空。
+- “别记这段”会在当前用户气泡显示私密回合徽标；记忆页会显式展示 pending、skipped、数据库或 provider 错误，聊天与退出不因此阻塞。
 - 旧 `localStorage` facts/promises/sessions/topics 幂等迁移。
-- 16 个 Rust Memory v3 测试、前端语法检查、本地 macOS release build，以及 PR #27 的 macOS / Windows Tauri CI build 已通过。
+- 16 个 Rust Memory v3 测试、50 个 JS 测试、前端语法检查、本地 macOS DMG build，以及 PR #27 的 macOS / Windows Tauri CI build 已通过。
 - 设置页明确区分在线 DeepSeek 巩固与本地 Ollama 巩固的数据边界；记忆数据库和归纳结果始终只保存在本机。
 
 ### 2.2 当前边界
@@ -117,8 +118,8 @@ flowchart TB
 - [x] 自动覆盖入队幂等、`doNotRemember`/敏感消息过滤、card/user 隔离、无关召回、Top-K/字符预算、删除/清空后的 FTS 与 job 级联。
 - [x] 自动覆盖 processing 崩溃恢复、数据库暂时锁定后的 pending 保留与解锁恢复、retry 退避和 7 天原文清除。
 - [x] 使用真实 DeepSeek 和真实 Ollama 各跑一轮巩固 E2E。
-- [ ] 运行真实 App 验证重启恢复、无 Key和本地模型离线路径。
-- [ ] 验证“别记这段”、纠错、删除和清空的真实用户路径。
+- [ ] 按 [`qa-memory-v3-m0.md`](./qa-memory-v3-m0.md) 运行真实 App，验证重启恢复、无 Key 和本地模型离线路径。
+- [ ] 按同一清单验证“别记这段”、纠错、删除和清空的真实用户路径。
 - [x] macOS 与 Windows CI/build；确认 packaged SQLite/FTS5。
 - [ ] 合并并进入正式发布；发布前不得把本节标记为 released。
 
