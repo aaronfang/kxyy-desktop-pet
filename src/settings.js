@@ -1034,6 +1034,55 @@ function memoryActionButton(label, action, className = "ghost") {
   return button;
 }
 
+function startMemoryEdit(card, textElement, actions, item) {
+  if (card.querySelector(".memory-edit")) return;
+  const editor = document.createElement("div");
+  editor.className = "memory-edit";
+  const input = document.createElement("textarea");
+  input.value = item.text || "";
+  input.rows = item.kind === "episode" ? 4 : 3;
+  input.maxLength = 1000;
+  input.setAttribute("aria-label", "记忆内容");
+  const editorActions = document.createElement("div");
+  editorActions.className = "memory-edit-actions";
+  const error = document.createElement("p");
+  error.className = "memory-edit-error";
+  const cancel = memoryActionButton("取消", () => {
+    editor.remove();
+    actions.hidden = false;
+  });
+  const save = memoryActionButton("保存", async () => {
+    const next = input.value.trim();
+    if (!next) {
+      error.textContent = "记忆内容不能为空";
+      input.focus();
+      return;
+    }
+    if (next === item.text) {
+      cancel.click();
+      return;
+    }
+    save.disabled = true;
+    cancel.disabled = true;
+    error.textContent = "保存中…";
+    try {
+      await invoke("memory_update", { request: { kind: item.kind, id: item.id, text: next } });
+      await loadMemoryPage();
+    } catch (e) {
+      save.disabled = false;
+      cancel.disabled = false;
+      error.textContent = `保存失败：${e.message || e}`;
+    }
+  });
+  editorActions.append(cancel, save);
+  editor.append(input, editorActions, error);
+  textElement.hidden = true;
+  card.insertBefore(editor, actions);
+  actions.hidden = true;
+  input.focus();
+  input.select();
+}
+
 function renderMemoryTimeline(box, result) {
   box.replaceChildren();
   const events = Array.isArray(result?.events) ? result.events : [];
@@ -1135,10 +1184,7 @@ function renderMemoryItems(items) {
       await loadMemoryPage();
     }));
     actions.appendChild(memoryActionButton("编辑", async () => {
-      const next = window.prompt("修改这条记忆：", item.text);
-      if (next == null || !next.trim() || next.trim() === item.text) return;
-      await invoke("memory_update", { request: { kind: item.kind, id: item.id, text: next.trim() } });
-      await loadMemoryPage();
+      startMemoryEdit(card, text, actions, item);
     }));
     if (item.kind === "commitment" && item.status === "pending") {
       actions.appendChild(memoryActionButton("标记已兑现", async () => {

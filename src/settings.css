@@ -555,6 +555,19 @@ button.danger:disabled {
 }
 .memory-card-meta { color: #9ca3af; font-size: 11px; }
 .memory-card-text { margin: 0 0 7px; color: #374151; font-size: 13px; white-space: pre-wrap; }
+.memory-edit { margin: 0 0 8px; }
+.memory-edit textarea {
+  display: block;
+  width: 100%;
+  min-height: 64px;
+  box-sizing: border-box;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.5;
+}
+.memory-edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 7px; }
+.memory-edit-actions button { height: 27px; padding: 0 9px; font-size: 12px; }
+.memory-edit-error { margin: 5px 0 0; color: #b91c1c; font-size: 11px; }
 .memory-source {
   margin: 0 0 8px;
   padding: 7px 8px;

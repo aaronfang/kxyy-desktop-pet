@@ -1697,8 +1697,8 @@ fn update_memory(
     }
     if let Some(pinned) = request.pinned {
         tx.execute(
-            &format!("UPDATE {table} SET pinned=?1,updated_at=?2 WHERE id=?3"),
-            params![pinned as i64, now, request.id],
+            &format!("UPDATE {table} SET pinned=?1 WHERE id=?2"),
+            params![pinned as i64, request.id],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -3711,6 +3711,76 @@ mod tests {
             )
             .unwrap();
         assert!(snapshot.contains("用户喜欢辣"));
+    }
+
+    #[test]
+    fn pinning_does_not_change_unpinned_sort_position() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "元宝").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_fact(
+            &tx,
+            "card",
+            &user,
+            None,
+            &fact("较早的记忆", "时间", "较早", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        insert_fact(
+            &tx,
+            "card",
+            &user,
+            None,
+            &fact("较新的记忆", "时间", "较新", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM memory_facts ORDER BY updated_at DESC")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let target = ids[1].clone();
+        conn.execute(
+            "UPDATE memory_facts SET updated_at=100 WHERE id=?1",
+            [&target],
+        )
+        .unwrap();
+        update_memory(
+            &mut conn,
+            &MemoryUpdateRequest {
+                kind: "fact".into(),
+                id: target.clone(),
+                text: None,
+                pinned: Some(true),
+                status: None,
+            },
+        )
+        .unwrap();
+        update_memory(
+            &mut conn,
+            &MemoryUpdateRequest {
+                kind: "fact".into(),
+                id: target.clone(),
+                text: None,
+                pinned: Some(false),
+                status: None,
+            },
+        )
+        .unwrap();
+        let (pinned, updated_at): (i64, i64) = conn
+            .query_row(
+                "SELECT pinned,updated_at FROM memory_facts WHERE id=?1",
+                [&target],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pinned, 0);
+        assert_eq!(updated_at, 100);
     }
 
     #[test]
