@@ -361,7 +361,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
-      memoryContext: "session-start-v1",
+      memoryContext: "turn-final-v1",
       vadShadow: "silero-onnx-shadow-v1",
       asr: {
         requested: "sensevoice",
@@ -389,7 +389,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
-    memoryContext: "session-start-v1",
+    memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
     asr: {
       requested: "sensevoice",
@@ -692,8 +692,10 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const sockets = [];
   globalThis.WebSocket = class {
+    static OPEN = 1;
     constructor() {
       this.sent = [];
+      this.readyState = 1;
       sockets.push(this);
     }
 
@@ -710,7 +712,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[0].onopen();
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
-  assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1"]);
+  assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
   local.trace.startSession();
@@ -719,7 +721,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
       type: "session",
       state: "started",
       downlinkAudio: "managed-v1",
-      memoryContext: "session-start-v1",
+      memoryContext: "turn-final-v1",
       interruptionHint: "candidate-snapshot-v1",
       ttsStream: "provider-pcm-v1",
     }),
@@ -730,13 +732,35 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
-    memoryContext: "session-start-v1",
+    memoryContext: "turn-final-v1",
     vadShadow: "disabled",
     asr: {
       requested: "whisper",
       active: "none",
       status: "not-reported",
     },
+  });
+  const memoryRequests = [];
+  local.cb.onMemoryContextRequest = (request) => memoryRequests.push(request);
+  local._onMessage({
+    data: JSON.stringify({
+      type: "memory_context_request",
+      generation: 7,
+    }),
+  });
+  assert.deepEqual(memoryRequests, [{ generation: 7 }]);
+  local._backendGeneration = 7;
+  assert.equal(
+    local.sendMemoryContext({
+      generation: 7,
+      items: [{ kind: "fact", text: "记忆线索", confidence: 1 }],
+    }),
+    true,
+  );
+  assert.deepEqual(sockets[0].sent.at(-1), {
+    type: "memory_context",
+    generation: 7,
+    items: [{ kind: "fact", text: "记忆线索", uncertain: false, pinned: false }],
   });
 
   const cosy = new RealtimeSession({ provider: "cosyvoice" });
@@ -746,7 +770,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[1].onopen();
   await cosyOpen;
   assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
-  assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1"]);
+  assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
 
@@ -759,7 +783,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[2].onopen();
   await legacyOpen;
   assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
-  assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1"]);
+  assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
 

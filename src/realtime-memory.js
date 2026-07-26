@@ -7,6 +7,7 @@
 export const REALTIME_MEMORY_MAX_ITEMS = 3;
 export const REALTIME_MEMORY_MAX_CHARS = 700;
 export const REALTIME_MEMORY_TIMEOUT_MS = 120;
+export const REALTIME_TURN_MEMORY_TIMEOUT_MS = 80;
 
 const LABELS = Object.freeze({
   fact: "事实",
@@ -43,16 +44,15 @@ function itemPriority(item) {
   return pinned + commitment;
 }
 
-/** 将召回卡片限制为最多 3 条/约 250 token，并格式化为内部线索。 */
-export function formatRealtimeMemoryHints(
+/** 生成可经实时私有协议传递的有界记忆卡片，不传来源正文、分数或其它字段。 */
+export function selectRealtimeMemoryItems(
   items,
   { maxItems = REALTIME_MEMORY_MAX_ITEMS, maxChars = REALTIME_MEMORY_MAX_CHARS } = {},
 ) {
-  if (!Array.isArray(items) || !items.length) return "";
+  if (!Array.isArray(items) || !items.length) return [];
   const limit = Math.max(0, Math.min(REALTIME_MEMORY_MAX_ITEMS, Number(maxItems) || 0));
   const budget = Math.max(0, Math.min(REALTIME_MEMORY_MAX_CHARS, Number(maxChars) || 0));
-  if (!limit || !budget) return "";
-
+  if (!limit || !budget) return [];
   const candidates = items
     .filter((item) => item && typeof item.text === "string" && item.text.trim())
     .map((item, index) => ({ item, index }))
@@ -63,18 +63,37 @@ export function formatRealtimeMemoryHints(
     if (selected.length >= limit) break;
     const text = item.text.trim();
     if (chars + text.length > budget) continue;
-    const label = LABELS[item.kind] || "记忆";
-    const uncertain = item.uncertain || Number(item.confidence) < 0.65 ? "[不确定]" : "";
-    const pinned = item.pinned ? "[置顶]" : "";
-    selected.push(`- [${label}]${pinned}${uncertain} ${text}`);
+    selected.push({
+      kind: ["fact", "episode", "commitment"].includes(item.kind) ? item.kind : "memory",
+      text,
+      uncertain: item.uncertain === true || Number(item.confidence) < 0.65,
+      pinned: item.pinned === true,
+    });
     chars += text.length;
   }
-  if (!selected.length) return "";
+  return selected;
+}
+
+/** 将召回卡片限制为最多 3 条/约 250 token，并格式化为内部线索。 */
+export function formatRealtimeMemoryHints(
+  items,
+  { maxItems = REALTIME_MEMORY_MAX_ITEMS, maxChars = REALTIME_MEMORY_MAX_CHARS } = {},
+) {
+  const selected = selectRealtimeMemoryItems(items, { maxItems, maxChars });
+  const lines = [];
+  for (const item of selected) {
+    const text = item.text;
+    const label = LABELS[item.kind] || "记忆";
+    const uncertain = item.uncertain ? "[不确定]" : "";
+    const pinned = item.pinned ? "[置顶]" : "";
+    lines.push(`- [${label}]${pinned}${uncertain} ${text}`);
+  }
+  if (!lines.length) return "";
   return [
     "",
     "# 通话开始时可用的内部记忆线索",
     "- 这些内容只用于自然回应，不要展示档案或逐条复述。",
     "- 低置信度内容只能试探确认，不能当作确定事实。",
-    ...selected,
+    ...lines,
   ].join("\n");
 }

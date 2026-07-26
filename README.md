@@ -72,6 +72,7 @@ npm run dev        # 开发模式（tauri dev）
 - **Memory v3（当前开发版本）**：长期记忆由 Rust + SQLite 保存为事实、共同经历和约定；聊天前只选择性召回与当前话题相关的少量内容，后台异步巩固，不再把全部历史塞进 prompt。设置页可搜索、筛选、编辑、置顶、兑现或永久删除记忆；数据库或模型不可用时会回退，不阻塞正常聊天。
 - **0.2.34 Memory v3.1-E**：实时通话建立前在 120ms 内预加载最多 3 条置顶记忆、未完成约定或当前话题线索；召回失败自动使用原有通话人设提示，不改变音频协议和打断状态机。逐轮 ASR final 记忆仍未开启，见 Memory Brain 路线图 M2。
 - **0.2.35 Memory v3.1-F**：新增实时记忆能力门和诊断字段，三条实时语音路径明确协商 `session-start-v1`；未获得动态 context 能力回显时固定显示为 `none`，避免把 ASR final 误当作逐轮记忆支持。应用诊断 schema 升为 v6。
+- **0.2.36 Memory v3.1-G**：本地 Qwen/CosyVoice 级联通话在 ASR final 后支持 `turn-final-v1` 记忆协调：后端暂停最多 100ms 等待前端回传当前 generation 的最多 3 条记忆卡片，超时或过期结果自动丢弃；火山端到端仍保持 session-start-only。
 - **Memory Brain 路线**：发布验证、实时通话逐轮记忆、Obsidian 式 Memory Graph、Global Workspace/J-Space 类实验和外部工程接入，统一见 [`docs/roadmap-memory-brain.md`](docs/roadmap-memory-brain.md)。未标记为 released 的阶段不作为当前正式版能力承诺。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。

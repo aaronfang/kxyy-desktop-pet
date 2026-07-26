@@ -56,6 +56,8 @@ import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 import {
   recallRealtimeMemory,
   formatRealtimeMemoryHints,
+  selectRealtimeMemoryItems,
+  REALTIME_TURN_MEMORY_TIMEOUT_MS,
 } from "./realtime-memory.js";
 
 const invoke = window.__TAURI__.core.invoke;
@@ -2182,6 +2184,34 @@ function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
   void maybeUpdateRecap();
 }
 
+async function provideTurnMemoryContext(session, generation) {
+  if (!session || !activeName || !Number.isSafeInteger(generation)) {
+    session?.sendMemoryContext?.({ generation, items: [] });
+    return;
+  }
+  const last = history.find((message) => message.id === callLastUserMessageId);
+  if (!last || last.role !== "user" || !last.call || !(last.content || "").trim()) {
+    session.sendMemoryContext({ generation, items: [] });
+    return;
+  }
+  const items = await recallRealtimeMemory(
+    invoke,
+    {
+      cardId: settings.personaCardId || "",
+      nickname: activeName,
+      query: last.content,
+      imageCaption: "",
+      maxItems: 3,
+    },
+    { timeoutMs: REALTIME_TURN_MEMORY_TIMEOUT_MS },
+  );
+  if (!callActive || callSession !== session) return;
+  session.sendMemoryContext({
+    generation,
+    items: selectRealtimeMemoryItems(items),
+  });
+}
+
 async function startCall() {
   if (!isKxyyPersona(settings.personaCardId)) return;
   if (callActive || callTraceFinalizing || busy) return;
@@ -2206,7 +2236,8 @@ async function startCall() {
   appendPatNotice(`📞 正在接通${aiShortName()}…`);
   petSignal("thinking");
 
-  callSession = new RealtimeSession({
+  let session;
+  session = new RealtimeSession({
     provider: settings.realtimeBackend,
     onState: (state) => {
       if (state === "started") {
@@ -2226,6 +2257,9 @@ async function startCall() {
     // ASR 全文是覆盖式更新；只在 asr_end 定稿，避免中间态被标成 final 时切成多条。
     onAsr: (text) => upsertCallUserBubble(text, { interim: true }),
     onAsrEnd: () => finalizeCallUserBubble(),
+    onMemoryContextRequest: ({ generation }) => {
+      void provideTurnMemoryContext(session, generation);
+    },
     onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
     onAssistantEnd: () => finalizeCallAsstBubble(),
     onAssistantDiscarded: (meta) => discardCallAsstBubble(meta),
@@ -2249,11 +2283,11 @@ async function startCall() {
       endCall({ notice: false });
     },
   });
+  callSession = session;
   updateRealtimeDiagnosticAction();
 
   // 必须在 await 之前、点击同步栈内解锁 Web Audio，否则首句 TTS 会静音。
-  callSession.prepareAudio();
-  const session = callSession;
+  session.prepareAudio();
 
   try {
     const systemRole = await buildRealtimeSystemRole();

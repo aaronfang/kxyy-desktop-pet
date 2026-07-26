@@ -614,7 +614,7 @@ function sanitizeRuntimeSummary(runtime) {
     ),
     memoryContext: safeEnum(
       value.memoryContext,
-      ["session-start-v1", "none"],
+      ["session-start-v1", "turn-final-v1", "none"],
       "none",
     ),
     vadShadow: safeEnum(

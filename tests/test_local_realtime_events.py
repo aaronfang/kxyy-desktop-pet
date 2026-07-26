@@ -8,6 +8,7 @@ import queue
 import struct
 import sys
 import threading
+import time
 import types
 import unittest
 import urllib.error
@@ -2203,7 +2204,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
                 "ttsStream": [common.TTS_STREAMING_CAPABILITY],
                 "interruptionHint": [common.INTERRUPTION_HINT_CAPABILITY],
-                "memoryContext": [common.MEMORY_CONTEXT_CAPABILITY],
+                "memoryContext": [
+                    common.MEMORY_CONTEXT_CAPABILITY,
+                    common.TURN_MEMORY_CAPABILITY,
+                ],
             }
         )
         self.assertEqual(self.session.downlink_audio, common.MANAGED_AUDIO_CAPABILITY)
@@ -2224,10 +2228,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             last_json_of_type(self.ws, "session")["interruptionHint"],
             common.INTERRUPTION_HINT_CAPABILITY,
         )
-        self.assertEqual(self.session.memory_context, common.MEMORY_CONTEXT_CAPABILITY)
+        self.assertEqual(self.session.memory_context, common.TURN_MEMORY_CAPABILITY)
         self.assertEqual(
             last_json_of_type(self.ws, "session")["memoryContext"],
-            common.MEMORY_CONTEXT_CAPABILITY,
+            common.TURN_MEMORY_CAPABILITY,
         )
 
         old_ws = FakeWebSocket()
@@ -2262,6 +2266,42 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(no_adapter.tts_streaming, "none")
+
+    async def test_turn_memory_wait_is_bounded_and_rejects_stale_generation(self):
+        await self.session.on_start(
+            {
+                "memoryContext": [common.TURN_MEMORY_CAPABILITY],
+            }
+        )
+        scope = common.GenerationCancelScope(4, "asr")
+        pending = asyncio.create_task(self.session._request_turn_memory(scope))
+        await asyncio.sleep(0)
+        request = last_json_of_type(self.ws, "memory_context_request")
+        self.assertEqual(request["generation"], 4)
+        self.session.on_memory_context(
+            {
+                "generation": 3,
+                "items": [{"kind": "fact", "text": "过期"}],
+            }
+        )
+        self.session.on_memory_context(
+            {
+                "generation": 4,
+                "items": [
+                    {"kind": "commitment", "text": "下次提醒我", "uncertain": True},
+                    {"kind": "fact", "text": "忽略这条未知字段", "extra": "drop"},
+                ],
+            }
+        )
+        context = await pending
+        self.assertIn("下次提醒我", context)
+        self.assertIn("[不确定]", context)
+        self.assertNotIn("extra", context)
+
+        started = time.perf_counter()
+        timeout_scope = common.GenerationCancelScope(5, "asr")
+        self.assertEqual(await self.session._request_turn_memory(timeout_scope), "")
+        self.assertLess(time.perf_counter() - started, common.TURN_MEMORY_WAIT_SECONDS + 0.08)
 
     async def test_session_asr_runtime_never_exports_paths_or_raw_state(self):
         original = common._asr_runtime
@@ -2453,6 +2493,30 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 for message in self.session.history
             )
         )
+
+    async def test_turn_memory_is_an_ephemeral_observation_in_llm_history(self):
+        captured_histories = []
+
+        def capture_history(_role, history, _text, _scope, out):
+            captured_histories.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+            return None
+
+        common._synth_tts = lambda _text: b"unused"
+        common.start_llm_stream_producer = capture_history
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        context = common.format_turn_memory_context(
+            [{"kind": "fact", "text": "用户下周有面试", "uncertain": False}]
+        )
+        await self.session._reply_pipeline(
+            "我有点紧张",
+            scope,
+            memory_context=context,
+        )
+        self.assertEqual(len(captured_histories), 1)
+        self.assertIn("用户下周有面试", captured_histories[0][-1]["content"])
+        self.assertNotIn("用户下周有面试", " ".join(message["content"] for message in self.session.history))
 
     async def test_valid_candidate_is_confirmed_before_asr_payload(self):
         original_transcribe = common.transcribe

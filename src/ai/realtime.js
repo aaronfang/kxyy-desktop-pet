@@ -17,8 +17,8 @@
 //     本地级联控制事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //     上行 text 可含 {type:"playback_segment",generation,segmentId,state:"completed"}；
 //     只回执句段标识，不回传文本或 PCM。
-//     memoryContext 目前只协商 session-start-v1；服务端未明确回显时视为 none，
-//     不把 ASR final 误当作支持动态 context。
+//     memoryContext 可协商 session-start-v1；本地/Cosy 还可协商 turn-final-v1，
+//     服务端未明确回显时视为 none，不把 ASR final 误当作支持动态 context。
 //   挂断发 {type:"hangup"}。
 //
 // 音频采集/播放放前端而非 Rust 的原因：getUserMedia 自带回声消除(AEC)/降噪/AGC，
@@ -48,7 +48,10 @@ const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
-const MEMORY_CONTEXT_CAPABILITY = "session-start-v1";
+const SESSION_MEMORY_CAPABILITY = "session-start-v1";
+const TURN_MEMORY_CAPABILITY = "turn-final-v1";
+const MAX_TURN_MEMORY_ITEMS = 3;
+const MAX_TURN_MEMORY_CHARS = 700;
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 const VAD_SHADOW_FINAL_WAIT_MS = 50;
@@ -133,6 +136,7 @@ export class RealtimeSession {
     onLevel,
     onSpeechCandidate,
     onSpeechRejected,
+    onMemoryContextRequest,
     onPlaybackStats,
     onError,
     provider = "unknown",
@@ -153,6 +157,7 @@ export class RealtimeSession {
       onLevel,
       onSpeechCandidate,
       onSpeechRejected,
+      onMemoryContextRequest,
       onPlaybackStats,
       onError,
     };
@@ -274,7 +279,9 @@ export class RealtimeSession {
           : {};
         // 明确声明当前只支持会话开始时注入记忆；动态逐轮 context 必须由后端
         // 显式回显新能力后才能启用，不能因为收到 ASR final 就默认支持。
-        cascadeCapabilities.memoryContext = [MEMORY_CONTEXT_CAPABILITY];
+        cascadeCapabilities.memoryContext = usesManagedCascade(this.trace.provider)
+          ? [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY]
+          : [SESSION_MEMORY_CAPABILITY];
         if (
           usesManagedCascade(this.trace.provider) &&
           this._playbackMode === "worklet" &&
@@ -346,8 +353,8 @@ export class RealtimeSession {
       case "session":
         if (msg.state === "started") {
           this._memoryContextMode =
-            msg.memoryContext === MEMORY_CONTEXT_CAPABILITY
-              ? MEMORY_CONTEXT_CAPABILITY
+            [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY].includes(msg.memoryContext)
+              ? msg.memoryContext
               : "none";
         }
         if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
@@ -450,6 +457,15 @@ export class RealtimeSession {
         }
         break;
       }
+      case "memory_context_request":
+        if (
+          this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
+          Number.isSafeInteger(msg.generation) &&
+          msg.generation === this._backendGeneration
+        ) {
+          this.cb.onMemoryContextRequest?.({ generation: msg.generation });
+        }
+        break;
       case "assistant":
         this._assistantActive = true;
         this.trace.startResponse();
@@ -504,6 +520,37 @@ export class RealtimeSession {
       default:
         break;
     }
+  }
+
+  /** 回传当前 final turn 的有界记忆卡片；旧 generation、旧服务或火山路径拒绝发送。 */
+  sendMemoryContext({ generation, items } = {}) {
+    if (
+      this._memoryContextMode !== TURN_MEMORY_CAPABILITY ||
+      !Number.isSafeInteger(generation) ||
+      generation !== this._backendGeneration ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) {
+      return false;
+    }
+    const safe = [];
+    let chars = 0;
+    for (const item of Array.isArray(items) ? items : []) {
+      if (safe.length >= MAX_TURN_MEMORY_ITEMS) break;
+      const text = typeof item?.text === "string" ? item.text.trim() : "";
+      if (!text || chars + text.length > MAX_TURN_MEMORY_CHARS) continue;
+      safe.push({
+        kind: ["fact", "episode", "commitment", "memory"].includes(item.kind)
+          ? item.kind
+          : "memory",
+        text,
+        uncertain: item.uncertain === true,
+        pinned: item.pinned === true,
+      });
+      chars += text.length;
+    }
+    this.ws.send(JSON.stringify({ type: "memory_context", generation, items: safe }));
+    return true;
   }
 
   // ---- 电平：供声波可视化（麦克风 + 下行播放取较大值）----
