@@ -1,13 +1,13 @@
 {
   "name": "kxyy-desktop-pet",
-  "version": "0.2.40",
+  "version": "0.2.41",
   "description": "元元桌宠 · 基于 webmeji 动画的 macOS / Windows 跨平台桌面宠物（Tauri）",
   "author": "aaronfang",
   "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js",
+    "test": "node --test tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:resources": "node scripts/verify-vad-resources.mjs",
     "tauri": "tauri",

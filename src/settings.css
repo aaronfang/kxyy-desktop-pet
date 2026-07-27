@@ -539,6 +539,20 @@ button.danger:disabled {
   border-color: #f3bfd0;
   color: #be567a;
 }
+.memory-workspace-settings {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fafafa;
+}
+.memory-workspace-settings label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.memory-workspace-settings select { height: 28px; }
+
 .memory-graph-panel {
   margin-bottom: 12px;
   padding: 10px;

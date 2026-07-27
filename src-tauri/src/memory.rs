@@ -938,6 +938,9 @@ pub struct MemoryRecallItem {
     pub score: f64,
     pub uncertain: bool,
     pub pinned: bool,
+    pub predicate: Option<String>,
+    pub value: Option<String>,
+    pub conflict_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1905,6 +1908,233 @@ pub fn memory_rebuild_derived(
     rebuild_derived(conn)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRebuildEventsRequest {
+    pub card_id: String,
+    #[serde(default)]
+    pub nickname: Option<String>,
+}
+
+/// Rebuild the user-facing materialized memory tables from the append-only
+/// event log. The event rows are never changed or deleted; all derived tables
+/// are replaced inside one transaction and rebuilt indexes/edges afterwards.
+#[tauri::command]
+pub fn memory_rebuild_from_events(
+    state: State<'_, MemoryState>,
+    request: MemoryRebuildEventsRequest,
+) -> Result<MemoryRebuildResponse, String> {
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    rebuild_from_events(conn, &request)
+}
+
+fn rebuild_from_events(
+    conn: &mut Connection,
+    request: &MemoryRebuildEventsRequest,
+) -> Result<MemoryRebuildResponse, String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let users: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM memory_users WHERE card_id=?1 AND (?2 IS NULL OR normalized_name=lower(trim(?2)))")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![request.card_id, request.nickname.as_deref()], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    if users.is_empty() {
+        return Err("找不到要重建的记忆范围".into());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(users.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let in_params = |sql: &str| sql.replace("{0}", &placeholders);
+    for sql in [
+        in_params("DELETE FROM memory_edges WHERE user_id IN ({0})"),
+        in_params("DELETE FROM memory_search WHERE user_id IN ({0})"),
+        in_params("DELETE FROM memory_topics WHERE user_id IN ({0})"),
+        in_params("DELETE FROM memory_entities WHERE user_id IN ({0})"),
+        in_params("DELETE FROM memory_facts WHERE user_id IN ({0})"),
+        in_params("DELETE FROM memory_episodes WHERE user_id IN ({0})"),
+        in_params("DELETE FROM memory_commitments WHERE user_id IN ({0})"),
+    ] {
+        let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut values = Vec::with_capacity(users.len());
+        for user in &users {
+            values.push(user.as_str());
+        }
+        stmt.execute(rusqlite::params_from_iter(values))
+            .map_err(|e| e.to_string())?;
+    }
+    let event_sql = format!(
+        "SELECT user_id,item_kind,item_id,event_type,source_id,observed_at,trust,payload_json FROM memory_events WHERE user_id IN ({placeholders}) ORDER BY created_at ASC,id ASC"
+    );
+    let mut events = tx.prepare(&event_sql).map_err(|e| e.to_string())?;
+    let event_values: Vec<&str> = users.iter().map(String::as_str).collect();
+    let rows = events
+        .query_map(rusqlite::params_from_iter(event_values), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, f64>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (user_id, kind, id, event_type, source_id, observed_at, trust, payload) =
+            row.map_err(|e| e.to_string())?;
+        let value: Value =
+            serde_json::from_str(&payload).map_err(|e| format!("事件 {id} payload 无效：{e}"))?;
+        let snapshot = value.get("snapshot").unwrap_or(&value);
+        match kind.as_str() {
+            "episode" => replay_episode(
+                &tx,
+                &user_id,
+                &id,
+                source_id.as_deref(),
+                observed_at,
+                trust,
+                snapshot,
+                &event_type,
+            )
+            .map_err(|e| e.to_string())?,
+            "fact" => replay_fact(
+                &tx,
+                &user_id,
+                &id,
+                observed_at,
+                trust,
+                snapshot,
+                &event_type,
+            )
+            .map_err(|e| e.to_string())?,
+            "commitment" => {
+                replay_commitment(&tx, &user_id, &id, observed_at, snapshot, &event_type)
+                    .map_err(|e| e.to_string())?
+            }
+            _ => {}
+        }
+    }
+    drop(events);
+    rebuild_search_index(&tx).map_err(|e| e.to_string())?;
+    backfill_v5_graph(&tx).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(MemoryRebuildResponse {
+        schema_version: SCHEMA_VERSION,
+        rebuilt_search_rows: scalar_count(conn, "SELECT COUNT(*) FROM memory_search").unwrap_or(0),
+        rebuilt_edges: scalar_count(conn, "SELECT COUNT(*) FROM memory_edges").unwrap_or(0),
+        rebuilt_at: now_ts(),
+    })
+}
+
+fn replay_episode(
+    tx: &Transaction<'_>,
+    user_id: &str,
+    id: &str,
+    session_id: Option<&str>,
+    observed_at: i64,
+    trust: f64,
+    p: &Value,
+    event_type: &str,
+) -> rusqlite::Result<()> {
+    if event_type.ends_with("superseded") || event_type.ends_with("deleted") {
+        return Ok(());
+    }
+    let summary = p.get("summary").and_then(Value::as_str).unwrap_or("");
+    if summary.trim().is_empty() {
+        return Ok(());
+    }
+    let topics = p
+        .get("topics")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let entities = p
+        .get("entities")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    tx.execute("INSERT INTO memory_episodes(id,user_id,session_id,summary,emotion,importance,topics_json,entities_json,occurred_at,created_at,updated_at,pinned,user_edited) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET summary=excluded.summary,emotion=excluded.emotion,importance=excluded.importance,topics_json=excluded.topics_json,entities_json=excluded.entities_json,updated_at=excluded.updated_at,pinned=excluded.pinned,user_edited=excluded.user_edited", params![id,user_id,session_id,truncate_chars(summary,1000),p.get("emotion").and_then(Value::as_str).unwrap_or(""),clamp01(p.get("importance").and_then(Value::as_f64).unwrap_or(trust)),serde_json::to_string(&topics).unwrap_or("[]".into()),serde_json::to_string(&entities).unwrap_or("[]".into()),observed_at,p.get("pinned").and_then(Value::as_bool).unwrap_or(false) as i64,p.get("userEdited").and_then(Value::as_bool).unwrap_or(false) as i64])?;
+    Ok(())
+}
+
+fn replay_fact(
+    tx: &Transaction<'_>,
+    user_id: &str,
+    id: &str,
+    observed_at: i64,
+    trust: f64,
+    p: &Value,
+    event_type: &str,
+) -> rusqlite::Result<()> {
+    if event_type.ends_with("superseded") {
+        tx.execute(
+            "UPDATE memory_facts SET status='superseded',valid_to=?2,updated_at=?2 WHERE id=?1",
+            params![id, observed_at],
+        )?;
+        return Ok(());
+    }
+    if event_type.ends_with("deleted") {
+        tx.execute("DELETE FROM memory_facts WHERE id=?1", [id])?;
+        return Ok(());
+    }
+    let text = p.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let status = p
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| event_type.ends_with("disputed").then_some("disputed"))
+        .unwrap_or("active");
+    tx.execute("INSERT INTO memory_facts(id,user_id,source_episode_id,text,predicate,value,confidence,importance,durability,status,valid_from,valid_to,confirmation_count,pinned,user_edited,first_seen_at,last_confirmed_at,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13,?14,?15,?15,?15,?15) ON CONFLICT(id) DO UPDATE SET source_episode_id=excluded.source_episode_id,text=excluded.text,predicate=excluded.predicate,value=excluded.value,confidence=excluded.confidence,importance=excluded.importance,durability=excluded.durability,status=excluded.status,valid_from=excluded.valid_from,valid_to=excluded.valid_to,pinned=excluded.pinned,user_edited=excluded.user_edited,updated_at=excluded.updated_at,last_confirmed_at=excluded.last_confirmed_at", params![id,user_id,p.get("sourceEpisodeId").and_then(Value::as_str),truncate_chars(text,600),p.get("predicate").and_then(Value::as_str).unwrap_or(text),p.get("value").and_then(Value::as_str).unwrap_or(text),clamp01(p.get("confidence").and_then(Value::as_f64).unwrap_or(trust)),clamp01(p.get("importance").and_then(Value::as_f64).unwrap_or(0.5)),p.get("durability").and_then(Value::as_str).unwrap_or("stable"),status,p.get("validFrom").and_then(Value::as_i64),p.get("validTo").and_then(Value::as_i64),p.get("pinned").and_then(Value::as_bool).unwrap_or(false) as i64,p.get("userEdited").and_then(Value::as_bool).unwrap_or(false) as i64,observed_at])?;
+    Ok(())
+}
+
+fn replay_commitment(
+    tx: &Transaction<'_>,
+    user_id: &str,
+    id: &str,
+    observed_at: i64,
+    p: &Value,
+    event_type: &str,
+) -> rusqlite::Result<()> {
+    if event_type.ends_with("deleted") {
+        tx.execute("DELETE FROM memory_commitments WHERE id=?1", [id])?;
+        return Ok(());
+    }
+    let text = p.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.trim().is_empty() {
+        if event_type.ends_with("status_changed") {
+            if let Some(status) = p.get("status").and_then(Value::as_str) {
+                tx.execute(
+                    "UPDATE memory_commitments SET status=?2,resolved_at=?3,updated_at=?3 WHERE id=?1",
+                    params![id, status, (status != "pending").then_some(observed_at)],
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    let status = p.get("status").and_then(Value::as_str).unwrap_or(
+        if event_type.ends_with("status_changed") {
+            "fulfilled"
+        } else {
+            "pending"
+        },
+    );
+    tx.execute("INSERT INTO memory_commitments(id,user_id,source_episode_id,text,due_at,status,importance,pinned,user_edited,created_at,updated_at,resolved_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?11) ON CONFLICT(id) DO UPDATE SET source_episode_id=excluded.source_episode_id,text=excluded.text,due_at=excluded.due_at,status=excluded.status,importance=excluded.importance,pinned=excluded.pinned,user_edited=excluded.user_edited,updated_at=excluded.updated_at,resolved_at=excluded.resolved_at", params![id,user_id,p.get("sourceEpisodeId").and_then(Value::as_str),truncate_chars(text,600),p.get("dueAt").and_then(Value::as_i64),status,clamp01(p.get("importance").and_then(Value::as_f64).unwrap_or(0.7)),p.get("pinned").and_then(Value::as_bool).unwrap_or(false) as i64,p.get("userEdited").and_then(Value::as_bool).unwrap_or(false) as i64,observed_at,(status != "pending").then_some(observed_at)])?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn memory_timeline(
     state: State<'_, MemoryState>,
@@ -2719,6 +2949,8 @@ struct Candidate {
     pinned: bool,
     occurred_at: Option<i64>,
     updated_at: i64,
+    predicate: Option<String>,
+    value: Option<String>,
 }
 
 #[tauri::command]
@@ -2873,6 +3105,9 @@ fn recall_memory(
             score,
             uncertain: candidate.status == "disputed" || candidate.confidence < 0.65,
             pinned: candidate.pinned,
+            conflict_key: candidate.predicate.clone(),
+            predicate: candidate.predicate,
+            value: candidate.value,
         });
     }
     let recalled_at = now_ts();
@@ -2915,7 +3150,7 @@ fn load_recent_candidates(conn: &Connection, user_id: &str) -> rusqlite::Result<
     let mut out = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id,text,predicate||' '||value,status,confidence,importance,pinned,
+            "SELECT id,text,predicate,value,predicate||' '||value,status,confidence,importance,pinned,
                     valid_from,updated_at
              FROM memory_facts
              WHERE user_id=?1 AND status IN ('active','disputed')
@@ -2927,13 +3162,15 @@ fn load_recent_candidates(conn: &Connection, user_id: &str) -> rusqlite::Result<
                 id: r.get(0)?,
                 kind: "fact".into(),
                 text: r.get(1)?,
-                tags: r.get(2)?,
-                status: r.get(3)?,
-                confidence: r.get(4)?,
-                importance: r.get(5)?,
-                pinned: r.get::<_, i64>(6)? != 0,
-                occurred_at: r.get(7)?,
-                updated_at: r.get(8)?,
+                predicate: r.get(2)?,
+                value: r.get(3)?,
+                tags: r.get(4)?,
+                status: r.get(5)?,
+                confidence: r.get(6)?,
+                importance: r.get(7)?,
+                pinned: r.get::<_, i64>(8)? != 0,
+                occurred_at: r.get(9)?,
+                updated_at: r.get(10)?,
             })
         })?;
         out.extend(rows.filter_map(Result::ok));
@@ -2957,6 +3194,8 @@ fn load_recent_candidates(conn: &Connection, user_id: &str) -> rusqlite::Result<
                 pinned: r.get::<_, i64>(6)? != 0,
                 occurred_at: r.get(7)?,
                 updated_at: r.get(8)?,
+                predicate: None,
+                value: None,
             })
         })?;
         out.extend(rows.filter_map(Result::ok));
@@ -2979,6 +3218,8 @@ fn load_recent_candidates(conn: &Connection, user_id: &str) -> rusqlite::Result<
                 pinned: r.get::<_, i64>(6)? != 0,
                 occurred_at: r.get(7)?,
                 updated_at: r.get(8)?,
+                predicate: None,
+                value: None,
             })
         })?;
         out.extend(rows.filter_map(Result::ok));
@@ -3029,17 +3270,17 @@ fn load_candidate_by_id(
 ) -> rusqlite::Result<Option<Candidate>> {
     match kind {
         "fact" => conn.query_row(
-            "SELECT id,text,predicate||' '||value,status,confidence,importance,pinned,valid_from,updated_at
+            "SELECT id,text,predicate,value,predicate||' '||value,status,confidence,importance,pinned,valid_from,updated_at
              FROM memory_facts WHERE id=?1 AND status IN ('active','disputed') AND (valid_to IS NULL OR valid_to>=?2)",
-            params![id,now_ts()], |r| Ok(Candidate { id:r.get(0)?,kind:"fact".into(),text:r.get(1)?,tags:r.get(2)?,status:r.get(3)?,confidence:r.get(4)?,importance:r.get(5)?,pinned:r.get::<_,i64>(6)?!=0,occurred_at:r.get(7)?,updated_at:r.get(8)? })
+            params![id,now_ts()], |r| Ok(Candidate { id:r.get(0)?,kind:"fact".into(),text:r.get(1)?,predicate:r.get(2)?,value:r.get(3)?,tags:r.get(4)?,status:r.get(5)?,confidence:r.get(6)?,importance:r.get(7)?,pinned:r.get::<_,i64>(8)?!=0,occurred_at:r.get(9)?,updated_at:r.get(10)?, })
         ).optional(),
         "episode" => conn.query_row(
             "SELECT id,summary,topics_json||' '||entities_json,'active',1.0,importance,pinned,occurred_at,updated_at FROM memory_episodes WHERE id=?1",
-            [id], |r| Ok(Candidate { id:r.get(0)?,kind:"episode".into(),text:r.get(1)?,tags:r.get(2)?,status:r.get(3)?,confidence:r.get(4)?,importance:r.get(5)?,pinned:r.get::<_,i64>(6)?!=0,occurred_at:r.get(7)?,updated_at:r.get(8)? })
+            [id], |r| Ok(Candidate { id:r.get(0)?,kind:"episode".into(),text:r.get(1)?,tags:r.get(2)?,status:r.get(3)?,confidence:r.get(4)?,importance:r.get(5)?,pinned:r.get::<_,i64>(6)?!=0,occurred_at:r.get(7)?,updated_at:r.get(8)?,predicate:None,value:None })
         ).optional(),
         "commitment" => conn.query_row(
             "SELECT id,text,'约定 承诺',status,1.0,importance,pinned,due_at,updated_at FROM memory_commitments WHERE id=?1 AND status='pending'",
-            [id], |r| Ok(Candidate { id:r.get(0)?,kind:"commitment".into(),text:r.get(1)?,tags:r.get(2)?,status:r.get(3)?,confidence:r.get(4)?,importance:r.get(5)?,pinned:r.get::<_,i64>(6)?!=0,occurred_at:r.get(7)?,updated_at:r.get(8)? })
+            [id], |r| Ok(Candidate { id:r.get(0)?,kind:"commitment".into(),text:r.get(1)?,tags:r.get(2)?,status:r.get(3)?,confidence:r.get(4)?,importance:r.get(5)?,pinned:r.get::<_,i64>(6)?!=0,occurred_at:r.get(7)?,updated_at:r.get(8)?,predicate:None,value:None })
         ).optional(),
         _ => Ok(None),
     }
@@ -4262,7 +4503,17 @@ correction/preferenceChange 只在用户明确纠正或说明发生变化时使�
 sourceMessageIds 必须逐字使用输入中真实存在的 id。所有字段允许为空，不要硬凑。
 严格只输出 JSON：
 {"episode":{"summary":"","emotion":"","importance":0.5,"topics":[],"entities":[],"sourceMessageIds":[]},"facts":[{"text":"","predicate":"","value":"","durability":"temporary|stable|permanent","evidence":"assertion|confirmation|correction|preferenceChange","confidence":0.7,"importance":0.5,"validFrom":null}],"commitments":[{"text":"","dueAt":null,"importance":0.7}]}"#;
-    let raw = crate::api::complete_memory_json(app, system, &formatted)?;
+    let provider = crate::api::ApiMemoryCompletionProvider::new(app.clone());
+    let raw = crate::memory_core::MemoryCompletionProvider::complete_memory_batch(
+        &provider,
+        crate::memory_core::MemoryCompletionRequest {
+            system: system.to_string(),
+            input: formatted,
+            max_output_tokens: Some(1400),
+        },
+    )
+    .map_err(|e| e.to_string())?
+    .json;
     let json = extract_json_object(&raw).ok_or_else(|| "记忆整理结果不是 JSON".to_string())?;
     serde_json::from_str(json).map_err(|e| format!("解析记忆整理结果失败：{e}"))
 }
@@ -5034,6 +5285,140 @@ mod tests {
         let found = search_candidates(&conn, "card", &user, "产品经理面试").unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].text.contains("面试"));
+    }
+
+    #[test]
+    fn recall_exposes_structured_fact_conflict_fields() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_fact(
+            &tx,
+            "card",
+            &user,
+            None,
+            &fact("用户喜欢辣", "饮食偏好", "喜欢辣", "assertion"),
+            now_ts(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let response = recall_memory(
+            &mut conn,
+            &MemoryRecallRequest {
+                card_id: "card".into(),
+                nickname: "小明".into(),
+                query: "喜欢辣".into(),
+                image_caption: String::new(),
+                max_items: Some(6),
+            },
+        )
+        .unwrap();
+        let item = response
+            .items
+            .iter()
+            .find(|item| item.kind == "fact")
+            .unwrap();
+        assert_eq!(item.predicate.as_deref(), Some("饮食偏好"));
+        assert_eq!(item.value.as_deref(), Some("喜欢辣"));
+        assert_eq!(item.conflict_key.as_deref(), Some("饮食偏好"));
+    }
+
+    #[test]
+    fn recall_in_memory_p95_stays_under_budget() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for index in 0..20 {
+            insert_fact(
+                &tx,
+                "card",
+                &user,
+                None,
+                &fact(
+                    &format!("用户偏好测试项{index}"),
+                    "偏好",
+                    &format!("测试项{index}"),
+                    "assertion",
+                ),
+                now_ts(),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let mut elapsed = Vec::new();
+        for _ in 0..100 {
+            let started = Instant::now();
+            let response = recall_memory(
+                &mut conn,
+                &MemoryRecallRequest {
+                    card_id: "card".into(),
+                    nickname: "小明".into(),
+                    query: "测试项".into(),
+                    image_caption: String::new(),
+                    max_items: Some(6),
+                },
+            )
+            .unwrap();
+            elapsed.push(started.elapsed().as_millis());
+            assert!(response.total_chars <= RECALL_CHAR_BUDGET);
+            assert!(response.items.len() <= MAX_RECALL_ITEMS);
+        }
+        elapsed.sort_unstable();
+        assert!(elapsed[94] < 30, "recall p95 too slow: {}ms", elapsed[94]);
+    }
+
+    #[test]
+    fn event_replay_restores_materialized_items_without_changing_log() {
+        let mut conn = test_db();
+        let user = get_or_create_user(&conn, "card", "小明").unwrap();
+        let before = scalar_count(&conn, "SELECT COUNT(*) FROM memory_events").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let episode_id = "episode-replay";
+        tx.execute("INSERT INTO memory_episodes(id,user_id,summary,importance,topics_json,entities_json,occurred_at,created_at,updated_at) VALUES(?1,?2,'面试经历',0.9,'[\"面试\"]','[]',100,100,100)", params![episode_id, &user]).unwrap();
+        append_event(&tx, &MemoryEventInput { user_id: &user, card_id: "card", item_kind: "episode", item_id: episode_id, event_type: "episode.created", source_type: "test", source_id: None, modality: "text", observed_at: 100, trust: 0.9, consent: "allowed", idempotency_key: "replay-episode", payload_json: r#"{"summary":"面试经历","importance":0.9,"topics":["面试"],"entities":[]}"# }).unwrap();
+        tx.execute("INSERT INTO memory_facts(id,user_id,text,predicate,value,confidence,importance,durability,status,valid_from,first_seen_at,last_confirmed_at,created_at,updated_at) VALUES('fact-replay',?1,'用户准备面试','安排','面试',0.8,0.7,'stable','active',100,100,100,100,100)", [&user]).unwrap();
+        append_event(&tx, &MemoryEventInput { user_id: &user, card_id: "card", item_kind: "fact", item_id: "fact-replay", event_type: "fact.created", source_type: "test", source_id: None, modality: "text", observed_at: 100, trust: 0.8, consent: "allowed", idempotency_key: "replay-fact", payload_json: r#"{"text":"用户准备面试","predicate":"安排","value":"面试","confidence":0.8,"importance":0.7,"durability":"stable"}"# }).unwrap();
+        tx.commit().unwrap();
+        let events = scalar_count(&conn, "SELECT COUNT(*) FROM memory_events").unwrap();
+        assert_eq!(events, before + 2);
+        conn.execute("DELETE FROM memory_facts", []).unwrap();
+        conn.execute("DELETE FROM memory_episodes", []).unwrap();
+        rebuild_from_events(
+            &mut conn,
+            &MemoryRebuildEventsRequest {
+                card_id: "card".into(),
+                nickname: Some("小明".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_events").unwrap(),
+            events
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM memory_facts WHERE id='fact-replay'"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM memory_episodes WHERE id='episode-replay'"
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM memory_search WHERE item_id='fact-replay'"
+            )
+            .unwrap()
+                > 0
+        );
     }
 
     #[test]

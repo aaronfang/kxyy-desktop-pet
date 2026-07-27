@@ -355,6 +355,15 @@
         <section>
           <h2>长期记忆</h2>
           <p class="hint memory-intro">记忆数据库只保存在本机。元元会按当前话题选择性想起相关内容，不会把整份档案发进每次对话。</p>
+          <div class="memory-workspace-settings">
+            <label><input id="memoryWorkspace" type="checkbox" /> 启用实验性全局工作区</label>
+            <select id="memoryWorkspaceMode" aria-label="联想强度">
+              <option value="conservative">保守联想</option>
+              <option value="balanced">平衡联想</option>
+              <option value="exploratory">探索联想</option>
+            </select>
+            <span class="hint">只生成有界的内部观察，不会自动写入长期记忆；假设不是事实。</span>
+          </div>
           <p id="memoryPrivacy" class="memory-privacy" role="status"></p>
           <div class="memory-stats" id="memoryStats">
             <span>正在读取…</span>
@@ -431,6 +440,7 @@
             <div class="memory-maintenance-actions">
               <button id="memoryIntegrity" type="button" class="ghost">检查完整性</button>
               <button id="memoryRebuild" type="button" class="ghost">重建索引与关系</button>
+              <button id="memoryReplayEvents" type="button" class="ghost">从事件重建记忆</button>
               <button id="memoryExport" type="button" class="ghost">导出脱敏记忆</button>
               <button id="memoryBackup" type="button" class="ghost">创建数据库备份</button>
             </div>

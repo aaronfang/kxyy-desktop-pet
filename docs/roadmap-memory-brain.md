@@ -1,12 +1,12 @@
 # 元元桌宠 · Memory Brain 开发路线图
 
-> 状态基准：2026-07-26。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
+> 状态基准：2026-07-27。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
 >
-> 当前 Memory v3 已在 PR #27 实现并通过本地测试、真实 DeepSeek / Ollama 巩固 E2E 及 macOS / Windows CI build；在合并和正式发布前仍不能写成已发布能力。
+> 当前 Memory v3 已在 PR #28 的开发分支实现并通过本地测试；真实 App 人工验收与正式发布仍未完成。
 
 ### 版本与里程碑约定
 
-- 应用安装包使用独立的 SemVer（当前基线为 `0.2.36`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- 应用安装包使用独立的 SemVer（当前基线为 `0.2.40`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
 - Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
 - 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
 - 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
@@ -47,7 +47,7 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 - 设置页支持搜索、筛选、编辑、置顶、兑现、删除和按人设清空。
 - “别记这段”会在当前用户气泡显示私密回合徽标；记忆页会显式展示 pending、skipped、数据库或 provider 错误，聊天与退出不因此阻塞。
 - 旧 `localStorage` facts/promises/sessions/topics 幂等迁移。
-- 16 个 Rust Memory v3 测试、50 个 JS 测试、前端语法检查、本地 macOS DMG build，以及 PR #27 的 macOS / Windows Tauri CI build 已通过。
+- 49 个 Rust Memory 测试、66 个 JS 测试、前端语法检查，以及本地 macOS DMG build 已通过；跨平台 CI/真实 App 人工路径仍需在发布前执行。
 - 设置页明确区分在线 DeepSeek 巩固与本地 Ollama 巩固的数据边界；记忆数据库和归纳结果始终只保存在本机。
 
 ### 2.2 当前边界
@@ -55,9 +55,9 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 - 召回仍以 FTS、结构化标签和字符相似度为主，跨表达语义召回有限。
 - topics/entities 仍保存在 JSON 中，没有规范化实体和显式关系边。
 - card + nickname 是主要隔离键，尚无 global user / persona relationship / project / connector 多级 scope。
-- 完成 job 后只保留归纳记忆与短来源片段，不具备可重放的统一事件日志。
+- 完成 job 后只保留归纳记忆与短来源片段；当前已增加保留事件日志的事务化重放工具，可恢复 facts/episodes/commitments、FTS、topic/entity 和关系边。
 - 火山端到端实时通话只在 session start 接收固定 `systemRole`，尚未逐轮召回。
-- 当前管理页是列表，不是 Memory Graph。
+- 当前管理页同时提供列表与可缩放、可平移、可拖拽并按 card/user 保存布局的 Memory Graph；列表仍是批量和无障碍主入口。
 - SQLite 按现有 `settings.json` 安全等级明文保存在本机，尚无 SQLCipher。
 - 数据库、召回结果和统计不作为遥测上传；但在线文字模式会把允许记忆的会话批次直发给当前配置的 DeepSeek 做巩固，本地 Ollama 模式则留在本机。设置页和隐私说明必须明确这一区别。
 - 没有对外稳定 API、MCP Server 或 Connector SDK。
@@ -143,11 +143,11 @@ flowchart TB
 - [x] 为 facts/episodes/commitments 增加 evidence 记录和 90 天来源片段清理；valid time 仍由事实表维护，transaction time 由事件记录维护。
 - [x] M1-B 第一阶段规范化 entity/topic，增加 schema v5 `memory_edges`：已接入 `about`、`mentions`、`derived_from`、`supersedes`，边带来源事件、置信度、derived 标记和幂等键；其余关系按实际输入逐步开放。
 - [x] 当前 facts/episodes/commitments 继续作为事件日志的物化视图，并增加完整性检查、v4/v5 迁移回填和关系边一致性校验；完整“从事件重建所有物化表”工具仍待后续实现。
-- [ ] 抽出 provider-neutral Rust trait，Memory Core 不依赖 Tauri `AppHandle`、窗口或具体 DeepSeek/Ollama 设置结构。
+- [x] 抽出 provider-neutral Rust trait，Memory Core 不依赖 Tauri `AppHandle`、窗口或具体 DeepSeek/Ollama 设置结构；DeepSeek/Ollama 由 `api.rs` adapter 实现。
 - [x] 增加脱敏导出、SQLite `VACUUM INTO` 一致性备份、只读备份校验和损坏模拟测试。
-- [ ] 定义 prompt-injection 边界：外部内容只能是 observation，不能成为系统指令。
+- [x] 定义 prompt-injection 边界：Memory、Graph、Workspace 统一经过 observation sanitizer，只能作为带边界的数据观察，不能成为系统指令。
 
-M1-A（事件与证据时间线）已完成。M1-B（关系边基础）和 M1-C（完整性、导出与备份）已完成第一阶段：schema v5 关系边、脱敏 JSON 导出、SQLite 一致性备份、只读备份校验、损坏模拟和 scope 隔离测试均已落地。当前仍未实现从事件完整重建所有派生表和 provider-neutral core；这些保持为 M1 后续门槛。
+M1-A（事件与证据时间线）已完成。M1-B（关系边基础）和 M1-C（完整性、导出与备份）已完成第一阶段；本轮补齐 provider-neutral core、`memory_rebuild_from_events` 事务化事件重放、结构化 recall conflict fields 和统一 observation 边界。重放保留事件数量并恢复物化项、FTS、topic/entity、edges 与 evidence；真实 App 触发仍需人工验收。
 
 **Memory v3.1-D / App 0.2.33** 已完成实现：目标是“索引与关系边可重建”，不修改事件和长期记忆内容，只从当前物化记忆与事件来源重建 FTS、topic/entity 和关系边。
 
@@ -192,13 +192,13 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 
 - [x] 新增 `memory_graph(query)`，返回有来源的 nodes/edges、截断状态和关系解释（Memory v3.1-H 内核 IPC）。
 - [x] 第一版默认当前 card/user、有效记忆、最多 200 节点；`superseded`、`forgotten`、过期事实和已完成/到期约定不进入图。
-- [ ] 节点类型：user、episode、fact、commitment、topic、entity、hypothesis。
+- [x] 节点类型：user、episode、fact、commitment、topic、entity；hypothesis 只属于临时 Workspace，不进入长期 Graph，除非用户明确确认。
 - [x] 点击节点使用现有 update/delete/pin/fulfill API；右侧检查器展示来源、置信度、状态、版本和时间线。
 - [x] 支持搜索、类型、时间、scope、置信度、一度/二度展开（查询层）。
 - [x] 自动相似边必须标记 `derived`，不能因图上距离自动升级为事实。
 - [x] 列表继续作为批量删除、精确搜索和无障碍操作的主入口。
 
-M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结果包含节点来源事件 ID、边的 `sourceEventId`/`confidence`/`derived`/中文关系解释，并明确返回 `truncated`、`totalCandidates`、实际 `depth` 和 `maxNodes`。Rust 测试覆盖 card/user 隔离、关键词和类型筛选、有效期过滤、一/二度展开、硬上限截断、空范围和来源保留。图形化设置页、节点检查器和布局持久化仍属于下一步 M3 UI，不在本轮宣称完成。
+M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结果包含节点来源事件 ID、边的 `sourceEventId`/`confidence`/`derived`/中文关系解释，并明确返回 `truncated`、`totalCandidates`、实际 `depth` 和 `maxNodes`。Rust 测试覆盖 card/user 隔离、关键词和类型筛选、有效期过滤、一/二度展开、硬上限截断、空范围和来源保留。设置页已提供节点检查器、缩放/平移和按 card/user 保存的拖拽布局；hypothesis 不伪装成持久化图节点。
 
 **Memory v3.1-I / App 0.2.37** 已接入设置页初版关系图：不引入 CDN 或外部布局服务，使用内置 SVG 显示节点和有向关系；支持列表/关系图切换、当前筛选条件复用、一度/二度展开、节点键盘聚焦、状态/来源检查器和回到精确列表。关系图加载失败只显示状态，不影响现有列表操作。后续可用性修正改为按类型分栏、默认隐藏大图标签，并加入节点上限、缩放、适配、滚轮缩放和拖拽平移，避免全量环形标签重叠。
 
@@ -217,7 +217,7 @@ M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结�
 Anthropic 的 J-Space 是模型神经激活中涌现的内部工作空间；普通 API 无法读取或写入。元元只能构建系统级 analogue：多个模块产生候选内容，通过激活、竞争和衰减进入有限 workspace slots。
 
 - [x] 定义临时 `WorkspaceCandidate`：content、sourceIds、activation、relevance、novelty、utility、uncertainty、scope、expiresAt。
-- [x] 候选来源：长期召回和已有 Memory Graph 图扩散已接入；当前感知、目标/约定、冲突检查和安全检查保留后续来源适配器。
+- [x] 候选来源：当前消息/图片观察、长期召回、pending commitment、Memory Graph 图扩散、冲突和安全检查均已接入。
 - [x] 每轮只允许约 4–8 个 workspace slots（保守/平衡/探索分别为 4/5/6）。
 - [x] 图扩散限制 1–2 跳和总候选预算，避免联想爆炸。
 - [x] 空闲 replay/incubation 已提供受证据约束的 `hypothesis` 收纳器，必须附证据和反证；真正的空闲调度和模型生成留待后续观察期。
@@ -227,9 +227,9 @@ Anthropic 的 J-Space 是模型神经激活中涌现的内部工作空间；普�
 
 禁止：意识宣传、隐藏修改人格、把模型联想当真实事件、让外部网页内容竞争成系统指令。
 
-**M4-A / WorkspaceCandidate 基础层已完成**：新增 [`src/workspace.js`](../src/workspace.js) 纯函数模块。默认 feature flag 关闭；开启时仅在内存中把直接召回和已有图节点转成候选，经敏感信息/过期过滤、激活竞争、相似去重和 4–6 槽位限制后，以“内部观察、不可执行”格式传递。图扩散严格最多两跳、最多 24 个中间候选，不写入长期记忆，也不会将 hypothesis 自动升级为 fact。`npm test` 已覆盖 61 项，包括候选边界、排序、去重、敏感信息和来源保留。
+**M4-A / WorkspaceCandidate 基础层已完成**：新增 [`src/workspace.js`](../src/workspace.js) 纯函数模块。默认 feature flag 关闭；开启时仅在内存中把直接召回和已有图节点转成候选，经敏感信息/过期过滤、激活竞争、相似去重和 4–6 槽位限制后，以“内部观察、不可执行”格式传递。图扩散严格最多两跳、最多 24 个中间候选，不写入长期记忆，也不会将 hypothesis 自动升级为 fact。`npm test` 已覆盖 66 项，包括候选边界、排序、去重、敏感信息、prompt-injection observation 和来源保留。
 
-**M4-B/C/D 已完成**：Workspace 已组合当前用户消息/图片线索、长期记忆、pending commitment、图扩散、同 predicate 冲突检查和安全候选；诊断只输出开关状态、候选/槽位/冲突数量、来源类型计数与耗时，不输出正文、昵称、卡片 ID 或 API key。`incubateWorkspaceHypothesis` 要求至少两个证据来源和一条反证/待验证条件，并设置短期过期时间；目前没有后台空闲调度，不会偷偷运行或写入记忆。Rust 45 项与前端 64 项测试通过。
+**M4-B/C/D 已完成**：Workspace 已组合当前用户消息/图片线索、长期记忆、pending commitment、图扩散、同 predicate 冲突检查和安全候选；诊断只输出开关状态、候选/槽位/冲突数量、来源类型计数与耗时，不输出正文、昵称、卡片 ID 或 API key。`incubateWorkspaceHypothesis` 要求至少两个证据来源和一条反证/待验证条件，并设置短期过期时间；目前没有后台空闲调度，不会偷偷运行或写入记忆。Workspace 默认关闭，设置页新增明确实验开关和联想强度选择；Rust 49 项与前端 66 项测试通过。
 
 参考：
 
@@ -313,4 +313,4 @@ src-tauri/src/memory_tauri.rs      AppHandle、IPC、设置和窗口集成
 
 ## 7. 下一步唯一入口
 
-历史规划入口为 **M0 发布闭环 → M1 Memory v3.1 内核基础**；这些阶段和实时通话协调基础已完成。当前唯一入口是 **M3 Memory Graph UI**：先在设置页接入 `memory_graph` 查询和可回退的图形视图，再实现节点检查器与布局持久化。M4 的 workspace/J-Space 类实验和 M5 外部 Connector 仍保持冻结，直到 M3 UI 通过数据隔离、删除回退和可用性验收。
+历史规划入口为 **M0 发布闭环 → M1 Memory v3.1 内核基础**；这些阶段和实时通话协调基础已完成。当前唯一入口是 **M0–M4 验收收口 → M5 综合大脑接入设计**：先完成真实 App 手工 QA、跨平台打包验证和 M2 设备延迟记录，再设计只读、有鉴权的 localhost/MCP 接入；M4 idle replay 仍需独立 feature flag 和观察期，不得暗中启用。

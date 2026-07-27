@@ -387,6 +387,38 @@ pub(crate) fn complete_memory_json(
     Err(format!("连接{provider}失败：{last_error}"))
 }
 
+/// Adapter that keeps the memory domain independent from provider/config types.
+pub(crate) struct ApiMemoryCompletionProvider {
+    app: AppHandle,
+}
+
+impl ApiMemoryCompletionProvider {
+    pub(crate) fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl crate::memory_core::MemoryCompletionProvider for ApiMemoryCompletionProvider {
+    fn complete_memory_batch(
+        &self,
+        request: crate::memory_core::MemoryCompletionRequest,
+    ) -> Result<crate::memory_core::MemoryCompletionResult, crate::memory_core::MemoryProviderError>
+    {
+        let started = std::time::Instant::now();
+        let json = complete_memory_json(&self.app, &request.system, &request.input)
+            .map_err(crate::memory_core::MemoryProviderError::Request)?;
+        Ok(crate::memory_core::MemoryCompletionResult {
+            json,
+            provider: if crate::ai_config(&self.app).text_provider == "local" {
+                "ollama".into()
+            } else {
+                "deepseek".into()
+            },
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+}
+
 fn proxy_chat(
     app: &AppHandle,
     client: &reqwest::blocking::Client,

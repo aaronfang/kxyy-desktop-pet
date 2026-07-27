@@ -1,6 +1,7 @@
 mod api;
 mod local_text;
 mod memory;
+mod memory_core;
 mod persona_assets;
 mod realtime;
 
@@ -1320,6 +1321,10 @@ struct AiSettingsInput {
     #[serde(default = "default_vl_provider")]
     vl_provider: String,
     thinking: bool,
+    #[serde(default)]
+    memory_workspace: bool,
+    #[serde(default = "default_workspace_mode")]
+    memory_workspace_mode: String,
     temperature: f64,
     user_name: String,
     #[serde(default)]
@@ -1411,6 +1416,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             _ => "qwen".into(),
         };
         s.thinking = settings.thinking;
+        s.memory_workspace = settings.memory_workspace;
+        s.memory_workspace_mode = match settings.memory_workspace_mode.trim() {
+            "balanced" | "exploratory" => settings.memory_workspace_mode.trim().into(),
+            _ => "conservative".into(),
+        };
         s.temperature = settings.temperature;
         s.user_name = settings.user_name.trim().to_string();
         s.pat_text = settings.pat_text.trim().to_string();
@@ -1711,6 +1721,7 @@ pub fn run() {
             memory::memory_backup,
             memory::memory_verify_backup,
             memory::memory_rebuild_derived,
+            memory::memory_rebuild_from_events,
             memory::memory_timeline,
             memory::memory_edges,
             memory::memory_graph,

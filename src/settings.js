@@ -190,6 +190,8 @@ function fill(s) {
   syncTextFields();
   syncVlFields();
   el("thinking").checked = !!s.thinking;
+  if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
+  if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
   el("userName").value = s.userName || "";
   el("patText").value = s.patText || "";
@@ -568,6 +570,8 @@ function collect() {
     localVlModel: el("localVlModel").value.trim(),
     vlProvider: currentVlProvider(),
     thinking: el("thinking").checked,
+    memoryWorkspace: el("memoryWorkspace")?.checked === true,
+    memoryWorkspaceMode: el("memoryWorkspaceMode")?.value || "conservative",
     temperature: Number(el("temperature").value) || 0.8,
     personaCardId: el("personaCardId").value.trim(),
     userName: el("userName").value.trim(),
@@ -1259,6 +1263,30 @@ let memoryGraphScene = null;
 let memoryGraphZoom = 1;
 let memoryGraphPan = { x: 0, y: 0 };
 let memoryGraphLayout = { width: 1100, height: 560 };
+let memoryGraphDrag = null;
+
+function memoryGraphScopeKey() {
+  return `kxyy-memory-graph-layout:${selectedMemoryCardId()}:${el("memoryNickname")?.value.trim() || ""}`;
+}
+
+function readMemoryGraphPositions() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(memoryGraphScopeKey()) || "{}");
+    return raw && typeof raw === "object" ? raw : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveMemoryGraphPosition(key, point) {
+  try {
+    const positions = readMemoryGraphPositions();
+    positions[key] = { x: Math.round(point.x), y: Math.round(point.y) };
+    localStorage.setItem(memoryGraphScopeKey(), JSON.stringify(positions));
+  } catch (_) {
+    // Layout persistence is UI-only and must never block memory management.
+  }
+}
 
 const MEMORY_GRAPH_COLORS = {
   user: "#64748b",
@@ -1292,6 +1320,7 @@ function graphLayout(nodes) {
   const cellWidth = 112;
   const rowHeight = 29;
   const positions = new Map();
+  const saved = readMemoryGraphPositions();
   const columnGroups = [];
   let xOffset = 42;
   let maxRowsUsed = 1;
@@ -1305,7 +1334,11 @@ function graphLayout(nodes) {
     group.forEach((node, index) => {
       const column = Math.floor(index / maxRows);
       const row = index % maxRows;
-      positions.set(graphKey(node), {
+      const key = graphKey(node);
+      positions.set(key, saved[key] && Number.isFinite(saved[key].x) && Number.isFinite(saved[key].y) ? {
+        x: Math.max(20, Math.min(4000, Number(saved[key].x))),
+        y: Math.max(20, Math.min(4000, Number(saved[key].y))),
+      } : {
         x: xOffset + column * cellWidth + cellWidth / 2,
         y: 70 + row * rowHeight,
       });
@@ -1426,6 +1459,19 @@ function renderMemoryGraph(result) {
       if (memoryGraphSelectedKey !== graphKey(node) && !showLabels) text.classList.add("hidden");
     });
     group.addEventListener("click", select);
+    group.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.stopPropagation();
+      memoryGraphDrag = {
+        id: event.pointerId,
+        key: graphKey(node),
+        group,
+        startX: event.clientX,
+        startY: event.clientY,
+        point: { ...point },
+      };
+      group.setPointerCapture?.(event.pointerId);
+    });
     group.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
@@ -1635,6 +1681,13 @@ memoryGraphViewport?.addEventListener("pointerdown", (event) => {
   memoryGraphViewport.setPointerCapture?.(event.pointerId);
 });
 memoryGraphViewport?.addEventListener("pointermove", (event) => {
+  if (memoryGraphDrag?.id === event.pointerId) {
+    const rect = memoryGraphViewport.getBoundingClientRect();
+    const dx = (event.clientX - memoryGraphDrag.startX) * memoryGraphLayout.width / Math.max(1, rect.width) / memoryGraphZoom;
+    const dy = (event.clientY - memoryGraphDrag.startY) * memoryGraphLayout.height / Math.max(1, rect.height) / memoryGraphZoom;
+    memoryGraphDrag.group.setAttribute("transform", `translate(${dx} ${dy})`);
+    return;
+  }
   if (!memoryGraphPointer || memoryGraphPointer.id !== event.pointerId) return;
   const rect = memoryGraphViewport.getBoundingClientRect();
   const scaleX = memoryGraphLayout.width / Math.max(1, rect.width);
@@ -1646,6 +1699,17 @@ memoryGraphViewport?.addEventListener("pointermove", (event) => {
   updateMemoryGraphTransform();
 });
 const finishMemoryGraphPointer = (event) => {
+  if (memoryGraphDrag?.id === event.pointerId) {
+    const drag = memoryGraphDrag;
+    const rect = memoryGraphViewport.getBoundingClientRect();
+    const dx = (event.clientX - drag.startX) * memoryGraphLayout.width / Math.max(1, rect.width) / memoryGraphZoom;
+    const dy = (event.clientY - drag.startY) * memoryGraphLayout.height / Math.max(1, rect.height) / memoryGraphZoom;
+    saveMemoryGraphPosition(drag.key, { x: drag.point.x + dx, y: drag.point.y + dy });
+    drag.group.releasePointerCapture?.(event.pointerId);
+    memoryGraphDrag = null;
+    renderMemoryGraph(memoryGraphResult);
+    return;
+  }
   if (!memoryGraphPointer || memoryGraphPointer.id !== event.pointerId) return;
   memoryGraphViewport.classList.remove("dragging");
   memoryGraphViewport.releasePointerCapture?.(event.pointerId);
@@ -1745,6 +1809,27 @@ el("memoryRebuild")?.addEventListener("click", async () => {
     await loadMemoryPage();
   } catch (e) {
     setMemoryMaintenanceStatus(`重建失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryReplayEvents")?.addEventListener("click", async () => {
+  if (!window.confirm("从不可变事件日志重建当前范围的事实、经历、约定、搜索索引和关系边？\n\n事件日志本身不会删除；当前范围的物化数据会在事务中替换。")) return;
+  const button = el("memoryReplayEvents");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("从事件重建中…");
+  try {
+    const result = await invoke("memory_rebuild_from_events", {
+      request: {
+        cardId: selectedMemoryCardId(),
+        nickname: el("memoryNickname").value.trim() || null,
+      },
+    });
+    setMemoryMaintenanceStatus(`事件重建完成：${result.rebuiltSearchRows || 0} 条索引、${result.rebuiltEdges || 0} 条关系边。`);
+    await loadMemoryPage();
+  } catch (e) {
+    setMemoryMaintenanceStatus(`事件重建失败：${e.message || e}`, false);
   } finally {
     button.disabled = false;
   }
