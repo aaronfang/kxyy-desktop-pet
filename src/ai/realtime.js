@@ -17,6 +17,7 @@
 //     本地级联控制事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //     上行 text 可含 {type:"playback_segment",generation,segmentId,state:"completed"}；
 //     只回执句段标识，不回传文本或 PCM。
+//     本地/Cosy 清空播放时可发 {type:"playback_reset"}，清理服务端的有界尾部状态。
 //     memoryContext 可协商 session-start-v1；本地/Cosy 还可协商 turn-final-v1，
 //     服务端未明确回显时视为 none，不把 ASR final 误当作支持动态 context。
 //   挂断发 {type:"hangup"}。
@@ -1050,6 +1051,20 @@ export class RealtimeSession {
     this._handleSegmentCompleted(segment);
   }
 
+  _notifyPlaybackReset() {
+    if (
+      !usesManagedCascade(this.trace.provider) ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    )
+      return;
+    try {
+      this.ws.send(JSON.stringify({ type: "playback_reset" }));
+    } catch {
+      /* the session cleanup path remains local and bounded */
+    }
+  }
+
   _discardPendingAudioSegments() {
     this._currentAudioSegment = null;
     for (const segment of this._audioSegments.values()) segment.dropped = true;
@@ -1337,6 +1352,7 @@ export class RealtimeSession {
   _flushPlayback(reason = "session_ended") {
     if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
     this._playbackDrainTimer = 0;
+    this._notifyPlaybackReset();
     if (this._hasPlayback()) {
       this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, {
         reason,

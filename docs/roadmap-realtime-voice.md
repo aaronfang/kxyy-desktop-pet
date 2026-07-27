@@ -81,6 +81,8 @@ P0 落地时的设计占位 `speech_candidate`、`speech_rejected`、`response_c
 
 前端下行播放已迁移到常驻 `playback-worklet.js`：24k PCM 进入固定容量 ring buffer，由 Worklet 重采样到设备输出采样率；支持约 30ms duck 后暂停消费、约 60ms resume 淡入和确认时 clear。Worklet 每 500ms 上报 `queuedMs`、underrun、丢弃/已播放样本数，并写入有界 trace。默认暂停容量为 3 秒，用于兼容本地链路目前仍较慢的整段 ASR 确认；这是测试期上限，不是最终 120–250ms 正常排队目标。溢出时保留候选点之后最早的可恢复音频并拒绝新样本，不会无限增长。
 
+尾部排队保护（下一测试包）：本地/CosyVoice 服务端会保留最多 256 个已下发但尚未收到前端 `playback_segment:completed` 的句段标识；LLM/TTS producer 结束不再立即把 `playing` 降为 idle，Worklet drain 完成后才恢复空闲。确认打断或挂断时前端发送一次无文本的 `playback_reset` 清空该有界状态。它只延长播放期间的既有 RMS 候选门槛，不改变 ASR、Silero shadow 或 provider 选择；旧客户端未发送 reset 时，generation 取消路径仍会主动清理。
+
 两条链路的当前映射：
 
 - **本地/CosyVoice 级联**：现有 RMS 连续响声门槛命中后立即发 `speech_candidate`；前端变黄色并 duck/暂停。整段 Whisper 校验通过后发 confirmed、清空 ring、取消旧回复；无效 ASR 发 rejected 并继续播放候选点后的缓冲。

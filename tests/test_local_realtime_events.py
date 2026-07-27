@@ -2991,6 +2991,37 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["llm"]["total"], 16)
         self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
 
+    async def test_reply_keeps_playing_until_frontend_segment_receipt(self):
+        common._synth_tts = lambda _text: (
+            b"\x01\x00" * 40,
+            {"characters": 8, "provider": "CosyVoice"},
+        )
+        self.stream_events = [
+            {"type": "delta", "text": "尾部不能提前结束。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+
+        await self.session._reply_pipeline("用户输入", scope)
+
+        self.assertTrue(self.session.playing)
+        self.assertTrue(self.session.play_enabled)
+        self.assertEqual(
+            self.session._pending_playback_segments,
+            {(scope.generation, 1)},
+        )
+        self.session.on_playback_segment(
+            {"generation": scope.generation, "segmentId": 1, "state": "completed"}
+        )
+        self.assertFalse(self.session.playing)
+        self.assertFalse(self.session.play_enabled)
+
+        self.session.playing = True
+        self.session.on_playback_reset()
+        self.assertFalse(self.session.playing)
+        self.assertFalse(self.session.play_enabled)
+
     async def test_tts_chunk_sequence_is_independent_of_text_provider_metadata(self):
         first = "甲" * 19 + "。"
         second = "乙" * 19 + "。"
