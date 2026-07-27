@@ -1032,7 +1032,7 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
   session._onMessage({
     data: JSON.stringify({ type: "speech_confirmed", candidateId: 11 }),
   });
-  assert.deepEqual(sent, [
+  assert.deepEqual(sent.filter((message) => message.type !== "playback_reset"), [
     {
       type: "playback_interruption",
       state: "confirmed",
@@ -1051,7 +1051,11 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
     playedSamples: 25000,
     inProgress: true,
   });
-  assert.equal(sent.length, 1, "one candidate may send at most one receipt");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    1,
+    "one candidate may send at most one receipt",
+  );
 
   session._userTurnOpen = false;
   beginSegment(4);
@@ -1070,7 +1074,11 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
     playedSamples: 24001,
     inProgress: true,
   });
-  assert.equal(sent.length, 2, "a snapshot arriving after clear keeps numeric identity only");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    2,
+    "a snapshot arriving after clear keeps numeric identity only",
+  );
 
   session._userTurnOpen = false;
   beginSegment(5);
@@ -1098,7 +1106,7 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
     data: JSON.stringify({ type: "speech_rejected", candidateId: 13 }),
   });
   assert.equal(
-    sent.length,
+    sent.filter((message) => message.type !== "playback_reset").length,
     2,
     "rejected, dropped and wrong-candidate snapshots never send receipts",
   );
@@ -1461,9 +1469,13 @@ test("desktop session ducks candidates, resumes rejection and gates stale audio"
 
 test("barge-in attributes cleared playback to the interrupted generation", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const previousWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
   const session = new RealtimeSession({ provider: "local" });
   const playbackCommands = [];
+  const wireMessages = [];
+  session.ws = { readyState: 1, send: (message) => wireMessages.push(JSON.parse(message)) };
   session.playbackNode = {
     port: { postMessage: (message) => playbackCommands.push(message) },
   };
@@ -1474,6 +1486,7 @@ test("barge-in attributes cleared playback to the interrupted generation", async
   session._playbackQueuedMs = 2202.666;
 
   session._onMessage({ data: JSON.stringify({ type: "speech_confirmed" }) });
+  globalThis.WebSocket = previousWebSocket;
 
   const events = session.getTraceSnapshot().events;
   const cancelled = events.find((event) => event.eventType === TRACE_EVENT.RESPONSE_CANCELLED);
@@ -1487,6 +1500,7 @@ test("barge-in attributes cleared playback to the interrupted generation", async
   assert.equal(stopped.metrics.queuedMs, 2202.666);
   assert.ok(confirmed.generationId > stopped.generationId);
   assert.equal(playbackCommands.at(-1).type, "clear");
+  assert.deepEqual(wireMessages, [{ type: "playback_reset" }]);
 });
 
 test("desktop session rejects stale generation control events before reopening audio", async () => {
@@ -1596,14 +1610,18 @@ test("candidate defers a completed segment until rejection and discards it on co
   session._onPlaybackMessage({ type: "segment_completed", generation: 1, segmentId: 1 });
   assert.deepEqual(sent, []);
   session._rejectSpeech("voice_rejected");
-  assert.equal(sent.length, 1);
+  assert.equal(sent.filter((message) => message.type !== "playback_reset").length, 1);
 
   start(2, 1);
   session._speechCandidate = true;
   session._candidateInterruptsResponse = true;
   session._onPlaybackMessage({ type: "segment_completed", generation: 2, segmentId: 1 });
   session._confirmSpeech();
-  assert.equal(sent.length, 1, "confirmed interruption must not commit the faded tail");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    1,
+    "confirmed interruption must not commit the faded tail",
+  );
 });
 
 test("suspended audio keeps PCM before its segment end marker", async () => {
@@ -1686,7 +1704,7 @@ test("legacy playback receipts require natural source completion and remain boun
   });
   assert.equal(sent.length, 0);
   sources[0].onended();
-  assert.equal(sent.length, 1);
+  assert.equal(sent.filter((message) => message.type !== "playback_reset").length, 1);
   if (session._playbackDrainTimer) clearTimeout(session._playbackDrainTimer);
   session._playbackDrainTimer = 0;
 
@@ -1702,7 +1720,11 @@ test("legacy playback receipts require natural source completion and remain boun
   }
   assert.ok(session._legacySegments.size <= 64);
   session._flushPlayback("turn_detected");
-  assert.equal(sent.length, 1, "cleared legacy sources must not add receipts");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    1,
+    "cleared legacy sources must not add receipts",
+  );
   if (session._playbackDrainTimer) clearTimeout(session._playbackDrainTimer);
 });
 

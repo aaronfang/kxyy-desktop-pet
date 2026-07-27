@@ -540,6 +540,7 @@ BARGE_IN_FRAMES_PLAY = 12  # ~360ms
 MAX_HISTORY_MESSAGES = 24
 MAX_PENDING_HISTORY_TURNS = 4
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
+MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
 LLM_STREAM_QUEUE_MAX = 32
 LLM_STREAM_MAX_PRODUCERS = 2
 TTS_STREAM_MAX_TASKS = 2
@@ -2202,6 +2203,10 @@ class Session:
         self.playing = False
         # 播报中正在旁路采集候选打断（后端不停播；前端会 duck 并暂停消费）
         self.play_barge_pending = False
+        # TTS 生产结束早于 Worklet 播放 drain；保留已下发但尚未收到
+        # playback_segment completed 回执的句段，避免尾部排队音频期间
+        # 降级到空闲态而被外放回声误判为新一轮用户语音。
+        self._pending_playback_segments: set[tuple[int, int]] = set()
         self.candidate_emitted = False
         self.closed = False
         self.loop = asyncio.get_event_loop()
@@ -2492,6 +2497,7 @@ class Session:
         self._response_started_at = 0.0
         self.play_enabled = False
         self.playing = False
+        self._pending_playback_segments.clear()
         t = self.reply_task
         self.reply_task = None
         if t and not t.done():
@@ -2609,7 +2615,24 @@ class Session:
             or state != "completed"
         ):
             return
+        self._pending_playback_segments.discard((generation, segment_id))
         self._audible_history.acknowledge(generation, segment_id, state)
+        if not self._pending_playback_segments and self.response_scope is None:
+            self.playing = False
+            self.play_enabled = False
+
+    def _track_playback_segment(self, generation: int, segment_id: int) -> None:
+        if len(self._pending_playback_segments) >= MAX_PENDING_PLAYBACK_SEGMENTS:
+            raise SafeRealtimeError("播放句段过多，已停止播报")
+        self._pending_playback_segments.add((generation, segment_id))
+
+    def on_playback_reset(self, _msg: dict | None = None) -> None:
+        """Drop client-side queued audio after a confirmed interruption/stop."""
+
+        self._pending_playback_segments.clear()
+        if self.response_scope is None:
+            self.playing = False
+            self.play_enabled = False
 
     def on_memory_context(self, msg: dict) -> None:
         """接收当前 final turn 的有界记忆卡片；旧 generation 一律丢弃。"""
@@ -3218,6 +3241,7 @@ class Session:
                                     spoken_sentence,
                                 ):
                                     raise SafeRealtimeError("本轮语音句段过多，已停止播报")
+                                self._track_playback_segment(scope.generation, segment_id)
                                 if not await self.send_json(
                                     {
                                         "type": "audio_segment_start",
@@ -3227,6 +3251,9 @@ class Session:
                                     },
                                     scope=scope,
                                 ):
+                                    self._pending_playback_segments.discard(
+                                        (scope.generation, segment_id)
+                                    )
                                     return
                                 self.playing = True
                                 if not speaking_sent:
@@ -3312,6 +3339,7 @@ class Session:
                     spoken_sentence,
                 ):
                     raise SafeRealtimeError("本轮语音句段过多，已停止播报")
+                self._track_playback_segment(scope.generation, segment_id)
                 if not await self.send_json(
                     {
                         "type": "audio_segment_start",
@@ -3321,6 +3349,9 @@ class Session:
                     },
                     scope=scope,
                 ):
+                    self._pending_playback_segments.discard(
+                        (scope.generation, segment_id)
+                    )
                     return
                 self.playing = True
                 if not speaking_sent:
@@ -3474,8 +3505,16 @@ class Session:
             if self.reply_task is asyncio.current_task():
                 self.reply_task = None
             if self.response_scope is scope:
-                self.playing = False
-                self.play_enabled = False
+                if self._pending_playback_segments:
+                    # The reply/TTS producer can finish while the frontend
+                    # Worklet still drains queued PCM. Keep the stricter
+                    # playback-time barge-in policy until a completion receipt
+                    # or explicit playback_reset arrives.
+                    self.playing = True
+                    self.play_enabled = True
+                else:
+                    self.playing = False
+                    self.play_enabled = False
                 self.response_scope = None
                 scope.complete()
 
@@ -3510,6 +3549,8 @@ async def _handler(ws):
                 break
             elif typ == "playback_segment":
                 session.on_playback_segment(msg)
+            elif typ == "playback_reset":
+                session.on_playback_reset(msg)
             elif typ == "playback_interruption":
                 session.on_playback_interruption(msg)
             elif typ == "memory_context":
