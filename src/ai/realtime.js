@@ -1116,11 +1116,14 @@ export class RealtimeSession {
     if (interruptsResponse && this.trace.responseId) {
       this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "turn_detected" });
     }
+    if (interruptsResponse) this._audioGate = true;
+    // Flush while the previous generation is still current. Otherwise opening
+    // the new turn first tags playback_stopped with the new generation even
+    // though it is the previous response that was actually cleared.
+    this._flushPlayback("turn_detected");
     this.trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
     this._traceAsrFinalSeen = false;
     this._bargeInTurn = true;
-    if (interruptsResponse) this._audioGate = true;
-    this._flushPlayback("turn_detected");
     return true;
   }
 
@@ -1335,7 +1338,14 @@ export class RealtimeSession {
     if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
     this._playbackDrainTimer = 0;
     if (this._hasPlayback()) {
-      this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, { reason });
+      this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, {
+        reason,
+        // Preserve the amount of audio that was still queued immediately
+        // before the clear. This is bounded, provider-neutral, and lets a
+        // diagnostic distinguish an intentional barge-in clear from a TTS or
+        // transport failure without retaining PCM or text.
+        metrics: { queuedMs: this._playbackQueuedMs },
+      });
     }
     for (const pending of this._pendingPcm) this._markSegmentDropped(pending?.segment);
     this._pendingPcm = [];

@@ -66,6 +66,11 @@
 | `playback_queued` / `playback_started` / `playback_stopped` | 播放 Worklet ring 调度、清空和 drain | legacy source-node fallback 保留同一观测语义 |
 | `response_started` / `response_cancelled` / `response_completed` | ASR 结束、确认插话、挂断或 TTS 生产结束后播放 drain | 本地控制/scoped sender 与 managed 下行已有后端 generation；火山/raw fallback 仍未贯穿 |
 
+本次诊断补充（待下个版本发布）：确认插话或挂断清空播放时，先在旧 generation 下记录
+`playback_stopped`，再打开新 turn；该事件同时携带清空前的 `queuedMs`。这样可以区分“文字已结束、
+但排队语音因新一轮确认而被主动清空”和 TTS/传输异常。该指标仍只表示桌面播放队列，不代表供应商
+内部流式进度；不会改变 RMS/ASR 的打断决策。
+
 隐私与资源边界：默认内存队列最多 256 条（构造时可调，但硬上限 4096），溢出丢最旧事件并累计 `droppedEvents`；schema 不接受密钥、URL、persona、原始 PCM 或完整用户/助手文本，自由格式取消原因与未列入允许列表的指标会被丢弃。阶段耗时只能用 `timestampMs` 相减，禁止混用 wall clock。
 
 P0 落地时的设计占位 `speech_candidate`、`speech_rejected`、`response_completed` 已在后续 P1 测试版接入运行时，详见下一节。0.2.14 已让本地级联控制事件和发送任务携带后端 generation，0.2.16 已接入 LLM SSE，0.2.19 又让协商后的本地/CosyVoice 下行 binary 携带同一 generation。火山二进制帧与 raw fallback 仍没有该身份，前端继续用确认后的 audio gate 隔离旧尾包。神经 VAD、Windows/Linux Qwen 真正音频流式和火山后端 generation 仍属于 P2 或待实验范围；CosyVoice 与 macOS MLX Qwen 真流式的实现/实验边界见 2.15–2.16。
