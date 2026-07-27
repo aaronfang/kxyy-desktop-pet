@@ -1255,6 +1255,10 @@ function renderMemoryItems(items) {
 let memoryView = "list";
 let memoryGraphResult = null;
 let memoryGraphSelectedKey = "";
+let memoryGraphScene = null;
+let memoryGraphZoom = 1;
+let memoryGraphPan = { x: 0, y: 0 };
+let memoryGraphLayout = { width: 1100, height: 560 };
 
 const MEMORY_GRAPH_COLORS = {
   user: "#64748b",
@@ -1280,6 +1284,60 @@ function svgElement(name, attributes = {}) {
   return node;
 }
 
+function graphLayout(nodes) {
+  const kindOrder = ["user", "episode", "fact", "commitment", "topic", "entity"];
+  const groups = new Map(kindOrder.map((kind) => [kind, []]));
+  for (const node of nodes) (groups.get(node.kind) || groups.get("entity")).push(node);
+  const maxRows = 18;
+  const cellWidth = 112;
+  const rowHeight = 29;
+  const positions = new Map();
+  const columnGroups = [];
+  let xOffset = 42;
+  let maxRowsUsed = 1;
+  for (const kind of kindOrder) {
+    const group = groups.get(kind);
+    if (!group.length) continue;
+    const columnCount = Math.max(1, Math.ceil(group.length / maxRows));
+    const groupColumns = columnCount;
+    const groupWidth = groupColumns * cellWidth;
+    columnGroups.push({ kind, x: xOffset, width: groupWidth });
+    group.forEach((node, index) => {
+      const column = Math.floor(index / maxRows);
+      const row = index % maxRows;
+      positions.set(graphKey(node), {
+        x: xOffset + column * cellWidth + cellWidth / 2,
+        y: 70 + row * rowHeight,
+      });
+    });
+    maxRowsUsed = Math.max(maxRowsUsed, Math.min(maxRows, group.length));
+    xOffset += groupWidth + 28;
+  }
+  return {
+    positions,
+    columns: columnGroups,
+    width: Math.max(760, xOffset + 20),
+    height: Math.max(430, 110 + maxRowsUsed * rowHeight),
+  };
+}
+
+function updateMemoryGraphTransform() {
+  if (memoryGraphScene) {
+    memoryGraphScene.setAttribute(
+      "transform",
+      `translate(${memoryGraphPan.x} ${memoryGraphPan.y}) scale(${memoryGraphZoom})`,
+    );
+  }
+  const label = el("memoryGraphZoomLabel");
+  if (label) label.textContent = `${Math.round(memoryGraphZoom * 100)}%`;
+}
+
+function setMemoryGraphZoom(next, resetPan = false) {
+  memoryGraphZoom = Math.max(0.35, Math.min(3.5, next));
+  if (resetPan) memoryGraphPan = { x: 0, y: 0 };
+  updateMemoryGraphTransform();
+}
+
 function renderMemoryGraph(result) {
   const svg = el("memoryGraphSvg");
   const inspector = el("memoryGraphInspector");
@@ -1291,39 +1349,47 @@ function renderMemoryGraph(result) {
   if (memoryGraphSelectedKey && !nodes.some((node) => graphKey(node) === memoryGraphSelectedKey)) {
     memoryGraphSelectedKey = "";
   }
-  const positions = new Map();
-  const centerX = 380;
-  const centerY = 212;
-  const radius = Math.min(170, Math.max(70, nodes.length * 16));
-  nodes.forEach((node, index) => {
-    const angle = nodes.length === 1 ? 0 : (-Math.PI / 2) + (index * Math.PI * 2 / nodes.length);
-    positions.set(graphKey(node), {
-      x: centerX + Math.cos(angle) * radius,
-      y: centerY + Math.sin(angle) * radius,
+  const layout = graphLayout(nodes);
+  memoryGraphLayout = layout;
+  svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+  const positions = layout.positions;
+  const scene = svgElement("g", { class: "memory-graph-scene" });
+  memoryGraphScene = scene;
+  svg.appendChild(scene);
+  for (const column of layout.columns) {
+    const heading = svgElement("text", {
+      x: column.x + column.width / 2,
+      y: 28,
+      "text-anchor": "middle",
+      class: "memory-graph-column-heading",
     });
-  });
+    heading.textContent = memoryKindLabel(column.kind);
+    scene.appendChild(heading);
+  }
+  const showLabels = nodes.length <= 32;
   const nodeByKey = new Map(nodes.map((node) => [graphKey(node), node]));
   for (const edge of edges) {
     const from = positions.get(`${edge.fromKind}:${edge.fromId}`);
     const to = positions.get(`${edge.toKind}:${edge.toId}`);
     if (!from || !to) continue;
-    svg.appendChild(svgElement("line", {
+    const edgeLine = svgElement("line", {
       x1: from.x, y1: from.y, x2: to.x, y2: to.y,
       class: `memory-graph-edge${edge.derived ? " derived" : ""}`,
-    }));
+    });
+    scene.appendChild(edgeLine);
     const label = svgElement("text", {
       x: (from.x + to.x) / 2,
       y: (from.y + to.y) / 2 - 4,
       "text-anchor": "middle",
-      class: "memory-graph-edge-label",
+      class: `memory-graph-edge-label${nodes.length > 24 ? " hidden" : ""}`,
     });
     label.textContent = edge.relation || "关系";
-    svg.appendChild(label);
+    scene.appendChild(label);
   }
   if (!nodes.length) {
-    const empty = svgElement("text", { x: centerX, y: centerY, "text-anchor": "middle", class: "memory-graph-empty" });
+    const empty = svgElement("text", { x: layout.width / 2, y: layout.height / 2, "text-anchor": "middle", class: "memory-graph-empty" });
     empty.textContent = "暂无符合条件的关系图节点";
-    svg.appendChild(empty);
+    scene.appendChild(empty);
   }
   for (const node of nodes) {
     const point = positions.get(graphKey(node));
@@ -1344,14 +1410,22 @@ function renderMemoryGraph(result) {
       x: point.x,
       y: point.y + 32,
       "text-anchor": "middle",
+      class: showLabels || memoryGraphSelectedKey === graphKey(node) ? "" : "hidden",
     });
     text.textContent = truncateGraphLabel(node.label || node.text);
     group.append(circle, text);
+    const title = svgElement("title");
+    title.textContent = `${memoryKindLabel(node.kind)}：${node.label || node.text || "未命名"}`;
+    group.appendChild(title);
     const select = () => {
       memoryGraphSelectedKey = graphKey(node);
       renderMemoryGraph(memoryGraphResult);
       renderMemoryGraphInspector(node, nodeByKey);
     };
+    group.addEventListener("mouseenter", () => text.classList.remove("hidden"));
+    group.addEventListener("mouseleave", () => {
+      if (memoryGraphSelectedKey !== graphKey(node) && !showLabels) text.classList.add("hidden");
+    });
     group.addEventListener("click", select);
     group.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
@@ -1359,8 +1433,9 @@ function renderMemoryGraph(result) {
         select();
       }
     });
-    svg.appendChild(group);
+    scene.appendChild(group);
   }
+  updateMemoryGraphTransform();
   if (inspector && !memoryGraphSelectedKey) inspector.hidden = true;
 }
 
@@ -1413,13 +1488,13 @@ async function loadMemoryGraph() {
         kind: el("memoryKind").value,
         status: el("memoryStatus").value,
         depth: Number(el("memoryGraphDepth")?.value || 1),
-        maxNodes: 200,
+        maxNodes: Number(el("memoryGraphMaxNodes")?.value || 80),
       },
     });
     renderMemoryGraph(result);
     if (status) {
       const count = Array.isArray(result?.nodes) ? result.nodes.length : 0;
-      status.textContent = `${count} 个节点 · ${result?.edges?.length || 0} 条关系${result?.truncated ? " · 已按 200 节点截断" : ""}`;
+      status.textContent = `${count} 个节点 · ${result?.edges?.length || 0} 条关系${result?.truncated ? ` · 已按 ${result?.maxNodes || 200} 节点截断` : ""}`;
     }
   } catch (e) {
     renderMemoryGraph({ nodes: [], edges: [] });
@@ -1461,6 +1536,45 @@ el("memoryGraphRefresh")?.addEventListener("click", () => void loadMemoryGraph()
 el("memoryGraphDepth")?.addEventListener("change", () => {
   if (memoryView === "graph") void loadMemoryGraph();
 });
+el("memoryGraphMaxNodes")?.addEventListener("change", () => {
+  if (memoryView === "graph") void loadMemoryGraph();
+});
+el("memoryGraphZoomIn")?.addEventListener("click", () => setMemoryGraphZoom(memoryGraphZoom * 1.25));
+el("memoryGraphZoomOut")?.addEventListener("click", () => setMemoryGraphZoom(memoryGraphZoom / 1.25));
+el("memoryGraphFit")?.addEventListener("click", () => setMemoryGraphZoom(1, true));
+
+const memoryGraphViewport = el("memoryGraphViewport");
+let memoryGraphPointer = null;
+memoryGraphViewport?.addEventListener("pointerdown", (event) => {
+  if (event.target.closest?.(".memory-graph-node")) return;
+  memoryGraphPointer = { id: event.pointerId, x: event.clientX, y: event.clientY, pan: { ...memoryGraphPan } };
+  memoryGraphViewport.classList.add("dragging");
+  memoryGraphViewport.setPointerCapture?.(event.pointerId);
+});
+memoryGraphViewport?.addEventListener("pointermove", (event) => {
+  if (!memoryGraphPointer || memoryGraphPointer.id !== event.pointerId) return;
+  const rect = memoryGraphViewport.getBoundingClientRect();
+  const scaleX = memoryGraphLayout.width / Math.max(1, rect.width);
+  const scaleY = memoryGraphLayout.height / Math.max(1, rect.height);
+  memoryGraphPan = {
+    x: memoryGraphPointer.pan.x + (event.clientX - memoryGraphPointer.x) * scaleX / memoryGraphZoom,
+    y: memoryGraphPointer.pan.y + (event.clientY - memoryGraphPointer.y) * scaleY / memoryGraphZoom,
+  };
+  updateMemoryGraphTransform();
+});
+const finishMemoryGraphPointer = (event) => {
+  if (!memoryGraphPointer || memoryGraphPointer.id !== event.pointerId) return;
+  memoryGraphViewport.classList.remove("dragging");
+  memoryGraphViewport.releasePointerCapture?.(event.pointerId);
+  memoryGraphPointer = null;
+};
+memoryGraphViewport?.addEventListener("pointerup", finishMemoryGraphPointer);
+memoryGraphViewport?.addEventListener("pointercancel", finishMemoryGraphPointer);
+memoryGraphViewport?.addEventListener("wheel", (event) => {
+  if (memoryView !== "graph") return;
+  event.preventDefault();
+  setMemoryGraphZoom(memoryGraphZoom * (event.deltaY < 0 ? 1.1 : 0.9));
+}, { passive: false });
 
 async function loadMemoryPage({ resetPage = false } = {}) {
   if (!el("memoryList")) return;

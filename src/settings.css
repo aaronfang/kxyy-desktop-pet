@@ -567,23 +567,50 @@ button.danger:disabled {
   padding: 0 9px;
   font-size: 12px;
 }
+.memory-graph-zoom-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.memory-graph-zoom-controls button {
+  min-width: 29px;
+  padding: 0 7px;
+}
+#memoryGraphZoomLabel {
+  min-width: 45px;
+  color: #64748b;
+  font-size: 12px;
+  text-align: center;
+}
+.memory-graph-help {
+  margin: 0 0 8px;
+  color: #94a3b8;
+  font-size: 11px;
+}
 .memory-graph-viewport {
   min-height: 260px;
-  overflow: auto;
+  overflow: hidden;
+  cursor: grab;
   border: 1px solid #eef0f3;
   border-radius: 8px;
   background: radial-gradient(circle at center, #fff 0, #f8fafc 100%);
 }
+.memory-graph-viewport.dragging { cursor: grabbing; }
 #memoryGraphSvg {
   display: block;
   width: 100%;
-  min-width: 540px;
-  min-height: 280px;
+  min-width: 680px;
+  height: 520px;
   color: #64748b;
+  user-select: none;
+  touch-action: none;
 }
 .memory-graph-edge {
   stroke: #cbd5e1;
-  stroke-width: 1.5;
+  stroke-width: 1.25;
+  vector-effect: non-scaling-stroke;
+  opacity: .72;
 }
 .memory-graph-edge.derived {
   stroke-dasharray: 4 3;
@@ -604,6 +631,13 @@ button.danger:disabled {
   fill: #374151;
   font-size: 11px;
   pointer-events: none;
+}
+.memory-graph-node text.hidden,
+.memory-graph-edge-label.hidden { display: none; }
+.memory-graph-column-heading {
+  fill: #64748b;
+  font-size: 12px;
+  font-weight: 600;
 }
 .memory-graph-edge-label {
   fill: #94a3b8;

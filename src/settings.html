@@ -397,9 +397,23 @@
                   <option value="2">二度关系</option>
                 </select>
               </label>
+              <label>节点上限
+                <select id="memoryGraphMaxNodes" aria-label="关系图节点上限">
+                  <option value="80">80</option>
+                  <option value="120">120</option>
+                  <option value="200">200</option>
+                </select>
+              </label>
               <button id="memoryGraphRefresh" type="button" class="ghost">刷新关系图</button>
+              <span class="memory-graph-zoom-controls" aria-label="关系图缩放">
+                <button id="memoryGraphZoomOut" type="button" class="ghost" title="缩小">−</button>
+                <span id="memoryGraphZoomLabel" aria-live="polite">100%</span>
+                <button id="memoryGraphZoomIn" type="button" class="ghost" title="放大">+</button>
+                <button id="memoryGraphFit" type="button" class="ghost">适配</button>
+              </span>
               <span id="memoryGraphStatus" class="hint" role="status"></span>
             </div>
+            <p class="memory-graph-help">拖动空白处平移，滚轮缩放；节点标签仅在节点较少或选中时显示，点击节点查看完整内容。</p>
             <div id="memoryGraphViewport" class="memory-graph-viewport">
               <svg id="memoryGraphSvg" viewBox="0 0 760 430" role="img" aria-label="记忆关系图"></svg>
             </div>
