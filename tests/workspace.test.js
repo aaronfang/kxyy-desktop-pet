@@ -7,6 +7,9 @@ import {
   selectWorkspaceSlots,
   workspaceCandidatesFromMemory,
   workspaceCandidatesFromGraph,
+  buildWorkspace,
+  incubateWorkspaceHypothesis,
+  summarizeWorkspaceDiagnostics,
   workspaceFeatureEnabled,
 } from "../src/workspace.js";
 
@@ -85,4 +88,49 @@ test("workspace observations are bounded and explicitly non-executable", () => {
   assert.match(prompt, /假设/);
   assert.doesNotMatch(prompt, /score|sourceIds|activation/);
   assert.ok(prompt.length <= 500);
+});
+
+test("hypothesis incubation requires evidence and counter-evidence", () => {
+  assert.equal(incubateWorkspaceHypothesis({ content: "可能有关联", evidenceIds: ["one"] }), null);
+  assert.equal(incubateWorkspaceHypothesis({ content: "可能有关联", evidenceIds: ["one", "two"] }), null);
+  const hypothesis = incubateWorkspaceHypothesis({
+    content: "可能需要温和确认用户的面试安排",
+    evidenceIds: ["episode-1", "fact-1"],
+    counterEvidence: ["用户可能只是随口提到，并未确认安排"],
+  });
+  assert.equal(hypothesis.kind, "hypothesis");
+  assert.equal(hypothesis.uncertainty, 0.82);
+  assert.deepEqual(hypothesis.counterEvidence.length, 1);
+});
+
+test("workspace builder combines perception, memory and safety without persisting", () => {
+  const workspace = buildWorkspace({
+    enabled: true,
+    mode: "balanced",
+    query: "我下周要面试",
+    memoryItems: [
+      { id: "fact-1", kind: "fact", text: "喜欢辣", predicate: "饮食", confidence: 0.9 },
+      { id: "fact-2", kind: "fact", text: "最近不吃辣", predicate: "饮食", confidence: 0.9 },
+      { id: "commitment-1", kind: "commitment", text: "下次提醒带伞", status: "pending" },
+    ],
+  });
+  assert.equal(workspace.diagnostics.enabled, true);
+  assert.ok(workspace.diagnostics.candidateCount >= workspace.diagnostics.slotCount);
+  assert.equal(workspace.diagnostics.conflictCount, 1);
+  assert.ok(workspace.slots.some((slot) => slot.kind === "safety"));
+});
+
+test("diagnostic summary is privacy bounded", () => {
+  const summary = summarizeWorkspaceDiagnostics({
+    diagnostics: { enabled: true, candidateCount: 9999, slotCount: 99, conflictCount: 999, sourceCounts: { memory: 12 } },
+  }, { latencyMs: 99999 });
+  assert.deepEqual(summary, {
+    enabled: true,
+    candidateCount: 1000,
+    slotCount: 6,
+    conflictCount: 100,
+    sourceCounts: { memory: 12 },
+    latencyMs: 10000,
+  });
+  assert.equal("content" in summary, false);
 });

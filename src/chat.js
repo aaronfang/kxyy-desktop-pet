@@ -61,9 +61,8 @@ import {
 } from "./realtime-memory.js";
 import {
   renderWorkspaceObservations,
-  selectWorkspaceSlots,
-  workspaceCandidatesFromMemory,
-  workspaceCandidatesFromGraph,
+  buildWorkspace,
+  summarizeWorkspaceDiagnostics,
   workspaceFeatureEnabled,
 } from "./workspace.js";
 
@@ -1395,11 +1394,9 @@ async function buildRequestMessages(opts = {}) {
         },
       });
       if (workspaceFeatureEnabled(settings)) {
-        const candidates = workspaceCandidatesFromMemory(recalled?.items || [], {
-          scope: `${settings.personaCardId || ""}/${activeName}`,
-        });
+        let graph = null;
         try {
-          const graph = await invoke("memory_graph", {
+          graph = await invoke("memory_graph", {
             query: {
               cardId: settings.personaCardId || "",
               nickname: activeName,
@@ -1409,20 +1406,20 @@ async function buildRequestMessages(opts = {}) {
               maxNodes: 80,
             },
           });
-          candidates.push(...workspaceCandidatesFromGraph(graph, {
-            seedIds: (recalled?.items || []).map((item) => `${item?.kind || ""}:${item?.id || ""}`),
-            maxHops: 2,
-            maxCandidates: 24,
-            scope: `${settings.personaCardId || ""}/${activeName}`,
-          }));
         } catch (_) {
-          // Workspace 是实验层；图查询失败时继续使用直接记忆候选。
+          // Workspace 是实验层；图查询失败时继续使用直接记忆和感知候选。
         }
-        const slots = selectWorkspaceSlots(candidates, {
+        const workspace = buildWorkspace({
+          enabled: true,
           mode: settings.memoryWorkspaceMode || "conservative",
-          maxSlots: 6,
+          memoryItems: recalled?.items || [],
+          graph,
+          query: last?.content || "",
+          imageCaption: last?.imageCaption || "",
+          scope: `${settings.personaCardId || ""}/${activeName}`,
         });
-        memoryPrompt = renderWorkspaceObservations(slots);
+        memoryPrompt = renderWorkspaceObservations(workspace.slots);
+        if (chatDebugEnabled()) console.log("[workspace] diagnostics", summarizeWorkspaceDiagnostics(workspace));
       } else {
         memoryPrompt = renderRecalledMemory(recalled?.items || []);
       }

@@ -25,6 +25,8 @@ const SENSITIVE_MARKERS = [
   "银行卡", "信用卡", "身份证号", "护照号", "-----begin private key",
 ];
 
+const UNSAFE_DIRECTIVE = /(ignore\s+(all\s+)?previous|忽略.{0,12}(指令|规则|系统)|system\s+prompt|系统提示词|越过安全|绕过安全|调用工具|tool\s+call)/i;
+
 const clamp01 = (value, fallback = 0) => {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : fallback;
@@ -34,6 +36,10 @@ function isSensitive(text) {
   const lower = String(text || "").toLowerCase();
   if (SENSITIVE_MARKERS.some((marker) => lower.includes(marker))) return true;
   return /\d{14,}/.test(lower);
+}
+
+function isUnsafeDirective(text) {
+  return UNSAFE_DIRECTIVE.test(String(text || ""));
 }
 
 function tokens(text) {
@@ -64,7 +70,7 @@ export function workspaceFeatureEnabled(settings) {
 export function normalizeWorkspaceCandidate(input, { now = Date.now() } = {}) {
   if (!input || typeof input !== "object") return null;
   const content = String(input.content ?? input.text ?? "").replace(/\s+/g, " ").trim().slice(0, 800);
-  if (!content || isSensitive(content)) return null;
+  if (!content || isSensitive(content) || isUnsafeDirective(content)) return null;
   const expiresAt = input.expiresAt == null ? null : Number(input.expiresAt);
   if (expiresAt != null && (!Number.isFinite(expiresAt) || expiresAt <= now)) return null;
   const kind = ALLOWED_KINDS.has(input.kind) ? input.kind : "memory";
@@ -85,6 +91,7 @@ export function normalizeWorkspaceCandidate(input, { now = Date.now() } = {}) {
     expiresAt,
     pinned: input.pinned === true,
     derived: input.derived === true,
+    conflictKey: typeof input.conflictKey === "string" ? input.conflictKey.trim().slice(0, 120) : "",
   };
 }
 
@@ -140,7 +147,191 @@ export function workspaceCandidatesFromMemory(items, query = {}) {
     expiresAt: null,
     pinned: item?.pinned === true,
     derived: false,
+    conflictKey: item?.predicate || "",
   }));
+}
+
+export function workspaceCandidatesFromPerception({ query = "", imageCaption = "", scope = "current-session" } = {}) {
+  const candidates = [];
+  const text = String(query || "").replace(/\s+/g, " ").trim().slice(0, 420);
+  const image = String(imageCaption || "").replace(/\s+/g, " ").trim().slice(0, 420);
+  if (text && !isUnsafeDirective(text) && !isSensitive(text)) {
+    candidates.push({
+      id: "perception:message",
+      kind: "perception",
+      content: `当前用户提到：${text}`,
+      sourceIds: ["current-message"],
+      activation: 0.82,
+      relevance: 0.92,
+      novelty: 0.78,
+      utility: 0.72,
+      uncertainty: 0.18,
+      scope,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+  }
+  if (image && !isUnsafeDirective(image) && !isSensitive(image)) {
+    candidates.push({
+      id: "perception:image",
+      kind: "perception",
+      content: `当前图片线索：${image}`,
+      sourceIds: ["current-image"],
+      activation: 0.7,
+      relevance: 0.8,
+      novelty: 0.82,
+      utility: 0.62,
+      uncertainty: 0.35,
+      scope,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+  }
+  return candidates;
+}
+
+export function workspaceCandidatesFromGoals(items, { scope = "current-user" } = {}) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item) => item?.kind === "commitment" && item?.status === "pending")
+    .map((item, index) => ({
+      id: `goal:${item.id || index}`,
+      kind: "commitment",
+      content: item.text,
+      sourceIds: [item.id],
+      activation: item.pinned ? 0.95 : 0.76,
+      relevance: 0.72,
+      novelty: 0.42,
+      utility: 0.92,
+      uncertainty: 0.12,
+      scope,
+      expiresAt: item.dueAt ? Number(item.dueAt) * 1000 : null,
+      pinned: item.pinned === true,
+    }));
+}
+
+export function detectWorkspaceConflicts(candidates) {
+  const groups = new Map();
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const key = String(candidate?.conflictKey || candidate?.predicate || "").trim().toLowerCase();
+    if (!key || !candidate?.content) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(candidate);
+  }
+  return [...groups.entries()]
+    .map(([key, items]) => ({
+      key,
+      sourceIds: [...new Set(items.flatMap((item) => sourceIds(item.sourceIds)))],
+      contents: [...new Set(items.map((item) => item.content))],
+    }))
+    .filter((conflict) => conflict.contents.length > 1);
+}
+
+export function workspaceCandidatesFromSafety({ conflicts = [], scope = "current-session" } = {}) {
+  return (Array.isArray(conflicts) ? conflicts : []).map((conflict, index) => ({
+    id: `safety:conflict:${conflict.key || index}`,
+    kind: "safety",
+    content: "检测到同一主题存在互相冲突的候选，回复时应先谨慎确认，不要擅自覆盖旧信息。",
+    sourceIds: sourceIds(conflict.sourceIds),
+    activation: 0.95,
+    relevance: 0.9,
+    novelty: 0.7,
+    utility: 0.95,
+    uncertainty: 0.05,
+    scope,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  }));
+}
+
+/**
+ * 将空闲 replay/外部推理给出的假设收纳为临时候选。必须同时提供至少两个
+ * 证据来源和一条反证/待验证条件；缺任一项就拒绝，避免把联想伪装成事实。
+ */
+export function incubateWorkspaceHypothesis({
+  content,
+  evidenceIds = [],
+  counterEvidence = [],
+  scope = "current-session",
+  expiresAt = Date.now() + 10 * 60 * 1000,
+} = {}) {
+  const sources = sourceIds(evidenceIds);
+  const counter = (Array.isArray(counterEvidence) ? counterEvidence : [counterEvidence])
+    .map((item) => String(item || "").replace(/\s+/g, " ").trim().slice(0, 240))
+    .filter(Boolean)
+    .slice(0, 4);
+  if (sources.length < 2 || !counter.length) return null;
+  const candidate = normalizeWorkspaceCandidate({
+    id: `hypothesis:${sources.slice(0, 2).join(":")}`,
+    kind: "hypothesis",
+    content,
+    sourceIds: sources,
+    activation: 0.42,
+    relevance: 0.58,
+    novelty: 0.9,
+    utility: 0.5,
+    uncertainty: 0.82,
+    scope,
+    expiresAt,
+    derived: true,
+  });
+  return candidate ? { ...candidate, counterEvidence: counter } : null;
+}
+
+export function summarizeWorkspaceDiagnostics(workspace, { latencyMs = 0 } = {}) {
+  const diagnostics = workspace?.diagnostics || {};
+  const sourceCounts = diagnostics.sourceCounts && typeof diagnostics.sourceCounts === "object"
+    ? Object.fromEntries(Object.entries(diagnostics.sourceCounts).map(([key, value]) => [key, Math.max(0, Math.min(1000, Number(value) || 0))]))
+    : {};
+  return {
+    enabled: diagnostics.enabled === true,
+    candidateCount: Math.max(0, Math.min(1000, Number(diagnostics.candidateCount) || 0)),
+    slotCount: Math.max(0, Math.min(WORKSPACE_MAX_SLOTS, Number(diagnostics.slotCount) || 0)),
+    conflictCount: Math.max(0, Math.min(100, Number(diagnostics.conflictCount) || 0)),
+    sourceCounts,
+    latencyMs: Math.max(0, Math.min(10_000, Number(latencyMs) || 0)),
+  };
+}
+
+export function buildWorkspace({
+  enabled = false,
+  mode = "conservative",
+  memoryItems = [],
+  graph,
+  query = "",
+  imageCaption = "",
+  scope = "current-session",
+  now = Date.now(),
+} = {}) {
+  if (!enabled) return { slots: [], diagnostics: { enabled: false, candidateCount: 0, slotCount: 0 } };
+  const memory = workspaceCandidatesFromMemory(memoryItems, { scope });
+  const perception = workspaceCandidatesFromPerception({ query, imageCaption, scope });
+  const goals = workspaceCandidatesFromGoals(memoryItems, { scope });
+  const graphCandidates = workspaceCandidatesFromGraph(graph, {
+    seedIds: memoryItems.map((item) => `${item?.kind || ""}:${item?.id || ""}`),
+    maxHops: 2,
+    maxCandidates: 24,
+    scope,
+  });
+  const conflicts = detectWorkspaceConflicts(memoryItems.map((item) => ({
+    ...item,
+    content: item?.text,
+    sourceIds: [item?.id],
+  })));
+  const safety = workspaceCandidatesFromSafety({ conflicts, scope });
+  const all = [...memory, ...perception, ...goals, ...graphCandidates, ...safety];
+  const slots = selectWorkspaceSlots(all, { mode, now });
+  return {
+    slots,
+    diagnostics: {
+      enabled: true,
+      mode,
+      candidateCount: all.length,
+      slotCount: slots.length,
+      sourceCounts: all.reduce((counts, candidate) => {
+        counts[candidate.kind] = (counts[candidate.kind] || 0) + 1;
+        return counts;
+      }, {}),
+      conflictCount: conflicts.length,
+    },
+  };
 }
 
 /**

@@ -136,6 +136,12 @@ struct Settings {
     /// 思考模式（DeepSeek thinking.type / 本地 Qwen reasoning_effort）。
     #[serde(default)]
     thinking: bool,
+    /// M4 Global Workspace 实验开关；默认关闭，开启后仍只使用有界内部观察。
+    #[serde(default)]
+    memory_workspace: bool,
+    /// Workspace 联想强度：conservative / balanced / exploratory。
+    #[serde(default = "default_workspace_mode")]
+    memory_workspace_mode: String,
     /// 采样温度。
     #[serde(default = "default_temperature")]
     temperature: f64,
@@ -196,6 +202,10 @@ struct Settings {
 
 fn default_temperature() -> f64 {
     0.8
+}
+
+fn default_workspace_mode() -> String {
+    "conservative".into()
 }
 
 fn default_realtime_backend() -> String {
@@ -280,6 +290,8 @@ impl Settings {
             local_vl_model: String::new(),
             vl_provider: default_vl_provider(),
             thinking: false,
+            memory_workspace: false,
+            memory_workspace_mode: default_workspace_mode(),
             temperature: default_temperature(),
             user_name: String::new(),
             pat_text: String::new(),
