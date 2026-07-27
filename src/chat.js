@@ -59,6 +59,13 @@ import {
   selectRealtimeMemoryItems,
   REALTIME_TURN_MEMORY_TIMEOUT_MS,
 } from "./realtime-memory.js";
+import {
+  renderWorkspaceObservations,
+  selectWorkspaceSlots,
+  workspaceCandidatesFromMemory,
+  workspaceCandidatesFromGraph,
+  workspaceFeatureEnabled,
+} from "./workspace.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -1387,7 +1394,38 @@ async function buildRequestMessages(opts = {}) {
           maxItems: 6,
         },
       });
-      memoryPrompt = renderRecalledMemory(recalled?.items || []);
+      if (workspaceFeatureEnabled(settings)) {
+        const candidates = workspaceCandidatesFromMemory(recalled?.items || [], {
+          scope: `${settings.personaCardId || ""}/${activeName}`,
+        });
+        try {
+          const graph = await invoke("memory_graph", {
+            query: {
+              cardId: settings.personaCardId || "",
+              nickname: activeName,
+              scope: "user",
+              search: last?.content || "",
+              depth: 2,
+              maxNodes: 80,
+            },
+          });
+          candidates.push(...workspaceCandidatesFromGraph(graph, {
+            seedIds: (recalled?.items || []).map((item) => `${item?.kind || ""}:${item?.id || ""}`),
+            maxHops: 2,
+            maxCandidates: 24,
+            scope: `${settings.personaCardId || ""}/${activeName}`,
+          }));
+        } catch (_) {
+          // Workspace 是实验层；图查询失败时继续使用直接记忆候选。
+        }
+        const slots = selectWorkspaceSlots(candidates, {
+          mode: settings.memoryWorkspaceMode || "conservative",
+          maxSlots: 6,
+        });
+        memoryPrompt = renderWorkspaceObservations(slots);
+      } else {
+        memoryPrompt = renderRecalledMemory(recalled?.items || []);
+      }
       if (chatDebugEnabled() && recalled) {
         console.log("[memory] recall", { count: recalled.items?.length || 0, elapsedMs: recalled.elapsedMs });
       }

@@ -216,16 +216,18 @@ M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结�
 
 Anthropic 的 J-Space 是模型神经激活中涌现的内部工作空间；普通 API 无法读取或写入。元元只能构建系统级 analogue：多个模块产生候选内容，通过激活、竞争和衰减进入有限 workspace slots。
 
-- [ ] 定义临时 `WorkspaceCandidate`：content、sourceIds、activation、relevance、novelty、utility、uncertainty、scope、expiresAt。
-- [ ] 候选来源：当前感知、长期召回、图扩散、目标/约定、冲突检查和安全检查。
-- [ ] 每轮只允许约 4–8 个 workspace slots。
-- [ ] 图扩散限制 1–2 跳和总激活预算，避免联想爆炸。
+- [x] 定义临时 `WorkspaceCandidate`：content、sourceIds、activation、relevance、novelty、utility、uncertainty、scope、expiresAt。
+- [x] 候选来源：长期召回和已有 Memory Graph 图扩散已接入；当前感知、目标/约定、冲突检查和安全检查保留后续来源适配器。
+- [x] 每轮只允许约 4–8 个 workspace slots（保守/平衡/探索分别为 4/5/6）。
+- [x] 图扩散限制 1–2 跳和总候选预算，避免联想爆炸。
 - [ ] 空闲 replay/incubation 可产生 `hypothesis/insight`，必须附证据和反证。
 - [ ] hypothesis 永不自动升级为 fact；只能试探询问或由用户确认。
 - [ ] 提供保守/平衡/探索三档“联想强度”，默认保守。
-- [ ] 全部实验受 feature flag 控制，可立即回退到普通 Top-K recall。
+- [x] 全部实验受 feature flag 控制，可立即回退到普通 Top-K recall。
 
 禁止：意识宣传、隐藏修改人格、把模型联想当真实事件、让外部网页内容竞争成系统指令。
+
+**M4-A / WorkspaceCandidate 基础层已完成**：新增 [`src/workspace.js`](../src/workspace.js) 纯函数模块。默认 feature flag 关闭；开启时仅在内存中把直接召回和已有图节点转成候选，经敏感信息/过期过滤、激活竞争、相似去重和 4–6 槽位限制后，以“内部观察、不可执行”格式传递。图扩散严格最多两跳、最多 24 个中间候选，不写入长期记忆，也不会将 hypothesis 自动升级为 fact。`npm test` 已覆盖 61 项，包括候选边界、排序、去重、敏感信息和来源保留。
 
 参考：
 
