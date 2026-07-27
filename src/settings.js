@@ -433,6 +433,7 @@ async function deleteCurrentCard() {
   if (!window.confirm(`确定删除人设「${name}」？`)) return;
   try {
     await invoke("delete_persona_card", { cardId });
+    clearMemoryGraphLayouts(cardId);
     await loadCardList();
     sel.value = "";
     _lastCardId = "";
@@ -1288,6 +1289,20 @@ function saveMemoryGraphPosition(key, point) {
   }
 }
 
+function clearMemoryGraphLayouts(cardId, nickname = null) {
+  try {
+    const prefix = `kxyy-memory-graph-layout:${cardId}:`;
+    const exact = nickname == null ? null : `${prefix}${String(nickname).trim()}`;
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (!key || !key.startsWith(prefix) || (exact && key !== exact)) continue;
+      localStorage.removeItem(key);
+    }
+  } catch (_) {
+    // UI-only layout cleanup must not turn a successful memory clear into an error.
+  }
+}
+
 const MEMORY_GRAPH_COLORS = {
   user: "#64748b",
   episode: "#d97706",
@@ -1885,6 +1900,7 @@ document.querySelector('.tab-btn[data-tab="memory"]')?.addEventListener("click",
 
 async function clearCurrentCardMemory(statusNode, cardId = selectedMemoryCardId()) {
   await invoke("memory_clear_scope", { request: { cardId, nickname: "" } });
+  clearMemoryGraphLayouts(cardId);
   clearAllMemory(cardId);
   await emit("memory-cleared", { cardId });
   if (statusNode) statusNode.textContent = "已清空";

@@ -17,7 +17,10 @@ use uuid::Uuid;
 const SCHEMA_VERSION: i64 = 5;
 const SOURCE_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
-const RECALL_CHAR_BUDGET: usize = 600;
+// Chinese characters are close to one token in the target models; keep this
+// conservative so the prompt budget remains roughly 500 tokens without a
+// tokenizer dependency in the desktop bundle.
+const RECALL_CHAR_BUDGET: usize = 500;
 const MAX_RECALL_ITEMS: usize = 6;
 
 pub struct MemoryState {
@@ -1815,9 +1818,10 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let facts: Vec<(String, String, String, String, String)> = tx
         .prepare(
             "SELECT f.id,f.user_id,u.card_id,f.text,f.predicate||' '||f.value
-             FROM memory_facts f JOIN memory_users u ON u.id=f.user_id",
+             FROM memory_facts f JOIN memory_users u ON u.id=f.user_id
+             WHERE f.status IN ('active','disputed') AND (f.valid_to IS NULL OR f.valid_to >= ?1)",
         )?
-        .query_map([], |row| {
+        .query_map([now_ts()], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -1853,9 +1857,10 @@ fn rebuild_search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let commitments: Vec<(String, String, String, String)> = tx
         .prepare(
             "SELECT c.id,c.user_id,u.card_id,c.text
-             FROM memory_commitments c JOIN memory_users u ON u.id=c.user_id",
+             FROM memory_commitments c JOIN memory_users u ON u.id=c.user_id
+             WHERE c.status='pending' AND (c.due_at IS NULL OR c.due_at >= ?1)",
         )?
-        .query_map([], |row| {
+        .query_map([now_ts()], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .filter_map(Result::ok)
@@ -1973,7 +1978,7 @@ fn rebuild_from_events(
             .map_err(|e| e.to_string())?;
     }
     let event_sql = format!(
-        "SELECT user_id,item_kind,item_id,event_type,source_id,observed_at,trust,payload_json FROM memory_events WHERE user_id IN ({placeholders}) ORDER BY created_at ASC,id ASC"
+        "SELECT user_id,item_kind,item_id,event_type,source_id,observed_at,trust,payload_json FROM memory_events WHERE user_id IN ({placeholders}) ORDER BY created_at ASC,rowid ASC"
     );
     let mut events = tx.prepare(&event_sql).map_err(|e| e.to_string())?;
     let event_values: Vec<&str> = users.iter().map(String::as_str).collect();
@@ -5377,10 +5382,87 @@ mod tests {
         tx.execute("INSERT INTO memory_episodes(id,user_id,summary,importance,topics_json,entities_json,occurred_at,created_at,updated_at) VALUES(?1,?2,'面试经历',0.9,'[\"面试\"]','[]',100,100,100)", params![episode_id, &user]).unwrap();
         append_event(&tx, &MemoryEventInput { user_id: &user, card_id: "card", item_kind: "episode", item_id: episode_id, event_type: "episode.created", source_type: "test", source_id: None, modality: "text", observed_at: 100, trust: 0.9, consent: "allowed", idempotency_key: "replay-episode", payload_json: r#"{"summary":"面试经历","importance":0.9,"topics":["面试"],"entities":[]}"# }).unwrap();
         tx.execute("INSERT INTO memory_facts(id,user_id,text,predicate,value,confidence,importance,durability,status,valid_from,first_seen_at,last_confirmed_at,created_at,updated_at) VALUES('fact-replay',?1,'用户准备面试','安排','面试',0.8,0.7,'stable','active',100,100,100,100,100)", [&user]).unwrap();
-        append_event(&tx, &MemoryEventInput { user_id: &user, card_id: "card", item_kind: "fact", item_id: "fact-replay", event_type: "fact.created", source_type: "test", source_id: None, modality: "text", observed_at: 100, trust: 0.8, consent: "allowed", idempotency_key: "replay-fact", payload_json: r#"{"text":"用户准备面试","predicate":"安排","value":"面试","confidence":0.8,"importance":0.7,"durability":"stable"}"# }).unwrap();
+        append_event(&tx, &MemoryEventInput { user_id: &user, card_id: "card", item_kind: "fact", item_id: "fact-replay", event_type: "fact.created", source_type: "test", source_id: None, modality: "text", observed_at: 100, trust: 0.8, consent: "allowed", idempotency_key: "replay-fact", payload_json: r#"{"text":"用户准备面试","predicate":"安排","value":"面试","confidence":0.8,"importance":0.7,"durability":"stable","sourceEpisodeId":"episode-replay"}"# }).unwrap();
+        tx.execute("INSERT INTO memory_commitments(id,user_id,text,status,importance,created_at,updated_at) VALUES('commitment-replay',?1,'元元下次提醒面试','pending',0.8,100,100)", [&user]).unwrap();
+        append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &user,
+                card_id: "card",
+                item_kind: "commitment",
+                item_id: "commitment-replay",
+                event_type: "commitment.created",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: 100,
+                trust: 0.8,
+                consent: "allowed",
+                idempotency_key: "replay-commitment",
+                payload_json: r#"{"text":"元元下次提醒面试","importance":0.8}"#,
+            },
+        )
+        .unwrap();
+        append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &user,
+                card_id: "card",
+                item_kind: "commitment",
+                item_id: "commitment-replay",
+                event_type: "commitment.status_changed",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: 101,
+                trust: 0.9,
+                consent: "allowed",
+                idempotency_key: "replay-commitment-status",
+                payload_json: r#"{"status":"fulfilled"}"#,
+            },
+        )
+        .unwrap();
+        append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &user,
+                card_id: "card",
+                item_kind: "fact",
+                item_id: "fact-old",
+                event_type: "fact.created",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: 90,
+                trust: 0.7,
+                consent: "allowed",
+                idempotency_key: "replay-fact-old",
+                payload_json: r#"{"text":"用户喜欢辣","predicate":"饮食偏好","value":"喜欢辣","confidence":0.7,"importance":0.5,"durability":"stable"}"#,
+            },
+        )
+        .unwrap();
+        append_event(
+            &tx,
+            &MemoryEventInput {
+                user_id: &user,
+                card_id: "card",
+                item_kind: "fact",
+                item_id: "fact-old",
+                event_type: "fact.superseded",
+                source_type: "test",
+                source_id: None,
+                modality: "text",
+                observed_at: 102,
+                trust: 0.9,
+                consent: "allowed",
+                idempotency_key: "replay-fact-old-superseded",
+                payload_json: r#"{"supersededBy":"fact-replay"}"#,
+            },
+        )
+        .unwrap();
         tx.commit().unwrap();
         let events = scalar_count(&conn, "SELECT COUNT(*) FROM memory_events").unwrap();
-        assert_eq!(events, before + 2);
+        assert_eq!(events, before + 6);
         conn.execute("DELETE FROM memory_facts", []).unwrap();
         conn.execute("DELETE FROM memory_episodes", []).unwrap();
         rebuild_from_events(
@@ -5404,12 +5486,48 @@ mod tests {
             1
         );
         assert_eq!(
+            conn.query_row(
+                "SELECT source_episode_id FROM memory_facts WHERE id='fact-replay'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("episode-replay")
+        );
+        assert_eq!(
             scalar_count(
                 &conn,
                 "SELECT COUNT(*) FROM memory_episodes WHERE id='episode-replay'"
             )
             .unwrap(),
             1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM memory_commitments WHERE id='commitment-replay'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "fulfilled"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM memory_facts WHERE id='fact-old'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM memory_search WHERE item_id='fact-old'"
+            )
+            .unwrap(),
+            0
         );
         assert!(
             scalar_count(
@@ -5418,6 +5536,24 @@ mod tests {
             )
             .unwrap()
                 > 0
+        );
+
+        conn.execute("INSERT INTO memory_events(id,scope_id,user_id,item_kind,item_id,event_type,source_type,modality,observed_at,trust,consent,idempotency_key,payload_json,created_at) SELECT 'bad-replay-event',scope_id,user_id,'fact','bad-replay','fact.created','test','text',100,0.5,'allowed','bad-replay','not-json',100 FROM memory_events WHERE idempotency_key='replay-fact'", []).unwrap();
+        assert!(rebuild_from_events(
+            &mut conn,
+            &MemoryRebuildEventsRequest {
+                card_id: "card".into(),
+                nickname: Some("小明".into())
+            }
+        )
+        .is_err());
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM memory_facts WHERE id='fact-replay'"
+            )
+            .unwrap(),
+            1
         );
     }
 
@@ -6474,6 +6610,48 @@ mod tests {
         assert!(payload.contains("m-safe"));
         assert!(!payload.contains("m-private"));
         assert!(!payload.contains("m-secret"));
+    }
+
+    #[test]
+    fn enqueue_keeps_final_user_and_assistant_turn_for_replay() {
+        let mut conn = test_db();
+        let result = enqueue_session(
+            &mut conn,
+            MemoryEnqueueRequest {
+                card_id: "card".into(),
+                nickname: "元宝".into(),
+                session_id: "final-turn".into(),
+                batch_start: 0,
+                batch_end: 2,
+                messages: vec![
+                    MemoryMessage {
+                        id: "final-user".into(),
+                        role: "user".into(),
+                        content: "我下周有面试".into(),
+                        image_caption: String::new(),
+                        do_not_remember: false,
+                    },
+                    MemoryMessage {
+                        id: "final-assistant".into(),
+                        role: "assistant".into(),
+                        content: "我会记住，下次可以问问进展".into(),
+                        image_caption: String::new(),
+                        do_not_remember: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert!(result.accepted);
+        let payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM memory_jobs WHERE id=?1",
+                [&result.job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("final-user"));
+        assert!(payload.contains("final-assistant"));
     }
 
     #[test]

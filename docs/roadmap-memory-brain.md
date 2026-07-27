@@ -6,7 +6,7 @@
 
 ### 版本与里程碑约定
 
-- 应用安装包使用独立的 SemVer（当前基线为 `0.2.40`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- 应用安装包使用独立的 SemVer（当前基线为 `0.2.42`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
 - Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
 - 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
 - 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
@@ -34,7 +34,7 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 
 ## 2. 当前基线：Memory v3
 
-### 2.1 已实现（PR #27，cross-platform verified）
+### 2.1 已实现（PR #28，当前分支 macOS verified；跨平台仍待本轮 PR CI）
 
 - Rust + bundled SQLite，数据库位于应用配置目录 `memory-v3.sqlite3`。
 - WAL、foreign keys、busy timeout、secure delete 和显式 schema version。
@@ -42,12 +42,12 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 - 最近对话与会话滚动摘要作为工作记忆。
 - 事实确认、纠错替代、冲突、temporary/stable/permanent、约定合并与完成。
 - 后台异步巩固、崩溃恢复、指数退避、7 天原始 job 和 90 天来源片段保留策略。
-- 每轮文字回复前选择性召回：最多 2 条置顶 + 4 条动态，总字符预算 600。
+- 每轮文字回复前选择性召回：最多 2 条置顶 + 4 条动态，总字符预算 500（按中文字符近似 token，避免额外 tokenizer 包体）。
 - 敏感信息本地过滤；失败时不阻塞聊天。
 - 设置页支持搜索、筛选、编辑、置顶、兑现、删除和按人设清空。
 - “别记这段”会在当前用户气泡显示私密回合徽标；记忆页会显式展示 pending、skipped、数据库或 provider 错误，聊天与退出不因此阻塞。
 - 旧 `localStorage` facts/promises/sessions/topics 幂等迁移。
-- 49 个 Rust Memory 测试、66 个 JS 测试、前端语法检查，以及本地 macOS DMG build 已通过；跨平台 CI/真实 App 人工路径仍需在发布前执行。
+- 50 个 Rust Memory 测试、67 个 JS 测试、190 个 Python 实时服务测试、前端语法检查，以及本地 macOS DMG build 已通过；跨平台 CI/真实 App 人工路径仍需在发布前执行。
 - 设置页明确区分在线 DeepSeek 巩固与本地 Ollama 巩固的数据边界；记忆数据库和归纳结果始终只保存在本机。
 
 ### 2.2 当前边界
@@ -132,7 +132,7 @@ flowchart TB
 
 验收指标沿用：召回 P95 < 30ms、长期注入不超过约 500 token、无关误召回 < 5%、明确纠错后旧事实使用率 0、成功入队最终处理率 100%。
 
-2026-07-26 验证证据：PR #27 CI 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。
+2026-07-26 验证证据：前序 PR #27 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。当前 PR #28 仍需重新取得跨平台 CI 证据。
 
 ### M1：Memory v3.1 内核基础（Graph 和外部接入的前置）
 
@@ -142,10 +142,10 @@ flowchart TB
 - [x] 增加 subject/scope 模型的第一阶段：建立 `persona-relationship:<user_id>` scope，并由外键保证 card/user 隔离；global/project/connector/private-session 留待后续阶段。
 - [x] 为 facts/episodes/commitments 增加 evidence 记录和 90 天来源片段清理；valid time 仍由事实表维护，transaction time 由事件记录维护。
 - [x] M1-B 第一阶段规范化 entity/topic，增加 schema v5 `memory_edges`：已接入 `about`、`mentions`、`derived_from`、`supersedes`，边带来源事件、置信度、derived 标记和幂等键；其余关系按实际输入逐步开放。
-- [x] 当前 facts/episodes/commitments 继续作为事件日志的物化视图，并增加完整性检查、v4/v5 迁移回填和关系边一致性校验；完整“从事件重建所有物化表”工具仍待后续实现。
+- [x] 当前 facts/episodes/commitments 继续作为事件日志的物化视图，并增加完整性检查、v4/v5 迁移回填、关系边一致性校验和 `memory_rebuild_from_events` 事件重放工具。
 - [x] 抽出 provider-neutral Rust trait，Memory Core 不依赖 Tauri `AppHandle`、窗口或具体 DeepSeek/Ollama 设置结构；DeepSeek/Ollama 由 `api.rs` adapter 实现。
 - [x] 增加脱敏导出、SQLite `VACUUM INTO` 一致性备份、只读备份校验和损坏模拟测试。
-- [x] 定义 prompt-injection 边界：Memory、Graph、Workspace 统一经过 observation sanitizer，只能作为带边界的数据观察，不能成为系统指令。
+- [x] 定义 prompt-injection 边界：Memory、Graph、Workspace 和实时通话记忆统一经过 observation sanitizer，只能作为带边界的数据观察，不能成为系统指令。
 
 M1-A（事件与证据时间线）已完成。M1-B（关系边基础）和 M1-C（完整性、导出与备份）已完成第一阶段；本轮补齐 provider-neutral core、`memory_rebuild_from_events` 事务化事件重放、结构化 recall conflict fields 和统一 observation 边界。重放保留事件数量并恢复物化项、FTS、topic/entity、edges 与 evidence；真实 App 触发仍需人工验收。
 
@@ -182,7 +182,7 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 
 本步门槛：三条实时路径的 handshake 回归测试通过；未知能力值在诊断导出中 fail-closed；后续只有拿到官方协议证据后才能新增 `dynamic-context-v1`。
 
-**Memory v3.1-G / App 0.2.36** 已完成本地/CosyVoice 逐轮协调第一版：ASR final 后服务端发出带 generation 的 `memory_context_request`，前端以 80ms 预算召回并回传最多 3 条、700 字符以内的结构化卡片；服务端最多等待 100ms，将卡片包装成不可执行的 observation 注入该轮文字模型 history。旧 generation、超时、挂断和数据库失败均不阻塞回复；partial ASR 永不触发写入或召回回传。实时 trace 只记录请求/响应计数、接受/超时/过期和 P50/P95 延迟，不记录文本。火山端到端没有动态 context 证据，继续使用 session-start-only。
+**Memory v3.1-G / App 0.2.36** 已完成本地/CosyVoice 逐轮协调第一版：ASR final 后服务端发出带 generation 的 `memory_context_request`，前端以 80ms 预算召回并回传最多 3 条、300 字符以内的结构化卡片；服务端最多等待 100ms，将卡片包装成不可执行的 observation 注入该轮文字模型 history。旧 generation、超时、挂断和数据库失败均不阻塞回复；partial ASR 永不触发写入或召回回传。实时 trace 只记录请求/响应计数、接受/超时/过期和 P50/P95 延迟，不记录文本。火山端到端没有动态 context 证据，继续使用 session-start-only。
 
 本步门槛：前端/本地服务覆盖 generation 隔离、超时回退、旧客户端兼容和 prompt-injection 边界；实时音频仍由既有状态机负责。设备实测需关注 ASR final 到首 token 的新增延迟，未达到 p95 < 120ms 前不扩大记忆预算。
 
@@ -229,7 +229,7 @@ Anthropic 的 J-Space 是模型神经激活中涌现的内部工作空间；普�
 
 **M4-A / WorkspaceCandidate 基础层已完成**：新增 [`src/workspace.js`](../src/workspace.js) 纯函数模块。默认 feature flag 关闭；开启时仅在内存中把直接召回和已有图节点转成候选，经敏感信息/过期过滤、激活竞争、相似去重和 4–6 槽位限制后，以“内部观察、不可执行”格式传递。图扩散严格最多两跳、最多 24 个中间候选，不写入长期记忆，也不会将 hypothesis 自动升级为 fact。`npm test` 已覆盖 66 项，包括候选边界、排序、去重、敏感信息、prompt-injection observation 和来源保留。
 
-**M4-B/C/D 已完成**：Workspace 已组合当前用户消息/图片线索、长期记忆、pending commitment、图扩散、同 predicate 冲突检查和安全候选；诊断只输出开关状态、候选/槽位/冲突数量、来源类型计数与耗时，不输出正文、昵称、卡片 ID 或 API key。`incubateWorkspaceHypothesis` 要求至少两个证据来源和一条反证/待验证条件，并设置短期过期时间；目前没有后台空闲调度，不会偷偷运行或写入记忆。Workspace 默认关闭，设置页新增明确实验开关和联想强度选择；Rust 49 项与前端 66 项测试通过。
+**M4-B/C/D 已完成**：Workspace 已组合当前用户消息/图片线索、长期记忆、pending commitment、图扩散、同 predicate 冲突检查和安全候选；诊断只输出开关状态、候选/槽位/冲突数量、来源类型计数与耗时，不输出正文、昵称、卡片 ID 或 API key。`incubateWorkspaceHypothesis` 要求至少两个证据来源和一条反证/待验证条件，并设置短期过期时间；目前没有后台空闲调度，不会偷偷运行或写入记忆。Workspace 默认关闭，设置页新增明确实验开关和联想强度选择；Rust 50 项、JS 67 项与 Python 190 项测试通过。
 
 参考：
 
