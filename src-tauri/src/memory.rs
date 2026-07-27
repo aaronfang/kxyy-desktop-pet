@@ -1197,6 +1197,7 @@ pub struct MemoryGraphNode {
     pub occurred_at: Option<i64>,
     pub user_id: String,
     pub source_event_ids: Vec<String>,
+    pub revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2112,6 +2113,15 @@ fn graph_event_ids(
     Ok(ids)
 }
 
+fn graph_revision(conn: &Connection, kind: &str, id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(revision_number),0)+1 FROM memory_revisions
+         WHERE kind=?1 AND item_id=?2",
+        params![kind, id],
+        |row| row.get(0),
+    )
+}
+
 fn graph_user_filter(
     conn: &Connection,
     query: &MemoryGraphQuery,
@@ -2216,6 +2226,7 @@ fn graph(conn: &Connection, query: &MemoryGraphQuery) -> Result<MemoryGraphRespo
             occurred_at: None,
             user_id: id.clone(),
             source_event_ids: vec![],
+            revision: None,
         });
     }
     let user_ids_vec: Vec<String> = user_ids.iter().cloned().collect();
@@ -2255,6 +2266,7 @@ fn graph(conn: &Connection, query: &MemoryGraphQuery) -> Result<MemoryGraphRespo
                 user_id: user_id.clone(),
                 source_event_ids: graph_event_ids(conn, user_id, "episode", &id)
                     .map_err(|e| e.to_string())?,
+                revision: Some(graph_revision(conn, "episode", &id).map_err(|e| e.to_string())?),
             };
             if node.text.is_empty() {
                 node.text = node.label.clone();
@@ -2302,6 +2314,7 @@ fn graph(conn: &Connection, query: &MemoryGraphQuery) -> Result<MemoryGraphRespo
                 user_id: user_id.clone(),
                 source_event_ids: graph_event_ids(conn, user_id, "fact", &id)
                     .map_err(|e| e.to_string())?,
+                revision: Some(graph_revision(conn, "fact", &id).map_err(|e| e.to_string())?),
             });
         }
         let mut stmt = conn
@@ -2341,6 +2354,7 @@ fn graph(conn: &Connection, query: &MemoryGraphQuery) -> Result<MemoryGraphRespo
                 user_id: user_id.clone(),
                 source_event_ids: graph_event_ids(conn, user_id, "commitment", &id)
                     .map_err(|e| e.to_string())?,
+                revision: Some(graph_revision(conn, "commitment", &id).map_err(|e| e.to_string())?),
             });
         }
         for (table, kind, label_column) in [
@@ -2371,6 +2385,7 @@ fn graph(conn: &Connection, query: &MemoryGraphQuery) -> Result<MemoryGraphRespo
                     occurred_at: Some(updated_at),
                     user_id: user_id.clone(),
                     source_event_ids: vec![],
+                    revision: None,
                 });
             }
         }
@@ -5433,6 +5448,14 @@ mod tests {
             .unwrap()
             .source_event_ids
             .contains(&event_id));
+        assert_eq!(
+            graph_result
+                .nodes
+                .iter()
+                .find(|node| node.id == fact_id)
+                .and_then(|node| node.revision),
+            Some(1)
+        );
         assert!(graph_result.edges.iter().all(|edge| edge.derived));
 
         let other_card = graph(

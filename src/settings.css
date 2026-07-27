@@ -658,7 +658,21 @@ button.danger:disabled {
 }
 .memory-graph-inspector strong { color: #374151; }
 .memory-graph-inspector p { margin: 3px 0; white-space: pre-wrap; }
+.memory-graph-inspector-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
 .memory-graph-inspector button { height: 26px; padding: 0 9px; font-size: 11px; }
+.memory-graph-edit-input {
+  display: block;
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.5;
+}
 .memory-list {
   display: flex;
   flex-direction: column;

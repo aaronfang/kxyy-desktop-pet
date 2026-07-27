@@ -193,10 +193,10 @@ M1-D 完成标准：`memory_rebuild_derived` 事务化执行、事件数量保�
 - [x] 新增 `memory_graph(query)`，返回有来源的 nodes/edges、截断状态和关系解释（Memory v3.1-H 内核 IPC）。
 - [x] 第一版默认当前 card/user、有效记忆、最多 200 节点；`superseded`、`forgotten`、过期事实和已完成/到期约定不进入图。
 - [ ] 节点类型：user、episode、fact、commitment、topic、entity、hypothesis。
-- [ ] 点击节点使用现有 update/delete/pin/fulfill API；右侧检查器展示来源、置信度、状态和版本。
+- [x] 点击节点使用现有 update/delete/pin/fulfill API；右侧检查器展示来源、置信度、状态、版本和时间线。
 - [x] 支持搜索、类型、时间、scope、置信度、一度/二度展开（查询层）。
 - [x] 自动相似边必须标记 `derived`，不能因图上距离自动升级为事实。
-- [ ] 列表继续作为批量删除、精确搜索和无障碍操作的主入口。
+- [x] 列表继续作为批量删除、精确搜索和无障碍操作的主入口。
 
 M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结果包含节点来源事件 ID、边的 `sourceEventId`/`confidence`/`derived`/中文关系解释，并明确返回 `truncated`、`totalCandidates`、实际 `depth` 和 `maxNodes`。Rust 测试覆盖 card/user 隔离、关键词和类型筛选、有效期过滤、一/二度展开、硬上限截断、空范围和来源保留。图形化设置页、节点检查器和布局持久化仍属于下一步 M3 UI，不在本轮宣称完成。
 
@@ -205,6 +205,8 @@ M3-H 内核验收证据：`memory_graph` 已注册为 Tauri command；查询结�
 本步门槛：前端回归测试和 Rust 全量测试通过；打包版本可在设置页切换视图，空图、截断、数据库不可用时有明确回退状态。关系图仍不承担批量删除和无障碍主操作，这些继续由列表完成。
 
 **Memory v3.1-J / App 0.2.38** 针对首轮人工截图反馈完成关系图可读性修正：大图使用按类型分栏布局，默认隐藏重叠标签；节点悬停、键盘聚焦或选中时显示短标签，原文和来源放入检查器。新增 80/120/200 节点上限、缩放百分比、放大/缩小、适配、滚轮缩放和空白处拖拽平移。该修正不改变 Memory Graph IPC、记忆数据或列表管理语义。
+
+**Memory v3.1-K / App 0.2.39** 完成节点检查器管理闭环：事实、经历和约定可直接编辑、置顶/取消置顶、删除，待兑现约定可直接标记已兑现；所有图节点可查看时间线，普通记忆节点可返回列表精确管理。图节点补充当前版本号，用户编辑仍沿用 revision/supersede 机制。
 
 建议本地打包 Cytoscape.js 或等价库，不使用 CDN。布局坐标与“长期记忆置顶”分开存储。
 

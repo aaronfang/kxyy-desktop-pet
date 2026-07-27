@@ -1367,7 +1367,6 @@ function renderMemoryGraph(result) {
     scene.appendChild(heading);
   }
   const showLabels = nodes.length <= 32;
-  const nodeByKey = new Map(nodes.map((node) => [graphKey(node), node]));
   for (const edge of edges) {
     const from = positions.get(`${edge.fromKind}:${edge.fromId}`);
     const to = positions.get(`${edge.toKind}:${edge.toId}`);
@@ -1420,7 +1419,7 @@ function renderMemoryGraph(result) {
     const select = () => {
       memoryGraphSelectedKey = graphKey(node);
       renderMemoryGraph(memoryGraphResult);
-      renderMemoryGraphInspector(node, nodeByKey);
+      renderMemoryGraphInspector(node);
     };
     group.addEventListener("mouseenter", () => text.classList.remove("hidden"));
     group.addEventListener("mouseleave", () => {
@@ -1439,7 +1438,7 @@ function renderMemoryGraph(result) {
   if (inspector && !memoryGraphSelectedKey) inspector.hidden = true;
 }
 
-function renderMemoryGraphInspector(node, nodeByKey = new Map()) {
+function renderMemoryGraphInspector(node) {
   const inspector = el("memoryGraphInspector");
   if (!inspector || !node) return;
   inspector.hidden = false;
@@ -1449,7 +1448,7 @@ function renderMemoryGraphInspector(node, nodeByKey = new Map()) {
   strong.textContent = `${memoryKindLabel(node.kind)}：`;
   title.append(strong, document.createTextNode(node.label || node.text || "未命名"));
   const meta = document.createElement("p");
-  meta.textContent = `状态：${memoryStatusLabel(node.status)} · 置信度：${Math.round((node.confidence || 0) * 100)}% · 重要度：${Math.round((node.importance || 0) * 100)}%${node.pinned ? " · 已置顶" : ""}`;
+  meta.textContent = `状态：${memoryStatusLabel(node.status)} · 置信度：${Math.round((node.confidence || 0) * 100)}% · 重要度：${Math.round((node.importance || 0) * 100)}%${node.revision ? ` · 版本 v${node.revision}` : ""}${node.pinned ? " · 已置顶" : ""}`;
   const source = document.createElement("p");
   source.textContent = node.sourceEventIds?.length
     ? `来源事件：${node.sourceEventIds.slice(0, 3).join("、")}`
@@ -1460,16 +1459,100 @@ function renderMemoryGraphInspector(node, nodeByKey = new Map()) {
     content.textContent = node.text;
     inspector.appendChild(content);
   }
+  const actions = document.createElement("div");
+  actions.className = "memory-graph-inspector-actions";
   if (["fact", "episode", "commitment"].includes(node.kind)) {
-    const button = memoryActionButton("在列表中查看", () => {
+    actions.appendChild(memoryActionButton(node.pinned ? "取消置顶" : "置顶", async () => {
+      await invoke("memory_update", { request: { kind: node.kind, id: node.id, pinned: !node.pinned } });
+      await loadMemoryPage({ resetPage: true });
+    }));
+    actions.appendChild(memoryActionButton("编辑", () => startMemoryGraphEdit(node)));
+    if (node.kind === "commitment" && node.status === "pending") {
+      actions.appendChild(memoryActionButton("标记已兑现", async () => {
+        await invoke("memory_update", { request: { kind: node.kind, id: node.id, status: "fulfilled" } });
+        await loadMemoryPage({ resetPage: true });
+      }));
+    }
+    actions.appendChild(memoryActionButton("删除", async () => {
+      if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
+      await invoke("memory_delete", { request: { items: [{ kind: node.kind, id: node.id }] } });
+      memoryGraphSelectedKey = "";
+      await loadMemoryPage({ resetPage: true });
+    }, "danger"));
+  }
+  if (["fact", "episode", "commitment", "topic", "entity"].includes(node.kind)) {
+    actions.appendChild(memoryActionButton("时间线", async () => {
+      inspector.replaceChildren();
+      const loading = document.createElement("p");
+      loading.textContent = "读取事件中…";
+      inspector.appendChild(loading);
+      try {
+        const result = await invoke("memory_timeline", {
+          query: { cardId: selectedMemoryCardId(), kind: node.kind, id: node.id, limit: 20 },
+        });
+        const back = memoryActionButton("返回节点", () => renderMemoryGraphInspector(node));
+        inspector.replaceChildren(back);
+        const timeline = document.createElement("div");
+        renderMemoryTimeline(timeline, result);
+        inspector.appendChild(timeline);
+      } catch (e) {
+        renderMemoryGraphInspector(node);
+        const error = document.createElement("p");
+        error.textContent = `读取时间线失败：${e.message || e}`;
+        inspector.appendChild(error);
+      }
+    }));
+  }
+  if (["fact", "episode", "commitment"].includes(node.kind)) {
+    actions.appendChild(memoryActionButton("在列表中查看", () => {
       memoryView = "list";
       updateMemoryViewButtons();
       el("memoryKind").value = node.kind;
       el("memorySearch").value = node.label || node.text || "";
       void loadMemoryPage({ resetPage: true });
-    });
-    inspector.appendChild(button);
+    }));
   }
+  if (actions.childElementCount) inspector.appendChild(actions);
+}
+
+function startMemoryGraphEdit(node) {
+  const inspector = el("memoryGraphInspector");
+  if (!inspector) return;
+  inspector.replaceChildren();
+  const input = document.createElement("textarea");
+  input.className = "memory-graph-edit-input";
+  input.rows = node.kind === "episode" ? 4 : 3;
+  input.maxLength = 1000;
+  input.value = node.text || node.label || "";
+  input.setAttribute("aria-label", "编辑关系图中的记忆");
+  const actions = document.createElement("div");
+  actions.className = "memory-graph-inspector-actions";
+  const error = document.createElement("p");
+  error.className = "memory-edit-error";
+  const cancel = memoryActionButton("取消", () => renderMemoryGraphInspector(node));
+  const save = memoryActionButton("保存", async () => {
+    const text = input.value.trim();
+    if (!text) {
+      error.textContent = "记忆内容不能为空";
+      input.focus();
+      return;
+    }
+    save.disabled = true;
+    cancel.disabled = true;
+    error.textContent = "保存中…";
+    try {
+      await invoke("memory_update", { request: { kind: node.kind, id: node.id, text } });
+      await loadMemoryPage({ resetPage: true });
+    } catch (e) {
+      save.disabled = false;
+      cancel.disabled = false;
+      error.textContent = `保存失败：${e.message || e}`;
+    }
+  });
+  actions.append(cancel, save);
+  inspector.append(input, actions, error);
+  input.focus();
+  input.select();
 }
 
 async function loadMemoryGraph() {
