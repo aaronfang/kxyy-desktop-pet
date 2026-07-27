@@ -1459,6 +1459,36 @@ test("desktop session ducks candidates, resumes rejection and gates stale audio"
   assert.equal(eventTypes.includes(TRACE_EVENT.RESPONSE_CANCELLED), true);
 });
 
+test("barge-in attributes cleared playback to the interrupted generation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  const playbackCommands = [];
+  session.playbackNode = {
+    port: { postMessage: (message) => playbackCommands.push(message) },
+  };
+  session.trace.startSession();
+  session.trace.openTurn();
+  session.trace.startResponse();
+  session._assistantActive = true;
+  session._playbackQueuedMs = 2202.666;
+
+  session._onMessage({ data: JSON.stringify({ type: "speech_confirmed" }) });
+
+  const events = session.getTraceSnapshot().events;
+  const cancelled = events.find((event) => event.eventType === TRACE_EVENT.RESPONSE_CANCELLED);
+  const stopped = events.find((event) => event.eventType === TRACE_EVENT.PLAYBACK_STOPPED);
+  const confirmed = events
+    .filter((event) => event.eventType === TRACE_EVENT.SPEECH_CONFIRMED)
+    .at(-1);
+  assert.equal(cancelled.reason, "turn_detected");
+  assert.equal(stopped.reason, "turn_detected");
+  assert.equal(stopped.generationId, cancelled.generationId);
+  assert.equal(stopped.metrics.queuedMs, 2202.666);
+  assert.ok(confirmed.generationId > stopped.generationId);
+  assert.equal(playbackCommands.at(-1).type, "clear");
+});
+
 test("desktop session rejects stale generation control events before reopening audio", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
