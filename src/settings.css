@@ -524,6 +524,107 @@ button.danger:disabled {
 }
 .memory-filters input,
 .memory-filters select { min-width: 0; }
+.memory-view-switch {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+.memory-view-switch button {
+  height: 29px;
+  padding: 0 11px;
+  font-size: 12px;
+}
+.memory-view-switch button.active {
+  background: #fff0f5;
+  border-color: #f3bfd0;
+  color: #be567a;
+}
+.memory-graph-panel {
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+.memory-graph-toolbar {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.memory-graph-toolbar label {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+}
+.memory-graph-toolbar select,
+.memory-graph-toolbar button {
+  height: 29px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+.memory-graph-viewport {
+  min-height: 260px;
+  overflow: auto;
+  border: 1px solid #eef0f3;
+  border-radius: 8px;
+  background: radial-gradient(circle at center, #fff 0, #f8fafc 100%);
+}
+#memoryGraphSvg {
+  display: block;
+  width: 100%;
+  min-width: 540px;
+  min-height: 280px;
+  color: #64748b;
+}
+.memory-graph-edge {
+  stroke: #cbd5e1;
+  stroke-width: 1.5;
+}
+.memory-graph-edge.derived {
+  stroke-dasharray: 4 3;
+}
+.memory-graph-node { cursor: pointer; }
+.memory-graph-node:focus { outline: none; }
+.memory-graph-node circle {
+  stroke: #fff;
+  stroke-width: 2;
+  transition: r .15s ease, stroke .15s ease;
+}
+.memory-graph-node:hover circle,
+.memory-graph-node.selected circle {
+  stroke: #1f2937;
+  stroke-width: 3;
+}
+.memory-graph-node text {
+  fill: #374151;
+  font-size: 11px;
+  pointer-events: none;
+}
+.memory-graph-edge-label {
+  fill: #94a3b8;
+  font-size: 9px;
+  pointer-events: none;
+}
+.memory-graph-empty {
+  fill: #9ca3af;
+  font-size: 13px;
+}
+.memory-graph-inspector {
+  margin-top: 8px;
+  padding: 9px 10px;
+  border-top: 1px solid #eef0f3;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.memory-graph-inspector strong { color: #374151; }
+.memory-graph-inspector p { margin: 3px 0; white-space: pre-wrap; }
+.memory-graph-inspector button { height: 26px; padding: 0 9px; font-size: 11px; }
 .memory-list {
   display: flex;
   flex-direction: column;

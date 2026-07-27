@@ -385,6 +385,26 @@
             <input id="memorySearch" type="search" placeholder="搜索记忆…" />
             <button id="memoryRefresh" type="button" class="ghost">刷新</button>
           </div>
+          <div class="memory-view-switch" role="tablist" aria-label="记忆视图">
+            <button id="memoryListView" type="button" class="ghost active" role="tab" aria-selected="true">列表</button>
+            <button id="memoryGraphView" type="button" class="ghost" role="tab" aria-selected="false">关系图</button>
+          </div>
+          <div id="memoryGraphPanel" class="memory-graph-panel" hidden>
+            <div class="memory-graph-toolbar">
+              <label>展开层数
+                <select id="memoryGraphDepth" aria-label="关系图展开层数">
+                  <option value="1">一度关系</option>
+                  <option value="2">二度关系</option>
+                </select>
+              </label>
+              <button id="memoryGraphRefresh" type="button" class="ghost">刷新关系图</button>
+              <span id="memoryGraphStatus" class="hint" role="status"></span>
+            </div>
+            <div id="memoryGraphViewport" class="memory-graph-viewport">
+              <svg id="memoryGraphSvg" viewBox="0 0 760 430" role="img" aria-label="记忆关系图"></svg>
+            </div>
+            <div id="memoryGraphInspector" class="memory-graph-inspector" hidden></div>
+          </div>
           <div id="memoryList" class="memory-list">
             <p class="memory-empty">暂无记忆</p>
           </div>

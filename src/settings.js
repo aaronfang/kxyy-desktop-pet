@@ -1252,6 +1252,216 @@ function renderMemoryItems(items) {
   }
 }
 
+let memoryView = "list";
+let memoryGraphResult = null;
+let memoryGraphSelectedKey = "";
+
+const MEMORY_GRAPH_COLORS = {
+  user: "#64748b",
+  episode: "#d97706",
+  fact: "#be567a",
+  commitment: "#2563eb",
+  topic: "#0f766e",
+  entity: "#7c3aed",
+};
+
+function graphKey(node) {
+  return `${node.kind}:${node.id}`;
+}
+
+function truncateGraphLabel(value, max = 18) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text || "未命名";
+}
+
+function svgElement(name, attributes = {}) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+  return node;
+}
+
+function renderMemoryGraph(result) {
+  const svg = el("memoryGraphSvg");
+  const inspector = el("memoryGraphInspector");
+  if (!svg) return;
+  svg.replaceChildren();
+  memoryGraphResult = result || { nodes: [], edges: [] };
+  const nodes = Array.isArray(memoryGraphResult.nodes) ? memoryGraphResult.nodes : [];
+  const edges = Array.isArray(memoryGraphResult.edges) ? memoryGraphResult.edges : [];
+  if (memoryGraphSelectedKey && !nodes.some((node) => graphKey(node) === memoryGraphSelectedKey)) {
+    memoryGraphSelectedKey = "";
+  }
+  const positions = new Map();
+  const centerX = 380;
+  const centerY = 212;
+  const radius = Math.min(170, Math.max(70, nodes.length * 16));
+  nodes.forEach((node, index) => {
+    const angle = nodes.length === 1 ? 0 : (-Math.PI / 2) + (index * Math.PI * 2 / nodes.length);
+    positions.set(graphKey(node), {
+      x: centerX + Math.cos(angle) * radius,
+      y: centerY + Math.sin(angle) * radius,
+    });
+  });
+  const nodeByKey = new Map(nodes.map((node) => [graphKey(node), node]));
+  for (const edge of edges) {
+    const from = positions.get(`${edge.fromKind}:${edge.fromId}`);
+    const to = positions.get(`${edge.toKind}:${edge.toId}`);
+    if (!from || !to) continue;
+    svg.appendChild(svgElement("line", {
+      x1: from.x, y1: from.y, x2: to.x, y2: to.y,
+      class: `memory-graph-edge${edge.derived ? " derived" : ""}`,
+    }));
+    const label = svgElement("text", {
+      x: (from.x + to.x) / 2,
+      y: (from.y + to.y) / 2 - 4,
+      "text-anchor": "middle",
+      class: "memory-graph-edge-label",
+    });
+    label.textContent = edge.relation || "关系";
+    svg.appendChild(label);
+  }
+  if (!nodes.length) {
+    const empty = svgElement("text", { x: centerX, y: centerY, "text-anchor": "middle", class: "memory-graph-empty" });
+    empty.textContent = "暂无符合条件的关系图节点";
+    svg.appendChild(empty);
+  }
+  for (const node of nodes) {
+    const point = positions.get(graphKey(node));
+    const group = svgElement("g", {
+      class: `memory-graph-node${memoryGraphSelectedKey === graphKey(node) ? " selected" : ""}`,
+      tabindex: "0",
+      role: "button",
+      "aria-label": `${node.kind}：${node.label || node.text}`,
+    });
+    const circle = svgElement("circle", {
+      cx: point.x,
+      cy: point.y,
+      r: node.pinned ? 19 : 15,
+      fill: MEMORY_GRAPH_COLORS[node.kind] || "#64748b",
+      opacity: node.status === "disputed" ? "0.62" : "0.92",
+    });
+    const text = svgElement("text", {
+      x: point.x,
+      y: point.y + 32,
+      "text-anchor": "middle",
+    });
+    text.textContent = truncateGraphLabel(node.label || node.text);
+    group.append(circle, text);
+    const select = () => {
+      memoryGraphSelectedKey = graphKey(node);
+      renderMemoryGraph(memoryGraphResult);
+      renderMemoryGraphInspector(node, nodeByKey);
+    };
+    group.addEventListener("click", select);
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        select();
+      }
+    });
+    svg.appendChild(group);
+  }
+  if (inspector && !memoryGraphSelectedKey) inspector.hidden = true;
+}
+
+function renderMemoryGraphInspector(node, nodeByKey = new Map()) {
+  const inspector = el("memoryGraphInspector");
+  if (!inspector || !node) return;
+  inspector.hidden = false;
+  inspector.replaceChildren();
+  const title = document.createElement("p");
+  const strong = document.createElement("strong");
+  strong.textContent = `${memoryKindLabel(node.kind)}：`;
+  title.append(strong, document.createTextNode(node.label || node.text || "未命名"));
+  const meta = document.createElement("p");
+  meta.textContent = `状态：${memoryStatusLabel(node.status)} · 置信度：${Math.round((node.confidence || 0) * 100)}% · 重要度：${Math.round((node.importance || 0) * 100)}%${node.pinned ? " · 已置顶" : ""}`;
+  const source = document.createElement("p");
+  source.textContent = node.sourceEventIds?.length
+    ? `来源事件：${node.sourceEventIds.slice(0, 3).join("、")}`
+    : "来源事件：暂无";
+  inspector.append(title, meta, source);
+  if (node.text && node.text !== node.label) {
+    const content = document.createElement("p");
+    content.textContent = node.text;
+    inspector.appendChild(content);
+  }
+  if (["fact", "episode", "commitment"].includes(node.kind)) {
+    const button = memoryActionButton("在列表中查看", () => {
+      memoryView = "list";
+      updateMemoryViewButtons();
+      el("memoryKind").value = node.kind;
+      el("memorySearch").value = node.label || node.text || "";
+      void loadMemoryPage({ resetPage: true });
+    });
+    inspector.appendChild(button);
+  }
+}
+
+async function loadMemoryGraph() {
+  const status = el("memoryGraphStatus");
+  const refresh = el("memoryGraphRefresh");
+  if (!el("memoryGraphPanel")) return;
+  if (refresh) refresh.disabled = true;
+  if (status) status.textContent = "读取关系图中…";
+  try {
+    const result = await invoke("memory_graph", {
+      query: {
+        cardId: selectedMemoryCardId(),
+        nickname: el("memoryNickname").value.trim(),
+        scope: el("memoryNickname").value.trim() ? "user" : "card",
+        search: el("memorySearch").value.trim(),
+        kind: el("memoryKind").value,
+        status: el("memoryStatus").value,
+        depth: Number(el("memoryGraphDepth")?.value || 1),
+        maxNodes: 200,
+      },
+    });
+    renderMemoryGraph(result);
+    if (status) {
+      const count = Array.isArray(result?.nodes) ? result.nodes.length : 0;
+      status.textContent = `${count} 个节点 · ${result?.edges?.length || 0} 条关系${result?.truncated ? " · 已按 200 节点截断" : ""}`;
+    }
+  } catch (e) {
+    renderMemoryGraph({ nodes: [], edges: [] });
+    if (status) status.textContent = `读取关系图失败：${e.message || e}`;
+  } finally {
+    if (refresh) refresh.disabled = false;
+  }
+}
+
+function updateMemoryViewButtons() {
+  const listButton = el("memoryListView");
+  const graphButton = el("memoryGraphView");
+  const panel = el("memoryGraphPanel");
+  const list = el("memoryList");
+  const pagination = el("memoryPageInfo")?.parentElement;
+  if (listButton) {
+    listButton.classList.toggle("active", memoryView === "list");
+    listButton.setAttribute("aria-selected", memoryView === "list" ? "true" : "false");
+  }
+  if (graphButton) {
+    graphButton.classList.toggle("active", memoryView === "graph");
+    graphButton.setAttribute("aria-selected", memoryView === "graph" ? "true" : "false");
+  }
+  if (panel) panel.hidden = memoryView !== "graph";
+  if (list) list.hidden = memoryView === "graph";
+  if (pagination) pagination.hidden = memoryView === "graph";
+}
+
+el("memoryListView")?.addEventListener("click", () => {
+  memoryView = "list";
+  updateMemoryViewButtons();
+});
+el("memoryGraphView")?.addEventListener("click", () => {
+  memoryView = "graph";
+  updateMemoryViewButtons();
+  void loadMemoryGraph();
+});
+el("memoryGraphRefresh")?.addEventListener("click", () => void loadMemoryGraph());
+el("memoryGraphDepth")?.addEventListener("change", () => {
+  if (memoryView === "graph") void loadMemoryGraph();
+});
+
 async function loadMemoryPage({ resetPage = false } = {}) {
   if (!el("memoryList")) return;
   if (resetPage) memoryPage = 1;
@@ -1276,6 +1486,7 @@ async function loadMemoryPage({ resetPage = false } = {}) {
     el("memoryPrev").disabled = memoryPage <= 1;
     el("memoryNext").disabled = memoryPage >= pages;
     await refreshMemoryStats();
+    if (memoryView === "graph") await loadMemoryGraph();
   } catch (e) {
     el("memoryList").textContent = `读取记忆失败：${e.message || e}`;
   }
