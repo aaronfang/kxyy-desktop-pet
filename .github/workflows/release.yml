@@ -297,6 +297,7 @@ jobs:
           releaseBody: ${{ steps.release-notes.outputs.body }}
           releaseDraft: false
           prerelease: false
+          assetNamePattern: "kxyy-desktop-pet_[version]_[platform]-[arch][setup][ext]"
           args: ${{ matrix.args }}
 
       - name: Restore plaintext persona assets
