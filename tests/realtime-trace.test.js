@@ -856,6 +856,33 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
 });
 
+test("visible chat can resume an interrupted audio context without rebuilding the session", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  let resumed = 0;
+  let flushed = 0;
+  session.audioCtx = {
+    state: "interrupted",
+    currentTime: 4,
+    async resume() {
+      resumed += 1;
+      this.state = "running";
+    },
+  };
+  session._flushPendingPcm = () => { flushed += 1; };
+
+  await session.resumeAudio();
+  assert.equal(resumed, 1);
+  assert.equal(flushed, 1);
+  assert.equal(session.playHead, 4);
+
+  session.stopped = true;
+  await session.resumeAudio();
+  assert.equal(resumed, 1);
+  assert.equal(flushed, 1);
+});
+
 test("proactive welcome is one-shot, negotiated and cancelled by user speech", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const sockets = [];

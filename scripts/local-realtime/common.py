@@ -568,6 +568,12 @@ PROACTIVE_WELCOME_PROMPT = (
 )
 MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
 TURN_MEMORY_CAPABILITY = "turn-final-v1"
+
+
+def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> float:
+    """Pace provider PCM at the source audio clock; queues absorb jitter, not speed-up."""
+
+    return max(0.0, samples_sent / OUTPUT_RATE - max(0.0, elapsed_seconds))
 TURN_MEMORY_WAIT_SECONDS = 0.1
 TURN_MEMORY_MAX_ITEMS = 3
 TURN_MEMORY_MAX_CHARS = 300
@@ -3392,8 +3398,14 @@ class Session:
                                         return
                                     speaking_sent = True
                                 stream_started_at = time.perf_counter()
+                            paused_at = time.perf_counter() if not self.play_enabled else None
                             while not self.play_enabled and scope.active:
                                 await asyncio.sleep(0.02)
+                            if paused_at is not None:
+                                # Candidate duck/pause time is not playback time. Shift the
+                                # audio clock so a rejected candidate cannot make the sender
+                                # burst queued provider chunks into the frontend ring.
+                                stream_started_at += time.perf_counter() - paused_at
                             if not scope.active or not await self.send_downlink_pcm(
                                 chunk,
                                 scope=scope,
@@ -3403,10 +3415,13 @@ class Session:
                                 return
                             chunks_sent += 1
                             samples_sent += chunk_samples
-                            # Provider 可能突发返回；单调 pacer 把发送速率限制在实时音频的
-                            # 约 1.33x，避免一次塞满前端 3 秒测试 ring。
-                            target_elapsed = (samples_sent / OUTPUT_RATE) * 0.75
-                            delay = target_elapsed - (time.perf_counter() - stream_started_at)
+                            # Provider 可能突发返回；严格按音频时钟发送，避免持续以
+                            # 1.33x 灌入前端 3 秒 ring。后者会在长句中稳定地产生丢样本，
+                            # 表现为跳音、音色突变、音量/语速异常。队列只用于吸收短时抖动。
+                            delay = realtime_stream_pacing_delay(
+                                samples_sent,
+                                time.perf_counter() - stream_started_at,
+                            )
                             if delay > 0:
                                 await asyncio.sleep(delay)
                         if not scope.active:

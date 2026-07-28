@@ -24,3 +24,10 @@
 1. 清空测试 card / `Memory M0 QA` scope，确认 facts、episodes、commitments、jobs 和 FTS 均为 0。
 2. 恢复原文字 provider、Key、模型、昵称、人设卡和窗口设置。
 3. 在 [`roadmap-memory-brain.md`](./roadmap-memory-brain.md) 记录应用版本、commit、平台和结果；未实际执行的项不得勾选。
+
+## 2026-07-29 实机记录
+
+- 平台 / 版本：macOS Apple Silicon，App `0.2.43`。
+- 用户实测通过：别记这段、纠错、单条删除、退出 / 重启恢复、无 Key 恢复、Ollama 恢复。
+- `0.2.44` 补充并由自动测试覆盖：按单个昵称清空；数据库备份列表、恢复前安全备份、恢复、失败回滚和恢复后的 worker 代际隔离。
+- 未在本记录中声称完成：数据库锁故障注入；SenseVoice 与 Whisper 的声学准确率 A/B。

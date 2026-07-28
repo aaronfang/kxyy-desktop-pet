@@ -788,8 +788,11 @@ button.danger:disabled {
 }
 .memory-maintenance-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .memory-maintenance-actions button { height: 29px; padding: 0 10px; font-size: 12px; }
+.memory-backup-restore { display: flex; gap: 8px; margin-top: 9px; }
+.memory-backup-restore select { min-width: 0; flex: 1; }
+.memory-backup-restore button { flex: 0 0 auto; }
 .memory-maintenance p { margin: 7px 0 0; }
-.memory-danger-zone { margin-top: 18px; padding-top: 14px; border-top: 1px solid #fee2e2; }
+.memory-danger-zone { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #fee2e2; }
 .memory-empty { color: #9ca3af; text-align: center; margin: 48px 0; }
 @media (max-width: 760px) {
   .memory-filters { grid-template-columns: 1fr 1fr; }

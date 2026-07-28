@@ -2186,6 +2186,12 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         common.start_llm_stream_producer = fake_start
         common._tts_stream_slots = threading.BoundedSemaphore(common.TTS_STREAM_MAX_TASKS)
 
+    def test_realtime_stream_pacer_uses_the_source_audio_clock(self):
+        one_second = common.OUTPUT_RATE
+        self.assertAlmostEqual(common.realtime_stream_pacing_delay(one_second, 0.25), 0.75)
+        self.assertEqual(common.realtime_stream_pacing_delay(one_second, 1.0), 0.0)
+        self.assertEqual(common.realtime_stream_pacing_delay(one_second, 1.5), 0.0)
+
     async def asyncTearDown(self):
         if self.session.reply_task:
             await self.session.reply_task

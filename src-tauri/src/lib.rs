@@ -1739,6 +1739,8 @@ pub fn run() {
             memory::memory_integrity_check,
             memory::memory_export,
             memory::memory_backup,
+            memory::memory_list_backups,
+            memory::memory_restore_backup,
             memory::memory_verify_backup,
             memory::memory_rebuild_derived,
             memory::memory_rebuild_from_events,

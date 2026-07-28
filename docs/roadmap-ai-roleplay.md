@@ -1,6 +1,6 @@
 # 元元桌宠 · AI 角色扮演体验分析报告与改进路线图
 
-> 状态基准：2026-07-28，当前正式版为 `v0.2.43`。下面的完成度按“已发布 / 测试版或部分实现 / 待实现”描述，不使用主观百分比；Memory 与实时语音的实现边界分别以各自专项路线图为准。
+> 状态基准：2026-07-29，当前正式版为 `v0.2.44`。下面的完成度按“已发布 / 测试版或部分实现 / 待实现”描述，不使用主观百分比；Memory 与实时语音的实现边界分别以各自专项路线图为准。
 
 | 方向 | 当前状态 | 已交付 | 下一硬门槛 |
 |---|---|---|---|
@@ -92,8 +92,8 @@ graph TD
 | 文字对话 | DeepSeek (`deepseek-v4-flash`/`deepseek-v4-pro` + `thinking.type`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换；0.2.29 本地迁移旧模型名并拒绝透传未知值 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
-| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR 与诊断 schema v5，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Windows/Linux Qwen TTS/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
-| 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3/v3.1 | `memory.rs` + Tauri IPC | 事实/经历/约定、事件时间线、关系图、异步巩固、选择性召回和管理页；已随 App `v0.2.43` 正式发布，后续路线以 `roadmap-memory-brain.md` 为准 |
+| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR，当前诊断 schema 为 v6；0.2.44 补充 IPv4 优先下载、阶段进度、1× PCM pacing 和隐藏窗口音频恢复，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Windows/Linux Qwen TTS/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
+| 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3/v3.1 | `memory.rs` + Tauri IPC | 事实/经历/约定、事件时间线、关系图、异步巩固、选择性召回和管理页；`v0.2.44` 增加单昵称清除和数据库备份恢复，后续路线以 `roadmap-memory-brain.md` 为准 |
 | 会话摘要 | 复用文字模型 | 同上 | `chat.js` + Memory v3 | 最近对话与滚动摘要保留为工作记忆，跨会话不再全量注入 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |
 

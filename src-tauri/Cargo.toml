@@ -1,6 +1,6 @@
 [package]
 name = "kxyy-desktop-pet"
-version = "0.2.43"
+version = "0.2.44"
 description = "元元桌宠"
 authors = ["aaronfang"]
 license = "MIT"
@@ -36,7 +36,7 @@ uuid = { version = "1", features = ["v4"] }
 # 注册表卡片生成时用当前日期填充 meta.created
 chrono = "0.4"
 # Memory v3：使用随应用编译的 SQLite，避免依赖用户机器上的系统 SQLite。
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 # 进程被外部信号强杀时（SIGINT/SIGTERM、Windows Ctrl+C/关闭控制台/注销/关机）的兜底清理，
 # 避免托管的本地语音子进程（server.py）变成孤儿。termination 特性额外覆盖 SIGTERM/SIGHUP。
 ctrlc = { version = "3", features = ["termination"] }

@@ -17,6 +17,7 @@ const RECENT_LOG_MAX_LINES: usize = 30;
 const SETUP_LOG_MAX_LINES: usize = 40;
 /// 启动超过该时间仍未就绪时更新一次进度；子进程存活期间继续探测，不误报失败。
 const STARTUP_SLOW_NOTICE_SECS: u64 = 180;
+const SENSEVOICE_PROGRESS_PREFIX: &str = "KXYY_SENSEVOICE_PROGRESS ";
 
 /// 进程级共享 secret：拉起本地 TTS 服务时经环境变量 KXYY_TTS_SECRET 注入，
 /// 代理转发 /tts 时带同值 X-Tts-Secret 头，阻止任意本机进程直接刷云端计费。
@@ -195,6 +196,67 @@ fn take_log_summary(logs: &Arc<Mutex<VecDeque<String>>>) -> String {
     msg
 }
 
+fn parse_sensevoice_install_progress(line: &str) -> Option<serde_json::Value> {
+    let raw = line.strip_prefix(SENSEVOICE_PROGRESS_PREFIX)?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let object = value.as_object()?;
+    let state = object.get("state")?.as_str()?;
+    let phase = object.get("phase")?.as_str()?;
+    let message = object.get("message")?.as_str()?;
+    if !matches!(state, "installing" | "ready" | "failed")
+        || !matches!(
+            phase,
+            "downloading" | "installing" | "extracting" | "verifying" | "complete" | "failed"
+        )
+        || message.is_empty()
+        || message.chars().count() > 120
+        || message.contains(['\n', '\r', '\\'])
+        || message.contains("/private/")
+        || message.contains("/Users/")
+        || message.to_ascii_lowercase().contains("://")
+    {
+        return None;
+    }
+    let completed_bytes = object
+        .get("completedBytes")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0)
+        .min(1_000_000_000);
+    let total_bytes = object
+        .get("totalBytes")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0)
+        .min(1_000_000_000);
+    let raw_reason = object.get("reason").and_then(|item| item.as_str());
+    if raw_reason.is_some_and(|reason| {
+        !matches!(
+            reason,
+            "runtime-root-unavailable"
+                | "download-failed"
+                | "download-integrity-failed"
+                | "install-busy"
+                | "subprocess-failed"
+                | "model-archive-invalid"
+                | "model-integrity-failed"
+                | "unsupported-python"
+                | "unsupported-arch"
+                | "unsupported-os"
+                | "install-failed"
+        )
+    }) {
+        return None;
+    }
+    let reason = raw_reason.unwrap_or("");
+    Some(serde_json::json!({
+        "state": state,
+        "phase": phase,
+        "message": message,
+        "completedBytes": completed_bytes,
+        "totalBytes": total_bytes,
+        "reason": reason,
+    }))
+}
+
 /// macOS 从 Finder 启动时 PATH 常不含 Homebrew；本地语音 ASR（mlx-whisper）依赖 ffmpeg CLI。
 pub(crate) fn augmented_tool_path() -> std::ffi::OsString {
     let current = std::env::var_os("PATH").unwrap_or_default();
@@ -273,10 +335,11 @@ mod fingerprint_tests {
     use super::{
         backend_still_selected, begin_sensevoice_runtime_install, begin_vad_runtime_install,
         finish_sensevoice_runtime_install, finish_vad_runtime_install, normalize_asr_provider,
-        normalize_turn_pause_tolerance, record_desired_voice_config, resolve_hf_endpoint,
-        sensevoice_install_matches_target, should_defer_for_vad_install,
-        should_restart_for_fingerprint, startup_slow_message, supports_vad_runtime_install,
-        voice_target_still_selected, VoiceServiceManager, DEFAULT_HF_ENDPOINT,
+        normalize_turn_pause_tolerance, parse_sensevoice_install_progress,
+        record_desired_voice_config, resolve_hf_endpoint, sensevoice_install_matches_target,
+        should_defer_for_vad_install, should_restart_for_fingerprint, startup_slow_message,
+        supports_vad_runtime_install, voice_target_still_selected, VoiceServiceManager,
+        DEFAULT_HF_ENDPOINT,
     };
 
     #[test]
@@ -417,6 +480,29 @@ mod fingerprint_tests {
         finish_sensevoice_runtime_install(&mut inner, "local");
         assert!(inner.sensevoice_install_backend.is_empty());
         assert!(begin_vad_runtime_install(&mut inner, "local"));
+    }
+
+    #[test]
+    fn sensevoice_install_progress_accepts_only_bounded_fixed_shape_messages() {
+        let valid = parse_sensevoice_install_progress(
+            "KXYY_SENSEVOICE_PROGRESS {\"state\":\"installing\",\"phase\":\"downloading\",\"message\":\"正在下载 SenseVoice 模型（3/3，总进度 80%）…\",\"completedBytes\":800,\"totalBytes\":1000}",
+        )
+        .unwrap();
+        assert_eq!(valid["completedBytes"], 800);
+        assert_eq!(valid["totalBytes"], 1000);
+        assert_eq!(valid["reason"], "");
+
+        let failed = parse_sensevoice_install_progress(
+            "KXYY_SENSEVOICE_PROGRESS {\"state\":\"failed\",\"phase\":\"failed\",\"message\":\"SenseVoice runtime 安装失败：下载失败，请检查网络后重试。\",\"reason\":\"download-failed\"}",
+        )
+        .unwrap();
+        assert_eq!(failed["reason"], "download-failed");
+
+        assert!(parse_sensevoice_install_progress("untrusted output").is_none());
+        assert!(parse_sensevoice_install_progress(
+            "KXYY_SENSEVOICE_PROGRESS {\"state\":\"failed\",\"phase\":\"failed\",\"message\":\"泄露 /private/path\",\"reason\":\"future-reason\"}"
+        )
+        .is_none());
     }
 }
 
@@ -1193,7 +1279,7 @@ pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<
         cmd.arg(&script)
             .current_dir(script.parent().unwrap_or(Path::new(".")))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env("KXYY_ASR_RUNTIME_ROOT", &runtime_root)
             .env("PYTHONUTF8", "1")
@@ -1205,7 +1291,27 @@ pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let success = cmd.status().map(|status| status.success()).unwrap_or(false);
+        let mut failure_detail = None;
+        let success = match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(stdout) = child.stdout.take() {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        let Some(payload) = parse_sensevoice_install_progress(&line) else {
+                            continue;
+                        };
+                        if payload.get("state").and_then(|value| value.as_str()) == Some("failed") {
+                            failure_detail = payload
+                                .get("message")
+                                .and_then(|value| value.as_str())
+                                .map(ToOwned::to_owned);
+                        }
+                        let _ = app2.emit("sensevoice-runtime-install-progress", payload);
+                    }
+                }
+                child.wait().map(|status| status.success()).unwrap_or(false)
+            }
+            Err(_) => false,
+        };
         let manager = app2.state::<VoiceServiceManager>();
         let Ok(_lifecycle) = manager.lifecycle.lock() else {
             return;
@@ -1227,19 +1333,29 @@ pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<
             Err(_) => return,
         };
         let (state, message) = match (success, still_selected) {
-            (true, true) => ("ready", "SenseVoice runtime 已就绪，正在重启当前语音服务…"),
+            (true, true) => (
+                "ready",
+                "SenseVoice runtime 已就绪，正在重启当前语音服务…".to_string(),
+            ),
             (true, false) => (
                 "ready",
-                "SenseVoice runtime 已就绪；当前语音设置已改变，未重启服务",
+                "SenseVoice runtime 已就绪；当前语音设置已改变，未重启服务".to_string(),
             ),
-            (false, true) => (
-                "failed",
-                "SenseVoice runtime 安装失败；正在恢复当前语音服务",
-            ),
-            (false, false) => (
-                "failed",
-                "SenseVoice runtime 安装失败；当前语音设置已改变，未重启服务",
-            ),
+            (false, true) => {
+                let detail = failure_detail
+                    .as_deref()
+                    .unwrap_or("SenseVoice runtime 安装失败");
+                ("failed", format!("{detail}；正在恢复当前语音服务"))
+            }
+            (false, false) => {
+                let detail = failure_detail
+                    .as_deref()
+                    .unwrap_or("SenseVoice runtime 安装失败");
+                (
+                    "failed",
+                    format!("{detail}；当前语音设置已改变，未重启服务"),
+                )
+            }
         };
         let _ = app2.emit(
             "sensevoice-runtime-install-progress",

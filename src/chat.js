@@ -2731,21 +2731,35 @@ listen("apply-settings", async ({ payload }) => {
 // 设置页清空长期记忆：同步内存态，并避免收起窗口时把当前会话再写回记忆。
 listen("memory-cleared", ({ payload }) => {
   if ((payload?.cardId || "") !== (settings.personaCardId || "")) return;
+  if (payload?.nickname && payload.nickname.trim().toLowerCase() !== (activeName || "").trim().toLowerCase()) return;
   history.forEach((m) => { if (m?.id) memoryEnqueuedIds.add(m.id); });
 });
 
-/** 收起或退出前：挂断通话（把最后一轮写入 history）、停朗读，再刷长期记忆。 */
-async function prepareAndFlushMemory() {
-  if (callActive) endCall({ notice: false });
-  stopSpeak();
-  resetTtsQueue();
+/** 退出前挂断通话（把最后一轮写入 history）；收起窗口则保留通话。 */
+async function prepareAndFlushMemory({ hangup = true } = {}) {
+  // 隐藏聊天窗口不是挂断电话：Rust 仍保持 realtime WebSocket，窗口重新显示
+  // 后继续接收文字和音频。此时也不能提前巩固正在增长的可听助手句段，
+  // 否则同一消息 ID 被标成已入队后，恢复窗口继续播放的尾段会永久漏记。
+  if (!hangup && callActive) return;
+  // 真正退出/设置变更时才释放会话和音频设备，并在定稿后一次性入队。
+  if (hangup && callActive) await endCall({ notice: false });
+  if (!callActive) {
+    stopSpeak();
+    resetTtsQueue();
+  }
   await enqueueMemory();
 }
 
 // 聊天窗口收起时：停掉朗读，并把本次对话增量写入持久化队列。
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    void prepareAndFlushMemory();
+    void prepareAndFlushMemory({ hangup: false });
+    return;
+  }
+  if (document.visibilityState === "visible" && callActive) {
+    // macOS/WKWebView 常在隐藏窗口时挂起 Web Audio；恢复时只 resume，
+    // 不重建节点、不清空已排队的 PCM。
+    void callSession?.resumeAudio?.();
   }
 });
 
