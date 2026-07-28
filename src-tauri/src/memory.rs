@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveDateTime;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
@@ -22,11 +22,13 @@ const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 // tokenizer dependency in the desktop bundle.
 const RECALL_CHAR_BUDGET: usize = 500;
 const MAX_RECALL_ITEMS: usize = 6;
+const MAX_LISTED_BACKUPS: usize = 100;
 
 pub struct MemoryState {
     db_path: Option<PathBuf>,
     conn: Mutex<Option<Connection>>,
     worker_running: AtomicBool,
+    database_generation: AtomicU64,
     wake_generation: Mutex<u64>,
     worker_wakeup: Condvar,
     last_error: Mutex<Option<String>>,
@@ -64,6 +66,7 @@ impl MemoryState {
             db_path: path,
             conn: Mutex::new(conn),
             worker_running: AtomicBool::new(false),
+            database_generation: AtomicU64::new(0),
             wake_generation: Mutex::new(0),
             worker_wakeup: Condvar::new(),
             last_error: Mutex::new(error),
@@ -1034,6 +1037,25 @@ pub struct MemoryBackupResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryBackupEntry {
+    pub path: String,
+    pub file_name: String,
+    pub bytes: u64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRestoreResponse {
+    pub restored_from: String,
+    pub safety_backup_path: String,
+    pub schema_version: i64,
+    pub integrity_result: String,
+    pub foreign_key_errors: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryRebuildResponse {
     pub schema_version: i64,
     pub rebuilt_search_rows: i64,
@@ -1753,9 +1775,22 @@ fn backup_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn verify_backup_file(path: &PathBuf) -> Result<MemoryBackupResponse, String> {
+fn verify_backup_file(path: &Path) -> Result<MemoryBackupResponse, String> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("打开备份失败：{e}"))?;
+    let required_tables = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type IN ('table','view')
+               AND name IN ('memory_meta','memory_users','memory_jobs','memory_episodes',
+                            'memory_facts','memory_commitments','memory_search')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("检查备份结构失败：{e}"))?;
+    if required_tables != 7 {
+        return Err("所选文件不是受支持的 Memory 数据库备份".into());
+    }
     let integrity_result = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
         .map_err(|e| format!("备份完整性检查失败：{e}"))?;
@@ -1782,6 +1817,86 @@ fn verify_backup_file(path: &PathBuf) -> Result<MemoryBackupResponse, String> {
     })
 }
 
+fn create_backup_file(
+    app: &AppHandle,
+    conn: &mut Connection,
+    prefix: &str,
+) -> Result<MemoryBackupResponse, String> {
+    maintenance(conn).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| e.to_string())?;
+    let dir = backup_dir(app)?;
+    let path = dir.join(format!("{prefix}-{}-{}.sqlite3", now_ts(), Uuid::new_v4()));
+    conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+        .map_err(|e| format!("创建备份失败：{e}"))?;
+    match verify_backup_file(&path) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            Err(error)
+        }
+    }
+}
+
+fn validated_backup_path(app: &AppHandle, requested: &str) -> Result<PathBuf, String> {
+    let dir = backup_dir(app)?
+        .canonicalize()
+        .map_err(|e| format!("无法读取记忆备份目录：{e}"))?;
+    let path = PathBuf::from(requested)
+        .canonicalize()
+        .map_err(|e| format!("找不到所选备份：{e}"))?;
+    if path.parent() != Some(dir.as_path())
+        || path.extension().and_then(|v| v.to_str()) != Some("sqlite3")
+    {
+        return Err("只能使用应用记忆备份目录中的 SQLite 备份".into());
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+pub fn memory_list_backups(app: AppHandle) -> Result<Vec<MemoryBackupEntry>, String> {
+    let dir = backup_dir(&app)?;
+    let mut entries = Vec::new();
+    for item in fs::read_dir(&dir).map_err(|e| format!("读取记忆备份目录失败：{e}"))? {
+        let item = item.map_err(|e| format!("读取记忆备份失败：{e}"))?;
+        let path = item.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("sqlite3") {
+            continue;
+        }
+        let file_type = item
+            .file_type()
+            .map_err(|e| format!("读取备份类型失败：{e}"))?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let metadata = item
+            .metadata()
+            .map_err(|e| format!("读取备份信息失败：{e}"))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let created_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        entries.push(MemoryBackupEntry {
+            path: path.display().to_string(),
+            file_name: item.file_name().to_string_lossy().into_owned(),
+            bytes: metadata.len(),
+            created_at,
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.file_name.cmp(&a.file_name))
+    });
+    entries.truncate(MAX_LISTED_BACKUPS);
+    Ok(entries)
+}
+
 #[tauri::command]
 pub fn memory_backup(
     app: AppHandle,
@@ -1791,14 +1906,7 @@ pub fn memory_backup(
     let conn = guard
         .as_mut()
         .ok_or_else(|| "记忆数据库不可用".to_string())?;
-    maintenance(conn).map_err(|e| e.to_string())?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .map_err(|e| e.to_string())?;
-    let dir = backup_dir(&app)?;
-    let path = dir.join(format!("memory-v5-{}-{}.sqlite3", now_ts(), Uuid::new_v4()));
-    conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
-        .map_err(|e| format!("创建备份失败：{e}"))?;
-    verify_backup_file(&path)
+    create_backup_file(&app, conn, "memory-v5")
 }
 
 #[tauri::command]
@@ -1806,12 +1914,89 @@ pub fn memory_verify_backup(
     app: AppHandle,
     request: MemoryBackupRequest,
 ) -> Result<MemoryBackupResponse, String> {
-    let dir = backup_dir(&app)?;
-    let path = PathBuf::from(&request.path);
-    if path.parent() != Some(dir.as_path()) {
-        return Err("只能验证应用记忆备份目录中的文件".into());
-    }
+    let path = validated_backup_path(&app, &request.path)?;
     verify_backup_file(&path)
+}
+
+fn copy_database(source_path: &Path, destination: &mut Connection) -> Result<(), String> {
+    let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打开备份失败：{e}"))?;
+    let backup = rusqlite::backup::Backup::new(&source, destination)
+        .map_err(|e| format!("准备恢复备份失败：{e}"))?;
+    backup
+        .run_to_completion(128, Duration::from_millis(5), None)
+        .map_err(|e| format!("恢复备份失败：{e}"))
+}
+
+fn finish_restored_database(conn: &mut Connection) -> Result<MemoryIntegrityResponse, String> {
+    configure(conn).map_err(|e| format!("恢复数据库配置失败：{e}"))?;
+    migrate(conn).map_err(|e| format!("迁移恢复数据库失败：{e}"))?;
+    maintenance(conn).map_err(|e| format!("维护恢复数据库失败：{e}"))?;
+    let result = integrity_check(conn)?;
+    if !result.ok {
+        return Err(format!(
+            "恢复后的数据库未通过完整性检查：{}",
+            result.errors.join("；")
+        ));
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn memory_restore_backup(
+    app: AppHandle,
+    state: State<'_, MemoryState>,
+    request: MemoryBackupRequest,
+) -> Result<MemoryRestoreResponse, String> {
+    let source_path = validated_backup_path(&app, &request.path)?;
+    let verified = verify_backup_file(&source_path)?;
+    if verified.integrity_result != "ok" || verified.foreign_key_errors != 0 {
+        return Err("所选备份未通过完整性或外键检查，已拒绝恢复".into());
+    }
+    if verified.schema_version <= 0 || verified.schema_version > SCHEMA_VERSION {
+        return Err(format!(
+            "备份数据库版本 {} 不受当前应用支持",
+            verified.schema_version
+        ));
+    }
+
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let safety = create_backup_file(&app, conn, "memory-pre-restore")?;
+    state.database_generation.fetch_add(1, Ordering::SeqCst);
+    let restored = copy_database(&source_path, conn).and_then(|_| finish_restored_database(conn));
+    let integrity = match restored {
+        Ok(result) => result,
+        Err(restore_error) => {
+            let rollback_path = PathBuf::from(&safety.path);
+            let rollback =
+                copy_database(&rollback_path, conn).and_then(|_| finish_restored_database(conn));
+            let error = match rollback {
+                Ok(_) => format!("{restore_error}；已自动恢复操作前的数据库"),
+                Err(rollback_error) => format!(
+                    "{restore_error}；自动回滚也失败：{rollback_error}。操作前备份保留在 {}",
+                    safety.path
+                ),
+            };
+            drop(guard);
+            trigger_worker(&app);
+            return Err(error);
+        }
+    };
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    state.clear_error();
+    let response = MemoryRestoreResponse {
+        restored_from: source_path.display().to_string(),
+        safety_backup_path: safety.path,
+        schema_version: integrity.schema_version,
+        integrity_result: integrity.integrity_result,
+        foreign_key_errors: integrity.foreign_key_errors,
+    };
+    drop(guard);
+    trigger_worker(&app);
+    Ok(response)
 }
 
 fn rebuild_search_index(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -4351,12 +4536,13 @@ fn worker_loop(app: AppHandle) {
             let generation = *state.wake_generation.lock().unwrap();
             generation
         };
-        let (database_available, job_result) = {
+        let (database_available, job_result, database_generation) = {
             let state = app.state::<MemoryState>();
             let mut guard = state.conn.lock().unwrap();
             let available = guard.is_some();
             let result = guard.as_mut().map(take_due_job);
-            (available, result)
+            let database_generation = state.database_generation.load(Ordering::SeqCst);
+            (available, result, database_generation)
         };
         if !database_available {
             break;
@@ -4402,6 +4588,9 @@ fn worker_loop(app: AppHandle) {
         let result = process_job(&app, &job);
         let state = app.state::<MemoryState>();
         let mut guard = state.conn.lock().unwrap();
+        if state.database_generation.load(Ordering::SeqCst) != database_generation {
+            continue;
+        }
         if let Some(conn) = guard.as_mut() {
             match result {
                 Ok(extraction) => {
@@ -6134,6 +6323,85 @@ mod tests {
         assert_eq!(verified.integrity_result, "ok");
         assert_eq!(verified.foreign_key_errors, 0);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_backup_restore_replaces_database_and_keeps_it_usable() {
+        let source = test_db();
+        get_or_create_user(&source, "restored-card", "昨晚").unwrap();
+        let path =
+            std::env::temp_dir().join(format!("kxyy-memory-restore-{}.sqlite3", Uuid::new_v4()));
+        source
+            .execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])
+            .unwrap();
+
+        let mut destination = test_db();
+        get_or_create_user(&destination, "current-card", "今天").unwrap();
+        copy_database(&path, &mut destination).unwrap();
+        let integrity = finish_restored_database(&mut destination).unwrap();
+        assert!(integrity.ok);
+        assert_eq!(
+            destination
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_users WHERE card_id='restored-card'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            destination
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_users WHERE card_id='current-card'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backup_verification_rejects_unrelated_sqlite_files() {
+        let path =
+            std::env::temp_dir().join(format!("kxyy-unrelated-backup-{}.sqlite3", Uuid::new_v4()));
+        let unrelated = Connection::open(&path).unwrap();
+        unrelated
+            .execute_batch(
+                "CREATE TABLE memory_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                 INSERT INTO memory_meta(key,value) VALUES('schema_version','5');",
+            )
+            .unwrap();
+        drop(unrelated);
+        assert!(verify_backup_file(&path)
+            .unwrap_err()
+            .contains("不是受支持的 Memory 数据库备份"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn nickname_scope_clear_preserves_other_users_on_the_same_card() {
+        let mut conn = test_db();
+        get_or_create_user(&conn, "card", "小明").unwrap();
+        get_or_create_user(&conn, "card", "小红").unwrap();
+        clear_scope(
+            &mut conn,
+            &MemoryClearRequest {
+                card_id: "card".into(),
+                nickname: " 小明 ".into(),
+            },
+        )
+        .unwrap();
+        assert!(find_user(&conn, "card", "小明").unwrap().is_none());
+        assert!(find_user(&conn, "card", "小红").unwrap().is_some());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_users", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

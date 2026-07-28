@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import tarfile
 import tempfile
 import unittest
@@ -167,6 +168,40 @@ class SenseVoiceRuntimeInstallerTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "download-invalid"):
                     installer._download_artifact(artifact, destination)
+
+    def test_download_prefers_ipv4_and_falls_back_to_ipv6_with_progress(self):
+        payload = b"fixed artifact"
+        artifact = [
+            "fixed.whl",
+            "https://files.pythonhosted.org/fixed.whl",
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        ]
+        families = []
+        progress = []
+
+        def resolve(_host, _port, family=0, *_args):
+            families.append(family)
+            if family == socket.AF_INET:
+                raise OSError("synthetic IPv4 failure")
+            return []
+
+        def open_url(*_args, **_kwargs):
+            installer.socket.getaddrinfo("example.invalid", 443)
+            return FakeResponse(artifact[1], payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / artifact[0]
+            with mock.patch.object(installer.socket, "getaddrinfo", side_effect=resolve):
+                with mock.patch.object(installer.urllib.request, "urlopen", side_effect=open_url):
+                    installer._download_artifact(
+                        artifact,
+                        destination,
+                        progress=lambda received, total: progress.append((received, total)),
+                    )
+            self.assertEqual(destination.read_bytes(), payload)
+        self.assertEqual(families, [socket.AF_INET, socket.AF_INET6])
+        self.assertEqual(progress, [(len(payload), len(payload))])
 
     def test_archive_materialization_keeps_only_locked_files_and_smoke(self):
         files = {

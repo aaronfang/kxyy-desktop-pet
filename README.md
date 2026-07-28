@@ -2,7 +2,7 @@
 
 一个会在桌面散步、攀爬、陪你聊天的跨平台桌宠。支持 **Windows / macOS**，基于 **Tauri 2 + Rust + WebView**。
 
-当前正式版：[`v0.2.43`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.43)
+当前正式版：[`v0.2.44`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.44)
 
 ## 先用起来
 
@@ -119,7 +119,7 @@ $venv = Join-Path $env:LOCALAPPDATA "元元桌宠\scripts\local-realtime\.venv-q
 
 ## Memory 与隐私
 
-Memory v3/v3.1 使用本机 SQLite 保存事实、共同经历、约定、来源事件和关系边。聊天前只召回少量相关内容；设置页可以搜索、编辑、置顶、兑现、删除、清空或查看关系图。数据库或模型不可用时会回退，不阻塞聊天。
+Memory v3/v3.1 使用本机 SQLite 保存事实、共同经历、约定、来源事件和关系边。聊天前只召回少量相关内容；设置页可以搜索、编辑、置顶、兑现、按昵称或人设清空、查看关系图，也可以创建并恢复数据库备份。恢复前会自动保存当前数据库，失败时自动回滚。数据库或模型不可用时会回退，不阻塞聊天。
 
 | 数据 | 保存或发送位置 |
 |---|---|
@@ -203,9 +203,9 @@ npm run encrypt-assets
 
 ## 发布
 
-1. 同步修改 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 和 `Cargo.lock` 的版本号。
+1. 同步修改 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 和 `Cargo.lock` 的版本号。
 2. 提交 `chore(release): vX.Y.Z`，先推 commit，再推 `vX.Y.Z` tag。
-3. GitHub Actions 校验版本，并构建 Windows x64、macOS ARM64 和 macOS Intel。
+3. 推送 tag 后 GitHub Actions 先校验版本并构建 Windows x64；需要 macOS 时，在同一 tag 上手动运行 Release workflow 并勾选 `include_macos`，追加 ARM64 和 Intel DMG。
 4. Changelog 根据 Conventional Commits 自动生成，完整历史见 [GitHub Releases](https://github.com/aaronfang/kxyy-desktop-pet/releases)。
 
 CI 与发布职责：
@@ -213,7 +213,8 @@ CI 与发布职责：
 | 触发 | 工作流 | 结果 |
 |---|---|---|
 | push / PR → `main` | [CI](.github/workflows/ci.yml) | Windows x64 + macOS ARM64 检查，不发布 |
-| push `v*` tag | [Release](.github/workflows/release.yml) | 校验版本，构建三平台并上传 Release |
+| push `v*` tag | [Release](.github/workflows/release.yml) | 校验五个版本文件，构建 Windows 并上传 Release |
+| 手动 Release + `include_macos` | [Release](.github/workflows/release.yml) | 为同一 tag 追加 macOS ARM64 / Intel DMG |
 
 ## 项目文档
 

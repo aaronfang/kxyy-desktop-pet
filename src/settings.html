@@ -385,7 +385,7 @@
             <select id="memoryCardId" aria-label="记忆所属人设卡">
               <option value="">开心元元（默认）</option>
             </select>
-            <input id="memoryNickname" type="text" placeholder="昵称（留空=全部）" />
+            <input id="memoryNickname" type="text" maxlength="80" placeholder="昵称（留空=全部）" />
             <select id="memoryKind">
               <option value="">全部类型</option>
               <option value="fact">事实</option>
@@ -456,10 +456,17 @@
               <button id="memoryExport" type="button" class="ghost">导出脱敏记忆</button>
               <button id="memoryBackup" type="button" class="ghost">创建数据库备份</button>
             </div>
+            <div class="memory-backup-restore">
+              <select id="memoryBackupSelect" aria-label="选择要恢复的记忆数据库备份">
+                <option value="">暂无可用备份</option>
+              </select>
+              <button id="memoryRestoreBackup" type="button" class="ghost" disabled>恢复所选备份</button>
+            </div>
             <p id="memoryMaintenanceStatus" class="hint" role="status"></p>
-            <p class="hint">导出文件不包含来源原文、事件 payload 或证据片段；数据库备份保留在本机应用数据目录。</p>
+            <p class="hint">导出文件不包含来源原文、事件 payload 或证据片段，不能用于恢复；数据库备份保留在本机应用数据目录。恢复前会自动备份当前数据库。</p>
           </div>
           <div class="memory-danger-zone">
+            <button id="memoryClearNickname" type="button" class="danger" disabled>清空筛选昵称的全部记忆</button>
             <button id="memoryClearAll" type="button" class="danger">清空当前人设全部记忆</button>
             <span id="memoryManageStatus" class="hint"></span>
           </div>

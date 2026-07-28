@@ -1,12 +1,12 @@
 # 元元桌宠 · Memory Brain 开发路线图
 
-> 状态基准：2026-07-28。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
+> 状态基准：2026-07-29。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
 >
-> Memory v3/v3.1、关系图、实时通话记忆协调和默认关闭的 Workspace 基础已由 PR #29 合入 `main`，并随 App `v0.2.43` 正式发布；后续开发统一从该发布后的 `main` 建立新分支。
+> Memory v3/v3.1、关系图、实时通话记忆协调和默认关闭的 Workspace 基础已随 App `v0.2.43` 发布；App `v0.2.44` 又补齐单昵称清除和数据库备份恢复闭环。
 
 ### 版本与里程碑约定
 
-- 应用安装包使用独立的 SemVer（当前发布基线为 `0.2.43`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- 应用安装包使用独立的 SemVer（当前发布基线为 `0.2.44`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、`package-lock.json`、Tauri 配置、Cargo manifest 和 lockfile。
 - Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
 - 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
 - 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
@@ -125,14 +125,14 @@ flowchart TB
 - [x] 自动覆盖入队幂等、`doNotRemember`/敏感消息过滤、card/user 隔离、无关召回、Top-K/字符预算、删除/清空后的 FTS 与 job 级联。
 - [x] 自动覆盖 processing 崩溃恢复、数据库暂时锁定后的 pending 保留与解锁恢复、retry 退避和 7 天原文清除。
 - [x] 使用真实 DeepSeek 和真实 Ollama 各跑一轮巩固 E2E。
-- [x] 发布负责人于 2026-07-28 接受本轮真实 App 重启恢复、无 Key 和本地模型离线路径人工验收视为通过；逐项脚本证据未补录，按发布豁免处理。
-- [x] 发布负责人于 2026-07-28 接受“别记这段”、纠错、删除和清空路径人工验收视为通过；[`qa-memory-v3-m0.md`](./qa-memory-v3-m0.md) 保留未逐项执行的原始复核清单，不伪造实测记录。
+- [x] 2026-07-29 在 macOS Apple Silicon / App `0.2.43` 实测“别记这段”、纠错、单条删除、退出 / 重启恢复、无 Key 恢复和 Ollama 恢复通过；原始结果见 [`qa-memory-v3-m0.md`](./qa-memory-v3-m0.md)。
+- [x] App `0.2.44` 补充按单昵称清空，以及备份列表、恢复前安全备份、SQLite online backup 恢复、失败自动回滚和 worker generation 隔离；自动测试覆盖跨昵称隔离、恢复可用性和无关 SQLite 拒绝。
 - [x] macOS 与 Windows CI/build；确认 packaged SQLite/FTS5。
 - [x] PR #29 合入 `main`，Windows x64 与 macOS aarch64 CI 通过；App `v0.2.43` 已发布 Windows NSIS、macOS aarch64 DMG 和 macOS x64 DMG。
 
 验收指标沿用：召回 P95 < 30ms、长期注入不超过约 500 token、无关误召回 < 5%、明确纠错后旧事实使用率 0、成功入队最终处理率 100%。
 
-2026-07-26 验证证据：前序 PR #27 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。2026-07-28，集成 PR #29 及其 `main` merge commit `8072c43` 的 Windows/macOS CI 均通过；标签 `v0.2.43` 的独立 release quality gate 通过，并发布三个平台资产。人工路径按发布负责人决定视为通过，逐项脚本证据仍不伪造。
+2026-07-26 验证证据：前序 PR #27 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。2026-07-28，集成 PR #29 及其 `main` merge commit `8072c43` 的 Windows/macOS CI 均通过；标签 `v0.2.43` 的独立 release quality gate 通过，并发布三个平台资产。2026-07-29 的人工结果只覆盖验收记录中明确列出的路径；数据库锁故障注入仍不伪造为已实测。
 
 ### M1：Memory v3.1 内核基础（Graph 和外部接入的前置）
 

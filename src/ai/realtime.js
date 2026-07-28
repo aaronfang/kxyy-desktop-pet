@@ -693,7 +693,7 @@ export class RealtimeSession {
       this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
     const ctx = this.audioCtx;
-    if (ctx.state === "suspended") {
+    if (ctx.state !== "running" && ctx.state !== "closed") {
       ctx.resume().catch(() => {});
     }
     if (!this._outGain) {
@@ -738,7 +738,7 @@ export class RealtimeSession {
 
   async _resumeAudioCtx() {
     if (!this.audioCtx || this.stopped) return;
-    if (this.audioCtx.state === "suspended") {
+    if (this.audioCtx.state !== "running" && this.audioCtx.state !== "closed") {
       try {
         await this.audioCtx.resume();
       } catch {
@@ -747,6 +747,13 @@ export class RealtimeSession {
     }
     this.playHead = this.audioCtx.currentTime;
     this._flushPendingPcm();
+  }
+
+  // 聊天窗口被系统隐藏后 WebView 可能自动 suspend AudioContext；重新显示时
+  // 由 chat.js 调用，保持实时会话和播放队列不变。
+  async resumeAudio() {
+    if (this.stopped) return;
+    await this._resumeAudioCtx();
   }
 
   _beginSpeechCandidate(msg = {}) {

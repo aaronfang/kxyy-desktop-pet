@@ -9,7 +9,7 @@ name: Release
 # 在 Actions 页面对该 tag 手动 Run workflow 并勾选 include_macos 即可（会追加 dmg
 # 到同一个 Release）。
 #
-# 流程：verify（校验 tag 已在 main 且四处版本一致）→ quality（Windows 确定性测试与
+# 流程：verify（校验 tag 已在 main 且五个版本表面一致）→ quality（Windows 确定性测试与
 # 真实可选 ORT smoke）+ setup-matrix（按触发方式决定构建平台）→ release（按矩阵并行
 # 构建 + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
 #
@@ -56,16 +56,19 @@ jobs:
             echo "::error::tag commit 必须已经合入 main"
             exit 1
           fi
-      - name: Check tag ↔ package.json ↔ tauri.conf.json ↔ Cargo.toml
+      - name: Check tag against manifests and lockfiles
         run: |
           TAG="${{ github.ref_name }}"
           TAG_VER="${TAG#v}"
           PKG_VER=$(node -p "require('./package.json').version")
+          PKG_LOCK_VER=$(node -p "require('./package-lock.json').version")
+          PKG_LOCK_ROOT_VER=$(node -p "require('./package-lock.json').packages[''].version")
           TAURI_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
           CARGO_VER=$(grep '^version' src-tauri/Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "tag=$TAG_VER  package.json=$PKG_VER  tauri.conf.json=$TAURI_VER  Cargo.toml=$CARGO_VER"
-          if [ "$TAG_VER" != "$PKG_VER" ] || [ "$TAG_VER" != "$TAURI_VER" ] || [ "$TAG_VER" != "$CARGO_VER" ]; then
-            echo "::error::tag 与三处版本号必须完全一致；请先 bump 再打 tag"
+          CARGO_LOCK_VER=$(awk '/^name = "kxyy-desktop-pet"$/{found=1; next} found && /^version = / {gsub(/version = |"/, ""); print; exit}' src-tauri/Cargo.lock)
+          echo "tag=$TAG_VER  package.json=$PKG_VER  package-lock.json=$PKG_LOCK_VER/$PKG_LOCK_ROOT_VER  tauri.conf.json=$TAURI_VER  Cargo.toml=$CARGO_VER  Cargo.lock=$CARGO_LOCK_VER"
+          if [ "$TAG_VER" != "$PKG_VER" ] || [ "$TAG_VER" != "$PKG_LOCK_VER" ] || [ "$TAG_VER" != "$PKG_LOCK_ROOT_VER" ] || [ "$TAG_VER" != "$TAURI_VER" ] || [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$CARGO_LOCK_VER" ]; then
+            echo "::error::tag 与 manifests/lockfiles 版本号必须完全一致；请先 bump 再打 tag"
             exit 1
           fi
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import socket
 import ssl
 import struct
 import subprocess
@@ -30,12 +31,45 @@ RUNTIME_VERSION = "1.13.4"
 RUNTIME_MARKER = ".kxyy-sensevoice-ready"
 INSTALL_TIMEOUT_SECONDS = 300
 VERIFY_TIMEOUT_SECONDS = 90
+DOWNLOAD_SOCKET_TIMEOUT_SECONDS = 30
 DOWNLOAD_CHUNK_BYTES = 64 * 1024
+DOWNLOAD_PROGRESS_BYTES = 1024 * 1024
 MODEL_DIRNAME = "sensevoice-small-int8-2024-07-17"
+PROGRESS_PREFIX = "KXYY_SENSEVOICE_PROGRESS "
 MARKER_TEXT = (
     "sherpa-onnx=1.13.4\n"
     "model=sensevoice-small-int8-2024-07-17\n"
 )
+
+
+def _emit_progress(state, phase, message, *, completed_bytes=0, total_bytes=0, reason=""):
+    payload = {
+        "state": state,
+        "phase": phase,
+        "message": message,
+        "completedBytes": max(0, int(completed_bytes)),
+        "totalBytes": max(0, int(total_bytes)),
+    }
+    if reason:
+        payload["reason"] = reason
+    print(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+@contextmanager
+def _address_family(family):
+    """Limit one urllib attempt to IPv4 or IPv6 without changing system networking."""
+
+    original = socket.getaddrinfo
+
+    def resolve(host, port, requested_family=0, sock_type=0, proto=0, flags=0):
+        selected = family if requested_family in (0, socket.AF_UNSPEC) else requested_family
+        return original(host, port, selected, sock_type, proto, flags)
+
+    socket.getaddrinfo = resolve
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original
 
 
 def _hash_file(path):
@@ -229,47 +263,64 @@ def _install_lock(lock_path):
             handle.close()
 
 
-def _download_artifact(artifact, destination):
+def _download_artifact(artifact, destination, progress=None):
     filename, url, expected_size, expected_hash = artifact
     destination = Path(destination)
     if destination.name != filename or not url.startswith("https://"):
         raise RuntimeError("download-invalid")
-    digest = hashlib.sha256()
-    received = 0
+    request = urllib.request.Request(url, headers={"User-Agent": "kxyy-sensevoice-installer/1"})
+    context = ssl.create_default_context()
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "kxyy-sensevoice-installer/1"})
-        context = ssl.create_default_context()
-        try:
-            import certifi
+        import certifi
 
-            context.load_verify_locations(cafile=certifi.where())
-        except ImportError:
-            pass
-        with urllib.request.urlopen(
-            request, timeout=INSTALL_TIMEOUT_SECONDS, context=context
-        ) as response:
-            if not str(response.geturl()).startswith("https://"):
-                raise RuntimeError("download-invalid")
-            with destination.open("xb") as output:
-                while True:
-                    chunk = response.read(DOWNLOAD_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    received += len(chunk)
-                    if received > expected_size:
-                        raise RuntimeError("download-integrity-failed")
-                    output.write(chunk)
-                    digest.update(chunk)
-    except RuntimeError:
+        context.load_verify_locations(cafile=certifi.where())
+    except ImportError:
+        pass
+
+    last_error = None
+    # Prefer IPv4 because some macOS networks resolve both families but leave the
+    # IPv6 transfer established without delivering bytes. IPv6 remains the
+    # bounded fallback for IPv6-only networks.
+    for family in (socket.AF_INET, socket.AF_INET6):
         destination.unlink(missing_ok=True)
-        raise
-    except Exception as error:
-        destination.unlink(missing_ok=True)
-        raise RuntimeError("download-failed") from error
-    if received != expected_size or digest.hexdigest() != expected_hash:
-        destination.unlink(missing_ok=True)
-        raise RuntimeError("download-integrity-failed")
-    return destination
+        digest = hashlib.sha256()
+        received = 0
+        reported = 0
+        try:
+            with _address_family(family):
+                with urllib.request.urlopen(
+                    request, timeout=DOWNLOAD_SOCKET_TIMEOUT_SECONDS, context=context
+                ) as response:
+                    if not str(response.geturl()).startswith("https://"):
+                        raise RuntimeError("download-invalid")
+                    with destination.open("xb") as output:
+                        while True:
+                            chunk = response.read(DOWNLOAD_CHUNK_BYTES)
+                            if not chunk:
+                                break
+                            received += len(chunk)
+                            if received > expected_size:
+                                raise RuntimeError("download-integrity-failed")
+                            output.write(chunk)
+                            digest.update(chunk)
+                            if progress and (
+                                received == expected_size
+                                or received - reported >= DOWNLOAD_PROGRESS_BYTES
+                            ):
+                                progress(received, expected_size)
+                                reported = received
+        except RuntimeError:
+            destination.unlink(missing_ok=True)
+            raise
+        except Exception as error:
+            destination.unlink(missing_ok=True)
+            last_error = error
+            continue
+        if received != expected_size or digest.hexdigest() != expected_hash:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError("download-integrity-failed")
+        return destination
+    raise RuntimeError("download-failed") from last_error
 
 
 def _copy_locked_member(archive, member_name, destination, expected_size, expected_hash):
@@ -417,7 +468,9 @@ def install(runtime_root):
         if marker.is_file():
             try:
                 if marker.read_text(encoding="utf-8") == MARKER_TEXT:
+                    _emit_progress("installing", "verifying", "正在校验已安装的 SenseVoice runtime…")
                     _verify_target(target)
+                    _emit_progress("ready", "complete", "SenseVoice runtime 已就绪。")
                     return target
             except Exception:
                 pass
@@ -429,16 +482,42 @@ def install(runtime_root):
         payload.mkdir()
         smoke_path = staging_root / "zh.wav"
         try:
-            print("正在下载经过哈希锁定的 SenseVoice runtime…", flush=True)
-            wheel_paths = []
-            for artifact in (wrapper, core):
-                wheel_paths.append(
-                    _download_artifact(artifact, downloads / artifact[0])
-                )
-            archive_artifact = lock["model"]["archive"]
-            archive_path = _download_artifact(
-                archive_artifact, downloads / archive_artifact[0]
+            artifacts = (
+                ("Python 绑定", wrapper),
+                ("推理核心", core),
+                ("SenseVoice 模型", lock["model"]["archive"]),
             )
+            total_download_bytes = sum(artifact[2] for _, artifact in artifacts)
+            completed_before = 0
+            wheel_paths = []
+            downloaded = []
+            for index, (label, artifact) in enumerate(artifacts, start=1):
+                _emit_progress(
+                    "installing",
+                    "downloading",
+                    f"正在下载 {label}（{index}/3）…",
+                    completed_bytes=completed_before,
+                    total_bytes=total_download_bytes,
+                )
+
+                def report(received, _expected, *, base=completed_before, name=label, item=index):
+                    total_received = base + received
+                    percent = min(100, total_received * 100 // total_download_bytes)
+                    _emit_progress(
+                        "installing",
+                        "downloading",
+                        f"正在下载 {name}（{item}/3，总进度 {percent}%）…",
+                        completed_bytes=total_received,
+                        total_bytes=total_download_bytes,
+                    )
+
+                downloaded.append(
+                    _download_artifact(artifact, downloads / artifact[0], progress=report)
+                )
+                completed_before += artifact[2]
+            wheel_paths.extend(downloaded[:2])
+            archive_path = downloaded[2]
+            _emit_progress("installing", "installing", "正在安装 SenseVoice 推理 runtime…")
             _run_fixed(
                 [
                     sys.executable,
@@ -453,16 +532,18 @@ def install(runtime_root):
                 ],
                 timeout=INSTALL_TIMEOUT_SECONDS,
             )
+            _emit_progress("installing", "extracting", "正在校验并解包 SenseVoice 模型…")
             _materialize_model(
                 archive_path,
                 lock["model"],
                 payload / MODEL_DIRNAME,
                 smoke_path,
             )
+            _emit_progress("installing", "verifying", "正在运行 SenseVoice 真实推理校验…")
             _verify_target(payload, smoke_path)
             (payload / RUNTIME_MARKER).write_text(MARKER_TEXT, encoding="utf-8")
             _publish_payload(payload, target)
-            print("SenseVoice runtime 已就绪，请重启语音服务。", flush=True)
+            _emit_progress("ready", "complete", "SenseVoice runtime 已就绪，请重启语音服务。")
             return target
         finally:
             shutil.rmtree(staging_root, ignore_errors=True)
@@ -545,13 +626,28 @@ def main():
         return
     runtime_root = os.environ.get("KXYY_ASR_RUNTIME_ROOT")
     if not runtime_root:
-        raise SystemExit("SenseVoice runtime 安装失败（runtime-root-unavailable）")
+        reason = "runtime-root-unavailable"
+        _emit_progress("failed", "failed", "SenseVoice runtime 安装失败：无法定位应用数据目录。", reason=reason)
+        raise SystemExit(f"SenseVoice runtime 安装失败（{reason}）")
     try:
         install(Path(runtime_root))
     except Exception as error:
         reason = str(error)
         if not reason or not all(ch.islower() or ch.isdigit() or ch == "-" for ch in reason):
             reason = "install-failed"
+        messages = {
+            "download-failed": "下载失败，请检查网络后重试。",
+            "download-integrity-failed": "下载文件未通过完整性校验。",
+            "install-busy": "已有安装任务正在运行。",
+            "subprocess-failed": "安装或推理校验子进程失败。",
+            "model-archive-invalid": "模型压缩包格式无效。",
+            "model-integrity-failed": "模型文件未通过完整性校验。",
+            "unsupported-python": "当前 Python 版本不受支持。",
+            "unsupported-arch": "当前处理器架构不受支持。",
+            "unsupported-os": "当前操作系统不受支持。",
+        }
+        detail = messages.get(reason, "安装校验失败。")
+        _emit_progress("failed", "failed", f"SenseVoice runtime 安装失败：{detail}", reason=reason)
         raise SystemExit(f"SenseVoice runtime 安装失败（{reason}）") from None
 
 

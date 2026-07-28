@@ -1,6 +1,6 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
-import { clearAllMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
+import { clearAllMemory, clearMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
 import { memoryHealthState } from "./memory-ui.js";
 
 const invoke = window.__TAURI__.core.invoke;
@@ -1007,6 +1007,37 @@ function selectedMemoryCardId() {
   return (el("memoryCardId")?.value ?? el("personaCardId").value).trim();
 }
 
+function selectedMemoryCardLabel() {
+  return el("memoryCardId")?.selectedOptions?.[0]?.textContent?.trim() || selectedMemoryCardId() || "默认人设";
+}
+
+function formatBackupOption(entry) {
+  const date = entry.createdAt ? new Date(entry.createdAt * 1000).toLocaleString("zh-CN") : "时间未知";
+  return `${date} · ${Math.max(1, Math.round((entry.bytes || 0) / 1024))} KB · ${entry.fileName}`;
+}
+
+async function refreshMemoryBackups(preferredPath = "") {
+  const select = el("memoryBackupSelect");
+  const restore = el("memoryRestoreBackup");
+  if (!select || !restore) return;
+  const previous = preferredPath || select.value;
+  try {
+    const entries = await invoke("memory_list_backups");
+    select.replaceChildren();
+    if (!entries.length) {
+      select.appendChild(new Option("暂无可用备份", ""));
+    } else {
+      for (const entry of entries) select.appendChild(new Option(formatBackupOption(entry), entry.path));
+      if (entries.some((entry) => entry.path === previous)) select.value = previous;
+    }
+    restore.disabled = !select.value;
+  } catch (e) {
+    select.replaceChildren(new Option("读取备份列表失败", ""));
+    restore.disabled = true;
+    setMemoryMaintenanceStatus(`读取备份列表失败：${e.message || e}`, false);
+  }
+}
+
 async function refreshMemoryStats() {
   const box = el("memoryStats");
   const health = el("memoryHealth");
@@ -1315,6 +1346,18 @@ function clearMemoryGraphLayouts(cardId, nickname = null) {
     }
   } catch (_) {
     // UI-only layout cleanup must not turn a successful memory clear into an error.
+  }
+}
+
+function clearAllMemoryGraphLayouts() {
+  try {
+    const prefix = "kxyy-memory-graph-layout:";
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(prefix)) localStorage.removeItem(key);
+    }
+  } catch (_) {
+    // UI-only layout cleanup must not turn a successful database restore into an error.
   }
 }
 
@@ -1787,6 +1830,14 @@ el("memoryRefresh")?.addEventListener("click", () => loadMemoryPage({ resetPage:
 for (const id of ["memoryNickname", "memoryKind", "memoryStatus"]) {
   el(id)?.addEventListener("change", () => loadMemoryPage({ resetPage: true }));
 }
+function updateClearNicknameButton() {
+  const nickname = el("memoryNickname")?.value.trim() || "";
+  const button = el("memoryClearNickname");
+  if (!button) return;
+  button.disabled = !nickname;
+  button.textContent = nickname ? `清空「${nickname}」的全部记忆` : "清空筛选昵称的全部记忆";
+}
+el("memoryNickname")?.addEventListener("input", updateClearNicknameButton);
 el("memoryCardId")?.addEventListener("change", async () => {
   await migrateSelectedCardMemory();
   await loadMemoryPage({ resetPage: true });
@@ -1901,6 +1952,7 @@ el("memoryBackup")?.addEventListener("click", async () => {
     const result = await invoke("memory_backup");
     const name = String(result.path || "").split(/[\\/]/).pop() || "memory backup";
     setMemoryMaintenanceStatus(`备份已创建：${name}（${Math.round((result.bytes || 0) / 1024)} KB，完整性 ${result.integrityResult}）。`);
+    await refreshMemoryBackups(result.path || "");
   } catch (e) {
     setMemoryMaintenanceStatus(`备份失败：${e.message || e}`, false);
   } finally {
@@ -1908,8 +1960,38 @@ el("memoryBackup")?.addEventListener("click", async () => {
   }
 });
 
+el("memoryBackupSelect")?.addEventListener("change", () => {
+  el("memoryRestoreBackup").disabled = !el("memoryBackupSelect").value;
+});
+
+el("memoryRestoreBackup")?.addEventListener("click", async () => {
+  const path = el("memoryBackupSelect")?.value || "";
+  if (!path) return;
+  const label = el("memoryBackupSelect")?.selectedOptions?.[0]?.textContent || "所选备份";
+  if (!window.confirm(
+    `确定恢复这份记忆数据库备份？\n\n${label}\n\n这会把所有人设和昵称的记忆回滚到该时间点。恢复前会自动备份当前数据库。`,
+  )) return;
+  const button = el("memoryRestoreBackup");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("正在校验并恢复备份…");
+  try {
+    const result = await invoke("memory_restore_backup", { request: { path } });
+    clearAllMemoryGraphLayouts();
+    await emit("memory-cleared", { cardId: el("personaCardId").value.trim() });
+    const safetyName = String(result.safetyBackupPath || "").split(/[\\/]/).pop() || "自动安全备份";
+    setMemoryMaintenanceStatus(`恢复完成；恢复前的数据已保存为 ${safetyName}。`);
+    await refreshMemoryBackups(path);
+    await loadMemoryPage({ resetPage: true });
+  } catch (e) {
+    setMemoryMaintenanceStatus(`恢复失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = !el("memoryBackupSelect")?.value;
+  }
+});
+
 document.querySelector('.tab-btn[data-tab="memory"]')?.addEventListener("click", async () => {
   await migrateSelectedCardMemory();
+  await refreshMemoryBackups();
   await loadMemoryPage({ resetPage: true });
 });
 
@@ -1921,6 +2003,32 @@ async function clearCurrentCardMemory(statusNode, cardId = selectedMemoryCardId(
   if (statusNode) statusNode.textContent = "已清空";
   await loadMemoryPage({ resetPage: true });
 }
+
+el("memoryClearNickname")?.addEventListener("click", async () => {
+  const nickname = el("memoryNickname")?.value.trim() || "";
+  if (!nickname) return;
+  const cardId = selectedMemoryCardId();
+  if (!window.confirm(
+    `确定永久清空人设「${selectedMemoryCardLabel()}」下昵称「${nickname}」的全部长期记忆？\n\n只影响这个昵称；数据库记录、来源片段和待巩固会话都会删除。此操作不可撤销。`,
+  )) return;
+  const button = el("memoryClearNickname");
+  const status = el("memoryManageStatus");
+  button.disabled = true;
+  try {
+    const result = await invoke("memory_clear_scope", { request: { cardId, nickname } });
+    clearMemoryGraphLayouts(cardId, nickname);
+    clearMemory(cardId, nickname);
+    await emit("memory-cleared", { cardId, nickname });
+    status.textContent = result.affected ? `已清空「${nickname}」` : `未找到昵称「${nickname}」的记忆`;
+    status.style.color = "#16a34a";
+    await loadMemoryPage({ resetPage: true });
+  } catch (e) {
+    status.textContent = `失败：${e.message || e}`;
+    status.style.color = "#dc2626";
+  } finally {
+    updateClearNicknameButton();
+  }
+});
 
 el("clearMemory").addEventListener("click", async () => {
   const ok = window.confirm(
