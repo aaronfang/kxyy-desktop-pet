@@ -249,6 +249,18 @@
             <p class="hint">等待更久可减少思考停顿被拆成两轮，但会相应延后 AI 开始回答的时间。</p>
           </div>
 
+          <div id="conversationModeFields" hidden>
+            <label>
+              <span>实时对话主动性<small>本地 Qwen3 / CosyVoice</small></span>
+              <select id="realtimeConversationMode">
+                <option value="follow-user" selected>跟随用户（保持当前方式）</option>
+                <option value="balanced">自然轮流（元元会先打招呼）</option>
+                <option value="ai-leads">元元带聊（更快主动开场）</option>
+              </select>
+            </label>
+            <p class="hint">第一版会在接通后由元元主动打招呼并抛出轻松话题；你一开口，主动生成会立即让路。火山实时通话暂时保持跟随用户。</p>
+          </div>
+
           <div id="asrFields" hidden>
             <label>
               <span>用户语音识别（final ASR）<small>仅本地 Qwen3 / CosyVoice 通话</small></span>

@@ -2271,6 +2271,7 @@ async function startCall() {
   let session;
   session = new RealtimeSession({
     provider: settings.realtimeBackend,
+    conversationMode: settings.realtimeConversationMode,
     onState: (state) => {
       if (state === "started") {
         appendPatNotice("📞 通话已接通");

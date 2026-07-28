@@ -561,6 +561,11 @@ MANAGED_AUDIO_CHUNK_MAX_SAMPLES = OUTPUT_RATE * 80 // 1000
 MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750
 TTS_STREAMING_CAPABILITY = "provider-pcm-v1"
 INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1"
+PROACTIVE_TURN_CAPABILITY = "local-v1"
+PROACTIVE_WELCOME_PROMPT = (
+    "（内部控制：实时通话刚接通，用户还没开口。请按当前人设自然地先打招呼，"
+    "顺手抛一个轻松、很容易回应的小话题。只说一到两句，不要解释任务，不要催促用户。）"
+)
 MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
 TURN_MEMORY_CAPABILITY = "turn-final-v1"
 TURN_MEMORY_WAIT_SECONDS = 0.1
@@ -800,6 +805,7 @@ class AudibleHistory:
         self.messages: list[dict] = []
         self._turns: dict[int, dict] = {}
         self._order: list[int] = []
+        self._proactive_assistants: list[dict] = []
 
     def begin_turn(self, generation: int, user_text: str) -> list[dict]:
         """返回当前轮之前的快照，再登记当前用户输入。"""
@@ -819,6 +825,23 @@ class AudibleHistory:
             expired = self._order.pop(0)
             self._turns.pop(expired, None)
         self._trim()
+        return snapshot
+
+    def begin_proactive_turn(self, generation: int) -> list[dict]:
+        """登记无虚构用户消息的主动轮；控制提示只存在于本次请求。"""
+        snapshot = [dict(message) for message in self.messages]
+        self._turns[generation] = {
+            "user": None,
+            "assistant": None,
+            "segments": [],
+            "segmentIds": set(),
+            "completed": set(),
+            "cancelled": False,
+        }
+        self._order.append(generation)
+        while len(self._order) > self.max_pending_turns:
+            expired = self._order.pop(0)
+            self._turns.pop(expired, None)
         return snapshot
 
     def add_segment(self, generation: int, segment_id: int, text: str) -> bool:
@@ -854,6 +877,11 @@ class AudibleHistory:
         if assistant is None:
             assistant = {"role": "assistant", "content": audible}
             turn["assistant"] = assistant
+            if turn["user"] is None:
+                self.messages.append(assistant)
+                self._proactive_assistants.append(assistant)
+                self._trim()
+                return True
             try:
                 user_index = next(
                     index
@@ -888,8 +916,15 @@ class AudibleHistory:
             del self.messages[:overflow]
         # 不能让 OpenAI-compatible history 以孤立 assistant 开头；满容量时
         # 宁可再丢一条最旧回复，也要保持剩余上下文的角色顺序可解释。
-        while self.messages and self.messages[0].get("role") == "assistant":
+        while (
+            self.messages
+            and self.messages[0].get("role") == "assistant"
+            and not any(self.messages[0] is item for item in self._proactive_assistants)
+        ):
             del self.messages[0]
+        self._proactive_assistants = [
+            item for item in self._proactive_assistants if any(item is msg for msg in self.messages)
+        ]
 
 
 class SafeRealtimeError(RuntimeError):
@@ -2220,6 +2255,10 @@ class Session:
         self.tts_streaming = "none"
         self.interruption_hint = "none"
         self.memory_context = "none"
+        self.proactive_turn = "none"
+        self._last_proactive_trigger_id = 0
+        self._proactive_response_generation: int | None = None
+        self._proactive_response_trigger_id: int | None = None
         self._candidate_sequence = 0
         self._candidate_id: int | None = None
         self._candidate_confirmed = False
@@ -2492,6 +2531,23 @@ class Session:
                 await self.send_json(
                     {"type": "assistant_discarded", "generation": scope.generation}
                 )
+            if scope.generation == self._proactive_response_generation:
+                trigger_id = self._proactive_response_trigger_id
+                self._proactive_response_generation = None
+                self._proactive_response_trigger_id = None
+                if self._response_generated:
+                    await self.send_json(
+                        {"type": "assistant_discarded", "generation": scope.generation}
+                    )
+                if trigger_id is not None:
+                    await self.send_json(
+                        {
+                            "type": "proactive_turn_status",
+                            "triggerId": trigger_id,
+                            "state": "cancelled",
+                            "generation": scope.generation,
+                        }
+                    )
         self._response_generated = False
         self._response_tts_admitted = False
         self._response_started_at = 0.0
@@ -2572,6 +2628,14 @@ class Session:
                 else "none"
             )
         )
+        offered_proactive_turn = msg.get("proactiveTurn")
+        self.proactive_turn = (
+            PROACTIVE_TURN_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and isinstance(offered_proactive_turn, list)
+            and PROACTIVE_TURN_CAPABILITY in offered_proactive_turn
+            else "none"
+        )
         self._clear_interruption_candidate()
         vad_shadow = await self._start_or_reset_vad_shadow()
         await self.send_json(
@@ -2582,12 +2646,65 @@ class Session:
                 "ttsStream": self.tts_streaming,
                 "interruptionHint": self.interruption_hint,
                 "memoryContext": self.memory_context,
+                "proactiveTurn": self.proactive_turn,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
                 "asrRuntime": asr_runtime_summary(),
             }
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
+
+    async def on_proactive_turn(self, msg: dict) -> None:
+        trigger_id = msg.get("triggerId")
+        valid_id = (
+            isinstance(trigger_id, int)
+            and not isinstance(trigger_id, bool)
+            and 1 <= trigger_id <= 0xFFFFFFFF
+            and trigger_id > self._last_proactive_trigger_id
+        )
+        accepted = bool(
+            self.proactive_turn == PROACTIVE_TURN_CAPABILITY
+            and valid_id
+            and msg.get("kind") == "welcome"
+            and not self.closed
+            and not self.in_speech
+            and not self.candidate_emitted
+            and self.asr_scope is None
+            and (self.asr_task is None or self.asr_task.done())
+            and not self._busy()
+            and not self.playing
+            and not self._pending_playback_segments
+        )
+        if valid_id:
+            self._last_proactive_trigger_id = trigger_id
+        if not accepted:
+            if valid_id:
+                await self.send_json(
+                    {
+                        "type": "proactive_turn_status",
+                        "triggerId": trigger_id,
+                        "state": "vetoed",
+                    }
+                )
+            return
+
+        scope = self._new_scope("response")
+        self.response_scope = scope
+        self._response_generated = False
+        self._response_tts_admitted = False
+        self._response_started_at = time.perf_counter()
+        self._proactive_response_generation = scope.generation
+        self._proactive_response_trigger_id = trigger_id
+        await self.send_json(
+            {
+                "type": "proactive_turn_status",
+                "triggerId": trigger_id,
+                "state": "accepted",
+            }
+        )
+        self.reply_task = asyncio.create_task(
+            self._reply_pipeline("", scope, proactive_kind="welcome")
+        )
 
     async def send_vad_shadow_summary(self, *, final: bool) -> bool:
         """Send one bounded, text-free aggregate outside the per-frame path."""
@@ -2781,6 +2898,11 @@ class Session:
         if self.candidate_emitted:
             return
         self.candidate_emitted = True
+        if (
+            self.response_scope is not None
+            and self.response_scope.generation == self._proactive_response_generation
+        ):
+            await self.cancel_reply("proactive_speech_candidate")
         payload = {"type": "speech_candidate"}
         if self.interruption_hint == INTERRUPTION_HINT_CAPABILITY:
             self._candidate_sequence = (self._candidate_sequence % 0xFFFFFFFF) + 1
@@ -3067,13 +3189,18 @@ class Session:
         interruption_hint: bool = False,
         continuation_hint: bool = False,
         memory_context: str = "",
+        proactive_kind: str = "",
     ) -> None:
         sentences = StableSentenceBuffer(min_chars=REALTIME_TTS_MIN_CHARS)
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
         try:
             assert _synth_tts is not None
             t1 = time.perf_counter()
-            history_snapshot = self._audible_history.begin_turn(scope.generation, text)
+            history_snapshot = (
+                self._audible_history.begin_proactive_turn(scope.generation)
+                if proactive_kind == "welcome"
+                else self._audible_history.begin_turn(scope.generation, text)
+            )
             if memory_context:
                 history_snapshot.append({"role": "system", "content": memory_context})
             if interruption_hint:
@@ -3085,10 +3212,11 @@ class Session:
                     {"role": "system", "content": CONTINUATION_HINT_TEXT}
                 )
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
+            request_text = PROACTIVE_WELCOME_PROMPT if proactive_kind == "welcome" else text
             start_llm_stream_producer(
                 self.system_role,
                 history_snapshot,
-                text,
+                request_text,
                 scope,
                 events,
             )
@@ -3516,6 +3644,9 @@ class Session:
                     self.playing = False
                     self.play_enabled = False
                 self.response_scope = None
+                if self._proactive_response_generation == scope.generation:
+                    self._proactive_response_generation = None
+                    self._proactive_response_trigger_id = None
                 scope.complete()
 
 
@@ -3555,6 +3686,8 @@ async def _handler(ws):
                 session.on_playback_interruption(msg)
             elif typ == "memory_context":
                 session.on_memory_context(msg)
+            elif typ == "proactive_turn":
+                await session.on_proactive_turn(msg)
     except Exception as e:
         log(f"连接结束: {e}")
     finally:

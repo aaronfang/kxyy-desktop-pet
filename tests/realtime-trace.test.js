@@ -739,7 +739,7 @@ test("managed audio decoder validates the complete fixed header and payload", as
   for (const frame of invalid) assert.equal(decodeManagedAudioFrame(frame), null);
 });
 
-test("managed audio is explicitly offered only by cascade clients", async () => {
+test("managed and proactive capabilities are explicitly offered only by eligible cascade clients", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const sockets = [];
   globalThis.WebSocket = class {
@@ -756,7 +756,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
 
-  const local = new RealtimeSession({ provider: "local" });
+  const local = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
   local._playbackMode = "worklet";
   local.playbackNode = { port: { postMessage: () => {} } };
   const localOpen = local._openSocket("ws://local", { systemRole: "role", botName: "元元" });
@@ -766,6 +766,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
+  assert.deepEqual(sockets[0].sent[0].proactiveTurn, ["local-v1"]);
   local.trace.startSession();
   local._onMessage({
     data: JSON.stringify({
@@ -775,6 +776,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
       memoryContext: "turn-final-v1",
       interruptionHint: "candidate-snapshot-v1",
       ttsStream: "provider-pcm-v1",
+      proactiveTurn: "local-v1",
     }),
   });
   assert.deepEqual(local.getTraceSnapshot().runtime, {
@@ -814,7 +816,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
     items: [{ kind: "fact", text: "记忆线索", uncertain: false, pinned: false }],
   });
 
-  const cosy = new RealtimeSession({ provider: "cosyvoice" });
+  const cosy = new RealtimeSession({ provider: "cosyvoice", conversationMode: "balanced" });
   cosy._playbackMode = "worklet";
   cosy.playbackNode = { port: { postMessage: () => {} } };
   const cosyOpen = cosy._openSocket("ws://cosy", { systemRole: "role", botName: "元元" });
@@ -824,6 +826,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
+  assert.deepEqual(sockets[1].sent[0].proactiveTurn, ["local-v1"]);
 
   const legacy = new RealtimeSession({ provider: "local" });
   legacy._playbackMode = "legacy";
@@ -837,6 +840,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
+  assert.equal("proactiveTurn" in sockets[2].sent[0], false);
 
   const volcano = new RealtimeSession({ provider: "volcano" });
   const volcanoOpen = volcano._openSocket("ws://volcano", {
@@ -848,7 +852,84 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
   assert.equal("ttsStream" in sockets[3].sent[0], false);
+  assert.equal("proactiveTurn" in sockets[3].sent[0], false);
   assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
+});
+
+test("proactive welcome is one-shot, negotiated and cancelled by user speech", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.sent = [];
+      this.readyState = 1;
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const open = async (options, started = {}) => {
+    const session = new RealtimeSession({ proactiveGreetingDelayMs: 0, ...options });
+    session._playbackMode = "worklet";
+    session.playbackNode = { port: { postMessage: () => {} } };
+    session._micReady = true;
+    const pending = session._openSocket("ws://test", { systemRole: "role", botName: "元元" });
+    const socket = sockets.at(-1);
+    socket.onopen();
+    await pending;
+    session._onMessage({
+      data: JSON.stringify({
+        type: "session",
+        state: "started",
+        downlinkAudio: "managed-v1",
+        ...started,
+      }),
+    });
+    return { session, socket };
+  };
+
+  const active = await open(
+    { provider: "local", conversationMode: "ai-leads" },
+    { proactiveTurn: "local-v1" },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(
+    active.socket.sent.filter((message) => message.type === "proactive_turn"),
+    [{ type: "proactive_turn", triggerId: 1, kind: "welcome" }],
+  );
+  active.session._scheduleProactiveWelcome();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(active.socket.sent.filter((message) => message.type === "proactive_turn").length, 1);
+
+  const interrupted = await open(
+    { provider: "cosyvoice", conversationMode: "balanced", proactiveGreetingDelayMs: 20 },
+    { proactiveTurn: "local-v1" },
+  );
+  interrupted.session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 1 }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    interrupted.socket.sent.filter((message) => message.type === "proactive_turn").length,
+    0,
+  );
+
+  interrupted.session._playbackQueuedMs = 250;
+  interrupted.session._onMessage({
+    data: JSON.stringify({
+      type: "proactive_turn_status",
+      triggerId: 1,
+      state: "cancelled",
+    }),
+  });
+  assert.equal(interrupted.session._playbackQueuedMs, 0);
+
+  const oldServer = await open({ provider: "local", conversationMode: "ai-leads" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(oldServer.socket.sent.filter((message) => message.type === "proactive_turn").length, 0);
 });
 
 test("streamed managed segments require explicit negotiation and exact final totals", async () => {

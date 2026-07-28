@@ -256,7 +256,7 @@ graph TD
 | 特性 | 来源 | 依赖关系 | 兼容 | 状态 |
 |---|---|---|---|---|---|
 | 人设关系状态（好感度/心情） | 3.1 | 依赖 Memory Brain M1 的 event/evidence 与 `persona-relationship` scope | **高** | `- [ ]` |
-| **语音陪聊主导方式（本地/CosyVoice）** | 3.1 / 实时语音 4.7 | 先完成 provider-neutral 设置和纯状态调度；复用 generation、candidate、可听历史与播放完成回执，火山不做伪触发 | 中 | `- [ ]` |
+| **语音陪聊主导方式（本地/CosyVoice）** | 3.1 / 实时语音 4.7 | 三档设置、`local-v1` 协商和每通一次主动开场已实现；复用 generation、candidate、可听历史与播放完成回执，火山不做伪触发；同题续说/短附和/换题仍待实现 | 中 | `- [~]` 🔧 A+B 已实现 |
 | Memory v3.1 事件/证据/scope/关系内核 | Memory Brain M1 | Memory Graph、实时通话和外部接入的共同前置，不在角色 prompt 中实现 | 高 | `- [x]` ✅ 基础完成（0.2.33+） |
 | 好感度系统（轻量版） | 3.2 | 依赖上一条 | 中 | `- [ ]` |
 | 统一情绪→动作/语音映射表 | 3.3 | 无前置依赖，建议尽早做以避免情绪词表继续分裂 | 低 | `- [ ]` |
@@ -552,6 +552,7 @@ graph TD
 | 2026-07-12 | `computeLiveContext` 参数化 | 硬编码 `20:30` → `lore.open_time` 可配置；硬编码阶段流程（PK/打野/唠嗑/跳舞/梳妆/唱歌/回家段）→ `lore.live_stages` 驱动 + `guessStage()` 独立函数；周日特殊活动逻辑保留 | `src/ai/persona.js` |
 | 2026-07-26 | Memory Brain 路线收口 | Memory v3 现状、内核演进、实时记忆、Memory Graph、Global Workspace/J-Space 类实验、外部接入和独立项目决策统一迁移到权威路线图；本文件移除重复 schema 和过时 `localStorage` 方案 | `docs/roadmap-memory-brain.md`、本文件、`docs/roadmap-realtime-voice.md` |
 | 2026-07-28 | Ackem 参考与 AI 主动带聊规划 | 增加 Ackem clean-room 借鉴审查；定义跟随/均衡/元元带聊三档产品语义，并把实时协议、状态机和后端能力边界路由到语音专项路线图 | 本文件、`docs/roadmap-realtime-voice.md`、`docs/roadmap-memory-brain.md` |
+| 2026-07-28 | 主动带聊首个实现切片 | 落地三档设置、`local-v1` 双向能力门和本地/CosyVoice 每通一次主动问候；candidate 立即让路，火山/旧端降级，完整同题续说与 TopicLeadState 继续按实时语音 4.7 推进 | `src/settings.*`、`src/ai/realtime.js`、`scripts/local-realtime/common.py`、确定性测试 |
 | 2026-07-12 | 构建脚本更新 | `encrypt-assets` 改为指向 `scripts/build-persona-enc.mjs`；新增 `distill` / `validate-card` / `update-persona` npm 脚本；`.gitignore` 新增 persona-distill 本地产物忽略规则 | `package.json`、`.gitignore` |
 | 2026-07-21 | 实时语音专项调研 | 新增实时语音与情绪语音专项路线图；修正 CosyVoice/火山 TTS 情绪能力、SenseVoice 已发布范围和本地打断时序结论；补充两阶段打断、流式管线、`SpeechStyle` 与验证指标 | `docs/roadmap-realtime-voice.md`、本文件 |
 | 2026-07-12 | Roadmap 更新 | 同步最近修改到 roadmap：更新 2.1 诊断（人设链路/直播场景）、P0 新增完成项、P2 状态更新、7.2 变更日志 | 同文件 |

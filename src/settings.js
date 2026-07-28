@@ -22,6 +22,7 @@ const FIELDS = [
   "localRefText",
   "asrProvider",
   "turnPauseTolerance",
+  "realtimeConversationMode",
   "voiceVolume",
   "textProvider",
   "textModel",
@@ -82,6 +83,11 @@ function currentTurnPauseTolerance() {
   return value === "fast" || value === "long" ? value : "standard";
 }
 
+function currentRealtimeConversationMode() {
+  const value = (el("realtimeConversationMode")?.value || "follow-user").toLowerCase();
+  return value === "balanced" || value === "ai-leads" ? value : "follow-user";
+}
+
 /** 按所选语音后端只展示对应设置项。 */
 function syncVoiceFields() {
   const backend = currentBackend();
@@ -104,6 +110,10 @@ function syncVoiceFields() {
   const pauseBox = el("turnPauseFields");
   if (pauseBox) {
     pauseBox.hidden = backend !== "local" && backend !== "cosyvoice";
+  }
+  const conversationModeBox = el("conversationModeFields");
+  if (conversationModeBox) {
+    conversationModeBox.hidden = backend !== "local" && backend !== "cosyvoice";
   }
   const installSenseVoice = el("installSenseVoiceRuntime");
   if (installSenseVoice) {
@@ -170,6 +180,10 @@ function fill(s) {
     s.turnPauseTolerance === "fast" || s.turnPauseTolerance === "long"
       ? s.turnPauseTolerance
       : "standard";
+  el("realtimeConversationMode").value =
+    s.realtimeConversationMode === "balanced" || s.realtimeConversationMode === "ai-leads"
+      ? s.realtimeConversationMode
+      : "follow-user";
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
   const vol = Number(s.voiceVolume);
   el("voiceVolume").value = Number.isFinite(vol)
@@ -558,6 +572,7 @@ function collect() {
     localRefText: el("localRefText").value.trim(),
     asrProvider: currentAsrProvider(),
     turnPauseTolerance: currentTurnPauseTolerance(),
+    realtimeConversationMode: currentRealtimeConversationMode(),
     voiceVolume: Math.max(
       0,
       Math.min(200, parseInt(el("voiceVolume").value, 10) || 100),

@@ -51,6 +51,7 @@ const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
+const PROACTIVE_TURN_CAPABILITY = "local-v1";
 const MAX_TURN_MEMORY_ITEMS = 3;
 const MAX_TURN_MEMORY_CHARS = 700;
 const CANDIDATE_ID_MAX = 0xffffffff;
@@ -141,6 +142,8 @@ export class RealtimeSession {
     onPlaybackStats,
     onError,
     provider = "unknown",
+    conversationMode = "follow-user",
+    proactiveGreetingDelayMs,
     maxTraceEvents = 256,
     onTrace,
   } = {}) {
@@ -210,6 +213,20 @@ export class RealtimeSession {
     this._candidateSegmentKeys = null;
     this._pendingConfirmedCandidate = null;
     this._candidateSnapshotTimer = 0;
+    this._conversationMode = ["balanced", "ai-leads"].includes(conversationMode)
+      ? conversationMode
+      : "follow-user";
+    this._proactiveTurnMode = "none";
+    this._proactiveTriggerId = 0;
+    this._proactiveWelcomeSent = false;
+    this._proactiveGreetingTimer = 0;
+    this._sessionStarted = false;
+    this._micReady = false;
+    this._proactiveGreetingDelayMs = Number.isFinite(proactiveGreetingDelayMs)
+      ? Math.max(0, proactiveGreetingDelayMs)
+      : this._conversationMode === "ai-leads"
+        ? 600
+        : 1200;
   }
 
   /**
@@ -286,6 +303,12 @@ export class RealtimeSession {
           : [SESSION_MEMORY_CAPABILITY];
         if (
           usesManagedCascade(this.trace.provider) &&
+          this._conversationMode !== "follow-user"
+        ) {
+          cascadeCapabilities.proactiveTurn = [PROACTIVE_TURN_CAPABILITY];
+        }
+        if (
+          usesManagedCascade(this.trace.provider) &&
           this._playbackMode === "worklet" &&
           this.playbackNode
         ) {
@@ -354,6 +377,7 @@ export class RealtimeSession {
     switch (msg.type) {
       case "session":
         if (msg.state === "started") {
+          this._sessionStarted = true;
           this._memoryContextMode =
             [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY].includes(msg.memoryContext)
               ? msg.memoryContext
@@ -387,6 +411,12 @@ export class RealtimeSession {
                 ? msg.vadShadow
                 : "unavailable";
           this._asrRuntime = sanitizeAsrRuntime(msg.asrRuntime);
+          this._proactiveTurnMode =
+            this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
+            msg.proactiveTurn === PROACTIVE_TURN_CAPABILITY
+              ? PROACTIVE_TURN_CAPABILITY
+              : "none";
+          this._scheduleProactiveWelcome();
         }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
@@ -403,6 +433,7 @@ export class RealtimeSession {
         }
         break;
       case "asr_start":
+        this._cancelProactiveWelcome();
         if (this._confirmSpeech()) this.cb.onAsrStart?.();
         break;
       case "speech_candidate":
@@ -486,6 +517,7 @@ export class RealtimeSession {
         }
         break;
       case "assistant":
+        this._cancelProactiveWelcome();
         this._assistantActive = true;
         this.trace.startResponse();
         this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
@@ -503,6 +535,17 @@ export class RealtimeSession {
         if (!usesManagedCascade(this.trace.provider)) break;
         this._assistantActive = false;
         this.cb.onAssistantDiscarded?.({ generation: msg.generation });
+        break;
+      case "proactive_turn_status":
+        if (
+          usesManagedCascade(this.trace.provider) &&
+          this._proactiveTurnMode === PROACTIVE_TURN_CAPABILITY &&
+          msg.state === "cancelled"
+        ) {
+          this._backendAudioPending = false;
+          this._assistantActive = false;
+          this._flushPlayback("speech_candidate");
+        }
         break;
       case "tts_start":
         this._backendAudioPending = true;
@@ -709,6 +752,7 @@ export class RealtimeSession {
   _beginSpeechCandidate(msg = {}) {
     if (this._speechCandidate || this._userTurnOpen) return false;
     this._resetInterruptionCandidate();
+    this._cancelProactiveWelcome();
     this._speechCandidate = true;
     this._candidateInterruptsResponse = this._assistantActive || this._hasPlayback();
     const candidateId = msg.candidateId;
@@ -743,6 +787,47 @@ export class RealtimeSession {
     this._candidateSnapshot = null;
     this._candidateSegmentKeys = null;
     this._pendingConfirmedCandidate = null;
+  }
+
+  _scheduleProactiveWelcome() {
+    if (
+      this._proactiveWelcomeSent ||
+      this._proactiveGreetingTimer ||
+      !this._sessionStarted ||
+      !this._micReady ||
+      this._proactiveTurnMode !== PROACTIVE_TURN_CAPABILITY ||
+      this._conversationMode === "follow-user"
+    ) {
+      return;
+    }
+    this._proactiveGreetingTimer = setTimeout(() => {
+      this._proactiveGreetingTimer = 0;
+      if (
+        this.stopped ||
+        this._speechCandidate ||
+        this._userTurnOpen ||
+        this._assistantActive ||
+        this._hasPlayback() ||
+        !this.ws ||
+        this.ws.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      this._proactiveWelcomeSent = true;
+      this._proactiveTriggerId += 1;
+      this.ws.send(
+        JSON.stringify({
+          type: "proactive_turn",
+          triggerId: this._proactiveTriggerId,
+          kind: "welcome",
+        }),
+      );
+    }, this._proactiveGreetingDelayMs);
+  }
+
+  _cancelProactiveWelcome() {
+    if (this._proactiveGreetingTimer) clearTimeout(this._proactiveGreetingTimer);
+    this._proactiveGreetingTimer = 0;
   }
 
   _acceptCandidateSnapshot(message) {
@@ -1425,6 +1510,8 @@ export class RealtimeSession {
       }
     };
     this.micSource.connect(this.workletNode);
+    this._micReady = true;
+    this._scheduleProactiveWelcome();
     // 不接到 destination，避免把麦克风原声播出去。
   }
 
@@ -1432,6 +1519,7 @@ export class RealtimeSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this._cancelProactiveWelcome();
     this._backendAudioPending = false;
     if (this._levelRaf) cancelAnimationFrame(this._levelRaf);
     this._levelRaf = 0;

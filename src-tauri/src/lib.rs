@@ -119,6 +119,9 @@ struct Settings {
     /// 本地级联通话的用户停顿容忍度：`fast` / `standard` / `long`。
     #[serde(default = "default_turn_pause_tolerance")]
     turn_pause_tolerance: String,
+    /// 实时通话主动性：`follow-user` / `balanced` / `ai-leads`。
+    #[serde(default = "default_realtime_conversation_mode")]
+    realtime_conversation_mode: String,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
     #[serde(default)]
     text_model: String,
@@ -221,6 +224,10 @@ fn default_turn_pause_tolerance() -> String {
     "standard".into()
 }
 
+fn default_realtime_conversation_mode() -> String {
+    "follow-user".into()
+}
+
 fn default_text_provider() -> String {
     "deepseek".into()
 }
@@ -285,6 +292,7 @@ impl Settings {
             vad_shadow_enabled: false,
             asr_provider: default_asr_provider(),
             turn_pause_tolerance: default_turn_pause_tolerance(),
+            realtime_conversation_mode: default_realtime_conversation_mode(),
             text_model: String::new(),
             text_provider: default_text_provider(),
             local_text_model: String::new(),
@@ -415,6 +423,14 @@ fn normalize_turn_pause_tolerance(value: &str) -> &'static str {
         "fast" => "fast",
         "long" => "long",
         _ => "standard",
+    }
+}
+
+fn normalize_realtime_conversation_mode(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "balanced" => "balanced",
+        "ai-leads" => "ai-leads",
+        _ => "follow-user",
     }
 }
 
@@ -1311,6 +1327,8 @@ struct AiSettingsInput {
     asr_provider: String,
     #[serde(default = "default_turn_pause_tolerance")]
     turn_pause_tolerance: String,
+    #[serde(default = "default_realtime_conversation_mode")]
+    realtime_conversation_mode: String,
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
@@ -1404,6 +1422,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.asr_provider = normalize_asr_provider(&settings.asr_provider).into();
         s.turn_pause_tolerance =
             normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).into();
+        s.realtime_conversation_mode =
+            normalize_realtime_conversation_mode(&settings.realtime_conversation_mode).into();
         s.text_model = settings.text_model.trim().to_string();
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
@@ -1746,7 +1766,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_asr_provider, normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
+        normalize_asr_provider, normalize_realtime_conversation_mode,
+        normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
     };
 
     #[test]
@@ -1792,5 +1813,22 @@ mod tests {
         assert_ne!(standard, voice_config_fingerprint(&settings));
         settings.turn_pause_tolerance = "unknown".into();
         assert_eq!(standard, voice_config_fingerprint(&settings));
+    }
+
+    #[test]
+    fn realtime_conversation_mode_is_allowlisted_without_restarting_voice_service() {
+        assert_eq!(
+            normalize_realtime_conversation_mode(" balanced "),
+            "balanced"
+        );
+        assert_eq!(normalize_realtime_conversation_mode("AI-LEADS"), "ai-leads");
+        for value in ["", "future", "always"] {
+            assert_eq!(normalize_realtime_conversation_mode(value), "follow-user");
+        }
+
+        let mut settings = Settings::defaults();
+        let follow_user = voice_config_fingerprint(&settings);
+        settings.realtime_conversation_mode = "ai-leads".into();
+        assert_eq!(follow_user, voice_config_fingerprint(&settings));
     }
 }
