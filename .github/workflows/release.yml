@@ -219,6 +219,7 @@ jobs:
       # 自动归类：feat* → 新增，fix* → 修复，其余（跳过 chore(release)/docs/ci/build）→ 其他
       # merge commits 用 --no-merges 排除
       - name: Generate release notes
+        id: release-notes
         shell: bash
         run: |
           set -euo pipefail
@@ -270,6 +271,12 @@ jobs:
 
           echo "===== release_notes.md ====="
           cat release_notes.md
+          DELIMITER="KXYY_RELEASE_NOTES_EOF_7F2C9A81"
+          {
+            echo "body<<$DELIMITER"
+            cat release_notes.md
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Encrypt persona assets
         run: npm run encrypt-assets
@@ -287,7 +294,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "元元桌宠 ${{ github.ref_name }}"
-          releaseBodyFile: release_notes.md
+          releaseBody: ${{ steps.release-notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
