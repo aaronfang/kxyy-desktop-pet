@@ -47,16 +47,16 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 - 设置页支持搜索、筛选、编辑、置顶、兑现、删除和按人设清空。
 - “别记这段”会在当前用户气泡显示私密回合徽标；记忆页会显式展示 pending、skipped、数据库或 provider 错误，聊天与退出不因此阻塞。
 - 旧 `localStorage` facts/promises/sessions/topics 幂等迁移。
-- 50 个 Rust Memory 测试、67 个 JS 测试、190 个 Python 实时服务测试、前端语法检查，以及本地 macOS DMG build 已通过；跨平台 CI/真实 App 人工路径仍需在发布前执行。
+- 50 个 Rust Memory 测试、67 个 JS 测试、190 个 Python 实时服务测试、前端语法检查，以及本地 macOS DMG build 已通过；PR #29、发布标签和发布后 `main` 的 Windows/macOS CI 均通过，真实设备上的 M2 延迟与声学体验仍需单独记录。
 - 设置页明确区分在线 DeepSeek 巩固与本地 Ollama 巩固的数据边界；记忆数据库和归纳结果始终只保存在本机。
 
 ### 2.2 当前边界
 
 - 召回仍以 FTS、结构化标签和字符相似度为主，跨表达语义召回有限。
-- topics/entities 仍保存在 JSON 中，没有规范化实体和显式关系边。
-- card + nickname 是主要隔离键，尚无 global user / persona relationship / project / connector 多级 scope。
-- 完成 job 后只保留归纳记忆与短来源片段；当前已增加保留事件日志的事务化重放工具，可恢复 facts/episodes/commitments、FTS、topic/entity 和关系边。
-- 火山端到端实时通话只在 session start 接收固定 `systemRole`，尚未逐轮召回。
+- schema v5 已把第一阶段 topic/entity 和 `about`、`mentions`、`derived_from`、`supersedes` 关系边规范化；更多关系类型、可选语义召回和跨模态 artifact 仍未进入正式路径。
+- card/user 隔离和 `persona-relationship:<user_id>` scope 已落地；global user、project、connector 和 private-session 多级 scope 仍待后续阶段。
+- append-only 事件、evidence、短来源片段和事务化重放工具已落地，可恢复 facts/episodes/commitments、FTS、topic/entity 和关系边；长期来源保留仍受既定清理策略约束。
+- 本地 Qwen/CosyVoice 已支持有界 `turn-final-v1` 逐轮召回；火山端到端仍只在 session start 接收记忆，且 M2 的真实设备延迟 P95 尚未形成验收记录。
 - 当前管理页同时提供列表与可缩放、可平移、可拖拽并按 card/user 保存布局的 Memory Graph；列表仍是批量和无障碍主入口。
 - SQLite 按现有 `settings.json` 安全等级明文保存在本机，尚无 SQLCipher。
 - 数据库、召回结果和统计不作为遥测上传；但在线文字模式会把允许记忆的会话批次直发给当前配置的 DeepSeek 做巩固，本地 Ollama 模式则留在本机。设置页和隐私说明必须明确这一区别。
@@ -280,7 +280,7 @@ export()
 当前不应立即把 Memory Brain 拆成单独项目，原因：
 
 - 目前只有元元桌宠一个真实 consumer。
-- Memory v3 仍依赖 Tauri `AppHandle`、应用配置、当前 AI provider 和设置结构。
+- provider-neutral core trait 已从具体 DeepSeek/Ollama 设置中抽离，但 SQLite 生命周期、IPC、设置 UI 和发布仍嵌在桌宠仓库，尚未形成可独立版本化的 crate/service 合同。
 - schema、召回和语音接入还会快速迭代，跨仓版本联调会放大维护成本。
 - 现在拆仓会过早冻结 API，同时增加发布、CI、兼容和迁移负担。
 
