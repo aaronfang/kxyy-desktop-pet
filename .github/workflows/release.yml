@@ -244,7 +244,7 @@ jobs:
 
           ### 安装包
 
-          - **Windows**：\`.exe\`（NSIS，需 WebView2；Win10/11 一般已内置）。安装时可勾选配置 GPU 本地语音模型（IndexTTS-2 / CosyVoice3）。
+          - **Windows**：\`.exe\`（NSIS，需 WebView2；Win10/11 一般已内置）。安装后可配置本地 Qwen3-TTS 或云端 CosyVoice/火山语音。
           - **macOS**：\`.dmg\`（Apple Silicon 选 \`aarch64\`，Intel 选 \`x64\`）；菜单栏托盘应用，不占用 Dock。
 
           ## ${TAG} 更新内容
