@@ -1,12 +1,12 @@
 # 元元桌宠 · Memory Brain 开发路线图
 
-> 状态基准：2026-07-27。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
+> 状态基准：2026-07-28。本文是长期记忆、记忆图、实时语音记忆、认知工作区和外部接入的**唯一权威路线图**。角色体验只引用结论，不在 `roadmap-ai-roleplay.md` 复制实现方案；音频时序仍以 [`roadmap-realtime-voice.md`](./roadmap-realtime-voice.md) 为准。
 >
-> 当前 Memory v3 已在 PR #28 的开发分支实现并通过本地测试；真实 App 人工验收与正式发布仍未完成。
+> Memory v3/v3.1、关系图、实时通话记忆协调和默认关闭的 Workspace 基础已由 PR #29 合入 `main`，并随 App `v0.2.43` 正式发布；后续开发统一从该发布后的 `main` 建立新分支。
 
 ### 版本与里程碑约定
 
-- 应用安装包使用独立的 SemVer（当前基线为 `0.2.42`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
+- 应用安装包使用独立的 SemVer（当前发布基线为 `0.2.43`）；每个交给用户集中测试的功能包至少递增一个 patch/minor 版本，并同步 `package.json`、Tauri 配置、Cargo manifest 和 lockfile。
 - Memory 内核使用 schema version（当前 v5）和能力里程碑（M1-A、M1-B、M1-C…）双重标记。schema version 只表示数据库迁移，不等同应用版本。
 - 实时语音和 Memory 独立演进；实时语音未完工不是延迟 Memory 应用版本的理由。只有跨模块 API 破坏性变更才需要共同 bump minor/major。
 - 进入人工测试的构建必须在变更记录中同时写明应用版本、Memory milestone、schema version、commit 和构建产物路径。
@@ -34,7 +34,7 @@ Memory Brain 的目标不是把更多历史塞进 prompt，而是把以下职责
 
 ## 2. 当前基线：Memory v3
 
-### 2.1 已实现（PR #28，当前分支 macOS verified；跨平台仍待本轮 PR CI）
+### 2.1 已实现并发布（PR #29 / App v0.2.43）
 
 - Rust + bundled SQLite，数据库位于应用配置目录 `memory-v3.sqlite3`。
 - WAL、foreign keys、busy timeout、secure delete 和显式 schema version。
@@ -116,7 +116,7 @@ flowchart TB
 
 ## 4. 分阶段路线与硬门槛
 
-### M0：Memory v3 发布闭环（当前最高优先级）
+### M0：Memory v3 发布闭环（已发布）
 
 目标：先把当前实现变成可信赖的正式基线，再增加 schema 和 UI。
 
@@ -128,11 +128,11 @@ flowchart TB
 - [x] 发布负责人于 2026-07-28 接受本轮真实 App 重启恢复、无 Key 和本地模型离线路径人工验收视为通过；逐项脚本证据未补录，按发布豁免处理。
 - [x] 发布负责人于 2026-07-28 接受“别记这段”、纠错、删除和清空路径人工验收视为通过；[`qa-memory-v3-m0.md`](./qa-memory-v3-m0.md) 保留未逐项执行的原始复核清单，不伪造实测记录。
 - [x] macOS 与 Windows CI/build；确认 packaged SQLite/FTS5。
-- [ ] 合并并进入正式发布；发布前不得把本节标记为 released。
+- [x] PR #29 合入 `main`，Windows x64 与 macOS aarch64 CI 通过；App `v0.2.43` 已发布 Windows NSIS、macOS aarch64 DMG 和 macOS x64 DMG。
 
 验收指标沿用：召回 P95 < 30ms、长期注入不超过约 500 token、无关误召回 < 5%、明确纠错后旧事实使用率 0、成功入队最终处理率 100%。
 
-2026-07-26 验证证据：前序 PR #27 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。当前 PR #28 仍需重新取得跨平台 CI 证据。
+2026-07-26 验证证据：前序 PR #27 的 macOS aarch64 与 Windows x64 job 均完成完整 Tauri build；隔离合成 scope 通过真实 App worker 分别调用 DeepSeek 与本地 Ollama，两个 job 均零重试完成并生成 episode、facts、commitment 与 FTS 索引，验证后 scope、派生记录、job 和 FTS 索引已全部清除。2026-07-28，集成 PR #29 及其 `main` merge commit `8072c43` 的 Windows/macOS CI 均通过；标签 `v0.2.43` 的独立 release quality gate 通过，并发布三个平台资产。人工路径按发布负责人决定视为通过，逐项脚本证据仍不伪造。
 
 ### M1：Memory v3.1 内核基础（Graph 和外部接入的前置）
 
@@ -317,4 +317,4 @@ src-tauri/src/memory_tauri.rs      AppHandle、IPC、设置和窗口集成
 
 ## 7. 下一步唯一入口
 
-历史规划入口为 **M0 发布闭环 → M1 Memory v3.1 内核基础**；这些阶段和实时通话协调基础已完成。当前唯一入口是 **M0–M4 验收收口 → M5 综合大脑接入设计**：先完成真实 App 手工 QA、跨平台打包验证和 M2 设备延迟记录，再设计只读、有鉴权的 localhost/MCP 接入；M4 idle replay 仍需独立 feature flag 和观察期，不得暗中启用。
+历史规划入口 **M0 发布闭环 → M1 Memory v3.1 内核基础 → M3/M4 第一阶段** 已随 `v0.2.43` 收口。当前唯一入口是 **M2 设备延迟记录 → M5 综合大脑接入设计**：后续从发布后的 `main` 新建独立分支，先记录实时逐轮记忆的设备延迟，再设计只读、有鉴权的 localhost/MCP 接入；M4 idle replay 仍需独立 feature flag 和观察期，不得暗中启用。

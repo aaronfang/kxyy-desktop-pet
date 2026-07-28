@@ -82,7 +82,7 @@ graph TD
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
 | 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR 与诊断 schema v5，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Windows/Linux Qwen TTS/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
-| 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3 | `memory.rs` + Tauri IPC | 事实/经历/约定、异步巩固、选择性召回和管理页；当前工作树 locally verified，尚未正式发布 |
+| 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3/v3.1 | `memory.rs` + Tauri IPC | 事实/经历/约定、事件时间线、关系图、异步巩固、选择性召回和管理页；已随 App `v0.2.43` 正式发布，后续路线以 `roadmap-memory-brain.md` 为准 |
 | 会话摘要 | 复用文字模型 | 同上 | `chat.js` + Memory v3 | 最近对话与滚动摘要保留为工作记忆，跨会话不再全量注入 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |
 
@@ -110,7 +110,7 @@ graph TD
 | AI 只会等用户先说话 | `src/ai/persona.js` 的 `PROACTIVE_HINT` 常量已经写好 `welcome`（观众刚来）、`comeback`（离开又回来）、`idle`（沉默主动搭话）三套完整 prompt 模板，`buildMessages()` 支持 `proactiveKind` 参数；但**全仓搜索确认 `src/chat.js` 仅在两处传入 `proactiveKind`：`"followup"`（1406行）与 `"pat"`（1464行）**，`welcome`/`comeback`/`idle` 从未被调度过。 | AI 角色扮演最有代入感的"主动找你聊天"能力已经在逻辑层写好，只差桌面端一个触发调度器，是全项目**性价比最高的技术债**。 |
 | **直播场景"下班感"过重——对话被直播间框死** | `computeLiveContext()`（第 399-497 行）每轮对话都向 system prompt 注入详细的直播状态机：周一休息日、20:30 开播时间表、PK/打野/梳妆/唱歌/回家段等环节阶段、"距开播还有 X 小时"倒计时等。虽然 `OFF_AIR_NOTE`（第 394 行）已在下播时段禁止播报直播状态，但 system prompt 仍以直播为核心场景构建上下文——AI 每轮都能"看到"这些状态，倾向于用"刚开播呢""一会要下播了""还没开播呢""今天周一休息"作为话头或回应的一部分。用户期望以主播**身份**像朋友日常唠嗑，而非每轮都被提醒"你现在在直播间里"。<br><br>**更新（2026-07-12）**：`computeLiveContext()` 已重构——硬编码的 `20:30` 开播时间和固定阶段流程（PK→打野→唠嗑→跳舞→梳妆→唱歌→回家段）均改为由 `lore.open_time` / `lore.live_stages` 驱动，抽取 `guessStage()` 独立函数。主播侧行为已参数化，但"淡化直播场景、切换为日常聊天模式"的整体体验目标仍需在 P0 中完成 system prompt 层面的语境调整。 | 体验是"在直播间里跟主播聊天"，而非"跟主播像朋友一样聊天"。直播间状态作为默认上下文过于强势，深层原因是 `computeLiveContext` 的逻辑设计之初就是为了给 AI 提供"现在该干什么"的直播脚本，而非"现在跟朋友聊什么"的日常话题提示。**已参数化但未淡化——仍待 P0 工作。** |
 | 单一固定人设 | 语料链路：`persona-assets.js`(明文) → `encrypt-assets.mjs`(XOR) → `persona-assets.enc`(编译期 `include_bytes!` 嵌入) → `persona_assets.rs`(运行时解密) → `/api/assets` 一次性下发。整条链路**只支撑一份人设**，没有"人设 ID"概念，也没有存储多份语料的数据结构。<br><br>**更新（2026-07-12）**：`persona_assets.rs` 已重构为"编译期默认 + 运行时动态覆盖"双通道架构——通过 `load_card_from_file()` 从 `persona-cards/<card_id>/persona-card.json` 动态加载人格卡覆盖编译期嵌入的默认值。`Settings.persona_card_id` + `set_persona_card` IPC 命令已在 Rust 侧就绪，**但前端（设置页）尚缺人格卡选择/切换 UI**，暂无法让最终用户直接操作。 | 无法做"多角色切换"（例如同时提供温柔系/毒舌系/职场系人设供用户选），扩展新角色卡需要改代码重新编译，而非配置文件级操作。**后端已支持动态加载，前端 UI 待补齐。** |
-| Memory v3.1 已形成事件、证据、关系边、实时召回和管理闭环 | 当前工作树已有 append-only event、evidence、scope、规范化实体/关系边、可重建派生索引、实时 session/turn recall、列表与关系图；Workspace 仍默认关闭。当前缺口是 M0–M4 真实 App/设备验收、M5 外部接入和 M6 可选 embedding，而不是继续在 prompt 内堆记忆。 | 当前发布重点是把已实现基线验证完整；后续严格按 [Memory Brain M0–M6](./roadmap-memory-brain.md#4-分阶段路线与硬门槛) 推进。 |
+| Memory v3.1 已形成事件、证据、关系边、实时召回和管理闭环 | App `v0.2.43` 已发布 append-only event、evidence、scope、规范化实体/关系边、可重建派生索引、实时 session/turn recall、列表与关系图；Workspace 仍默认关闭。当前缺口是 M2 设备延迟记录、M5 外部接入和 M6 可选 embedding，而不是继续在 prompt 内堆记忆。 | 后续从发布后的 `main` 建立独立分支，严格按 [Memory Brain M0–M6](./roadmap-memory-brain.md#4-分阶段路线与硬门槛) 推进。 |
 | 观众画像三档但无法自主创建新角色关系模板 | `resolveUserProfile()` 只处理"本人 ππ 完整画像 / 自填字段 / 默认元宝"三种，`persona_relationship`/`persona_facts` 等字段是**扁平文本框**，非结构化数据。 | 关系设定难以复用/导出/分享。 |
 | 深聊模式已有但触发面窄 | `detectDeepIntent()` 靠正则匹配"你觉得/展开说"等固定句式，非语义理解。 | 用户换种问法（比如"哎我最近很烦"这种没有疑问词的话）大概率不会触发深聊，体验不稳定。 |
 
@@ -240,11 +240,11 @@ graph TD
 |---|---|---|---|---|---|
 | 接入 idle/welcome/comeback 主动性调度 | 3.1 | 逻辑已在 `persona.js` 写好，只缺 `chat.js` 侧调度，投入产出比最高 | **低** | `- [ ]` |
 | **淡化直播场景、切换为"主播日常聊天"模式** | 3.1 | 用户最核心的体验痛点——AI 不再每轮说"开播/下播/还没开播"，聊天更自然。`computeLiveContext()` 已参数化解耦（开播时间/阶段流程由 lore 驱动），**剩余工作：system prompt 层面淡化直播语境** | **中** | `- [~]` 🔧 进行中（2026-07-12 已参数化） |
-| **Memory v3 发布闭环** | Memory Brain M0 | 元数据、冲突、异步巩固、选择性召回和管理页已实现；剩余真实 provider/E2E、跨平台构建与发布验证 | **高** | `- [~]` 🔧 locally verified，尚未发布 |
+| **Memory v3 发布闭环** | Memory Brain M0 | 元数据、冲突、异步巩固、选择性召回、管理页和跨平台发布均已完成 | **高** | `- [x]` ✅ App `v0.2.43` 已发布 |
 | 每日签到 / 每日一句 | 3.2 | 直接搭在主动性调度基建之上，几乎零增量成本 | 低 | `- [ ]` |
 | **桌宠待机动作多样性扩展** | 3.2 | 不增加新素材也能丰富桌宠"活物感"，纯前端改动 | 低 | `- [ ]` |
 | 记住用户生日并主动庆祝 | 3.2 | 复用已验证的时间驱动叙事模式，成本低 | **中** | `- [ ]` |
-| 列表式记忆管理页 | 3.5 | 已支持搜索、编辑、置顶、兑现、删除和按人设清空；Memory Graph 另列 M3 | 低 | `- [x]` ✅ 当前工作树已实现 |
+| 列表式记忆管理页 | 3.5 | 已支持搜索、编辑、置顶、兑现、删除和按人设清空；Memory Graph 另列 M3 | 低 | `- [x]` ✅ App `v0.2.43` 已发布 |
 | 点歌/小彩蛋指令 | 3.2 | 纯 prompt 层彩蛋，无需新架构 | 中 | `- [ ]` |
 | 社区形象素材规范化文档 | 3.4 | 纯文档工作，零代码风险 | 无 | `- [ ]` |
 | **人设蒸馏验证**（阶段 1） | 新增 | 从 5 条直播回放 WAV 蒸馏元元人格模式，对照当前 system prompt 的差距。框架已就绪 `scripts/persona-distill/`，只需放入测试 WAV 即可跑 | 无（新增工具） | `- [x]` ✅ 2026-07-11 |
