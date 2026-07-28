@@ -171,7 +171,7 @@ $vp = Start-Process -FilePath $VenvPy -ArgumentList @("$checkPy") `
 if ($vp.ExitCode -eq 0) {
   Get-Content $check -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" -ForegroundColor Green }
   Write-Host "OK. Qwen3-TTS PyTorch backend is ready." -ForegroundColor Green
-  Write-Host "The 1.7B model (Qwen/Qwen3-TTS-12Hz-1.7B-Base) downloads on first use (several GB)." -ForegroundColor Green
+  Write-Host "The Windows default 0.6B model (Qwen/Qwen3-TTS-12Hz-0.6B-Base) downloads on first use." -ForegroundColor Green
 } else {
   Write-Host "Import check failed. Last lines:" -ForegroundColor Red
   if (Test-Path "$check.err") { Get-Content "$check.err" -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkRed } }

@@ -14,6 +14,7 @@ SERVER_PATH = (
     / "local-realtime"
     / "server.py"
 )
+TORCH_BACKEND_PATH = SERVER_PATH.with_name("tts_qwen3_torch.py")
 
 
 def _load_server():
@@ -59,6 +60,27 @@ def _load_server():
 
 
 server, common = _load_server()
+
+
+def _load_torch_backend():
+    spec = importlib.util.spec_from_file_location(
+        "kxyy_qwen_torch_backend", TORCH_BACKEND_PATH
+    )
+    backend = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    previous_common = sys.modules.get("common")
+    sys.modules["common"] = common
+    try:
+        spec.loader.exec_module(backend)
+    finally:
+        if previous_common is None:
+            sys.modules.pop("common", None)
+        else:
+            sys.modules["common"] = previous_common
+    return backend
+
+
+torch_backend = _load_torch_backend()
 
 
 class FakeDecoder:
@@ -368,6 +390,18 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
                 sys.modules.pop("tts_qwen3_torch", None)
             else:
                 sys.modules["tts_qwen3_torch"] = previous_qwen
+
+    def test_windows_torch_default_prefers_low_latency_06b_model(self):
+        self.assertEqual(
+            torch_backend.WINDOWS_DEFAULT_MODEL,
+            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        )
+        self.assertEqual(
+            torch_backend.DEFAULT_MODEL,
+            torch_backend.WINDOWS_DEFAULT_MODEL
+            if sys.platform == "win32"
+            else torch_backend.LINUX_DEFAULT_MODEL,
+        )
 
 
 if __name__ == "__main__":

@@ -218,10 +218,10 @@
             <p class="hint">
               macOS(Apple Silicon)：保存后<strong>自动配置</strong> Qwen3-TTS（创建 venv、装依赖、下载 MLX 量化模型到
               <code>~/Library/Application Support/…/voice-runtime</code>，首次需网络、可能数分钟）。<br/>
-              Windows / Linux：走官方 PyTorch 包 <code>qwen-tts</code>（默认 1.7B 模型），先运行
+              Windows / Linux：走官方 PyTorch 包 <code>qwen-tts</code>（Windows 默认低延迟 0.6B；Linux 保持 1.7B），先运行
               <code>scripts/windows/setup-qwen3-tts.cmd</code> 创建 <code>.venv-qwen3</code> 环境并安装 torch / qwen-tts 等依赖
              （NVIDIA 显卡自动装 CUDA 版 torch；RTX 50 系需 cu128）。<br/>
-              启动服务（通话 :19876，朗读 :19976），零样本克隆参考音频，不消耗火山 token。
+              首次下载可能持续数分钟；超过 180 秒后仍会继续加载并在就绪后自动恢复。启动服务（通话 :19876，朗读 :19976），零样本克隆参考音频，不消耗火山 token。
             </p>
           </div>
 

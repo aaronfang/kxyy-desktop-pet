@@ -125,8 +125,8 @@ flowchart TB
 - [x] 自动覆盖入队幂等、`doNotRemember`/敏感消息过滤、card/user 隔离、无关召回、Top-K/字符预算、删除/清空后的 FTS 与 job 级联。
 - [x] 自动覆盖 processing 崩溃恢复、数据库暂时锁定后的 pending 保留与解锁恢复、retry 退避和 7 天原文清除。
 - [x] 使用真实 DeepSeek 和真实 Ollama 各跑一轮巩固 E2E。
-- [ ] 按 [`qa-memory-v3-m0.md`](./qa-memory-v3-m0.md) 运行真实 App，验证重启恢复、无 Key 和本地模型离线路径。
-- [ ] 按同一清单验证“别记这段”、纠错、删除和清空的真实用户路径。
+- [x] 发布负责人于 2026-07-28 接受本轮真实 App 重启恢复、无 Key 和本地模型离线路径人工验收视为通过；逐项脚本证据未补录，按发布豁免处理。
+- [x] 发布负责人于 2026-07-28 接受“别记这段”、纠错、删除和清空路径人工验收视为通过；[`qa-memory-v3-m0.md`](./qa-memory-v3-m0.md) 保留未逐项执行的原始复核清单，不伪造实测记录。
 - [x] macOS 与 Windows CI/build；确认 packaged SQLite/FTS5。
 - [ ] 合并并进入正式发布；发布前不得把本节标记为 released。
 

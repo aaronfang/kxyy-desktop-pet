@@ -15,8 +15,8 @@ use tauri::{AppHandle, Emitter, Manager};
 const RECENT_LOG_MAX_LINES: usize = 30;
 /// 自动配置脚本进度缓存上限（macOS/Windows 共用）。
 const SETUP_LOG_MAX_LINES: usize = 40;
-/// 端口就绪等待上限（秒）；模型加载可能较久（本地 Qwen）。
-const START_TIMEOUT_SECS: u64 = 180;
+/// 启动超过该时间仍未就绪时更新一次进度；子进程存活期间继续探测，不误报失败。
+const STARTUP_SLOW_NOTICE_SECS: u64 = 180;
 
 /// 进程级共享 secret：拉起本地 TTS 服务时经环境变量 KXYY_TTS_SECRET 注入，
 /// 代理转发 /tts 时带同值 X-Tts-Secret 头，阻止任意本机进程直接刷云端计费。
@@ -257,15 +257,26 @@ fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> 
     matches!(backend, "local" | "cosyvoice") && !next.is_empty() && previous != next
 }
 
+fn startup_slow_message(backend: &str, elapsed_secs: u64) -> Option<&'static str> {
+    if elapsed_secs != STARTUP_SLOW_NOTICE_SECS {
+        return None;
+    }
+    Some(if backend == "local" {
+        "首次使用可能正在下载数 GB 模型；语音服务仍在下载或加载，完成后将自动恢复"
+    } else {
+        "语音服务仍在加载本地模型，完成后将自动恢复"
+    })
+}
+
 #[cfg(test)]
 mod fingerprint_tests {
     use super::{
         backend_still_selected, begin_sensevoice_runtime_install, begin_vad_runtime_install,
         finish_sensevoice_runtime_install, finish_vad_runtime_install, normalize_asr_provider,
-        normalize_turn_pause_tolerance, record_desired_voice_config,
+        normalize_turn_pause_tolerance, record_desired_voice_config, resolve_hf_endpoint,
         sensevoice_install_matches_target, should_defer_for_vad_install,
-        should_restart_for_fingerprint, supports_vad_runtime_install, voice_target_still_selected,
-        VoiceServiceManager,
+        should_restart_for_fingerprint, startup_slow_message, supports_vad_runtime_install,
+        voice_target_still_selected, VoiceServiceManager, DEFAULT_HF_ENDPOINT,
     };
 
     #[test]
@@ -286,6 +297,33 @@ mod fingerprint_tests {
         for value in ["", "standard", "custom", "2250"] {
             assert_eq!(normalize_turn_pause_tolerance(value), "standard");
         }
+    }
+
+    #[test]
+    fn hugging_face_endpoint_defaults_official_and_keeps_explicit_overrides() {
+        assert_eq!(resolve_hf_endpoint("", None), DEFAULT_HF_ENDPOINT);
+        assert_eq!(
+            resolve_hf_endpoint("", Some(" https://private-mirror.example/ ")),
+            "https://private-mirror.example"
+        );
+        assert_eq!(
+            resolve_hf_endpoint(" https://settings-mirror.example/ ", Some("ignored")),
+            "https://settings-mirror.example"
+        );
+    }
+
+    #[test]
+    fn slow_model_startup_stays_in_progress_until_the_child_exits_or_becomes_ready() {
+        assert_eq!(startup_slow_message("local", 179), None);
+        assert_eq!(
+            startup_slow_message("local", 180),
+            Some("首次使用可能正在下载数 GB 模型；语音服务仍在下载或加载，完成后将自动恢复")
+        );
+        assert_eq!(startup_slow_message("local", 181), None);
+        assert_eq!(
+            startup_slow_message("cosyvoice", 180),
+            Some("语音服务仍在加载本地模型，完成后将自动恢复")
+        );
     }
 
     #[test]
@@ -1214,14 +1252,30 @@ pub fn install_sensevoice_runtime(app: &AppHandle, backend_raw: &str) -> Result<
     Ok(())
 }
 
-/// HF 镜像站点：默认用 hf-mirror.com（国内可用），可通过 settings.json 的 hfEndpoint 覆盖。
-fn hf_mirror() -> String {
-    let custom = read_setting_str("hfEndpoint");
+const DEFAULT_HF_ENDPOINT: &str = "https://huggingface.co";
+
+/// Hugging Face endpoint：显式 settings/env 优先，默认使用官方站点。
+///
+/// 旧默认 `hf-mirror.com` 属于非官方单点依赖；已有模型缓存会掩盖其故障，
+/// 新模型首次下载时则直接导致语音服务无法启动。需要镜像的用户仍可通过
+/// settings.json 的 `hfEndpoint` 或父进程 `HF_ENDPOINT` 明确覆盖。
+fn resolve_hf_endpoint(custom: &str, inherited: Option<&str>) -> String {
+    let custom = custom.trim();
     if !custom.is_empty() {
-        return custom;
+        return custom.trim_end_matches('/').to_string();
     }
-    // 检查环境变量 HOSTNAME / 网络
-    std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://hf-mirror.com".into())
+
+    let inherited = inherited.unwrap_or_default().trim();
+    if !inherited.is_empty() {
+        return inherited.trim_end_matches('/').to_string();
+    }
+    DEFAULT_HF_ENDPOINT.into()
+}
+
+fn hf_endpoint() -> String {
+    let custom = read_setting_str("hfEndpoint");
+    let inherited = std::env::var("HF_ENDPOINT").ok();
+    resolve_hf_endpoint(&custom, inherited.as_deref())
 }
 
 fn emit_setup_progress(
@@ -1761,8 +1815,9 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
         // 下方按行读取时被丢弃，导致设置页只看到空的「进程已退出」兜底文案。
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
-        // HuggingFace 国内镜像；已在 pip 里配过镜像的可通过 settings.json 的 hfEndpoint 覆盖。
-        .env("HF_ENDPOINT", hf_mirror())
+        // 默认使用 Hugging Face 官方站点；需要镜像时可通过 settings.json 的
+        // hfEndpoint 或父进程 HF_ENDPOINT 显式覆盖。
+        .env("HF_ENDPOINT", hf_endpoint())
         // IndexTTS-2 自带网络探测（TCP 443 握手）可能在墙内误判为"可直连"，
         // 导致 huggingface_hub.hf_hub_download 直连 HF 超时崩溃。
         // 强制 USE_MODELSCOPE=true 让其走 ModelScope → hf-mirror 回退链。
@@ -1867,8 +1922,9 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     std::thread::spawn(move || {
         // 给日志线程一点时间读完短错误输出
         std::thread::sleep(Duration::from_millis(80));
-        // 模型加载可能较久（本地 Qwen）
-        for _ in 0..START_TIMEOUT_SECS {
+        // 首次下载可能远超 180 秒。只要受托管子进程仍存活，就继续探测；固定时限
+        // 只能作为进度提示，不能把仍在下载/加载的健康进程误报为失败。
+        for elapsed_secs in 0_u64.. {
             if service_running(port) {
                 emit(
                     &app2,
@@ -1924,31 +1980,18 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
                 }
                 return;
             }
+            if let Some(message) = startup_slow_message(&backend2, elapsed_secs) {
+                emit(
+                    &app2,
+                    VoiceServiceStatus {
+                        backend: backend2.clone(),
+                        state: "starting".into(),
+                        message: message.into(),
+                        port,
+                    },
+                );
+            }
             std::thread::sleep(Duration::from_secs(1));
-        }
-        if service_running(port) {
-            emit(
-                &app2,
-                VoiceServiceStatus {
-                    backend: backend2,
-                    state: "running".into(),
-                    message: format!("已启动（:{port}）"),
-                    port,
-                },
-            );
-        } else {
-            emit(
-                &app2,
-                VoiceServiceStatus {
-                    backend: backend2,
-                    state: "failed".into(),
-                    message: format!(
-                        "启动超时（{} 秒内端口未就绪），进程可能仍在加载模型",
-                        START_TIMEOUT_SECS
-                    ),
-                    port,
-                },
-            );
         }
     });
 }
