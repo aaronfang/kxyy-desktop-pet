@@ -1,6 +1,7 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
-import { clearAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
+import { clearAllMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
+import { memoryHealthState } from "./memory-ui.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -21,6 +22,7 @@ const FIELDS = [
   "localRefText",
   "asrProvider",
   "turnPauseTolerance",
+  "realtimeConversationMode",
   "voiceVolume",
   "textProvider",
   "textModel",
@@ -81,6 +83,11 @@ function currentTurnPauseTolerance() {
   return value === "fast" || value === "long" ? value : "standard";
 }
 
+function currentRealtimeConversationMode() {
+  const value = (el("realtimeConversationMode")?.value || "follow-user").toLowerCase();
+  return value === "balanced" || value === "ai-leads" ? value : "follow-user";
+}
+
 /** 按所选语音后端只展示对应设置项。 */
 function syncVoiceFields() {
   const backend = currentBackend();
@@ -104,6 +111,10 @@ function syncVoiceFields() {
   if (pauseBox) {
     pauseBox.hidden = backend !== "local" && backend !== "cosyvoice";
   }
+  const conversationModeBox = el("conversationModeFields");
+  if (conversationModeBox) {
+    conversationModeBox.hidden = backend !== "local" && backend !== "cosyvoice";
+  }
   const installSenseVoice = el("installSenseVoiceRuntime");
   if (installSenseVoice) {
     installSenseVoice.disabled = currentAsrProvider() !== "sensevoice";
@@ -126,6 +137,12 @@ function syncTextFields() {
   const provider = currentTextProvider();
   el("textFieldsDeepseek").hidden = provider !== "deepseek";
   el("textFieldsLocal").hidden = provider !== "local";
+  const privacy = el("memoryPrivacy");
+  if (privacy) {
+    privacy.textContent = provider === "local"
+      ? "当前选择本地巩固：允许记忆的会话片段和归纳结果都由 Ollama 在本机处理。敏感内容和“别记这段”会在入队前过滤。"
+      : "当前选择在线巩固：允许记忆的会话片段会直发 DeepSeek 进行后台整理；记忆数据库和归纳结果仍只保存在本机。敏感内容和“别记这段”会在发送前过滤。";
+  }
   // 当切换到 local 时自动探测 Ollama 状态
   if (provider === "local") {
     void probeLocalTextStatus();
@@ -163,6 +180,10 @@ function fill(s) {
     s.turnPauseTolerance === "fast" || s.turnPauseTolerance === "long"
       ? s.turnPauseTolerance
       : "standard";
+  el("realtimeConversationMode").value =
+    s.realtimeConversationMode === "balanced" || s.realtimeConversationMode === "ai-leads"
+      ? s.realtimeConversationMode
+      : "follow-user";
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
   const vol = Number(s.voiceVolume);
   el("voiceVolume").value = Number.isFinite(vol)
@@ -174,6 +195,7 @@ function fill(s) {
   el("showChatDebug").checked = s.showChatDebug === true;
   el("vadShadowEnabled").checked = s.vadShadowEnabled === true;
   el("personaCardId").value = s.personaCardId || "";
+  if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
@@ -182,6 +204,8 @@ function fill(s) {
   syncTextFields();
   syncVlFields();
   el("thinking").checked = !!s.thinking;
+  if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
+  if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
   el("userName").value = s.userName || "";
   el("patText").value = s.patText || "";
@@ -232,12 +256,21 @@ async function loadCardList() {
     opt.dataset.desc = card.description || "";
     sel.appendChild(opt);
   }
+  const memorySel = el("memoryCardId");
+  if (memorySel) {
+    const selected = memorySel.value;
+    memorySel.replaceChildren(...Array.from(sel.options, (option) => option.cloneNode(true)));
+    memorySel.value = Array.from(memorySel.options).some((option) => option.value === selected)
+      ? selected
+      : sel.value;
+  }
   updateCardInfoDisplay();
 }
 
 async function onCardChanged() {
   const sel = el("personaCardId");
   const cardId = sel.value.trim();
+  if (el("memoryCardId")) el("memoryCardId").value = cardId;
 
   _lastCardId = cardId;
   updateCardInfoDisplay();
@@ -263,6 +296,10 @@ async function onCardChanged() {
   syncVoiceFields();
   probeBackendStatus();
   updateCardLabels();
+  if (el("tab-memory")?.classList.contains("active")) {
+    await migrateSelectedCardMemory();
+    await loadMemoryPage({ resetPage: true });
+  }
 }
 
 /** 有仓库内置参考音的人设（assets/<cardId>/）；空 cardId = 默认开心元元。 */
@@ -410,6 +447,7 @@ async function deleteCurrentCard() {
   if (!window.confirm(`确定删除人设「${name}」？`)) return;
   try {
     await invoke("delete_persona_card", { cardId });
+    clearMemoryGraphLayouts(cardId);
     await loadCardList();
     sel.value = "";
     _lastCardId = "";
@@ -534,6 +572,7 @@ function collect() {
     localRefText: el("localRefText").value.trim(),
     asrProvider: currentAsrProvider(),
     turnPauseTolerance: currentTurnPauseTolerance(),
+    realtimeConversationMode: currentRealtimeConversationMode(),
     voiceVolume: Math.max(
       0,
       Math.min(200, parseInt(el("voiceVolume").value, 10) || 100),
@@ -547,6 +586,8 @@ function collect() {
     localVlModel: el("localVlModel").value.trim(),
     vlProvider: currentVlProvider(),
     thinking: el("thinking").checked,
+    memoryWorkspace: el("memoryWorkspace")?.checked === true,
+    memoryWorkspaceMode: el("memoryWorkspaceMode")?.value || "conservative",
     temperature: Number(el("temperature").value) || 0.8,
     personaCardId: el("personaCardId").value.trim(),
     userName: el("userName").value.trim(),
@@ -934,6 +975,953 @@ listen("sensevoice-runtime-install-progress", ({ payload }) => {
   }
 });
 
+let memoryPage = 1;
+let memoryTotal = 0;
+let memoryCounts = { facts: 0, episodes: 0, commitments: 0 };
+const MEMORY_PAGE_SIZE = 30;
+
+function memoryKindLabel(kind) {
+  return { fact: "事实", episode: "经历", commitment: "约定" }[kind] || kind;
+}
+
+function memoryStatusLabel(status) {
+  return {
+    active: "有效", disputed: "待确认", superseded: "已被替代", forgotten: "已遗忘",
+    pending: "待兑现", fulfilled: "已兑现", cancelled: "已取消", expired: "已过期",
+  }[status] || status;
+}
+
+function formatMemoryDate(ts) {
+  if (!ts) return "";
+  try { return new Date(ts * 1000).toLocaleDateString("zh-CN"); } catch (_) { return ""; }
+}
+
+async function migrateSelectedCardMemory() {
+  const cardId = selectedMemoryCardId();
+  try {
+    await invoke("memory_import_legacy", { request: { cardId, memories: loadAllMemory(cardId) } });
+  } catch (_) {}
+}
+
+function selectedMemoryCardId() {
+  return (el("memoryCardId")?.value ?? el("personaCardId").value).trim();
+}
+
+async function refreshMemoryStats() {
+  const box = el("memoryStats");
+  const health = el("memoryHealth");
+  if (!box) return;
+  try {
+    const status = await invoke("memory_status");
+    const kb = Math.max(0, Math.round((status.databaseBytes || 0) / 1024));
+    box.replaceChildren();
+    for (const text of [
+      status.available ? "Memory v3 已就绪" : "记忆数据库不可用",
+      `事实 ${memoryCounts.facts || 0}`,
+      `经历 ${memoryCounts.episodes || 0}`,
+      `约定 ${memoryCounts.commitments || 0}`,
+      `事件 ${status.eventCount || 0}`,
+      `待巩固 ${status.pendingJobs || 0}`,
+      `跳过 ${status.skippedJobs || 0}`,
+      `数据库 ${kb} KB`,
+    ]) {
+      const span = document.createElement("span");
+      span.textContent = text;
+      box.appendChild(span);
+    }
+    box.title = status.lastError || "";
+    const healthState = memoryHealthState(status);
+    if (health) {
+      health.hidden = !healthState;
+      health.className = `memory-health${healthState ? ` ${healthState.kind}` : ""}`;
+      health.textContent = healthState?.text || "";
+    }
+  } catch (e) {
+    box.textContent = `读取状态失败：${e.message || e}`;
+    if (health) {
+      health.hidden = true;
+      health.textContent = "";
+    }
+  }
+}
+
+function memoryActionButton(label, action, className = "ghost") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", action);
+  return button;
+}
+
+function startMemoryEdit(card, textElement, actions, item) {
+  if (card.querySelector(".memory-edit")) return;
+  const editor = document.createElement("div");
+  editor.className = "memory-edit";
+  const input = document.createElement("textarea");
+  input.value = item.text || "";
+  input.rows = item.kind === "episode" ? 4 : 3;
+  input.maxLength = 1000;
+  input.setAttribute("aria-label", "记忆内容");
+  const editorActions = document.createElement("div");
+  editorActions.className = "memory-edit-actions";
+  const error = document.createElement("p");
+  error.className = "memory-edit-error";
+  const cancel = memoryActionButton("取消", () => {
+    editor.remove();
+    actions.hidden = false;
+  });
+  const save = memoryActionButton("保存", async () => {
+    const next = input.value.trim();
+    if (!next) {
+      error.textContent = "记忆内容不能为空";
+      input.focus();
+      return;
+    }
+    if (next === item.text) {
+      cancel.click();
+      return;
+    }
+    save.disabled = true;
+    cancel.disabled = true;
+    error.textContent = "保存中…";
+    try {
+      await invoke("memory_update", { request: { kind: item.kind, id: item.id, text: next } });
+      await loadMemoryPage();
+    } catch (e) {
+      save.disabled = false;
+      cancel.disabled = false;
+      error.textContent = `保存失败：${e.message || e}`;
+    }
+  });
+  editorActions.append(cancel, save);
+  editor.append(input, editorActions, error);
+  textElement.hidden = true;
+  card.insertBefore(editor, actions);
+  actions.hidden = true;
+  input.focus();
+  input.select();
+}
+
+function renderMemoryTimeline(box, result) {
+  box.replaceChildren();
+  const events = Array.isArray(result?.events) ? result.events : [];
+  const edges = Array.isArray(result?.edges) ? result.edges : [];
+  if (!events.length) {
+    if (!edges.length) box.textContent = "暂无可追溯事件";
+  }
+  if (edges.length) {
+    const relations = document.createElement("div");
+    relations.className = "memory-relations";
+    const title = document.createElement("strong");
+    title.textContent = "关系";
+    relations.appendChild(title);
+    const relationLabels = {
+      about: "涉及主题",
+      mentions: "提及实体",
+      derived_from: "来源经历",
+      supersedes: "替代事实",
+    };
+    for (const edge of edges) {
+      const row = document.createElement("span");
+      const target = edge.fromKind === result.itemKind && edge.fromId === result.itemId
+        ? `${edge.toKind}:${edge.toLabel || edge.toId.slice(0, 8)}`
+        : `${edge.fromKind}:${edge.fromLabel || edge.fromId.slice(0, 8)}`;
+      row.textContent = `${relationLabels[edge.relation] || edge.relation} → ${target}`;
+      relations.appendChild(row);
+    }
+    box.appendChild(relations);
+  }
+  if (!events.length) {
+    return;
+  }
+  const eventLabels = {
+    "episode.created": "创建经历",
+    "episode.imported": "导入经历",
+    "episode.edited": "编辑经历",
+    "fact.created": "建立事实",
+    "fact.imported": "导入事实",
+    "fact.confirmed": "再次确认事实",
+    "fact.corrected": "纠正事实",
+    "fact.disputed": "标记事实冲突",
+    "fact.superseded": "事实被替代",
+    "fact.edited": "编辑事实",
+    "commitment.created": "建立约定",
+    "commitment.imported": "导入约定",
+    "commitment.edited": "编辑约定",
+    "commitment.status_changed": "约定状态变化",
+    "commitment.pinned": "约定置顶变化",
+  };
+  const sourceLabels = {
+    "chat-consolidation": "聊天巩固",
+    "legacy-import": "旧版迁移",
+    "user-edit": "用户操作",
+    "schema-migration": "数据库迁移",
+  };
+  for (const event of events) {
+    const row = document.createElement("div");
+    row.className = "memory-event";
+    const head = document.createElement("div");
+    head.className = "memory-event-head";
+    const type = document.createElement("strong");
+    type.textContent = eventLabels[event.eventType] || event.eventType || "记忆事件";
+    const date = document.createElement("time");
+    date.textContent = event.observedAt
+      ? new Date(event.observedAt * 1000).toLocaleString("zh-CN")
+      : "时间未知";
+    head.append(type, date);
+    row.appendChild(head);
+    const summary = document.createElement("p");
+    summary.className = "memory-event-summary";
+    summary.textContent = event.summary || "无摘要";
+    row.appendChild(summary);
+    const meta = document.createElement("p");
+    meta.className = "memory-event-meta";
+    meta.textContent = `${sourceLabels[event.sourceType] || event.sourceType || "来源未知"} · 信任度 ${Math.round((event.trust || 0) * 100)}% · ${event.consent || "权限未知"}`;
+    row.appendChild(meta);
+    for (const evidence of event.evidence || []) {
+      const source = document.createElement("p");
+      source.className = "memory-event-evidence";
+      source.textContent = `${evidence.relation || "evidence"}${evidence.excerpt ? `：${evidence.excerpt}` : ""}`;
+      row.appendChild(source);
+    }
+    box.appendChild(row);
+  }
+}
+
+function renderMemoryItems(items) {
+  const list = el("memoryList");
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "memory-empty";
+    empty.textContent = "暂无符合条件的记忆";
+    list.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = "memory-card";
+    const head = document.createElement("div");
+    head.className = "memory-card-head";
+    const kind = document.createElement("span");
+    kind.className = "memory-kind";
+    kind.textContent = memoryKindLabel(item.kind);
+    const meta = document.createElement("span");
+    meta.className = "memory-card-meta";
+    const confidence = item.kind === "fact" ? ` · 置信度 ${Math.round((item.confidence || 0) * 100)}%` : "";
+    meta.textContent = `${item.nickname || "匿名"} · ${memoryStatusLabel(item.status)}${confidence}${item.occurredAt ? ` · ${formatMemoryDate(item.occurredAt)}` : ""}`;
+    head.append(kind, meta);
+    const text = document.createElement("p");
+    text.className = "memory-card-text";
+    text.textContent = item.text;
+    card.append(head, text);
+    if (item.sourceExcerpt) {
+      const source = document.createElement("p");
+      source.className = "memory-source";
+      source.textContent = `来源片段\n${item.sourceExcerpt}`;
+      card.appendChild(source);
+    }
+    const actions = document.createElement("div");
+    actions.className = "memory-card-actions";
+    actions.appendChild(memoryActionButton(item.pinned ? "取消置顶" : "置顶", async () => {
+      await invoke("memory_update", { request: { kind: item.kind, id: item.id, pinned: !item.pinned } });
+      await loadMemoryPage();
+    }));
+    actions.appendChild(memoryActionButton("编辑", async () => {
+      startMemoryEdit(card, text, actions, item);
+    }));
+    if (item.kind === "commitment" && item.status === "pending") {
+      actions.appendChild(memoryActionButton("标记已兑现", async () => {
+        await invoke("memory_update", { request: { kind: item.kind, id: item.id, status: "fulfilled" } });
+        await loadMemoryPage();
+      }));
+    }
+    const timeline = document.createElement("div");
+    timeline.className = "memory-timeline";
+    timeline.hidden = true;
+    const timelineButton = memoryActionButton("时间线", async () => {
+      if (!timeline.hidden) {
+        timeline.hidden = true;
+        return;
+      }
+      timeline.hidden = false;
+      timeline.textContent = "读取事件中…";
+      try {
+        const result = await invoke("memory_timeline", {
+          query: {
+            cardId: selectedMemoryCardId(),
+            kind: item.kind,
+            id: item.id,
+            limit: 20,
+          },
+        });
+        renderMemoryTimeline(timeline, result);
+      } catch (e) {
+        timeline.textContent = `读取时间线失败：${e.message || e}`;
+      }
+    });
+    actions.appendChild(timelineButton);
+    actions.appendChild(memoryActionButton("删除", async () => {
+      if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
+      await invoke("memory_delete", { request: { items: [{ kind: item.kind, id: item.id }] } });
+      await loadMemoryPage();
+    }, "danger"));
+    card.append(actions, timeline);
+    list.appendChild(card);
+  }
+}
+
+let memoryView = "list";
+let memoryGraphResult = null;
+let memoryGraphSelectedKey = "";
+let memoryGraphScene = null;
+let memoryGraphZoom = 1;
+let memoryGraphPan = { x: 0, y: 0 };
+let memoryGraphLayout = { width: 1100, height: 560 };
+let memoryGraphDrag = null;
+
+function memoryGraphScopeKey() {
+  return `kxyy-memory-graph-layout:${selectedMemoryCardId()}:${el("memoryNickname")?.value.trim() || ""}`;
+}
+
+function readMemoryGraphPositions() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(memoryGraphScopeKey()) || "{}");
+    return raw && typeof raw === "object" ? raw : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveMemoryGraphPosition(key, point) {
+  try {
+    const positions = readMemoryGraphPositions();
+    positions[key] = { x: Math.round(point.x), y: Math.round(point.y) };
+    localStorage.setItem(memoryGraphScopeKey(), JSON.stringify(positions));
+  } catch (_) {
+    // Layout persistence is UI-only and must never block memory management.
+  }
+}
+
+function clearMemoryGraphLayouts(cardId, nickname = null) {
+  try {
+    const prefix = `kxyy-memory-graph-layout:${cardId}:`;
+    const exact = nickname == null ? null : `${prefix}${String(nickname).trim()}`;
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (!key || !key.startsWith(prefix) || (exact && key !== exact)) continue;
+      localStorage.removeItem(key);
+    }
+  } catch (_) {
+    // UI-only layout cleanup must not turn a successful memory clear into an error.
+  }
+}
+
+const MEMORY_GRAPH_COLORS = {
+  user: "#64748b",
+  episode: "#d97706",
+  fact: "#be567a",
+  commitment: "#2563eb",
+  topic: "#0f766e",
+  entity: "#7c3aed",
+};
+
+function graphKey(node) {
+  return `${node.kind}:${node.id}`;
+}
+
+function truncateGraphLabel(value, max = 18) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text || "未命名";
+}
+
+function svgElement(name, attributes = {}) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+  return node;
+}
+
+function graphLayout(nodes) {
+  const kindOrder = ["user", "episode", "fact", "commitment", "topic", "entity"];
+  const groups = new Map(kindOrder.map((kind) => [kind, []]));
+  for (const node of nodes) (groups.get(node.kind) || groups.get("entity")).push(node);
+  const maxRows = 18;
+  const cellWidth = 112;
+  const rowHeight = 29;
+  const positions = new Map();
+  const saved = readMemoryGraphPositions();
+  const columnGroups = [];
+  let xOffset = 42;
+  let maxRowsUsed = 1;
+  for (const kind of kindOrder) {
+    const group = groups.get(kind);
+    if (!group.length) continue;
+    const columnCount = Math.max(1, Math.ceil(group.length / maxRows));
+    const groupColumns = columnCount;
+    const groupWidth = groupColumns * cellWidth;
+    columnGroups.push({ kind, x: xOffset, width: groupWidth });
+    group.forEach((node, index) => {
+      const column = Math.floor(index / maxRows);
+      const row = index % maxRows;
+      const key = graphKey(node);
+      positions.set(key, saved[key] && Number.isFinite(saved[key].x) && Number.isFinite(saved[key].y) ? {
+        x: Math.max(20, Math.min(4000, Number(saved[key].x))),
+        y: Math.max(20, Math.min(4000, Number(saved[key].y))),
+      } : {
+        x: xOffset + column * cellWidth + cellWidth / 2,
+        y: 70 + row * rowHeight,
+      });
+    });
+    maxRowsUsed = Math.max(maxRowsUsed, Math.min(maxRows, group.length));
+    xOffset += groupWidth + 28;
+  }
+  return {
+    positions,
+    columns: columnGroups,
+    width: Math.max(760, xOffset + 20),
+    height: Math.max(430, 110 + maxRowsUsed * rowHeight),
+  };
+}
+
+function updateMemoryGraphTransform() {
+  if (memoryGraphScene) {
+    memoryGraphScene.setAttribute(
+      "transform",
+      `translate(${memoryGraphPan.x} ${memoryGraphPan.y}) scale(${memoryGraphZoom})`,
+    );
+  }
+  const label = el("memoryGraphZoomLabel");
+  if (label) label.textContent = `${Math.round(memoryGraphZoom * 100)}%`;
+}
+
+function setMemoryGraphZoom(next, resetPan = false) {
+  memoryGraphZoom = Math.max(0.35, Math.min(3.5, next));
+  if (resetPan) memoryGraphPan = { x: 0, y: 0 };
+  updateMemoryGraphTransform();
+}
+
+function renderMemoryGraph(result) {
+  const svg = el("memoryGraphSvg");
+  const inspector = el("memoryGraphInspector");
+  if (!svg) return;
+  svg.replaceChildren();
+  memoryGraphResult = result || { nodes: [], edges: [] };
+  const nodes = Array.isArray(memoryGraphResult.nodes) ? memoryGraphResult.nodes : [];
+  const edges = Array.isArray(memoryGraphResult.edges) ? memoryGraphResult.edges : [];
+  if (memoryGraphSelectedKey && !nodes.some((node) => graphKey(node) === memoryGraphSelectedKey)) {
+    memoryGraphSelectedKey = "";
+  }
+  const layout = graphLayout(nodes);
+  memoryGraphLayout = layout;
+  svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
+  const positions = layout.positions;
+  const scene = svgElement("g", { class: "memory-graph-scene" });
+  memoryGraphScene = scene;
+  svg.appendChild(scene);
+  for (const column of layout.columns) {
+    const heading = svgElement("text", {
+      x: column.x + column.width / 2,
+      y: 28,
+      "text-anchor": "middle",
+      class: "memory-graph-column-heading",
+    });
+    heading.textContent = memoryKindLabel(column.kind);
+    scene.appendChild(heading);
+  }
+  const showLabels = nodes.length <= 32;
+  for (const edge of edges) {
+    const from = positions.get(`${edge.fromKind}:${edge.fromId}`);
+    const to = positions.get(`${edge.toKind}:${edge.toId}`);
+    if (!from || !to) continue;
+    const edgeLine = svgElement("line", {
+      x1: from.x, y1: from.y, x2: to.x, y2: to.y,
+      class: `memory-graph-edge${edge.derived ? " derived" : ""}`,
+    });
+    scene.appendChild(edgeLine);
+    const label = svgElement("text", {
+      x: (from.x + to.x) / 2,
+      y: (from.y + to.y) / 2 - 4,
+      "text-anchor": "middle",
+      class: `memory-graph-edge-label${nodes.length > 24 ? " hidden" : ""}`,
+    });
+    label.textContent = edge.relation || "关系";
+    scene.appendChild(label);
+  }
+  if (!nodes.length) {
+    const empty = svgElement("text", { x: layout.width / 2, y: layout.height / 2, "text-anchor": "middle", class: "memory-graph-empty" });
+    empty.textContent = "暂无符合条件的关系图节点";
+    scene.appendChild(empty);
+  }
+  for (const node of nodes) {
+    const point = positions.get(graphKey(node));
+    const group = svgElement("g", {
+      class: `memory-graph-node${memoryGraphSelectedKey === graphKey(node) ? " selected" : ""}`,
+      tabindex: "0",
+      role: "button",
+      "aria-label": `${node.kind}：${node.label || node.text}`,
+    });
+    const circle = svgElement("circle", {
+      cx: point.x,
+      cy: point.y,
+      r: node.pinned ? 19 : 15,
+      fill: MEMORY_GRAPH_COLORS[node.kind] || "#64748b",
+      opacity: node.status === "disputed" ? "0.62" : "0.92",
+    });
+    const text = svgElement("text", {
+      x: point.x,
+      y: point.y + 32,
+      "text-anchor": "middle",
+      class: showLabels || memoryGraphSelectedKey === graphKey(node) ? "" : "hidden",
+    });
+    text.textContent = truncateGraphLabel(node.label || node.text);
+    group.append(circle, text);
+    const title = svgElement("title");
+    title.textContent = `${memoryKindLabel(node.kind)}：${node.label || node.text || "未命名"}`;
+    group.appendChild(title);
+    const select = () => {
+      memoryGraphSelectedKey = graphKey(node);
+      renderMemoryGraph(memoryGraphResult);
+      renderMemoryGraphInspector(node);
+    };
+    group.addEventListener("mouseenter", () => text.classList.remove("hidden"));
+    group.addEventListener("mouseleave", () => {
+      if (memoryGraphSelectedKey !== graphKey(node) && !showLabels) text.classList.add("hidden");
+    });
+    group.addEventListener("click", select);
+    group.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.stopPropagation();
+      memoryGraphDrag = {
+        id: event.pointerId,
+        key: graphKey(node),
+        group,
+        startX: event.clientX,
+        startY: event.clientY,
+        point: { ...point },
+      };
+      group.setPointerCapture?.(event.pointerId);
+    });
+    group.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        select();
+      }
+    });
+    scene.appendChild(group);
+  }
+  updateMemoryGraphTransform();
+  if (inspector && !memoryGraphSelectedKey) inspector.hidden = true;
+}
+
+function renderMemoryGraphInspector(node) {
+  const inspector = el("memoryGraphInspector");
+  if (!inspector || !node) return;
+  inspector.hidden = false;
+  inspector.replaceChildren();
+  const title = document.createElement("p");
+  const strong = document.createElement("strong");
+  strong.textContent = `${memoryKindLabel(node.kind)}：`;
+  title.append(strong, document.createTextNode(node.label || node.text || "未命名"));
+  const meta = document.createElement("p");
+  meta.textContent = `状态：${memoryStatusLabel(node.status)} · 置信度：${Math.round((node.confidence || 0) * 100)}% · 重要度：${Math.round((node.importance || 0) * 100)}%${node.revision ? ` · 版本 v${node.revision}` : ""}${node.pinned ? " · 已置顶" : ""}`;
+  const source = document.createElement("p");
+  source.textContent = node.sourceEventIds?.length
+    ? `来源事件：${node.sourceEventIds.slice(0, 3).join("、")}`
+    : "来源事件：暂无";
+  inspector.append(title, meta, source);
+  if (node.text && node.text !== node.label) {
+    const content = document.createElement("p");
+    content.textContent = node.text;
+    inspector.appendChild(content);
+  }
+  const actions = document.createElement("div");
+  actions.className = "memory-graph-inspector-actions";
+  if (["fact", "episode", "commitment"].includes(node.kind)) {
+    actions.appendChild(memoryActionButton(node.pinned ? "取消置顶" : "置顶", async () => {
+      await invoke("memory_update", { request: { kind: node.kind, id: node.id, pinned: !node.pinned } });
+      await loadMemoryPage({ resetPage: true });
+    }));
+    actions.appendChild(memoryActionButton("编辑", () => startMemoryGraphEdit(node)));
+    if (node.kind === "commitment" && node.status === "pending") {
+      actions.appendChild(memoryActionButton("标记已兑现", async () => {
+        await invoke("memory_update", { request: { kind: node.kind, id: node.id, status: "fulfilled" } });
+        await loadMemoryPage({ resetPage: true });
+      }));
+    }
+    actions.appendChild(memoryActionButton("删除", async () => {
+      if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
+      await invoke("memory_delete", { request: { items: [{ kind: node.kind, id: node.id }] } });
+      memoryGraphSelectedKey = "";
+      await loadMemoryPage({ resetPage: true });
+    }, "danger"));
+  }
+  if (["fact", "episode", "commitment", "topic", "entity"].includes(node.kind)) {
+    actions.appendChild(memoryActionButton("时间线", async () => {
+      inspector.replaceChildren();
+      const loading = document.createElement("p");
+      loading.textContent = "读取事件中…";
+      inspector.appendChild(loading);
+      try {
+        const result = await invoke("memory_timeline", {
+          query: { cardId: selectedMemoryCardId(), kind: node.kind, id: node.id, limit: 20 },
+        });
+        const back = memoryActionButton("返回节点", () => renderMemoryGraphInspector(node));
+        inspector.replaceChildren(back);
+        const timeline = document.createElement("div");
+        renderMemoryTimeline(timeline, result);
+        inspector.appendChild(timeline);
+      } catch (e) {
+        renderMemoryGraphInspector(node);
+        const error = document.createElement("p");
+        error.textContent = `读取时间线失败：${e.message || e}`;
+        inspector.appendChild(error);
+      }
+    }));
+  }
+  if (["fact", "episode", "commitment"].includes(node.kind)) {
+    actions.appendChild(memoryActionButton("在列表中查看", () => {
+      memoryView = "list";
+      updateMemoryViewButtons();
+      el("memoryKind").value = node.kind;
+      el("memorySearch").value = node.label || node.text || "";
+      void loadMemoryPage({ resetPage: true });
+    }));
+  }
+  if (actions.childElementCount) inspector.appendChild(actions);
+}
+
+function startMemoryGraphEdit(node) {
+  const inspector = el("memoryGraphInspector");
+  if (!inspector) return;
+  inspector.replaceChildren();
+  const input = document.createElement("textarea");
+  input.className = "memory-graph-edit-input";
+  input.rows = node.kind === "episode" ? 4 : 3;
+  input.maxLength = 1000;
+  input.value = node.text || node.label || "";
+  input.setAttribute("aria-label", "编辑关系图中的记忆");
+  const actions = document.createElement("div");
+  actions.className = "memory-graph-inspector-actions";
+  const error = document.createElement("p");
+  error.className = "memory-edit-error";
+  const cancel = memoryActionButton("取消", () => renderMemoryGraphInspector(node));
+  const save = memoryActionButton("保存", async () => {
+    const text = input.value.trim();
+    if (!text) {
+      error.textContent = "记忆内容不能为空";
+      input.focus();
+      return;
+    }
+    save.disabled = true;
+    cancel.disabled = true;
+    error.textContent = "保存中…";
+    try {
+      await invoke("memory_update", { request: { kind: node.kind, id: node.id, text } });
+      await loadMemoryPage({ resetPage: true });
+    } catch (e) {
+      save.disabled = false;
+      cancel.disabled = false;
+      error.textContent = `保存失败：${e.message || e}`;
+    }
+  });
+  actions.append(cancel, save);
+  inspector.append(input, actions, error);
+  input.focus();
+  input.select();
+}
+
+async function loadMemoryGraph() {
+  const status = el("memoryGraphStatus");
+  const refresh = el("memoryGraphRefresh");
+  if (!el("memoryGraphPanel")) return;
+  if (refresh) refresh.disabled = true;
+  if (status) status.textContent = "读取关系图中…";
+  try {
+    const result = await invoke("memory_graph", {
+      query: {
+        cardId: selectedMemoryCardId(),
+        nickname: el("memoryNickname").value.trim(),
+        scope: el("memoryNickname").value.trim() ? "user" : "card",
+        search: el("memorySearch").value.trim(),
+        kind: el("memoryKind").value,
+        status: el("memoryStatus").value,
+        depth: Number(el("memoryGraphDepth")?.value || 1),
+        maxNodes: Number(el("memoryGraphMaxNodes")?.value || 80),
+      },
+    });
+    renderMemoryGraph(result);
+    if (status) {
+      const count = Array.isArray(result?.nodes) ? result.nodes.length : 0;
+      status.textContent = `${count} 个节点 · ${result?.edges?.length || 0} 条关系${result?.truncated ? ` · 已按 ${result?.maxNodes || 200} 节点截断` : ""}`;
+    }
+  } catch (e) {
+    renderMemoryGraph({ nodes: [], edges: [] });
+    if (status) status.textContent = `读取关系图失败：${e.message || e}`;
+  } finally {
+    if (refresh) refresh.disabled = false;
+  }
+}
+
+function updateMemoryViewButtons() {
+  const listButton = el("memoryListView");
+  const graphButton = el("memoryGraphView");
+  const panel = el("memoryGraphPanel");
+  const list = el("memoryList");
+  const pagination = el("memoryPageInfo")?.parentElement;
+  if (listButton) {
+    listButton.classList.toggle("active", memoryView === "list");
+    listButton.setAttribute("aria-selected", memoryView === "list" ? "true" : "false");
+  }
+  if (graphButton) {
+    graphButton.classList.toggle("active", memoryView === "graph");
+    graphButton.setAttribute("aria-selected", memoryView === "graph" ? "true" : "false");
+  }
+  if (panel) panel.hidden = memoryView !== "graph";
+  if (list) list.hidden = memoryView === "graph";
+  if (pagination) pagination.hidden = memoryView === "graph";
+}
+
+el("memoryListView")?.addEventListener("click", () => {
+  memoryView = "list";
+  updateMemoryViewButtons();
+});
+el("memoryGraphView")?.addEventListener("click", () => {
+  memoryView = "graph";
+  updateMemoryViewButtons();
+  void loadMemoryGraph();
+});
+el("memoryGraphRefresh")?.addEventListener("click", () => void loadMemoryGraph());
+el("memoryGraphDepth")?.addEventListener("change", () => {
+  if (memoryView === "graph") void loadMemoryGraph();
+});
+el("memoryGraphMaxNodes")?.addEventListener("change", () => {
+  if (memoryView === "graph") void loadMemoryGraph();
+});
+el("memoryGraphZoomIn")?.addEventListener("click", () => setMemoryGraphZoom(memoryGraphZoom * 1.25));
+el("memoryGraphZoomOut")?.addEventListener("click", () => setMemoryGraphZoom(memoryGraphZoom / 1.25));
+el("memoryGraphFit")?.addEventListener("click", () => setMemoryGraphZoom(1, true));
+
+const memoryGraphViewport = el("memoryGraphViewport");
+let memoryGraphPointer = null;
+memoryGraphViewport?.addEventListener("pointerdown", (event) => {
+  if (event.target.closest?.(".memory-graph-node")) return;
+  memoryGraphPointer = { id: event.pointerId, x: event.clientX, y: event.clientY, pan: { ...memoryGraphPan } };
+  memoryGraphViewport.classList.add("dragging");
+  memoryGraphViewport.setPointerCapture?.(event.pointerId);
+});
+memoryGraphViewport?.addEventListener("pointermove", (event) => {
+  if (memoryGraphDrag?.id === event.pointerId) {
+    const rect = memoryGraphViewport.getBoundingClientRect();
+    const dx = (event.clientX - memoryGraphDrag.startX) * memoryGraphLayout.width / Math.max(1, rect.width) / memoryGraphZoom;
+    const dy = (event.clientY - memoryGraphDrag.startY) * memoryGraphLayout.height / Math.max(1, rect.height) / memoryGraphZoom;
+    memoryGraphDrag.group.setAttribute("transform", `translate(${dx} ${dy})`);
+    return;
+  }
+  if (!memoryGraphPointer || memoryGraphPointer.id !== event.pointerId) return;
+  const rect = memoryGraphViewport.getBoundingClientRect();
+  const scaleX = memoryGraphLayout.width / Math.max(1, rect.width);
+  const scaleY = memoryGraphLayout.height / Math.max(1, rect.height);
+  memoryGraphPan = {
+    x: memoryGraphPointer.pan.x + (event.clientX - memoryGraphPointer.x) * scaleX / memoryGraphZoom,
+    y: memoryGraphPointer.pan.y + (event.clientY - memoryGraphPointer.y) * scaleY / memoryGraphZoom,
+  };
+  updateMemoryGraphTransform();
+});
+const finishMemoryGraphPointer = (event) => {
+  if (memoryGraphDrag?.id === event.pointerId) {
+    const drag = memoryGraphDrag;
+    const rect = memoryGraphViewport.getBoundingClientRect();
+    const dx = (event.clientX - drag.startX) * memoryGraphLayout.width / Math.max(1, rect.width) / memoryGraphZoom;
+    const dy = (event.clientY - drag.startY) * memoryGraphLayout.height / Math.max(1, rect.height) / memoryGraphZoom;
+    saveMemoryGraphPosition(drag.key, { x: drag.point.x + dx, y: drag.point.y + dy });
+    drag.group.releasePointerCapture?.(event.pointerId);
+    memoryGraphDrag = null;
+    renderMemoryGraph(memoryGraphResult);
+    return;
+  }
+  if (!memoryGraphPointer || memoryGraphPointer.id !== event.pointerId) return;
+  memoryGraphViewport.classList.remove("dragging");
+  memoryGraphViewport.releasePointerCapture?.(event.pointerId);
+  memoryGraphPointer = null;
+};
+memoryGraphViewport?.addEventListener("pointerup", finishMemoryGraphPointer);
+memoryGraphViewport?.addEventListener("pointercancel", finishMemoryGraphPointer);
+memoryGraphViewport?.addEventListener("wheel", (event) => {
+  if (memoryView !== "graph") return;
+  event.preventDefault();
+  setMemoryGraphZoom(memoryGraphZoom * (event.deltaY < 0 ? 1.1 : 0.9));
+}, { passive: false });
+
+async function loadMemoryPage({ resetPage = false } = {}) {
+  if (!el("memoryList")) return;
+  if (resetPage) memoryPage = 1;
+  const cardId = selectedMemoryCardId();
+  try {
+    const result = await invoke("memory_list", {
+      query: {
+        cardId,
+        nickname: el("memoryNickname").value.trim(),
+        kind: el("memoryKind").value,
+        status: el("memoryStatus").value,
+        search: el("memorySearch").value.trim(),
+        page: memoryPage,
+        pageSize: MEMORY_PAGE_SIZE,
+      },
+    });
+    memoryTotal = result.total || 0;
+    memoryCounts = result.counts || { facts: 0, episodes: 0, commitments: 0 };
+    renderMemoryItems(result.items || []);
+    const pages = Math.max(1, Math.ceil(memoryTotal / MEMORY_PAGE_SIZE));
+    el("memoryPageInfo").textContent = `第 ${memoryPage} / ${pages} 页 · 共 ${memoryTotal} 条`;
+    el("memoryPrev").disabled = memoryPage <= 1;
+    el("memoryNext").disabled = memoryPage >= pages;
+    await refreshMemoryStats();
+    if (memoryView === "graph") await loadMemoryGraph();
+  } catch (e) {
+    el("memoryList").textContent = `读取记忆失败：${e.message || e}`;
+  }
+}
+
+el("memoryRefresh")?.addEventListener("click", () => loadMemoryPage({ resetPage: true }));
+for (const id of ["memoryNickname", "memoryKind", "memoryStatus"]) {
+  el(id)?.addEventListener("change", () => loadMemoryPage({ resetPage: true }));
+}
+el("memoryCardId")?.addEventListener("change", async () => {
+  await migrateSelectedCardMemory();
+  await loadMemoryPage({ resetPage: true });
+});
+let memorySearchTimer = null;
+el("memorySearch")?.addEventListener("input", () => {
+  clearTimeout(memorySearchTimer);
+  memorySearchTimer = setTimeout(() => loadMemoryPage({ resetPage: true }), 250);
+});
+el("memoryPrev")?.addEventListener("click", () => { if (memoryPage > 1) { memoryPage--; void loadMemoryPage(); } });
+el("memoryNext")?.addEventListener("click", () => {
+  if (memoryPage * MEMORY_PAGE_SIZE < memoryTotal) { memoryPage++; void loadMemoryPage(); }
+});
+
+function setMemoryMaintenanceStatus(text, ok = true) {
+  const node = el("memoryMaintenanceStatus");
+  if (!node) return;
+  node.textContent = text;
+  node.style.color = ok ? "#16a34a" : "#dc2626";
+}
+
+el("memoryIntegrity")?.addEventListener("click", async () => {
+  const button = el("memoryIntegrity");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("检查中…");
+  try {
+    const result = await invoke("memory_integrity_check");
+    const counts = result.counts || {};
+    if (result.ok) {
+      setMemoryMaintenanceStatus(`完整性正常：${counts.events || 0} 个事件、${counts.edges || 0} 条关系边、${counts.searchRows || 0} 条搜索索引。`);
+    } else {
+      const details = (result.errors || []).slice(0, 2).join("；") || "发现未知问题";
+      setMemoryMaintenanceStatus(`检查发现问题：${details}`, false);
+    }
+  } catch (e) {
+    setMemoryMaintenanceStatus(`检查失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryRebuild")?.addEventListener("click", async () => {
+  if (!window.confirm("重建搜索索引与关系边？\n\n这不会修改事件和长期记忆正文，但会重新生成 topic、entity、FTS 和关系边。")) return;
+  const button = el("memoryRebuild");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("重建中…");
+  try {
+    const result = await invoke("memory_rebuild_derived");
+    setMemoryMaintenanceStatus(`重建完成：${result.rebuiltSearchRows || 0} 条索引、${result.rebuiltEdges || 0} 条关系边。`);
+    await loadMemoryPage();
+  } catch (e) {
+    setMemoryMaintenanceStatus(`重建失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryReplayEvents")?.addEventListener("click", async () => {
+  if (!window.confirm("从不可变事件日志重建当前范围的事实、经历、约定、搜索索引和关系边？\n\n事件日志本身不会删除；当前范围的物化数据会在事务中替换。")) return;
+  const button = el("memoryReplayEvents");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("从事件重建中…");
+  try {
+    const result = await invoke("memory_rebuild_from_events", {
+      request: {
+        cardId: selectedMemoryCardId(),
+        nickname: el("memoryNickname").value.trim() || null,
+      },
+    });
+    setMemoryMaintenanceStatus(`事件重建完成：${result.rebuiltSearchRows || 0} 条索引、${result.rebuiltEdges || 0} 条关系边。`);
+    await loadMemoryPage();
+  } catch (e) {
+    setMemoryMaintenanceStatus(`事件重建失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryExport")?.addEventListener("click", async () => {
+  const button = el("memoryExport");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("准备脱敏导出…");
+  try {
+    const result = await invoke("memory_export", {
+      request: {
+        cardId: selectedMemoryCardId(),
+        nickname: el("memoryNickname").value.trim(),
+      },
+    });
+    const blob = new Blob([result.json || "{}"], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = result.fileName || "memory-export.json";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setMemoryMaintenanceStatus(`已导出 ${result.itemCount || 0} 条记忆、${result.edgeCount || 0} 条关系边。`);
+  } catch (e) {
+    setMemoryMaintenanceStatus(`导出失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+el("memoryBackup")?.addEventListener("click", async () => {
+  const button = el("memoryBackup");
+  button.disabled = true;
+  setMemoryMaintenanceStatus("创建一致性备份…");
+  try {
+    const result = await invoke("memory_backup");
+    const name = String(result.path || "").split(/[\\/]/).pop() || "memory backup";
+    setMemoryMaintenanceStatus(`备份已创建：${name}（${Math.round((result.bytes || 0) / 1024)} KB，完整性 ${result.integrityResult}）。`);
+  } catch (e) {
+    setMemoryMaintenanceStatus(`备份失败：${e.message || e}`, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector('.tab-btn[data-tab="memory"]')?.addEventListener("click", async () => {
+  await migrateSelectedCardMemory();
+  await loadMemoryPage({ resetPage: true });
+});
+
+async function clearCurrentCardMemory(statusNode, cardId = selectedMemoryCardId()) {
+  await invoke("memory_clear_scope", { request: { cardId, nickname: "" } });
+  clearMemoryGraphLayouts(cardId);
+  clearAllMemory(cardId);
+  await emit("memory-cleared", { cardId });
+  if (statusNode) statusNode.textContent = "已清空";
+  await loadMemoryPage({ resetPage: true });
+}
+
 el("clearMemory").addEventListener("click", async () => {
   const ok = window.confirm(
     "确定清空当前人设卡的长期记忆？\n\n此操作只清当前人设卡下的记忆，不影响其他人设卡的记忆。此操作不可撤销。",
@@ -943,10 +1931,8 @@ el("clearMemory").addEventListener("click", async () => {
   const st = el("clearMemoryStatus");
   btn.disabled = true;
   try {
-    clearAllMemory(el("personaCardId").value.trim());
-    await emit("memory-cleared", {});
+    await clearCurrentCardMemory(st, el("personaCardId").value.trim());
     st.style.color = "#16a34a";
-    st.textContent = "已清空";
   } catch (e) {
     st.style.color = "#dc2626";
     st.textContent = `失败：${e.message || e}`;
@@ -956,6 +1942,22 @@ el("clearMemory").addEventListener("click", async () => {
       st.textContent = "";
       st.style.color = "";
     }, 2500);
+  }
+});
+
+el("memoryClearAll")?.addEventListener("click", async () => {
+  if (!window.confirm("确定永久清空当前人设卡下全部长期记忆？\n\n数据库记录、来源片段和待巩固会话都会删除，此操作不可撤销。")) return;
+  const btn = el("memoryClearAll");
+  const st = el("memoryManageStatus");
+  btn.disabled = true;
+  try {
+    await clearCurrentCardMemory(st);
+    st.style.color = "#16a34a";
+  } catch (e) {
+    st.style.color = "#dc2626";
+    st.textContent = `失败：${e.message || e}`;
+  } finally {
+    btn.disabled = false;
   }
 });
 
@@ -970,6 +1972,7 @@ async function init() {
   // 人设卡回退到默认 kxyy-yuanyuan。
   await loadCardList();
   await load();
+  await migrateSelectedCardMemory();
   _lastCardId = el("personaCardId").value.trim();
   updateCardInfoDisplay();
   if (_lastCardId) {

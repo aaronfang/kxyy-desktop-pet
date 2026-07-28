@@ -1,5 +1,7 @@
 mod api;
 mod local_text;
+mod memory;
+mod memory_core;
 mod persona_assets;
 mod realtime;
 
@@ -117,6 +119,9 @@ struct Settings {
     /// 本地级联通话的用户停顿容忍度：`fast` / `standard` / `long`。
     #[serde(default = "default_turn_pause_tolerance")]
     turn_pause_tolerance: String,
+    /// 实时通话主动性：`follow-user` / `balanced` / `ai-leads`。
+    #[serde(default = "default_realtime_conversation_mode")]
+    realtime_conversation_mode: String,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
     #[serde(default)]
     text_model: String,
@@ -135,6 +140,12 @@ struct Settings {
     /// 思考模式（DeepSeek thinking.type / 本地 Qwen reasoning_effort）。
     #[serde(default)]
     thinking: bool,
+    /// M4 Global Workspace 实验开关；默认关闭，开启后仍只使用有界内部观察。
+    #[serde(default)]
+    memory_workspace: bool,
+    /// Workspace 联想强度：conservative / balanced / exploratory。
+    #[serde(default = "default_workspace_mode")]
+    memory_workspace_mode: String,
     /// 采样温度。
     #[serde(default = "default_temperature")]
     temperature: f64,
@@ -197,6 +208,10 @@ fn default_temperature() -> f64 {
     0.8
 }
 
+fn default_workspace_mode() -> String {
+    "conservative".into()
+}
+
 fn default_realtime_backend() -> String {
     "volc".into()
 }
@@ -207,6 +222,10 @@ fn default_asr_provider() -> String {
 
 fn default_turn_pause_tolerance() -> String {
     "standard".into()
+}
+
+fn default_realtime_conversation_mode() -> String {
+    "follow-user".into()
 }
 
 fn default_text_provider() -> String {
@@ -273,12 +292,15 @@ impl Settings {
             vad_shadow_enabled: false,
             asr_provider: default_asr_provider(),
             turn_pause_tolerance: default_turn_pause_tolerance(),
+            realtime_conversation_mode: default_realtime_conversation_mode(),
             text_model: String::new(),
             text_provider: default_text_provider(),
             local_text_model: String::new(),
             local_vl_model: String::new(),
             vl_provider: default_vl_provider(),
             thinking: false,
+            memory_workspace: false,
+            memory_workspace_mode: default_workspace_mode(),
             temperature: default_temperature(),
             user_name: String::new(),
             pat_text: String::new(),
@@ -401,6 +423,14 @@ fn normalize_turn_pause_tolerance(value: &str) -> &'static str {
         "fast" => "fast",
         "long" => "long",
         _ => "standard",
+    }
+}
+
+fn normalize_realtime_conversation_mode(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "balanced" => "balanced",
+        "ai-leads" => "ai-leads",
+        _ => "follow-user",
     }
 }
 
@@ -838,8 +868,8 @@ fn commit_settings<F: FnOnce(&mut Settings)>(app: &AppHandle, f: F) {
     rebuild_tray(app);
 }
 
-/// 托盘「退出」：先通知 chat 窗口把未落盘的对话总结进长期记忆，再退出。
-/// chat 完成后会 invoke `memory_flushed`；超时兜底，避免总结卡住导致退不出。
+/// 托盘「退出」：先通知 chat 窗口把未落盘消息写入持久化队列，再退出。
+/// 后台 LLM 巩固不在退出路径上；超时只兜底前端或数据库 IPC 异常。
 fn request_quit_with_memory_flush(app: &AppHandle) {
     let state = app.state::<AppState>();
     if state.quitting.swap(true, Ordering::SeqCst) {
@@ -848,7 +878,7 @@ fn request_quit_with_memory_flush(app: &AppHandle) {
     let _ = app.emit("flush-memory-before-quit", ());
     let app2 = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(12));
+        std::thread::sleep(Duration::from_secs(6));
         app2.exit(0);
     });
 }
@@ -1297,6 +1327,8 @@ struct AiSettingsInput {
     asr_provider: String,
     #[serde(default = "default_turn_pause_tolerance")]
     turn_pause_tolerance: String,
+    #[serde(default = "default_realtime_conversation_mode")]
+    realtime_conversation_mode: String,
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
@@ -1307,6 +1339,10 @@ struct AiSettingsInput {
     #[serde(default = "default_vl_provider")]
     vl_provider: String,
     thinking: bool,
+    #[serde(default)]
+    memory_workspace: bool,
+    #[serde(default = "default_workspace_mode")]
+    memory_workspace_mode: String,
     temperature: f64,
     user_name: String,
     #[serde(default)]
@@ -1386,6 +1422,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.asr_provider = normalize_asr_provider(&settings.asr_provider).into();
         s.turn_pause_tolerance =
             normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).into();
+        s.realtime_conversation_mode =
+            normalize_realtime_conversation_mode(&settings.realtime_conversation_mode).into();
         s.text_model = settings.text_model.trim().to_string();
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
@@ -1398,6 +1436,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             _ => "qwen".into(),
         };
         s.thinking = settings.thinking;
+        s.memory_workspace = settings.memory_workspace;
+        s.memory_workspace_mode = match settings.memory_workspace_mode.trim() {
+            "balanced" | "exploratory" => settings.memory_workspace_mode.trim().into(),
+            _ => "conservative".into(),
+        };
         s.temperature = settings.temperature;
         s.user_name = settings.user_name.trim().to_string();
         s.pat_text = settings.pat_text.trim().to_string();
@@ -1442,6 +1485,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         local_text_model = guard.local_text_model.clone();
     }
     local_text::ensure(&app, &text_provider, &local_text_model);
+    // Key、服务商或本地模型恢复可用后，立即唤醒之前退避中的记忆任务。
+    memory::retry_pending_now(&app);
 }
 
 /// 只读探测本地文字模型（Ollama）状态，不改变系统状态。
@@ -1592,6 +1637,8 @@ pub fn run() {
                 });
             let realtime_port = realtime::start(handle.clone(), realtime_provider).unwrap_or(0);
             app.manage(voice_service::VoiceServiceManager::new());
+            let memory_state = memory::MemoryState::open(&handle);
+            app.manage(memory_state);
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
@@ -1621,6 +1668,7 @@ pub fn run() {
             voice_service::ensure(&handle, &settings.realtime_backend, &voice_fp);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
+            memory::trigger_worker(&handle);
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
@@ -1686,7 +1734,24 @@ pub fn run() {
             list_local_text_models,
             pull_local_text_model,
             install_vad_shadow_runtime,
-            install_sensevoice_runtime
+            install_sensevoice_runtime,
+            memory::memory_status,
+            memory::memory_integrity_check,
+            memory::memory_export,
+            memory::memory_backup,
+            memory::memory_verify_backup,
+            memory::memory_rebuild_derived,
+            memory::memory_rebuild_from_events,
+            memory::memory_timeline,
+            memory::memory_edges,
+            memory::memory_graph,
+            memory::memory_recall,
+            memory::memory_enqueue_session,
+            memory::memory_list,
+            memory::memory_update,
+            memory::memory_delete,
+            memory::memory_clear_scope,
+            memory::memory_import_legacy
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1701,7 +1766,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_asr_provider, normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
+        normalize_asr_provider, normalize_realtime_conversation_mode,
+        normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
     };
 
     #[test]
@@ -1747,5 +1813,22 @@ mod tests {
         assert_ne!(standard, voice_config_fingerprint(&settings));
         settings.turn_pause_tolerance = "unknown".into();
         assert_eq!(standard, voice_config_fingerprint(&settings));
+    }
+
+    #[test]
+    fn realtime_conversation_mode_is_allowlisted_without_restarting_voice_service() {
+        assert_eq!(
+            normalize_realtime_conversation_mode(" balanced "),
+            "balanced"
+        );
+        assert_eq!(normalize_realtime_conversation_mode("AI-LEADS"), "ai-leads");
+        for value in ["", "future", "always"] {
+            assert_eq!(normalize_realtime_conversation_mode(value), "follow-user");
+        }
+
+        let mut settings = Settings::defaults();
+        let follow_user = voice_config_fingerprint(&settings);
+        settings.realtime_conversation_mode = "ai-leads".into();
+        assert_eq!(follow_user, voice_config_fingerprint(&settings));
     }
 }

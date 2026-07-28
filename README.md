@@ -2,7 +2,7 @@
 
 基于 [webmeji](https://github.com/lars-rooij/webmeji) 动画逻辑改造的 **macOS / Windows 跨平台桌面宠物**，用 **[Tauri](https://tauri.app) 2** 封装（前端 Web 动画 + Rust 主进程）。桌宠会在屏幕上走动、坐下、跳舞、攀爬屏幕边缘，可拖拽、可抚摸，右键或托盘可切换形象。
 
-除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型，也可切换本地 Ollama 模型离线使用），支持发图看图（通义千问 VL）、语音朗读与**实时语音通话**（可切换火山云端 / 本地模型 / CosyVoice）、表情包回复与自定义人设。朗读与通话共用一套语音后端，并支持 **0–200% 播放音量**。所有 AI 服务 Key 只保存在本机，请求经内置本地代理直连服务商或本机模型，不经第三方。
+除动画外，还内置 **AI 聊天** 能力：通过全局快捷键唤出聊天气泡，与「元元」对话（DeepSeek 文字模型，也可切换本地 Ollama 模型离线使用），支持发图看图（通义千问 VL）、语音朗读与**实时语音通话**（可切换火山云端 / 本地模型 / CosyVoice）、表情包回复、自定义人设，以及本地 SQLite **Memory v3 长期记忆**。朗读与通话共用一套语音后端，并支持 **0–200% 播放音量**。所有 AI 服务 Key 和长期记忆只保存在本机，请求经内置本地代理直连服务商或本机模型，不经第三方。
 
 当前内置两套形象：**赛博元元**（`kxyy-cyber`）与 **苗疆元元**（`kxyy-miaojiang`，默认）。应用图标为苗疆元元头部特写，缩小后仍可辨认。macOS 上为菜单栏托盘应用，**不占用 Dock**。
 
@@ -62,27 +62,33 @@ npm run dev        # 开发模式（tauri dev）
   | --- | --- | --- |
   | **火山引擎（云端）** | 在线 | 云端 TTS + 端到端实时语音；需火山 Key / App ID / Access Key / `voice_id` |
   | **CosyVoice（通义云端）** | 在线 | 本机 Whisper + 当前文字服务（DeepSeek/Ollama），TTS 走通义云端；需通义 Key 与 CosyVoice 音色 id |
-  | **Qwen3-TTS（本地）** | 本地 | 跨平台：macOS(Apple Silicon) 走 mlx-audio（保存后自动配置）；Windows / Linux 走官方 PyTorch 包 `qwen-tts`（默认 1.7B，运行 `scripts/windows/setup-qwen3-tts.cmd` 配置）。零样本克隆参考音频，不消耗火山 token |
+  | **Qwen3-TTS（本地）** | 本地 | 跨平台：macOS(Apple Silicon) 走 mlx-audio（保存后自动配置）；Windows / Linux 走官方 PyTorch 包 `qwen-tts`（Windows 默认低延迟 0.6B，Linux 保持 1.7B；运行 `scripts/windows/setup-qwen3-tts.cmd` 配置）。零样本克隆参考音频，不消耗火山 token |
 - **播放音量**：设置里「AI 语音播放音量」0–200%（100% 为原音量），朗读与通话共用。
 - **本地通话识别（0.2.30 实验）**：Qwen3-TTS / CosyVoice 可在设置中把句尾 final ASR 从默认 Whisper 切到 SenseVoiceSmall INT8。SenseVoice runtime 与模型只在明确点击安装后下载到 App 独立数据目录；未安装、校验失败或当前 Python/平台不受支持时，本次语音服务启动固定回退 Whisper，不会逐轮切换或双跑。它仍是整句识别，不改变 RMS/VAD、endpoint 或快速打断，也尚未通过固定许可录音集证明准确率优于 Whisper。火山端到端实时语音不受影响。
 - **本地通话断句（0.2.31）**：Qwen3-TTS / CosyVoice 可选「说话停顿容忍度」：快速约 1.05 秒、标准约 1.65 秒（默认）、长停顿约 2.25 秒。它只决定 RMS soft-end 后还能续说多久，标准档减少中文思考停顿被拆成两轮的情况，但正常回复也会相应晚一些开始；火山端到端实时语音不受影响。
 - **未播音续说（0.2.32）**：本地/CosyVoice 在第一版回复仍处于 LLM 出字、尚未取得任何 TTS admission 时，若 8 秒内确认用户继续补充，会取消旧 generation、撤回未播的临时助手气泡，并让下一次 LLM 结合上一条用户消息只回答一次。一旦旧回复已开始 TTS admission、超时或不是确认人声，就严格走原有新轮/打断路径；不会撤回已播放内容，也不把提示写入历史、摘要或诊断。
 - **实时语音通话**：聊天气泡输入框最左侧的电话按钮开启 / 挂断；经本地 WebSocket 桥接上游（火山或本机 Python 服务），复用元元人设与克隆音色，支持打断。本地/CosyVoice 通话按 LLM 稳定句进入 4 项有界队列并严格按句序播放。CosyVoice 自 0.2.21、macOS Apple Silicon 的 MLX Qwen 自 0.2.22 起，可在播放 Worklet + `managed-v1` 上双向协商 `provider-pcm-v1`：provider 生成期音频按最多 80ms 下发，首版固定单路且不预取下一句。Windows/Linux 的官方 `qwen-tts` 当前没有公开音频 iterator，仍按句整段合成；未协商、legacy、旧服务与火山也继续原路径。流式句段只在结束时声明最终 samples/chunks，前端精确校验；失败、取消、错序、超限或总量不符不会产生“已完整播完”回执。0.2.20 的 `candidate-snapshot-v1` 仍只在 Worklet 本地/CosyVoice 上启用：同一 candidate 确认打断且当前句已播放至少 1 秒时，下一轮仅注入一次固定临时提示；它不进入 history、聊天摘要、长期记忆或日志，也不恢复字、音素或部分文本。通话中文字输入、发图与表情库会暂时锁定。macOS 首次使用会弹出麦克风权限提示。
 - **实时语音优化路线**：自然打断、流式管线、Qwen3-TTS/CosyVoice/火山情绪能力和 SenseVoice 评估见 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md)；其中尚未实现的目标不会作为当前功能承诺。
+- **Memory v3（当前开发版本）**：长期记忆由 Rust + SQLite 保存为事实、共同经历和约定；聊天前只选择性召回与当前话题相关的少量内容，后台异步巩固，不再把全部历史塞进 prompt。设置页可搜索、筛选、编辑、置顶、兑现或永久删除记忆；数据库或模型不可用时会回退，不阻塞正常聊天。
+- **0.2.42 Memory v3.1 收口补丁**：实时通话记忆与普通记忆统一使用 observation 安全过滤；事件日志可事务化重建事实、经历、约定、FTS 和关系边；关系图布局支持拖拽保存，并在删除人设或清空记忆时清理。
+- **0.2.34 Memory v3.1-E**：实时通话建立前在 120ms 内预加载最多 3 条置顶记忆、未完成约定或当前话题线索；召回失败自动使用原有通话人设提示，不改变音频协议和打断状态机。逐轮 ASR final 记忆仍未开启，见 Memory Brain 路线图 M2。
+- **0.2.35 Memory v3.1-F**：新增实时记忆能力门和诊断字段，三条实时语音路径明确协商 `session-start-v1`；未获得动态 context 能力回显时固定显示为 `none`，避免把 ASR final 误当作逐轮记忆支持。应用诊断 schema 升为 v6。
+- **0.2.36 Memory v3.1-G**：本地 Qwen/CosyVoice 级联通话在 ASR final 后支持 `turn-final-v1` 记忆协调：后端暂停最多 100ms 等待前端回传当前 generation 的最多 3 条记忆卡片，超时或过期结果自动丢弃；火山端到端仍保持 session-start-only。
+- **Memory Brain 路线**：发布验证、实时通话逐轮记忆、Obsidian 式 Memory Graph、Global Workspace/J-Space 类实验和外部工程接入，统一见 [`docs/roadmap-memory-brain.md`](docs/roadmap-memory-brain.md)。未标记为 released 的阶段不作为当前正式版能力承诺。
 - **表情包**：元元会按情绪回贴纸；也可点「表情库」手动发送。
 - **人设 / 观众画像**：在设置里填昵称、关系、想让它记住的事、暗号梗等，对话时注入，让元元更懂你。
 
-> **隐私**：所有 Key、观众画像、头像、参考音频路径仅写入本机配置目录的 `settings.json`（Windows 为 `%APPDATA%\<应用ID>\`），**不进仓库、不上传**；请求由内置本地代理（Rust `api.rs` / `realtime.rs` / `voice_service.rs`）直连各服务商或本机模型，不经任何第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
+> **隐私**：所有 Key、观众画像、头像、参考音频路径仅写入本机配置目录的 `settings.json`，长期记忆数据库写入同目录的 `memory-v3.sqlite3`（Windows 为 `%APPDATA%\<应用ID>\`），均不进仓库。Memory v3 当前与 `settings.json` 一样是本机明文存储，尚未引入 SQLCipher；数据库、召回结果和统计不作为遥测上传，但在线文字模式会把允许记忆的会话批次直发给当前配置的 DeepSeek 做巩固，本地 Ollama 模式则留在本机。其它聊天、识图和语音请求也由内置本地代理（Rust `api.rs` / `realtime.rs` / `voice_service.rs`）直连相应服务商或本机模型，不经额外第三方。内置人设语料经 XOR 加密后编译进 Rust 二进制，运行时由 `/api/assets` 下发，**安装包内不含明文 `persona-assets.js`**。
 
 ### 配置
 
-托盘菜单选 **设置…** 打开设置窗口，按分区填写：AI 服务 Key、语音服务（后端 / 参考音频 / 音量）、模型与人格、观众画像、头像与外观、快捷键与气泡尺寸。保存后即时生效（快捷键会重注册、聊天窗口按新尺寸重定位；切换本地语音后端，或修改 CosyVoice Key / 音色 / 模型，会自动启动或重启本机语音服务）。
+托盘菜单选 **设置…** 打开设置窗口，按分区填写：AI 服务 Key、语音服务（后端 / 参考音频 / 音量）、模型与人格、观众画像、头像与外观、快捷键与气泡尺寸；“记忆”页可管理当前人设/用户的长期记忆。保存后即时生效（快捷键会重注册、聊天窗口按新尺寸重定位；切换本地语音后端，或修改 CosyVoice Key / 音色 / 模型，会自动启动或重启本机语音服务）。
 
 ### 本地语音说明
 
 - **零样本克隆**：本地模型不训练音色，填入 10–20s 单人清晰参考录音（及可选文案）后，**保存并重启语音服务**（切换后端或重开 App）即按此录音克隆。
 - **macOS**：Qwen3-TTS 运行时落在 `~/Library/Application Support/com.aaronfang.kxyydesktoppet/voice-runtime`，首次选用本地后端会自动配置，也可手动执行 `scripts/macos/setup-qwen3-tts.sh`。
-- **Windows / Linux（本地 Qwen3-TTS）**：走官方 PyTorch 包 `qwen-tts`，默认加载 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`（首次运行自动下载，约数 GB）。Windows 运行 `scripts/windows/setup-qwen3-tts.cmd` 会创建独立环境 `scripts/local-realtime/.venv-qwen3` 并安装 torch + qwen-tts 等依赖（脚本按 GPU 自动选 wheel：RTX 50 系/Blackwell 用 `cu128`，其它 NVIDIA 用 `cu124`，无卡则 CPU，较慢；Python 需 3.10–3.13，3.14 暂无 wheel）。可在 `settings.json` 用 `qwen3ModelDir`（本地权重目录或模型 id）、`qwen3Language`（默认 `Auto`）覆盖。
+- **Windows / Linux（本地 Qwen3-TTS）**：走官方 PyTorch 包 `qwen-tts`。Windows 默认加载较低延迟的 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`；Linux 暂时保持 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`。两者首次运行都会从 Hugging Face 官方站点下载相应权重，且当前仍按稳定句整段生成，不等于真流式。下载可能持续数分钟；180 秒后 App 会继续显示下载/加载中并保持健康探测，模型就绪后自动恢复，不会仅因超过固定时限报启动失败。Windows 运行 `scripts/windows/setup-qwen3-tts.cmd` 会创建独立环境 `scripts/local-realtime/.venv-qwen3` 并安装 torch + qwen-tts 等依赖（脚本按 GPU 自动选 wheel：RTX 50 系/Blackwell 用 `cu128`，其它 NVIDIA 用 `cu124`，无卡则 CPU，较慢；Python 需 3.10–3.13，3.14 暂无 wheel）。可在 `settings.json` 用 `qwen3ModelDir`（本地权重目录或模型 id）、`qwen3Language`（默认 `Auto`）覆盖；显式配置始终优先于平台默认。需要自定义 Hugging Face 镜像时可另设 `hfEndpoint`，App 不再默认依赖第三方镜像。
 - **CosyVoice 0.2.21 实测重点**：选择 CosyVoice 后接通，观察稳定句开始合成后是否更早出声、长句是否无噪声/变速、连续两句是否严格有序，并在首句中途插话确认旧音频立即停止。公开资料未规范性写明 raw PCM 字节序；若听到白噪声、严重变速或音高异常，请结束通话并保留不含文本/PCM 的 trace，不要继续计费测试。
 - **Qwen MLX 0.2.22 实测重点**：在 Apple Silicon 选择本地 Qwen3-TTS，要求一段较长回复，观察首句是否在整句生成完前开始播放、chunk 接缝是否自然，并在首句中途插话确认旧生成在下一个 provider chunk 边界后释放、ASR 能继续运行。旧 `mlx-audio` API、非 24k 模型、Windows/Linux PyTorch、legacy 播放会自动回退整句；没有真实设备 trace 前不宣称 TTFA 或打断 p95 改善。
 - **0.2.23 通话诊断**：在设置中勾选“显示聊天界面调试信息”，接通并完成测试轮次后，可在聊天底部点击“复制通话诊断 JSON”（通话中或挂断后均可）。JSON 只含固定协商枚举、重新编号的会话 ID、单调相对时间和有界数值指标，不含 Key、persona、文本、路径或 PCM。先检查 `runtime` 是否为预期的 `worklet + managed-v1 + provider-pcm-v1`，再按 [`docs/roadmap-realtime-voice.md`](docs/roadmap-realtime-voice.md) 2.17 的 runbook 记录 TTFA、接缝与取消恢复；`maxSampledQueuedMs` 是 500ms 采样最高值，`drainInclusiveUnderruns` 包含自然播放结束，二者都不能解释成 provider 内部指标。
@@ -139,6 +145,7 @@ src/                  前端（渲染层，随前端一起打包）
 src-tauri/            Rust 主进程
   src/lib.rs          透明置顶穿透窗口、托盘菜单、开机自启、设置持久化、全局快捷键、聊天/设置窗口管理、IPC 命令；macOS 隐藏 Dock
   src/api.rs          本地 AI 代理：聊天 / TTS / 语料下发（/api/assets）
+  src/memory.rs       Memory v3：SQLite schema、巩固队列、事实演化、召回、管理 IPC 与测试
   src/realtime.rs     本地实时语音 WS 桥接（前端 ↔ 火山或本机语音服务）
   src/voice_service.rs 本地 Python 语音服务生命周期（启动 / 重启 / 日志）
   src/persona_assets.rs 人设语料 XOR 解密（编译期嵌入 persona-assets.enc）

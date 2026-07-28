@@ -3,8 +3,9 @@
 
 后端按平台自动选择：
   - macOS(Apple Silicon)：mlx-audio（mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit）。
-  - Windows / Linux：官方 PyTorch 包 qwen-tts（默认 Qwen/Qwen3-TTS-12Hz-1.7B-Base），
-    见 tts_qwen3_torch.py。Windows 首次使用请先运行 scripts/windows/setup-qwen3-tts.ps1。
+  - Windows / Linux：官方 PyTorch 包 qwen-tts；Windows 默认 0.6B Base，Linux
+    暂时保持 1.7B Base，见 tts_qwen3_torch.py。Windows 首次使用请先运行
+    scripts/windows/setup-qwen3-tts.ps1。
 
 用法：
   <venv>/python scripts/local-realtime/server.py

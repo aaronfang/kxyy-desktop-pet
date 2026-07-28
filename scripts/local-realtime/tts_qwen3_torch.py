@@ -2,7 +2,8 @@
 """Qwen3-TTS 官方 PyTorch 后端（跨平台，面向 Windows / Linux）。
 
 macOS(Apple Silicon) 走 mlx-audio（见 server.py）；本模块用阿里官方 `qwen-tts`
-（PyTorch），默认加载 1.7B 参数模型 `Qwen/Qwen3-TTS-12Hz-1.7B-Base`，做零样本语音克隆。
+（PyTorch）。Windows 默认加载更低延迟的 0.6B Base；Linux 暂时保持 1.7B Base，
+二者都用于零样本语音克隆。
 
 准备（建议独立 venv：scripts/local-realtime/.venv-qwen3）：
   1. 按 https://pytorch.org 安装匹配的 torch（NVIDIA 选对应 CUDA 版本；无 GPU 亦可 CPU，较慢）
@@ -11,7 +12,7 @@ macOS(Apple Silicon) 走 mlx-audio（见 server.py）；本模块用阿里官方
   也可直接运行 scripts/windows/setup-qwen3-tts.ps1 自动配置。
 
 settings.json（可选）：
-  qwen3ModelDir   本地权重目录，或 HF/ModelScope 模型 id（默认 Qwen/Qwen3-TTS-12Hz-1.7B-Base）
+  qwen3ModelDir   本地权重目录，或 HF/ModelScope 模型 id（空值使用平台默认）
   qwen3Language   合成语言（Auto / Chinese / English …），默认 Auto
 
 参考音：优先 settings.localRefWav / localRefText；留空则按 settings.personaCardId
@@ -21,12 +22,16 @@ settings.json（可选）：
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import common
 
-# 默认 1.7B 参数模型（首次运行自动下载，约数 GB）。
-DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+# Windows 实时通话优先降低整句 TTFA；Linux 保持既有默认，避免无明确请求时
+# 改变其质量/资源取舍。两者仍是官方 PyTorch 整句接口，不宣称真流式。
+WINDOWS_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+LINUX_DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_MODEL = WINDOWS_DEFAULT_MODEL if sys.platform == "win32" else LINUX_DEFAULT_MODEL
 
 _model = None
 _prompt = None

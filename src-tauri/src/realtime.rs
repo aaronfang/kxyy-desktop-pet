@@ -865,7 +865,13 @@ fn to_frontend_error(msg: &str) -> serde_json::Value {
 }
 
 fn to_frontend_session(state: &str) -> serde_json::Value {
-    serde_json::json!({ "type": "session", "state": state })
+    // 当前火山桥只支持 StartSession 注入 system role；没有 ASR final 后动态
+    // context 的已验证协议，因此显式回显 session-start-v1，供前端能力门记录。
+    serde_json::json!({
+        "type": "session",
+        "state": state,
+        "memoryContext": "session-start-v1"
+    })
 }
 
 // ============================ gzip 工具 ============================

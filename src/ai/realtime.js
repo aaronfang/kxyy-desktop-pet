@@ -17,6 +17,9 @@
 //     本地级联控制事件可附带单调 generation；低于当前 generation 的迟到事件会被丢弃。
 //     上行 text 可含 {type:"playback_segment",generation,segmentId,state:"completed"}；
 //     只回执句段标识，不回传文本或 PCM。
+//     本地/Cosy 清空播放时可发 {type:"playback_reset"}，清理服务端的有界尾部状态。
+//     memoryContext 可协商 session-start-v1；本地/Cosy 还可协商 turn-final-v1，
+//     服务端未明确回显时视为 none，不把 ASR final 误当作支持动态 context。
 //   挂断发 {type:"hangup"}。
 //
 // 音频采集/播放放前端而非 Rust 的原因：getUserMedia 自带回声消除(AEC)/降噪/AGC，
@@ -46,6 +49,11 @@ const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
+const SESSION_MEMORY_CAPABILITY = "session-start-v1";
+const TURN_MEMORY_CAPABILITY = "turn-final-v1";
+const PROACTIVE_TURN_CAPABILITY = "local-v1";
+const MAX_TURN_MEMORY_ITEMS = 3;
+const MAX_TURN_MEMORY_CHARS = 700;
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 const VAD_SHADOW_FINAL_WAIT_MS = 50;
@@ -130,9 +138,12 @@ export class RealtimeSession {
     onLevel,
     onSpeechCandidate,
     onSpeechRejected,
+    onMemoryContextRequest,
     onPlaybackStats,
     onError,
     provider = "unknown",
+    conversationMode = "follow-user",
+    proactiveGreetingDelayMs,
     maxTraceEvents = 256,
     onTrace,
   } = {}) {
@@ -150,6 +161,7 @@ export class RealtimeSession {
       onLevel,
       onSpeechCandidate,
       onSpeechRejected,
+      onMemoryContextRequest,
       onPlaybackStats,
       onError,
     };
@@ -190,6 +202,8 @@ export class RealtimeSession {
     this._downlinkAudioMode = "raw";
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
+    this._memoryContextMode = "none";
+    this._memoryContextRequestedAt = 0;
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
     this._vadShadowSummary = sanitizeVadShadowSummary();
@@ -199,6 +213,20 @@ export class RealtimeSession {
     this._candidateSegmentKeys = null;
     this._pendingConfirmedCandidate = null;
     this._candidateSnapshotTimer = 0;
+    this._conversationMode = ["balanced", "ai-leads"].includes(conversationMode)
+      ? conversationMode
+      : "follow-user";
+    this._proactiveTurnMode = "none";
+    this._proactiveTriggerId = 0;
+    this._proactiveWelcomeSent = false;
+    this._proactiveGreetingTimer = 0;
+    this._sessionStarted = false;
+    this._micReady = false;
+    this._proactiveGreetingDelayMs = Number.isFinite(proactiveGreetingDelayMs)
+      ? Math.max(0, proactiveGreetingDelayMs)
+      : this._conversationMode === "ai-leads"
+        ? 600
+        : 1200;
   }
 
   /**
@@ -268,6 +296,17 @@ export class RealtimeSession {
         const cascadeCapabilities = usesManagedCascade(this.trace.provider)
           ? { downlinkAudio: [MANAGED_AUDIO_CAPABILITY] }
           : {};
+        // 明确声明当前只支持会话开始时注入记忆；动态逐轮 context 必须由后端
+        // 显式回显新能力后才能启用，不能因为收到 ASR final 就默认支持。
+        cascadeCapabilities.memoryContext = usesManagedCascade(this.trace.provider)
+          ? [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY]
+          : [SESSION_MEMORY_CAPABILITY];
+        if (
+          usesManagedCascade(this.trace.provider) &&
+          this._conversationMode !== "follow-user"
+        ) {
+          cascadeCapabilities.proactiveTurn = [PROACTIVE_TURN_CAPABILITY];
+        }
         if (
           usesManagedCascade(this.trace.provider) &&
           this._playbackMode === "worklet" &&
@@ -337,6 +376,13 @@ export class RealtimeSession {
     }
     switch (msg.type) {
       case "session":
+        if (msg.state === "started") {
+          this._sessionStarted = true;
+          this._memoryContextMode =
+            [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY].includes(msg.memoryContext)
+              ? msg.memoryContext
+              : "none";
+        }
         if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
           this._downlinkAudioMode =
             msg.downlinkAudio === MANAGED_AUDIO_CAPABILITY
@@ -365,6 +411,12 @@ export class RealtimeSession {
                 ? msg.vadShadow
                 : "unavailable";
           this._asrRuntime = sanitizeAsrRuntime(msg.asrRuntime);
+          this._proactiveTurnMode =
+            this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
+            msg.proactiveTurn === PROACTIVE_TURN_CAPABILITY
+              ? PROACTIVE_TURN_CAPABILITY
+              : "none";
+          this._scheduleProactiveWelcome();
         }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
@@ -381,6 +433,7 @@ export class RealtimeSession {
         }
         break;
       case "asr_start":
+        this._cancelProactiveWelcome();
         if (this._confirmSpeech()) this.cb.onAsrStart?.();
         break;
       case "speech_candidate":
@@ -437,7 +490,34 @@ export class RealtimeSession {
         }
         break;
       }
+      case "memory_context_request":
+        if (
+          this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
+          Number.isSafeInteger(msg.generation) &&
+          msg.generation === this._backendGeneration
+        ) {
+          this._memoryContextRequestedAt = performance.now();
+          this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
+          this.cb.onMemoryContextRequest?.({ generation: msg.generation });
+        }
+        break;
+      case "memory_context_timeout":
+        if (
+          this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
+          Number.isSafeInteger(msg.generation) &&
+          msg.generation === this._backendGeneration
+        ) {
+          const latencyMs = this._memoryContextRequestedAt
+            ? Math.max(0, performance.now() - this._memoryContextRequestedAt)
+            : 0;
+          this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+            metrics: { accepted: false, timedOut: true, itemCount: 0, memoryChars: 0, latencyMs },
+          });
+          this._memoryContextRequestedAt = 0;
+        }
+        break;
       case "assistant":
+        this._cancelProactiveWelcome();
         this._assistantActive = true;
         this.trace.startResponse();
         this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
@@ -455,6 +535,17 @@ export class RealtimeSession {
         if (!usesManagedCascade(this.trace.provider)) break;
         this._assistantActive = false;
         this.cb.onAssistantDiscarded?.({ generation: msg.generation });
+        break;
+      case "proactive_turn_status":
+        if (
+          usesManagedCascade(this.trace.provider) &&
+          this._proactiveTurnMode === PROACTIVE_TURN_CAPABILITY &&
+          msg.state === "cancelled"
+        ) {
+          this._backendAudioPending = false;
+          this._assistantActive = false;
+          this._flushPlayback("speech_candidate");
+        }
         break;
       case "tts_start":
         this._backendAudioPending = true;
@@ -491,6 +582,66 @@ export class RealtimeSession {
       default:
         break;
     }
+  }
+
+  /** 回传当前 final turn 的有界记忆卡片；旧 generation、旧服务或火山路径拒绝发送。 */
+  sendMemoryContext({ generation, items } = {}) {
+    if (
+      this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
+      Number.isSafeInteger(generation) &&
+      generation !== this._backendGeneration
+    ) {
+      this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+        metrics: { accepted: false, stale: true, itemCount: 0, memoryChars: 0 },
+      });
+      return false;
+    }
+    if (
+      this._memoryContextMode !== TURN_MEMORY_CAPABILITY ||
+      !Number.isSafeInteger(generation) ||
+      generation !== this._backendGeneration ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) {
+      return false;
+    }
+    const safe = [];
+    let chars = 0;
+    for (const item of Array.isArray(items) ? items : []) {
+      if (safe.length >= MAX_TURN_MEMORY_ITEMS) break;
+      const text = typeof item?.text === "string" ? item.text.trim() : "";
+      if (!text || chars + text.length > MAX_TURN_MEMORY_CHARS) continue;
+      safe.push({
+        kind: ["fact", "episode", "commitment", "memory"].includes(item.kind)
+          ? item.kind
+          : "memory",
+        text,
+        uncertain: item.uncertain === true,
+        pinned: item.pinned === true,
+      });
+      chars += text.length;
+    }
+    try {
+      this.ws.send(JSON.stringify({ type: "memory_context", generation, items: safe }));
+    } catch {
+      this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+        metrics: { accepted: false, itemCount: 0, memoryChars: 0 },
+      });
+      return false;
+    }
+    const latencyMs = this._memoryContextRequestedAt
+      ? Math.max(0, performance.now() - this._memoryContextRequestedAt)
+      : 0;
+    this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
+      metrics: {
+        accepted: true,
+        itemCount: safe.length,
+        memoryChars: chars,
+        latencyMs,
+      },
+    });
+    this._memoryContextRequestedAt = 0;
+    return true;
   }
 
   // ---- 电平：供声波可视化（麦克风 + 下行播放取较大值）----
@@ -601,6 +752,7 @@ export class RealtimeSession {
   _beginSpeechCandidate(msg = {}) {
     if (this._speechCandidate || this._userTurnOpen) return false;
     this._resetInterruptionCandidate();
+    this._cancelProactiveWelcome();
     this._speechCandidate = true;
     this._candidateInterruptsResponse = this._assistantActive || this._hasPlayback();
     const candidateId = msg.candidateId;
@@ -635,6 +787,47 @@ export class RealtimeSession {
     this._candidateSnapshot = null;
     this._candidateSegmentKeys = null;
     this._pendingConfirmedCandidate = null;
+  }
+
+  _scheduleProactiveWelcome() {
+    if (
+      this._proactiveWelcomeSent ||
+      this._proactiveGreetingTimer ||
+      !this._sessionStarted ||
+      !this._micReady ||
+      this._proactiveTurnMode !== PROACTIVE_TURN_CAPABILITY ||
+      this._conversationMode === "follow-user"
+    ) {
+      return;
+    }
+    this._proactiveGreetingTimer = setTimeout(() => {
+      this._proactiveGreetingTimer = 0;
+      if (
+        this.stopped ||
+        this._speechCandidate ||
+        this._userTurnOpen ||
+        this._assistantActive ||
+        this._hasPlayback() ||
+        !this.ws ||
+        this.ws.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+      this._proactiveWelcomeSent = true;
+      this._proactiveTriggerId += 1;
+      this.ws.send(
+        JSON.stringify({
+          type: "proactive_turn",
+          triggerId: this._proactiveTriggerId,
+          kind: "welcome",
+        }),
+      );
+    }, this._proactiveGreetingDelayMs);
+  }
+
+  _cancelProactiveWelcome() {
+    if (this._proactiveGreetingTimer) clearTimeout(this._proactiveGreetingTimer);
+    this._proactiveGreetingTimer = 0;
   }
 
   _acceptCandidateSnapshot(message) {
@@ -943,6 +1136,20 @@ export class RealtimeSession {
     this._handleSegmentCompleted(segment);
   }
 
+  _notifyPlaybackReset() {
+    if (
+      !usesManagedCascade(this.trace.provider) ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    )
+      return;
+    try {
+      this.ws.send(JSON.stringify({ type: "playback_reset" }));
+    } catch {
+      /* the session cleanup path remains local and bounded */
+    }
+  }
+
   _discardPendingAudioSegments() {
     this._currentAudioSegment = null;
     for (const segment of this._audioSegments.values()) segment.dropped = true;
@@ -1009,11 +1216,14 @@ export class RealtimeSession {
     if (interruptsResponse && this.trace.responseId) {
       this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "turn_detected" });
     }
+    if (interruptsResponse) this._audioGate = true;
+    // Flush while the previous generation is still current. Otherwise opening
+    // the new turn first tags playback_stopped with the new generation even
+    // though it is the previous response that was actually cleared.
+    this._flushPlayback("turn_detected");
     this.trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
     this._traceAsrFinalSeen = false;
     this._bargeInTurn = true;
-    if (interruptsResponse) this._audioGate = true;
-    this._flushPlayback("turn_detected");
     return true;
   }
 
@@ -1227,8 +1437,16 @@ export class RealtimeSession {
   _flushPlayback(reason = "session_ended") {
     if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
     this._playbackDrainTimer = 0;
+    this._notifyPlaybackReset();
     if (this._hasPlayback()) {
-      this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, { reason });
+      this.trace.recordOnce("playback_stopped", TRACE_EVENT.PLAYBACK_STOPPED, {
+        reason,
+        // Preserve the amount of audio that was still queued immediately
+        // before the clear. This is bounded, provider-neutral, and lets a
+        // diagnostic distinguish an intentional barge-in clear from a TTS or
+        // transport failure without retaining PCM or text.
+        metrics: { queuedMs: this._playbackQueuedMs },
+      });
     }
     for (const pending of this._pendingPcm) this._markSegmentDropped(pending?.segment);
     this._pendingPcm = [];
@@ -1292,6 +1510,8 @@ export class RealtimeSession {
       }
     };
     this.micSource.connect(this.workletNode);
+    this._micReady = true;
+    this._scheduleProactiveWelcome();
     // 不接到 destination，避免把麦克风原声播出去。
   }
 
@@ -1299,6 +1519,7 @@ export class RealtimeSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this._cancelProactiveWelcome();
     this._backendAudioPending = false;
     if (this._levelRaf) cancelAnimationFrame(this._levelRaf);
     this._levelRaf = 0;
@@ -1375,6 +1596,7 @@ export class RealtimeSession {
         downlinkAudio: this._downlinkAudioMode,
         ttsStream: this._ttsStreamingMode,
         interruptionHint: this._interruptionHintMode,
+        memoryContext: this._memoryContextMode,
         vadShadow: this._vadShadowMode,
         asr: { ...this._asrRuntime },
       },

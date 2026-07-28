@@ -1,6 +1,8 @@
 # 实时语音与情绪语音优化路线图
 
 > 调研日期：2026-07-21。本文档记录当前实现、外部方案对比、目标接口和分阶段实施顺序，供后续开发使用；除明确标记为“已实现”的能力外，其余内容均不是当前产品承诺。
+>
+> 本文只负责音频管线、自然打断、ASR/TTS 与情绪语音。实时通话的逐轮记忆、写入边界、延迟预算和协议能力门统一以 [《Memory Brain 开发路线图》M2](./roadmap-memory-brain.md#m2实时通话逐轮记忆) 为准，避免在两份文档中维护不同的记忆接入方案。
 
 ## 1. 结论摘要
 
@@ -64,6 +66,11 @@
 | `playback_queued` / `playback_started` / `playback_stopped` | 播放 Worklet ring 调度、清空和 drain | legacy source-node fallback 保留同一观测语义 |
 | `response_started` / `response_cancelled` / `response_completed` | ASR 结束、确认插话、挂断或 TTS 生产结束后播放 drain | 本地控制/scoped sender 与 managed 下行已有后端 generation；火山/raw fallback 仍未贯穿 |
 
+本次诊断补充（待下个版本发布）：确认插话或挂断清空播放时，先在旧 generation 下记录
+`playback_stopped`，再打开新 turn；该事件同时携带清空前的 `queuedMs`。这样可以区分“文字已结束、
+但排队语音因新一轮确认而被主动清空”和 TTS/传输异常。该指标仍只表示桌面播放队列，不代表供应商
+内部流式进度；不会改变 RMS/ASR 的打断决策。
+
 隐私与资源边界：默认内存队列最多 256 条（构造时可调，但硬上限 4096），溢出丢最旧事件并累计 `droppedEvents`；schema 不接受密钥、URL、persona、原始 PCM 或完整用户/助手文本，自由格式取消原因与未列入允许列表的指标会被丢弃。阶段耗时只能用 `timestampMs` 相减，禁止混用 wall clock。
 
 P0 落地时的设计占位 `speech_candidate`、`speech_rejected`、`response_completed` 已在后续 P1 测试版接入运行时，详见下一节。0.2.14 已让本地级联控制事件和发送任务携带后端 generation，0.2.16 已接入 LLM SSE，0.2.19 又让协商后的本地/CosyVoice 下行 binary 携带同一 generation。火山二进制帧与 raw fallback 仍没有该身份，前端继续用确认后的 audio gate 隔离旧尾包。神经 VAD、Windows/Linux Qwen 真正音频流式和火山后端 generation 仍属于 P2 或待实验范围；CosyVoice 与 macOS MLX Qwen 真流式的实现/实验边界见 2.15–2.16。
@@ -73,6 +80,8 @@ P0 落地时的设计占位 `speech_candidate`、`speech_rejected`、`response_c
 ### 2.5 P1 可体验测试版（已实现，2026-07-22）
 
 前端下行播放已迁移到常驻 `playback-worklet.js`：24k PCM 进入固定容量 ring buffer，由 Worklet 重采样到设备输出采样率；支持约 30ms duck 后暂停消费、约 60ms resume 淡入和确认时 clear。Worklet 每 500ms 上报 `queuedMs`、underrun、丢弃/已播放样本数，并写入有界 trace。默认暂停容量为 3 秒，用于兼容本地链路目前仍较慢的整段 ASR 确认；这是测试期上限，不是最终 120–250ms 正常排队目标。溢出时保留候选点之后最早的可恢复音频并拒绝新样本，不会无限增长。
+
+尾部排队保护（下一测试包）：本地/CosyVoice 服务端会保留最多 256 个已下发但尚未收到前端 `playback_segment:completed` 的句段标识；LLM/TTS producer 结束不再立即把 `playing` 降为 idle，Worklet drain 完成后才恢复空闲。确认打断或挂断时前端发送一次无文本的 `playback_reset` 清空该有界状态。它只延长播放期间的既有 RMS 候选门槛，不改变 ASR、Silero shadow 或 provider 选择；旧客户端未发送 reset 时，generation 取消路径仍会主动清理。
 
 两条链路的当前映射：
 
@@ -388,6 +397,119 @@ response_completed{ responseId, generation, status }
 
 `managed-v1` 继续只负责 chunk 身份与完整性，不按 chunk 比例推断已听文本。0.2.20 的播放进度来自 Worklet 消费点，并与 candidate 绑定；固定提示为：“上一轮语音在句中被用户打断。不要假设未播完的尾句已被用户听到；按当前人设自然承接即可，不要机械道歉、抱怨或复述未播内容。”字/音素级位置、partial spoken text recovery、legacy/火山 parity 仍是未实现边界。
 
+### 4.7 主动语音与“元元带聊”模式（首个接通问候切片已实现）
+
+目标不是简单增加一个静默定时器，而是提供显式的**语音陪聊主导方式**，让不擅长找话题的用户可以主要倾听和附和。该能力默认保持当前行为，用户主动选择后才提高 AI 主导程度。
+
+**2026-07-28 首个实现切片**：设置、Rust 持久化白名单、前端 `local-v1` 能力协商和每通一次的接通问候已经落地；`follow-user` 是兼容默认值，`balanced` 在 session started 后约 1.2 秒、`ai-leads` 约 0.6 秒提交一次 `welcome` 候选。当前只有本地 Qwen/CosyVoice 且双方明确协商 `managed-v1 + local-v1` 才会启用；旧服务与火山保持 `none`。后端在无 speech candidate/ASR/reply/playback/pending receipt 时才接受，并在用户 speech candidate 出现时立即取消主动 generation、清空其前端播放和临时气泡。主动控制提示不伪造成 user history，仍只有完整播放回执确认的 assistant 句段进入上下文。尚未实现同题续说、短附和分类、静默换题、TopicLeadState、Memory 选题和主动诊断计数。
+
+| 设置值 | 用户体验 | 主动行为 |
+|---|---|---|
+| `follow-user`（跟随用户） | 用户掌控话题 | AI 只回应，不因静默自行开口 |
+| `balanced`（自然轮流） | 双方轮流推进 | 当前可接通问候；规划一次同题续说，长静默后至多有限次换题 |
+| `ai-leads`（元元带聊） | AI 负责准备和延续话题，用户可主要附和 | 更快主动开场，允许 2–3 个连续主动回合，并把短回应视为“继续讲”的邀请 |
+
+主动程度与 `fast|standard|long` 句中停顿容忍度必须保持独立：前者决定谁负责推进话题，后者只决定用户一句话何时提交。不得通过缩短 endpoint 来制造“AI 更主动”。
+
+#### 4.7.1 话题推进而不是连续审问
+
+通话内维护短期 `TopicLeadState`，不写长期记忆：
+
+```text
+topicKey
+phase: opening | expanding | inviting | closing
+aiTurnsOnTopic
+consecutiveShortReplies
+userEngagement
+lastProactiveAt
+topicsUsed (bounded)
+```
+
+一个话题按“主动抛题 → 自己先讲观点/细节 → 留低负担回应口 → 总结或换题”推进。不能每句都反问用户，也不能把“元元带聊”变成无限独白。话题来源按以下顺序竞争，并受去重、敏感信息和 scope 边界约束：
+
+1. 刚才已实际听到的话题及其可延伸方向。
+2. 用户明确说过的兴趣、最近经历。
+3. pending commitment、置顶记忆或未聊完事项。
+4. 当前时间、周末、季节等低敏上下文。
+5. 人设语料中的安全闲聊种子与通用生活话题。
+
+记忆候选继续使用 Memory observation 格式，不能成为系统指令；不确定信息要以试探口吻确认，不能编造元元的线下经历。`topicKey` 必须有会话内冷却，避免反复问工作、吃饭和睡觉。
+
+#### 4.7.2 用户回应分类
+
+第一版使用可测试的固定规则，不额外调用一个常驻分类模型：
+
+| 类别 | 示例 | 行为 |
+|---|---|---|
+| `backchannel` | 嗯、对、哈哈、是吗、然后呢、你继续 | 沿当前话题继续展开；不把短附和巩固成用户事实或承诺 |
+| `substantive` | 提供新事实、观点或较完整回答 | 正常响应，再决定是否继续由 AI 主导 |
+| `redirect` | 用户主动提出新话题、说“换个话题” | 立即放弃当前 topic，跟随用户 |
+| `pause` | 安静一会儿、让我想想、先别说 | 暂停本次通话主动调度，不能交给 LLM 自行裁决 |
+| `silence` | 播放完成后持续无新用户回合 | 先同题续说，再到期才有限次换题；达到上限后保持安静 |
+
+#### 4.7.3 调度状态机与安全门
+
+```mermaid
+stateDiagram-v2
+    [*] --> Listening
+    Listening --> ProactivePending: eligible trigger
+    ProactivePending --> Listening: speech_candidate / veto / cooldown
+    ProactivePending --> Generating: backend accepts
+    Generating --> Speaking: first managed audio
+    Generating --> Listening: cancelled / empty / failed
+    Speaking --> Listening: playback completed
+    Speaking --> Candidate: probable user speech
+    Candidate --> Speaking: speech_rejected
+    Candidate --> Listening: speech_confirmed / cancel generation
+```
+
+计时起点必须是**音频实际播放完成回执**，不是 `assistant_end`、`tts_end` 或 producer 完成。建议实验窗口而非首版硬承诺：
+
+| 触发 | `balanced` | `ai-leads` |
+|---|---:|---:|
+| 接通后问候候选 | 1.2–2.0s | 0.6–1.2s |
+| 同话题续说候选 | 7–12s | 2.5–5s |
+| 换新话题候选 | 25–40s | 8–15s |
+| 连续主动回合上限 | 1 | 2–3 |
+
+前端调度器负责用户设置、窗口/会话状态、话题候选、Memory recall 和冷却；语音后端做最后安全门。后端只有在 `in_speech=false`、无 candidate、无 ASR、无活跃 reply、无播放和无 pending playback receipt 时才能接受。任何 `speech_candidate` 都立即撤销尚未出声的主动候选；`speech_confirmed` 沿用现有 generation CancelScope、managed audio gate 和 clear 路径。
+
+#### 4.7.4 本地私有协议与历史语义
+
+本地/CosyVoice 首版协商能力建议为固定枚举：
+
+```text
+start.proactiveTurn: ["local-v1"]
+session.proactiveTurn: "local-v1" | "none"
+client: {type:"proactive_turn", triggerId, kind}
+server: {type:"proactive_turn_status", triggerId, state:"accepted|vetoed|cancelled"}
+```
+
+协议预留的 `kind` 为 `welcome|followup|idle|memory|commitment`；当前实现只接受 `welcome`，其余固定值在相应切片完成前一律 veto。`triggerId` 单调且会话内幂等；旧服务或未回显能力时不得发送。主动回合创建正常 response generation，复用现有 SSE、稳定句、有界 TTS、managed PCM 和 Worklet，不新建第二条播放管线。
+
+禁止把“（用户沉默了）”伪造成 user message。`AudibleHistory` 需要显式区分 `origin=user_turn|proactive_turn`：主动控制提示只存在于一次请求快照，不进入 history、recap、日志或长期记忆；只有实际完整播放的 assistant 句段可以进入后续实时上下文。短附和仍可保留为普通用户回合上下文，但不得仅凭“嗯/对”生成长期事实、纠错或承诺。
+
+逐轮 Memory request 可扩展固定 `reason` 枚举并继续使用 generation、80/100ms 有界预算和 observation sanitizer；不得把主动话题候选正文写入诊断。主动回复取消后，阻塞 LLM/TTS Future 继续遵循现有“不可强杀、返回点丢弃、admission 到真实结束才释放”的规则。
+
+#### 4.7.5 后端能力边界
+
+| 后端 | 首版支持范围 | 边界 |
+|---|---|---|
+| 本地 Qwen / CosyVoice 级联 | 当前：每通一次主动开场、用户候选即取消、可听历史；规划：同题续说与静默换题 | `local-v1` 已落地首个切片，后续 kind 仍默认 veto |
+| 火山端到端 | 仅用 system role 提高“用户说完后继续带话题”的倾向 | 当前 Rust 桥只验证了音频 `TaskRequest` 和 `hangup`；没有已验证的主动 generation/文本 turn/动态 context 协议，回显 `none` |
+
+火山路径不得发送伪造用户 PCM、播放“触发语”冒充用户，或在同一通话中并行启动本地文字模型/TTS 形成“双大脑”。只有当前账号官方文档和真实请求证明支持会话内文本 turn、主动 generation 或 context+trigger 后，才能新增独立 capability；否则不能为追求 UI 一致性重建会话或假装无损支持。
+
+#### 4.7.6 分阶段切片与验收
+
+1. **A：设置与能力门（已实现）**——三档固定枚举、兼容默认值、`local-v1` 双向协商和旧服务/火山 `none` 降级。
+2. **B：本地接通问候（已实现）**——只允许每通一次，candidate 即撤销，完整复用 generation/managed playback/可听历史；不伪造 user message。
+3. **C：同题续说**——以实际 playback completed 为计时起点；先复用现有 `followup` 意图，不接 Memory 新话题。
+4. **D：元元带聊**——`pause/redirect/backchannel` 固定规则、有界 TopicLeadState、短回应语义、有限换题和 Memory observation 候选。
+5. **E：火山能力门**——只做官方协议验证；无证据继续 `none`。
+
+除既有延迟/打断指标外，新增只含枚举和计数的诊断：候选、accepted/vetoed/cancelled、首音频前被用户抢回、出声后 1 秒内被打断、每通主动回合数和 topic switch 数。验收至少覆盖：接通即说话不被 AI 抢首句、候选期用户开口、生成期取消、播放期打断、短附和继续、明确暂停、连续沉默达到上限、旧客户端降级、挂断后迟到 generation。不能记录话题正文、用户/助手文本或记忆内容。
+
 ## 5. 情绪语音方案
 
 ### 5.1 统一风格对象
@@ -483,6 +605,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - **已实现（0.2.31 体验修复）**：本地/CosyVoice 的句中续说改为固定三档 reopen，默认总 1650ms；实时 TTS 最小稳定块提升为 30 字，并用 provider metadata 无关的 chunk-sequence 测试锁定。它不合并已经 committed 的两次 ASR，也不撤回已显示/已播放的回复；超出所选窗口仍是新轮。
 - **已实现（0.2.32 未播音收敛）**：本地/CosyVoice 的新确认人声若在旧 response 启动后 8 秒内到达，且旧 response 尚未取得任何 TTS admission，则取消旧 generation、按 generation 撤回未播临时助手气泡，并只向下一次 LLM history snapshot 注入固定 continuation hint。旧用户消息由既有有界 audible history 提供上下文；完整转写不进入 control event、日志或诊断。已开始 TTS、超时、挂断、旧服务和火山继续走原 supersede/barge-in，不撤回已播放内容。此切片不等待或强杀 blocking Future，也不宣称跨 committed ASR 已原子合并成一条用户消息。
 - **待实现**：许可声学回放、live 单调时钟候选上限、阈值/超时实验、噪声自适应和满足 p95 600ms 目标的 adaptive endpoint；当前不能把真实 shadow 或合成 evaluator 称为神经 VAD 完整方案或 live takeover。
+- **部分实现（主动陪聊 A+B）**：本地/CosyVoice 已增加三档设置、`local-v1` 协商和每通一次接通问候；candidate 撤销、旧端/火山降级、无伪 user history 与可听回执语义有确定性测试。C/D 的同题续说、短附和、静默换题、Memory 选题、TopicLeadState 和诊断计数仍待实现。
 - **待实验**：用有权利/同意证据的固定录音集比较 Whisper/SenseVoice；实测 CosyVoice PCM 字节序/TTFA 与 macOS MLX Qwen TTFA/接缝/取消资源恢复。Windows/Linux 继续等待官方音频 iterator。不得把整段音频再切块冒充真 streaming。
 
 ### P3：情绪闭环
@@ -496,6 +619,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 ### P4：协议和能力扩展
 
 - 将内部事件逐步对齐 OpenAI Realtime 语义子集。
+- 用当前账号官方文档和真实请求验证火山是否支持会话内文本 turn、主动 generation 或 context+trigger；没有证据继续回显 `proactiveTurn:none`，不使用伪 PCM、双模型或重建会话替代。
 - 评估结构化工具调用驱动桌宠动作，而不是继续扩展自由文本正则。
 - 只有出现远程浏览器/移动端需求时才评估 WebRTC；localhost 保持 PCM WebSocket。
 
@@ -507,6 +631,8 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 | 误触 | 咳嗽、敲键盘、桌面通知声 | 候选可恢复，不产生新用户轮次 |
 | 回声 | 音箱外放不同音量 | 不因助手自身声音确认打断 |
 | 连续轮次 | 连续两次打断、上一轮 TTS 迟到 | 只播放最新 generation |
+| 主动陪聊 | 接通即开口、静默开场、短附和、明确暂停、同题续说、有限换题、连续沉默 | candidate 可撤销且不抢首句；暂停即时生效；达到主动上限后安静；不产生伪 user history |
+| 主动能力协商 | 本地新/旧服务、legacy/Worklet、火山 `none`、重复/旧 triggerId | 仅双向确认 `local-v1` 才发送；旧端安全降级；trigger 幂等且旧 generation 不出声 |
 | 协议身份 | managed 协商/降级、旧/未来 generation、未知句段、错序/重复/缺失、样本总量不符 | 非法 frame 不入队，对应句段不产生 completed receipt；新代际可恢复 |
 | 打断提示 | Worklet/legacy 协商、candidateId、1 秒上下阈值、confirm/clear 后迟到快照、重复/错 ID/timeout | 仅合格 candidate 产生一次 text-free receipt；hint 只存在于一次请求快照 |
 | 中文停顿 | 句中停顿 300–900ms 后继续 | soft-end 可 reopen，不拆成两轮 |
@@ -527,6 +653,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - 不叠加 DeepFilterNet 等服务端增强，除非录音回放证明浏览器 AEC/NS 不足；重复降噪可能损伤人声。
 - Qwen 官方声称的最低合成延迟是特定条件下的模型指标，不能直接写成本工程端到端承诺。
 - 火山模型版本、复刻音色类型、角色控制字段和动态更新事件存在账号/商品差异，实施前必须用当前账号文档和真实请求验证。
+- 主动陪聊不能通过缩短用户 endpoint、伪造用户消息/PCM、并行“双大脑”或记录话题正文到诊断实现；用户明确暂停、candidate 抢回和每通主动回合上限高于生成完整性。
 - `KXAU`/`managed-v1` 只属于桌面本地/CosyVoice 级联协议，不能据此推断或修改火山帧布局、事件码或任何协议常量。
 - 0.2.27 已让 Silero shadow candidate latch 与离线 evaluator 机械有界，但模型仍没有决策权；不得把 96-frame 保护值、合成 aggregate、模型可执行、fake probability、shadow event count 或 RMS 数值写成准确率/体验改善，也不得在 live 单调时钟 deadline 和许可声学阈值验证前驱动线上打断。
 - 复制 Apache-2.0 项目代码时保留许可证、版权和修改说明；优先重新实现所需机制。
@@ -538,3 +665,4 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 3. 情绪路线默认保证复刻音色；CosyVoice 作为“复刻 + instruction”的表现力基准，Qwen CustomVoice 作为可选模式。
 4. SenseVoice final ASR 实验后端已在 0.2.30 以显式安装、启动期固定回退落地；下一步是许可录音 A/B 与 SER/AED 产品语义设计，仍不承担快速打断或 partial transcript。
 5. 所有后续实现以本文件的指标和回放集为验收依据，不能只凭主观单次试听上线。
+6. 主动语音先按 4.7 在本地/CosyVoice 做能力协商和分片验收；默认保持当前跟随行为，`元元带聊` 必须由用户显式选择。火山在主动 generation 协议得到真实证据前只改善用户回合后的带话题风格，不宣称支持静默自行开口。

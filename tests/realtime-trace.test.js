@@ -8,6 +8,7 @@ import {
   createTraceEvent,
   replayTrace,
   sanitizeVadShadowSummary,
+  summarizeMemoryContext,
   summarizeTraceLatency,
 } from "../src/ai/realtime-trace.js";
 
@@ -361,6 +362,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
+      memoryContext: "turn-final-v1",
       vadShadow: "silero-onnx-shadow-v1",
       asr: {
         requested: "sensevoice",
@@ -380,7 +382,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 5);
+  assert.equal(report.diagnosticSchemaVersion, 6);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -388,6 +390,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
     asr: {
       requested: "sensevoice",
@@ -435,6 +438,56 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
   }
 });
 
+test("memory context diagnostics expose bounded latency and stale/timeout counts only", () => {
+  const events = [
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_REQUEST,
+      timestampMs: 10,
+      sessionId: "session-memory",
+      generationId: 1,
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_RESPONSE,
+      timestampMs: 24,
+      sessionId: "session-memory",
+      generationId: 1,
+      metrics: { accepted: true, itemCount: 2, memoryChars: 140, latencyMs: 14 },
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_REQUEST,
+      timestampMs: 40,
+      sessionId: "session-memory",
+      generationId: 2,
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_RESPONSE,
+      timestampMs: 142,
+      sessionId: "session-memory",
+      generationId: 2,
+      metrics: { accepted: false, timedOut: true, itemCount: 0, memoryChars: 0, latencyMs: 102 },
+    }),
+    createTraceEvent({
+      eventType: TRACE_EVENT.MEMORY_CONTEXT_RESPONSE,
+      timestampMs: 160,
+      sessionId: "session-memory",
+      generationId: 2,
+      metrics: { accepted: false, stale: true, itemCount: 0, memoryChars: 0 },
+    }),
+  ];
+  assert.deepEqual(summarizeMemoryContext(events), {
+    requested: 2,
+    responded: 3,
+    accepted: 1,
+    timedOut: 1,
+    stale: 1,
+    latencyMs: { count: 2, p50: 14, p95: 102 },
+  });
+  const report = buildRealtimeDiagnosticReport({ events });
+  assert.deepEqual(report.aggregate.memoryContext, summarizeMemoryContext(events));
+  assert.equal(JSON.stringify(report).includes("memoryChars"), true);
+  assert.equal(JSON.stringify(report).includes("用户"), false);
+});
+
 test("diagnostic export fails closed on unknown runtime capability values", () => {
   const report = buildRealtimeDiagnosticReport({
     runtime: {
@@ -457,6 +510,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     downlinkAudio: "raw",
     ttsStream: "none",
     interruptionHint: "none",
+    memoryContext: "none",
     vadShadow: "disabled",
     asr: {
       requested: "whisper",
@@ -685,12 +739,14 @@ test("managed audio decoder validates the complete fixed header and payload", as
   for (const frame of invalid) assert.equal(decodeManagedAudioFrame(frame), null);
 });
 
-test("managed audio is explicitly offered only by cascade clients", async () => {
+test("managed and proactive capabilities are explicitly offered only by eligible cascade clients", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const sockets = [];
   globalThis.WebSocket = class {
+    static OPEN = 1;
     constructor() {
       this.sent = [];
+      this.readyState = 1;
       sockets.push(this);
     }
 
@@ -700,23 +756,27 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
 
-  const local = new RealtimeSession({ provider: "local" });
+  const local = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
   local._playbackMode = "worklet";
   local.playbackNode = { port: { postMessage: () => {} } };
   const localOpen = local._openSocket("ws://local", { systemRole: "role", botName: "元元" });
   sockets[0].onopen();
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
+  assert.deepEqual(sockets[0].sent[0].proactiveTurn, ["local-v1"]);
   local.trace.startSession();
   local._onMessage({
     data: JSON.stringify({
       type: "session",
       state: "started",
       downlinkAudio: "managed-v1",
+      memoryContext: "turn-final-v1",
       interruptionHint: "candidate-snapshot-v1",
       ttsStream: "provider-pcm-v1",
+      proactiveTurn: "local-v1",
     }),
   });
   assert.deepEqual(local.getTraceSnapshot().runtime, {
@@ -725,6 +785,7 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    memoryContext: "turn-final-v1",
     vadShadow: "disabled",
     asr: {
       requested: "whisper",
@@ -732,16 +793,40 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
       status: "not-reported",
     },
   });
+  const memoryRequests = [];
+  local.cb.onMemoryContextRequest = (request) => memoryRequests.push(request);
+  local._onMessage({
+    data: JSON.stringify({
+      type: "memory_context_request",
+      generation: 7,
+    }),
+  });
+  assert.deepEqual(memoryRequests, [{ generation: 7 }]);
+  local._backendGeneration = 7;
+  assert.equal(
+    local.sendMemoryContext({
+      generation: 7,
+      items: [{ kind: "fact", text: "记忆线索", confidence: 1 }],
+    }),
+    true,
+  );
+  assert.deepEqual(sockets[0].sent.at(-1), {
+    type: "memory_context",
+    generation: 7,
+    items: [{ kind: "fact", text: "记忆线索", uncertain: false, pinned: false }],
+  });
 
-  const cosy = new RealtimeSession({ provider: "cosyvoice" });
+  const cosy = new RealtimeSession({ provider: "cosyvoice", conversationMode: "balanced" });
   cosy._playbackMode = "worklet";
   cosy.playbackNode = { port: { postMessage: () => {} } };
   const cosyOpen = cosy._openSocket("ws://cosy", { systemRole: "role", botName: "元元" });
   sockets[1].onopen();
   await cosyOpen;
   assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
+  assert.deepEqual(sockets[1].sent[0].proactiveTurn, ["local-v1"]);
 
   const legacy = new RealtimeSession({ provider: "local" });
   legacy._playbackMode = "legacy";
@@ -752,8 +837,10 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   sockets[2].onopen();
   await legacyOpen;
   assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
+  assert.equal("proactiveTurn" in sockets[2].sent[0], false);
 
   const volcano = new RealtimeSession({ provider: "volcano" });
   const volcanoOpen = volcano._openSocket("ws://volcano", {
@@ -765,6 +852,84 @@ test("managed audio is explicitly offered only by cascade clients", async () => 
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
   assert.equal("ttsStream" in sockets[3].sent[0], false);
+  assert.equal("proactiveTurn" in sockets[3].sent[0], false);
+  assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
+});
+
+test("proactive welcome is one-shot, negotiated and cancelled by user speech", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.sent = [];
+      this.readyState = 1;
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const open = async (options, started = {}) => {
+    const session = new RealtimeSession({ proactiveGreetingDelayMs: 0, ...options });
+    session._playbackMode = "worklet";
+    session.playbackNode = { port: { postMessage: () => {} } };
+    session._micReady = true;
+    const pending = session._openSocket("ws://test", { systemRole: "role", botName: "元元" });
+    const socket = sockets.at(-1);
+    socket.onopen();
+    await pending;
+    session._onMessage({
+      data: JSON.stringify({
+        type: "session",
+        state: "started",
+        downlinkAudio: "managed-v1",
+        ...started,
+      }),
+    });
+    return { session, socket };
+  };
+
+  const active = await open(
+    { provider: "local", conversationMode: "ai-leads" },
+    { proactiveTurn: "local-v1" },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(
+    active.socket.sent.filter((message) => message.type === "proactive_turn"),
+    [{ type: "proactive_turn", triggerId: 1, kind: "welcome" }],
+  );
+  active.session._scheduleProactiveWelcome();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(active.socket.sent.filter((message) => message.type === "proactive_turn").length, 1);
+
+  const interrupted = await open(
+    { provider: "cosyvoice", conversationMode: "balanced", proactiveGreetingDelayMs: 20 },
+    { proactiveTurn: "local-v1" },
+  );
+  interrupted.session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 1 }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    interrupted.socket.sent.filter((message) => message.type === "proactive_turn").length,
+    0,
+  );
+
+  interrupted.session._playbackQueuedMs = 250;
+  interrupted.session._onMessage({
+    data: JSON.stringify({
+      type: "proactive_turn_status",
+      triggerId: 1,
+      state: "cancelled",
+    }),
+  });
+  assert.equal(interrupted.session._playbackQueuedMs, 0);
+
+  const oldServer = await open({ provider: "local", conversationMode: "ai-leads" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(oldServer.socket.sent.filter((message) => message.type === "proactive_turn").length, 0);
 });
 
 test("streamed managed segments require explicit negotiation and exact final totals", async () => {
@@ -948,7 +1113,7 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
   session._onMessage({
     data: JSON.stringify({ type: "speech_confirmed", candidateId: 11 }),
   });
-  assert.deepEqual(sent, [
+  assert.deepEqual(sent.filter((message) => message.type !== "playback_reset"), [
     {
       type: "playback_interruption",
       state: "confirmed",
@@ -967,7 +1132,11 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
     playedSamples: 25000,
     inProgress: true,
   });
-  assert.equal(sent.length, 1, "one candidate may send at most one receipt");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    1,
+    "one candidate may send at most one receipt",
+  );
 
   session._userTurnOpen = false;
   beginSegment(4);
@@ -986,7 +1155,11 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
     playedSamples: 24001,
     inProgress: true,
   });
-  assert.equal(sent.length, 2, "a snapshot arriving after clear keeps numeric identity only");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    2,
+    "a snapshot arriving after clear keeps numeric identity only",
+  );
 
   session._userTurnOpen = false;
   beginSegment(5);
@@ -1014,7 +1187,7 @@ test("candidate-bound interruption snapshots send one text-free confirmed receip
     data: JSON.stringify({ type: "speech_rejected", candidateId: 13 }),
   });
   assert.equal(
-    sent.length,
+    sent.filter((message) => message.type !== "playback_reset").length,
     2,
     "rejected, dropped and wrong-candidate snapshots never send receipts",
   );
@@ -1375,6 +1548,42 @@ test("desktop session ducks candidates, resumes rejection and gates stale audio"
   assert.equal(eventTypes.includes(TRACE_EVENT.RESPONSE_CANCELLED), true);
 });
 
+test("barge-in attributes cleared playback to the interrupted generation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const previousWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  const playbackCommands = [];
+  const wireMessages = [];
+  session.ws = { readyState: 1, send: (message) => wireMessages.push(JSON.parse(message)) };
+  session.playbackNode = {
+    port: { postMessage: (message) => playbackCommands.push(message) },
+  };
+  session.trace.startSession();
+  session.trace.openTurn();
+  session.trace.startResponse();
+  session._assistantActive = true;
+  session._playbackQueuedMs = 2202.666;
+
+  session._onMessage({ data: JSON.stringify({ type: "speech_confirmed" }) });
+  globalThis.WebSocket = previousWebSocket;
+
+  const events = session.getTraceSnapshot().events;
+  const cancelled = events.find((event) => event.eventType === TRACE_EVENT.RESPONSE_CANCELLED);
+  const stopped = events.find((event) => event.eventType === TRACE_EVENT.PLAYBACK_STOPPED);
+  const confirmed = events
+    .filter((event) => event.eventType === TRACE_EVENT.SPEECH_CONFIRMED)
+    .at(-1);
+  assert.equal(cancelled.reason, "turn_detected");
+  assert.equal(stopped.reason, "turn_detected");
+  assert.equal(stopped.generationId, cancelled.generationId);
+  assert.equal(stopped.metrics.queuedMs, 2202.666);
+  assert.ok(confirmed.generationId > stopped.generationId);
+  assert.equal(playbackCommands.at(-1).type, "clear");
+  assert.deepEqual(wireMessages, [{ type: "playback_reset" }]);
+});
+
 test("desktop session rejects stale generation control events before reopening audio", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -1482,14 +1691,18 @@ test("candidate defers a completed segment until rejection and discards it on co
   session._onPlaybackMessage({ type: "segment_completed", generation: 1, segmentId: 1 });
   assert.deepEqual(sent, []);
   session._rejectSpeech("voice_rejected");
-  assert.equal(sent.length, 1);
+  assert.equal(sent.filter((message) => message.type !== "playback_reset").length, 1);
 
   start(2, 1);
   session._speechCandidate = true;
   session._candidateInterruptsResponse = true;
   session._onPlaybackMessage({ type: "segment_completed", generation: 2, segmentId: 1 });
   session._confirmSpeech();
-  assert.equal(sent.length, 1, "confirmed interruption must not commit the faded tail");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    1,
+    "confirmed interruption must not commit the faded tail",
+  );
 });
 
 test("suspended audio keeps PCM before its segment end marker", async () => {
@@ -1572,7 +1785,7 @@ test("legacy playback receipts require natural source completion and remain boun
   });
   assert.equal(sent.length, 0);
   sources[0].onended();
-  assert.equal(sent.length, 1);
+  assert.equal(sent.filter((message) => message.type !== "playback_reset").length, 1);
   if (session._playbackDrainTimer) clearTimeout(session._playbackDrainTimer);
   session._playbackDrainTimer = 0;
 
@@ -1588,7 +1801,11 @@ test("legacy playback receipts require natural source completion and remain boun
   }
   assert.ok(session._legacySegments.size <= 64);
   session._flushPlayback("turn_detected");
-  assert.equal(sent.length, 1, "cleared legacy sources must not add receipts");
+  assert.equal(
+    sent.filter((message) => message.type !== "playback_reset").length,
+    1,
+    "cleared legacy sources must not add receipts",
+  );
   if (session._playbackDrainTimer) clearTimeout(session._playbackDrainTimer);
 });
 

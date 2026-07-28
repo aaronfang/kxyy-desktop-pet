@@ -21,6 +21,10 @@
         <span class="tab-icon">👤</span>
         <span class="tab-label">人设</span>
       </button>
+      <button class="tab-btn" data-tab="memory">
+        <span class="tab-icon">🗂</span>
+        <span class="tab-label">记忆</span>
+      </button>
       <button class="tab-btn" data-tab="appearance">
         <span class="tab-icon">🎨</span>
         <span class="tab-label">外观</span>
@@ -100,7 +104,7 @@
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
             <span id="clearMemoryStatus" class="hint"></span>
           </div>
-          <p id="memoryHint" class="hint">元元会按昵称记住偏好、约定与对话概要（仅存本机）。清空后不再记得过往，当前聊天气泡不会自动消失。</p>
+          <p id="memoryHint" class="hint">元元会按昵称记住偏好、约定与对话概要；记忆数据库仅保存在本机。在线 / 本地巩固的区别请见“记忆”页。清空后不再记得过往，当前聊天气泡不会自动消失。</p>
         </section>
 
         <!-- 视觉模型 -->
@@ -214,10 +218,10 @@
             <p class="hint">
               macOS(Apple Silicon)：保存后<strong>自动配置</strong> Qwen3-TTS（创建 venv、装依赖、下载 MLX 量化模型到
               <code>~/Library/Application Support/…/voice-runtime</code>，首次需网络、可能数分钟）。<br/>
-              Windows / Linux：走官方 PyTorch 包 <code>qwen-tts</code>（默认 1.7B 模型），先运行
+              Windows / Linux：走官方 PyTorch 包 <code>qwen-tts</code>（Windows 默认低延迟 0.6B；Linux 保持 1.7B），先运行
               <code>scripts/windows/setup-qwen3-tts.cmd</code> 创建 <code>.venv-qwen3</code> 环境并安装 torch / qwen-tts 等依赖
              （NVIDIA 显卡自动装 CUDA 版 torch；RTX 50 系需 cu128）。<br/>
-              启动服务（通话 :19876，朗读 :19976），零样本克隆参考音频，不消耗火山 token。
+              首次下载可能持续数分钟；超过 180 秒后仍会继续加载并在就绪后自动恢复。启动服务（通话 :19876，朗读 :19976），零样本克隆参考音频，不消耗火山 token。
             </p>
           </div>
 
@@ -243,6 +247,18 @@
               </select>
             </label>
             <p class="hint">等待更久可减少思考停顿被拆成两轮，但会相应延后 AI 开始回答的时间。</p>
+          </div>
+
+          <div id="conversationModeFields" hidden>
+            <label>
+              <span>实时对话主动性<small>本地 Qwen3 / CosyVoice</small></span>
+              <select id="realtimeConversationMode">
+                <option value="follow-user" selected>跟随用户（保持当前方式）</option>
+                <option value="balanced">自然轮流（元元会先打招呼）</option>
+                <option value="ai-leads">元元带聊（更快主动开场）</option>
+              </select>
+            </label>
+            <p class="hint">第一版会在接通后由元元主动打招呼并抛出轻松话题；你一开口，主动生成会立即让路。火山实时通话暂时保持跟随用户。</p>
           </div>
 
           <div id="asrFields" hidden>
@@ -346,7 +362,111 @@
         </section>
       </div>
 
-      <!-- ========== 页签 4：外观 ========== -->
+      <!-- ========== 页签 4：记忆 ========== -->
+      <div class="tab-panel" id="tab-memory">
+        <section>
+          <h2>长期记忆</h2>
+          <p class="hint memory-intro">记忆数据库只保存在本机。元元会按当前话题选择性想起相关内容，不会把整份档案发进每次对话。</p>
+          <div class="memory-workspace-settings">
+            <label><input id="memoryWorkspace" type="checkbox" /> 启用实验性全局工作区</label>
+            <select id="memoryWorkspaceMode" aria-label="联想强度">
+              <option value="conservative">保守联想</option>
+              <option value="balanced">平衡联想</option>
+              <option value="exploratory">探索联想</option>
+            </select>
+            <span class="hint">只生成有界的内部观察，不会自动写入长期记忆；假设不是事实。</span>
+          </div>
+          <p id="memoryPrivacy" class="memory-privacy" role="status"></p>
+          <div class="memory-stats" id="memoryStats">
+            <span>正在读取…</span>
+          </div>
+          <p id="memoryHealth" class="memory-health" role="status" hidden></p>
+          <div class="memory-filters">
+            <select id="memoryCardId" aria-label="记忆所属人设卡">
+              <option value="">开心元元（默认）</option>
+            </select>
+            <input id="memoryNickname" type="text" placeholder="昵称（留空=全部）" />
+            <select id="memoryKind">
+              <option value="">全部类型</option>
+              <option value="fact">事实</option>
+              <option value="episode">经历</option>
+              <option value="commitment">约定</option>
+            </select>
+            <select id="memoryStatus">
+              <option value="">全部状态</option>
+              <option value="active">有效</option>
+              <option value="disputed">待确认</option>
+              <option value="pending">待兑现</option>
+              <option value="fulfilled">已兑现</option>
+              <option value="cancelled">已取消</option>
+              <option value="expired">已过期</option>
+              <option value="superseded">已被替代</option>
+              <option value="forgotten">已遗忘</option>
+            </select>
+            <input id="memorySearch" type="search" placeholder="搜索记忆…" />
+            <button id="memoryRefresh" type="button" class="ghost">刷新</button>
+          </div>
+          <div class="memory-view-switch" role="tablist" aria-label="记忆视图">
+            <button id="memoryListView" type="button" class="ghost active" role="tab" aria-selected="true">列表</button>
+            <button id="memoryGraphView" type="button" class="ghost" role="tab" aria-selected="false">关系图</button>
+          </div>
+          <div id="memoryGraphPanel" class="memory-graph-panel" hidden>
+            <div class="memory-graph-toolbar">
+              <label>展开层数
+                <select id="memoryGraphDepth" aria-label="关系图展开层数">
+                  <option value="1">一度关系</option>
+                  <option value="2">二度关系</option>
+                </select>
+              </label>
+              <label>节点上限
+                <select id="memoryGraphMaxNodes" aria-label="关系图节点上限">
+                  <option value="80">80</option>
+                  <option value="120">120</option>
+                  <option value="200">200</option>
+                </select>
+              </label>
+              <button id="memoryGraphRefresh" type="button" class="ghost">刷新关系图</button>
+              <span class="memory-graph-zoom-controls" aria-label="关系图缩放">
+                <button id="memoryGraphZoomOut" type="button" class="ghost" title="缩小">−</button>
+                <span id="memoryGraphZoomLabel" aria-live="polite">100%</span>
+                <button id="memoryGraphZoomIn" type="button" class="ghost" title="放大">+</button>
+                <button id="memoryGraphFit" type="button" class="ghost">适配</button>
+              </span>
+              <span id="memoryGraphStatus" class="hint" role="status"></span>
+            </div>
+            <p class="memory-graph-help">拖动空白处平移，滚轮缩放；节点标签仅在节点较少或选中时显示，点击节点查看完整内容。</p>
+            <div id="memoryGraphViewport" class="memory-graph-viewport">
+              <svg id="memoryGraphSvg" viewBox="0 0 760 430" role="img" aria-label="记忆关系图"></svg>
+            </div>
+            <div id="memoryGraphInspector" class="memory-graph-inspector" hidden></div>
+          </div>
+          <div id="memoryList" class="memory-list">
+            <p class="memory-empty">暂无记忆</p>
+          </div>
+          <div class="memory-page-row">
+            <button id="memoryPrev" type="button" class="ghost">上一页</button>
+            <span id="memoryPageInfo" class="hint">第 1 页</span>
+            <button id="memoryNext" type="button" class="ghost">下一页</button>
+          </div>
+          <div class="memory-maintenance">
+            <div class="memory-maintenance-actions">
+              <button id="memoryIntegrity" type="button" class="ghost">检查完整性</button>
+              <button id="memoryRebuild" type="button" class="ghost">重建索引与关系</button>
+              <button id="memoryReplayEvents" type="button" class="ghost">从事件重建记忆</button>
+              <button id="memoryExport" type="button" class="ghost">导出脱敏记忆</button>
+              <button id="memoryBackup" type="button" class="ghost">创建数据库备份</button>
+            </div>
+            <p id="memoryMaintenanceStatus" class="hint" role="status"></p>
+            <p class="hint">导出文件不包含来源原文、事件 payload 或证据片段；数据库备份保留在本机应用数据目录。</p>
+          </div>
+          <div class="memory-danger-zone">
+            <button id="memoryClearAll" type="button" class="danger">清空当前人设全部记忆</button>
+            <span id="memoryManageStatus" class="hint"></span>
+          </div>
+        </section>
+      </div>
+
+      <!-- ========== 页签 5：外观 ========== -->
       <div class="tab-panel" id="tab-appearance">
 
         <!-- 头像与外观 -->
