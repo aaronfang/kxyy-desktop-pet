@@ -1,10 +1,12 @@
-# Windows / Linux：本地 Qwen3-TTS（PyTorch）依赖参考清单。
+# Windows：本地 Qwen3-TTS（CUDA graph 24-step 真流式）依赖参考清单。
 # 实际安装由 scripts/windows/setup-qwen3-tts.ps1 完成（会按 GPU 自动选 torch index-url：
 # RTX 50 系/Blackwell 用 cu128，其它 NVIDIA 用 cu124，无卡则 CPU）。
 # 此文件仅作依赖清单参考，不直接被 pip install -r 使用。
 #
-# Python 需 3.10–3.13（3.14 暂无 torch/qwen-tts wheel）。
-qwen-tts>=0.1.0
+# Python 需 3.10–3.13。faster-qwen3-tts 的公开 iterator 负责生成期 PCM；
+# 官方 qwen-tts 仍作为无 CUDA/依赖不兼容时的整句回退。
+faster-qwen3-tts==0.3.2
+qwen-tts>=0.1.1,<0.2
 soundfile>=0.12
 numpy>=2.0
 websockets>=12.0

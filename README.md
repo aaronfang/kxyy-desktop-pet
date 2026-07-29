@@ -2,7 +2,7 @@
 
 一个会在桌面散步、攀爬、陪你聊天的跨平台桌宠。支持 **Windows / macOS**，基于 **Tauri 2 + Rust + WebView**。
 
-当前正式版：[`v0.2.44`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.44)
+当前正式版：[`v0.2.45`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.45)
 
 ## 先用起来
 
@@ -79,15 +79,16 @@
 | 平台 | 运行方式 | 默认模型 |
 |---|---|---|
 | macOS Apple Silicon | App 自动配置 `mlx-audio`；也可运行 `scripts/macos/setup-qwen3-tts.sh` | Qwen3-TTS Base |
-| Windows | 运行 `scripts/windows/setup-qwen3-tts.cmd` 创建 `.venv-qwen3` | `Qwen3-TTS-12Hz-0.6B-Base` |
+| Windows | 运行 `scripts/windows/setup-qwen3-tts.cmd` 创建 `.venv-qwen3`；CUDA 优先使用 `faster-qwen3-tts` | `Qwen3-TTS-12Hz-1.7B-Base` |
 | Linux | 官方 PyTorch `qwen-tts` | `Qwen3-TTS-12Hz-1.7B-Base` |
 
 模型默认从 Hugging Face 官方源下载。下载超过 180 秒时，App 会继续显示“下载/加载中”并保持健康探测；模型就绪后自动恢复。只有显式设置 `hfEndpoint` 才会改用自定义镜像。
 
 ### 3. 了解流式边界
 
-- CosyVoice 和受支持的 macOS MLX Qwen 可协商生成期 PCM 流式下发。
-- Windows/Linux 的官方 PyTorch Qwen 当前没有公开音频 iterator，仍按稳定句整段合成。
+- CosyVoice、受支持的 macOS MLX Qwen，以及安装了 `faster-qwen3-tts==0.3.2` 的 Windows CUDA Qwen 可协商生成期 PCM 流式下发。
+- Windows 流式路径固定使用公开的 `generate_voice_clone_streaming(parity_mode=False)` CUDA-graph 路径和 24-step provider chunk；启动期完整耗尽一次同模式短预热，依赖、CUDA smoke、预热或 API 校验不通过时回退官方 `qwen-tts` 整句合成。Linux 暂时仍为整句路径。
+- 当前短预热主要消除运行时冷启动延迟，首次正式回复的克隆音色仍可能比后续句子波动；音色一致性将用独立冷启动听测继续优化，不属于本版已解决范围。
 - 本地/CosyVoice 默认使用 Whisper 句尾识别；SenseVoiceSmall INT8 是可选实验后端。
 - Silero VAD 仍是默认关闭的 shadow 实验，不参与线上打断、endpoint 或 ASR 决策。
 

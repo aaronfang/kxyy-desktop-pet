@@ -48,6 +48,7 @@ const MANAGED_AUDIO_CHUNK_MAX_SAMPLES = (OUTPUT_RATE * 80) / 1000;
 const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
+const STREAMING_PLAYBACK_STARTUP_MS = 240;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
@@ -140,6 +141,7 @@ export class RealtimeSession {
     onSpeechRejected,
     onMemoryContextRequest,
     onPlaybackStats,
+    onResponseError,
     onError,
     provider = "unknown",
     conversationMode = "follow-user",
@@ -163,6 +165,7 @@ export class RealtimeSession {
       onSpeechRejected,
       onMemoryContextRequest,
       onPlaybackStats,
+      onResponseError,
       onError,
     };
     this.ws = null;
@@ -393,6 +396,13 @@ export class RealtimeSession {
             msg.ttsStream === TTS_STREAMING_CAPABILITY
               ? TTS_STREAMING_CAPABILITY
               : "none";
+          this.playbackNode?.port.postMessage({
+            type: "startup_buffer",
+            milliseconds:
+              this._ttsStreamingMode === TTS_STREAMING_CAPABILITY
+                ? STREAMING_PLAYBACK_STARTUP_MS
+                : 0,
+          });
           this._interruptionHintMode =
             msg.interruptionHint === INTERRUPTION_HINT_CAPABILITY
               ? INTERRUPTION_HINT_CAPABILITY
@@ -573,11 +583,18 @@ export class RealtimeSession {
         break;
       case "error":
         this._backendAudioPending = false;
-        if (!this._hasPlayback()) this._schedulePlaybackCompletion();
         if (this.trace.responseId && this.trace.state.response === "active") {
           this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "error" });
         }
-        this.cb.onError?.(new Error(msg.message || "实时语音出错"));
+        if (msg.recoverable === true && usesManagedCascade(this.trace.provider)) {
+          this._assistantActive = false;
+          this._flushPlayback("response_error");
+          const callback = this.cb.onResponseError || this.cb.onError;
+          callback?.(new Error(msg.message || "本轮语音处理失败，请继续说话重试"));
+        } else {
+          if (!this._hasPlayback()) this._schedulePlaybackCompletion();
+          this.cb.onError?.(new Error(msg.message || "实时语音出错"));
+        }
         break;
       default:
         break;
@@ -1256,7 +1273,11 @@ export class RealtimeSession {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [1],
-        processorOptions: { sourceRate: OUTPUT_RATE, maxQueueMs: PLAYBACK_MAX_QUEUE_MS },
+        processorOptions: {
+          sourceRate: OUTPUT_RATE,
+          maxQueueMs: PLAYBACK_MAX_QUEUE_MS,
+          startupBufferMs: 0,
+        },
       });
       node.connect(this._outGain || ctx.destination);
       node.port.onmessage = (event) => this._onPlaybackMessage(event.data || {});

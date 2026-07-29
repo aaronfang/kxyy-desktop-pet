@@ -2379,6 +2379,20 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.session.reply_task.done())
         await self.session.cancel_reply("test")
 
+    async def test_speech_candidate_pauses_sender_until_rejected(self):
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        self.session.playing = True
+        self.session.play_enabled = True
+
+        await self.session._emit_speech_candidate()
+        self.assertFalse(self.session.play_enabled)
+        self.assertEqual(self.ws.json_messages()[-1]["type"], "speech_candidate")
+
+        await self.session._emit_speech_rejected()
+        await self.session._resume_play_if_paused()
+        self.assertTrue(self.session.play_enabled)
+
     async def test_turn_memory_wait_is_bounded_and_rejects_stale_generation(self):
         await self.session.on_start(
             {
@@ -3214,6 +3228,50 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         usage = next(m for m in messages if m["type"] == "usage")
         self.assertEqual(usage["ttsCharacters"], 7)
 
+    async def test_candidate_pauses_stream_sender_until_rejected(self):
+        async def fake_stream(_text):
+            yield {"type": "audio", "pcm": b"\x01\x00" * 1920}
+            yield {"type": "audio", "pcm": b"\x02\x00" * 1920}
+
+        common._synth_tts = lambda _text: b"buffered path must not run"
+        common._synth_tts_stream = fake_stream
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.stream_events = [
+            {"type": "delta", "text": "候选期间暂停发送流式音频。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+
+        for _ in range(100):
+            if len([m for m in self.ws.messages if isinstance(m, bytes)]) == 1:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(
+            len([m for m in self.ws.messages if isinstance(m, bytes)]), 1
+        )
+
+        await self.session._emit_speech_candidate()
+        await asyncio.sleep(0.12)
+        self.assertFalse(self.session.play_enabled)
+        self.assertFalse(task.done())
+        self.assertEqual(
+            len([m for m in self.ws.messages if isinstance(m, bytes)]), 1
+        )
+
+        await self.session._emit_speech_rejected()
+        await self.session._resume_play_if_paused()
+        await task
+        self.assertEqual(
+            len([m for m in self.ws.messages if isinstance(m, bytes)]), 2
+        )
+
     async def test_provider_pcm_stream_failure_closes_dropped_segment_without_history(self):
         async def failing_stream(_text):
             yield {"type": "audio", "pcm": b"\x01\x00" * 4}
@@ -3241,6 +3299,8 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end["status"], "failed")
         self.assertFalse(any(m["type"] == "tts_end" for m in messages))
         self.assertNotIn("provider detail", messages[-1].get("message", ""))
+        self.assertEqual(messages[-1]["type"], "error")
+        self.assertTrue(messages[-1]["recoverable"])
         self.session.on_playback_segment(
             {"generation": scope.generation, "segmentId": 1, "state": "completed"}
         )
@@ -3248,6 +3308,30 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.session.history,
             [{"role": "user", "content": "用户输入"}],
         )
+
+        async def successful_stream(_text):
+            yield {"type": "audio", "pcm": b"\x02\x00" * 4}
+
+        common._synth_tts_stream = successful_stream
+        self.stream_events = [
+            {"type": "delta", "text": "下一轮可以正常播报。"},
+            {"type": "done"},
+        ]
+        next_scope = self.session._new_scope("response")
+        self.session.response_scope = next_scope
+        await self.session._reply_pipeline("继续对话", next_scope)
+
+        next_end = last_json_of_type(self.ws, "audio_segment_end")
+        self.assertEqual(next_end["status"], "completed")
+        self.session.on_playback_segment(
+            {
+                "generation": next_scope.generation,
+                "segmentId": next_end["segmentId"],
+                "state": "completed",
+            }
+        )
+        self.assertEqual(self.session.history[-1]["role"], "assistant")
+        self.assertEqual(self.session.history[-1]["content"], "下一轮可以正常播报。")
 
     async def test_provider_pcm_stream_cancel_closes_generator_and_releases_slot(self):
         provider_wait = asyncio.Event()

@@ -2311,6 +2311,12 @@ async function startCall() {
     },
     onUsage: (msg) => noteCallUsage(msg),
     onLevel: (level) => updateCallWave(level),
+    onResponseError: (e) => {
+      callWaveSpeaking = false;
+      callWaveEl?.classList.remove("candidate", "speaking");
+      petSignal("abort");
+      appendPatNotice(`📞 本轮回复失败，可继续说话重试：${e.message || e}`);
+    },
     onError: (e) => {
       appendPatNotice(`📞 通话出错：${e.message || e}`);
       endCall({ notice: false });

@@ -2904,6 +2904,11 @@ class Session:
         if self.candidate_emitted:
             return
         self.candidate_emitted = True
+        # The Worklet pauses consumption as soon as it receives candidate. Pause
+        # the sender at the same boundary so a long final-ASR decision cannot fill
+        # the 3-second ring and drop already identified managed audio.
+        if self.playing and self.play_enabled:
+            self.play_enabled = False
         if (
             self.response_scope is not None
             and self.response_scope.generation == self._proactive_response_generation
@@ -2960,7 +2965,7 @@ class Session:
     async def _on_frame(self, frame: bytes) -> None:
         rms = pcm16_rms(frame)
         busy = self._busy() or self.playing
-        # AI 正在出声：用更严门槛，且确认前不停播（避免杂音触发前端 flush）
+        # AI 正在出声：用更严门槛；candidate 只暂停，不会 flush，确认后才清空。
         while_playing = self.playing and self.play_enabled
 
         if busy:
@@ -2980,7 +2985,7 @@ class Session:
                     self.speech_ms = FRAME_MS
                     self.silence_ms = 0
                     self.endpoint.reset()
-                    # 忙碌期（合成中或播报中）一律走「旁路采集」：不停播，
+                    # 忙碌期（合成中或播报中）一律走「旁路采集」：只暂停发送，
                     # 且在 ASR 验证通过前绝不发 asr_start。否则外放余音/杂音
                     # 只要够长就会误触发 asr_start，让前端把「已排队的整段回复」
                     # flush 掉——因为后端是超速灌音频，一 flush 就是后半句全没。
@@ -3051,7 +3056,7 @@ class Session:
             await self._handle_utterance(pcm, from_play_barge=was_play_barge)
 
     async def _resume_play_if_paused(self) -> None:
-        if self.playing and not self.play_enabled and self._busy():
+        if self.playing and not self.play_enabled:
             log("误打断，恢复播报")
             self.play_enabled = True
 
@@ -3637,7 +3642,7 @@ class Session:
                 )
                 log(f"回复失败: {type(e).__name__}")
                 await self.send_json(
-                    {"type": "error", "message": message},
+                    {"type": "error", "message": message, "recoverable": True},
                     scope=scope,
                 )
                 self._audible_history.cancel_turn(scope.generation)

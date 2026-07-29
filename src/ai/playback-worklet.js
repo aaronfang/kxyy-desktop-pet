@@ -3,6 +3,7 @@
 // Input messages:
 //   {type:"audio", pcm:ArrayBuffer, generation?, segmentId?} - PCM16 mono @ sourceRate
 //   {type:"segment_start|segment_end", generation, segmentId}
+//   {type:"startup_buffer", milliseconds} - enable only after streaming negotiation
 //   {type:"candidate_snapshot", candidateId} - exact current-segment playback snapshot
 //   {type:"duck"}                   - 30ms fade-out, then pause consumption
 //   {type:"resume"}                 - resume consumption with 60ms fade-in
@@ -18,6 +19,16 @@ class PcmPlayback extends AudioWorkletProcessor {
     this.sourceRate = Number(opts.sourceRate) || 24000;
     this.maxQueueMs = Math.max(250, Math.min(5000, Number(opts.maxQueueMs) || 3000));
     this.capacity = Math.max(2, Math.ceil((this.sourceRate * this.maxQueueMs) / 1000));
+    const requestedStartupMs = Number(opts.startupBufferMs);
+    this.startupBufferMs = Math.max(
+      0,
+      Math.min(
+        this.maxQueueMs,
+        Number.isFinite(requestedStartupMs) ? requestedStartupMs : 240,
+      ),
+    );
+    this.startupSamples = Math.ceil((this.sourceRate * this.startupBufferMs) / 1000);
+    this.buffering = this.startupSamples > 0;
     this.ring = new Float32Array(this.capacity);
     this.readIndex = 0;
     this.writeIndex = 0;
@@ -121,6 +132,10 @@ class PcmPlayback extends AudioWorkletProcessor {
         if (segment) {
           segment.ended = true;
           this._completeSegment(meta, segment);
+          // A complete very short sentence must not wait forever for the normal
+          // startup reservoir. It is safe to play because no further provider
+          // audio belongs to this segment.
+          if (this.buffering && segment.pending > 0) this.buffering = false;
         }
         break;
       }
@@ -159,6 +174,16 @@ class PcmPlayback extends AudioWorkletProcessor {
         this.state = "resuming";
         if (this.gain > 1) this.gain = 1;
         break;
+      case "startup_buffer": {
+        const requested = Number(message.milliseconds);
+        this.startupBufferMs = Math.max(
+          0,
+          Math.min(this.maxQueueMs, Number.isFinite(requested) ? requested : 0),
+        );
+        this.startupSamples = Math.ceil((this.sourceRate * this.startupBufferMs) / 1000);
+        this.buffering = this.startupSamples > 0 && this.size < this.startupSamples;
+        break;
+      }
       case "clear":
         this.readIndex = 0;
         this.writeIndex = 0;
@@ -170,6 +195,7 @@ class PcmPlayback extends AudioWorkletProcessor {
         this.state = "playing";
         this.gain = 1;
         this.wasAudible = false;
+        this.buffering = this.startupSamples > 0;
         this._post("cleared");
         break;
       default:
@@ -210,6 +236,7 @@ class PcmPlayback extends AudioWorkletProcessor {
       if (segment) segment.pending += accepted;
     }
     if (accepted > 0) this._post("queued");
+    if (this.buffering && this.size >= this.startupSamples) this.buffering = false;
   }
 
   _consumeSpanSample() {
@@ -281,6 +308,10 @@ class PcmPlayback extends AudioWorkletProcessor {
         output[i] = 0;
         continue;
       }
+      if (this.buffering) {
+        output[i] = 0;
+        continue;
+      }
       const sample = this._readSample();
       if (sample === null) {
         output[i] = 0;
@@ -296,7 +327,9 @@ class PcmPlayback extends AudioWorkletProcessor {
       this.underruns += 1;
       this._post("drained");
     }
-    this.wasAudible = audibleThisBlock || (this.size > 0 && this.state !== "paused");
+    if (this.size === 0 && audibleThisBlock) this.buffering = this.startupSamples > 0;
+    this.wasAudible =
+      audibleThisBlock || (this.size > 0 && this.state !== "paused" && !this.buffering);
 
     this.outputFramesSinceStats += output.length;
     if (this.outputFramesSinceStats >= sampleRate / 2) {
