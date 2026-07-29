@@ -788,8 +788,8 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
         if let Some(rt) = macos_voice_runtime() {
             list.push(rt.join(".venv/bin/python"));
         }
-        // Windows / Linux：本地 Qwen3-TTS 走官方 PyTorch 包（qwen-tts），
-        // 用独立环境 .venv-qwen3（由 scripts/windows/setup-qwen3-tts.ps1 创建）。
+        // Windows 优先走 faster-qwen3-tts CUDA graph 24-step 流式、回退官方 qwen-tts；
+        // Linux 保持官方整句路径。二者使用独立环境 .venv-qwen3。
         list.push(repo.join("scripts/local-realtime/.venv-qwen3/bin/python"));
         list.push(repo.join("scripts/local-realtime/.venv-qwen3/Scripts/python.exe"));
     }
@@ -1895,7 +1895,7 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
                     "找不到 Python。请安装 Python 3.10+（Apple Silicon），将自动创建语音运行时。"
                         .into()
                 } else if backend == "local" {
-                    "找不到本地 Qwen3-TTS 运行环境。请运行 scripts/windows/setup-qwen3-tts.cmd 自动配置（创建 .venv-qwen3 并安装 qwen-tts）。".into()
+                    "找不到本地 Qwen3-TTS 运行环境。请运行 scripts/windows/setup-qwen3-tts.cmd 自动配置（创建 .venv-qwen3 并安装流式运行时）。".into()
                 } else {
                     "找不到 Python。请先创建 scripts/voice-ab/.venv 并安装依赖。".into()
                 },

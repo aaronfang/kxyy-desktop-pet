@@ -1,17 +1,17 @@
 ; NSIS hooks：安装结束后可选配置本地语音模型。
-; - Qwen3-TTS（PyTorch）：跨平台本地后端，任意 Windows 用户可配（不需 NVIDIA）。
+; - Qwen3-TTS：NVIDIA 优先 CUDA graph 流式，无 CUDA 时回退官方整句路径。
 ; macOS 不走此流程。
 ;
 ; 卸载（NSIS_HOOK_PREUNINSTALL）：在 Section Uninstall 开头询问用户
 ; 是否要删除本地语音模型（.venv-qwen3）。
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; ---- Qwen3-TTS（PyTorch 本地后端，普适）----
+  ; ---- Qwen3-TTS 本地后端 ----
   MessageBox MB_YESNO|MB_ICONQUESTION \
-    "是否配置本地 Qwen3-TTS（PyTorch）？$\r$\n$\r$\n\
+    "是否配置本地 Qwen3-TTS？$\r$\n$\r$\n\
 跨平台本地语音后端，零样本克隆参考音频。$\r$\n\
-会创建独立 Python 环境 .venv-qwen3 并安装 torch + qwen-tts（约数 GB）。$\r$\n\
-有 NVIDIA 显卡会自动装 CUDA 版 torch（RTX 50 系用 cu128）；无卡则用 CPU（较慢）。$\r$\n$\r$\n\
+会创建独立 Python 环境 .venv-qwen3 并安装 torch + faster-qwen3-tts（约数 GB）。$\r$\n\
+有 NVIDIA 显卡会启用 24-step CUDA graph 流式（RTX 50 系用 cu128）；无卡可在安装脚本中选择 CPU 整句合成（较慢）。$\r$\n$\r$\n\
 选「否」可稍后运行 scripts\windows\setup-qwen3-tts.cmd 手动配置。" \
     IDYES qwen3_setup IDNO qwen3_skip
 

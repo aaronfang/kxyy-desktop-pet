@@ -1,15 +1,15 @@
 # 元元桌宠 · AI 角色扮演体验分析报告与改进路线图
 
-> 状态基准：2026-07-29，当前正式版为 `v0.2.44`。下面的完成度按“已发布 / 测试版或部分实现 / 待实现”描述，不使用主观百分比；Memory 与实时语音的实现边界分别以各自专项路线图为准。
+> 状态基准：2026-07-29，当前正式版为 `v0.2.45`。下面的完成度按“已发布 / 测试版或部分实现 / 待实现”描述，不使用主观百分比；Memory 与实时语音的实现边界分别以各自专项路线图为准。
 
 | 方向 | 当前状态 | 已交付 | 下一硬门槛 |
 |---|---|---|---|
 | 跨平台发布 | **已发布** | Windows x64 NSIS、macOS Apple Silicon DMG、macOS Intel DMG；PR #29、发布质量门和发布后 `main` CI 均通过 | 后续功能从发布后的 `main` 新建分支 |
 | Memory Brain | **核心与管理闭环已发布** | Memory v3/v3.1、事件/证据/scope、关系图、会话开始记忆和本地/CosyVoice `turn-final-v1` | 记录 M2 真实设备延迟，再推进 M5 外部接入；M6 embedding 仍为可选实验 |
-| 实时语音 | **基础管线已发布，体验仍属测试阶段** | Worklet 播放、有界句级管线、可听历史、打断候选、诊断、可选 Silero shadow/SenseVoice、CosyVoice 与 macOS MLX 流式 adapter | 许可声学回放和真实设备指标；Silero 暂不接管；Windows/Linux Qwen 等待官方音频 iterator |
+| 实时语音 | **基础管线已发布，体验仍属测试阶段** | Worklet 播放、有界句级管线、可听历史、打断候选、诊断、可选 Silero shadow/SenseVoice、CosyVoice、macOS MLX 与 Windows faster Qwen 流式 adapter | 许可声学回放和真实设备指标；Silero 暂不接管；Windows faster adapter 待实机验收，Linux Qwen 仍为整句 |
 | 主动陪聊 | **部分实现** | 本地/CosyVoice 三档能力协商与每通一次可撤销接通问候（A+B） | 同题续说、短附和、有限换题、TopicLeadState 与诊断计数（C+D） |
 | 人设与关系玩法 | **基础设施部分实现** | 人格卡后端、蒸馏工具和动态资源加载基础 | 前端热切换、日常聊天语境、关系/好感度和主动调度 |
-| Windows 本地 TTS | **0.6B 已发布，安装迁移有已知限制** | 新环境识别 RTX 50/Blackwell 并选择 `cu128` | 旧 `.venv-qwen3` 自动升级、`sm_120` 检查和真实 CUDA smoke；当前手工修复见 README |
+| Windows 本地 TTS | **1.7B/24-step 流式已发布** | 旧 `.venv-qwen3` 自动校验与修复、RTX 50/Blackwell `cu128`/`sm_120` 检查、真实 CUDA smoke | 首次正式回复音色一致性、弱起音阈值和冷启动盲听 |
 
 > 本文档基于对仓库当前代码（`src/`、`src-tauri/`、`shared/`、`scripts/`）的通读式评审产出，**不包含任何代码改动**，仅供后续立项决策参考。所有诊断与建议均标注了对应的代码位置，避免空泛建议。
 >
@@ -92,7 +92,7 @@ graph TD
 | 文字对话 | DeepSeek (`deepseek-v4-flash`/`deepseek-v4-pro` + `thinking.type`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换；0.2.29 本地迁移旧模型名并拒绝透传未知值 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
-| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR，当前诊断 schema 为 v6；0.2.44 补充 IPv4 优先下载、阶段进度、1× PCM pacing 和隐藏窗口音频恢复，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Windows/Linux Qwen TTS/legacy/火山保持原路径；朗读与通话**共用同一个语音后端选择** |
+| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式，Windows CUDA Qwen 在固定 faster runtime 可用时也可协商生成期 PCM；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR，当前诊断 schema 为 v6；0.2.44 补充 IPv4 优先下载、阶段进度、1× PCM pacing 和隐藏窗口音频恢复，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Linux/官方 Qwen fallback、legacy 与火山保持原路径；朗读与通话**共用同一个语音后端选择** |
 | 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3/v3.1 | `memory.rs` + Tauri IPC | 事实/经历/约定、事件时间线、关系图、异步巩固、选择性召回和管理页；`v0.2.44` 增加单昵称清除和数据库备份恢复，后续路线以 `roadmap-memory-brain.md` 为准 |
 | 会话摘要 | 复用文字模型 | 同上 | `chat.js` + Memory v3 | 最近对话与滚动摘要保留为工作记忆，跨会话不再全量注入 |
 | 人设语料 | — | 编译期加密嵌入 | `persona_assets.rs` | **单一人设**，见 2.1 |

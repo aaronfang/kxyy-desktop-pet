@@ -3,9 +3,10 @@
 
 后端按平台自动选择：
   - macOS(Apple Silicon)：mlx-audio（mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit）。
-  - Windows / Linux：官方 PyTorch 包 qwen-tts；Windows 默认 0.6B Base，Linux
-    暂时保持 1.7B Base，见 tts_qwen3_torch.py。Windows 首次使用请先运行
-    scripts/windows/setup-qwen3-tts.ps1。
+  - Windows：faster-qwen3-tts CUDA graph 24-step 真流式，缺失/不兼容时回退官方
+    qwen-tts 整句路径；默认 1.7B Base。
+  - Linux：暂时保持官方 qwen-tts 1.7B Base 整句路径。
+    Windows 首次使用请先运行 scripts/windows/setup-qwen3-tts.ps1。
 
 用法：
   <venv>/python scripts/local-realtime/server.py
@@ -254,7 +255,13 @@ def _run_torch() -> None:
     tts_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen3")
 
     def prepare() -> None:
-        qwen3.configure_from_settings()
+        qwen3.configure_from_settings(tts_pool)
+        if qwen3.streaming_supported():
+            common._synth_tts_stream = qwen3.synth_tts_stream
+            common.log("Qwen3-TTS provider PCM 流式已启用 (Windows CUDA graph 24-step)")
+        else:
+            common._synth_tts_stream = None
+            common.log("Qwen3-TTS provider PCM 流式不可用，回退整句合成")
         # 通话 ASR：Windows/Linux 用 openai-whisper（无 mlx-whisper）。缺失不阻断朗读。
         try:
             common._mlx_pool.submit(common.load_whisper_on_mlx_thread).result()
@@ -273,6 +280,7 @@ def _run_torch() -> None:
         tts_pool=tts_pool,
         tts_parallelism=1,
         tts_prefetch_while_playing=True,
+        synth_tts_stream=None,
         vad_shadow_pipeline_factory=vad_capability.pipeline_factory(),
         vad_shadow_start_status=vad_capability.status,
         vad_shadow_mode=vad_capability.mode,

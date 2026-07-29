@@ -1,4 +1,5 @@
 import asyncio
+import array
 import importlib.util
 import sys
 import threading
@@ -15,6 +16,19 @@ SERVER_PATH = (
     / "server.py"
 )
 TORCH_BACKEND_PATH = SERVER_PATH.with_name("tts_qwen3_torch.py")
+EVALUATOR_PATH = SERVER_PATH.with_name("evaluate_qwen_streaming.py")
+
+
+def _load_evaluator():
+    spec = importlib.util.spec_from_file_location("kxyy_qwen_stream_evaluator", EVALUATOR_PATH)
+    evaluator = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = evaluator
+    spec.loader.exec_module(evaluator)
+    return evaluator
+
+
+evaluator = _load_evaluator()
 
 
 def _load_server():
@@ -23,11 +37,18 @@ def _load_server():
     fake_common._mlx_pool = None
     fake_common._synth_tts_stream = None
     fake_common.ensure_ref_wav = lambda: (Path("/fake/ref.wav"), "reference")
+    fake_common.load_settings = lambda: {}
     fake_common.log = lambda _message: None
     fake_common.load_whisper_on_mlx_thread = lambda: None
     fake_common.text_for_speech = lambda text: text
     fake_common.clip_speech_text = lambda text: text.strip()
     fake_common.chunk_pcm = lambda pcm, _milliseconds: (pcm,)
+    fake_common.pcm16_rms = lambda pcm: (
+        sum((sample / 32768.0) ** 2 for sample in array.array("h", pcm))
+        / max(1, len(pcm) // 2)
+    ) ** 0.5
+    fake_common.pcm16_to_browser_wav = lambda pcm, _rate: pcm
+    fake_common.REPO = Path("/fake/repo")
     fake_common.run = lambda **_kwargs: None
     fake_capability = types.SimpleNamespace(
         status="disabled",
@@ -81,6 +102,66 @@ def _load_torch_backend():
 
 
 torch_backend = _load_torch_backend()
+
+
+class QwenStreamingEvaluatorTests(unittest.TestCase):
+    def test_normalization_and_edit_counts_track_missing_phonemes(self):
+        self.assertEqual(evaluator.normalize_text("你好，RTX 5080！"), "你好rtx5080")
+        self.assertEqual(
+            evaluator.edit_counts("爸爸把白布包摆好", "爸爸白布包摆好"),
+            {
+                "referenceChars": 8,
+                "edits": 1,
+                "deletions": 1,
+                "substitutions": 0,
+                "insertions": 0,
+            },
+        )
+
+    def test_boundary_ratio_detects_a_provider_seam_jump(self):
+        smooth_a = array.array("h", range(0, 1000, 10)).tobytes()
+        smooth_b = array.array("h", range(1000, 2000, 10)).tobytes()
+        jumped_b = array.array("h", range(10000, 11000, 10)).tobytes()
+        self.assertLess(evaluator.pcm_boundary_ratio([smooth_a, smooth_b]), 2.0)
+        self.assertGreater(evaluator.pcm_boundary_ratio([smooth_a, jumped_b]), 100.0)
+
+    def test_winner_requires_realtime_and_a_significant_quality_gain(self):
+        baseline = {
+            "candidateId": "fast12-full",
+            "realtimeQualified": True,
+            "deletionRate": 0.10,
+            "cer": 0.20,
+            "boundaryRatioP95": 3.0,
+            "ttfaP95Ms": 500.0,
+        }
+        too_small = {
+            "candidateId": "fast16-full",
+            "realtimeQualified": True,
+            "deletionRate": 0.09,
+            "cer": 0.19,
+            "boundaryRatioP95": 2.0,
+            "ttfaP95Ms": 650.0,
+        }
+        qualified_winner = {
+            "candidateId": "fast24-full",
+            "realtimeQualified": True,
+            "deletionRate": 0.07,
+            "cer": 0.19,
+            "boundaryRatioP95": 1.5,
+            "ttfaP95Ms": 850.0,
+        }
+        slow = {
+            "candidateId": "fast36-full",
+            "realtimeQualified": False,
+            "deletionRate": 0.01,
+            "cer": 0.02,
+            "boundaryRatioP95": 1.0,
+            "ttfaP95Ms": 1200.0,
+        }
+        self.assertEqual(
+            evaluator.select_winner([baseline, too_small, qualified_winner, slow]),
+            "fast24-full",
+        )
 
 
 class FakeDecoder:
@@ -370,21 +451,31 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
             else:
                 sys.modules["numpy"] = previous_numpy
 
-    def test_torch_backend_does_not_inject_streaming_adapter(self):
+    def test_torch_backend_gates_streaming_adapter_after_prepare(self):
         captured = {}
+        asr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-test")
+        previous_mlx_pool = common._mlx_pool
+        common._mlx_pool = asr_pool
         fake_qwen = types.ModuleType("tts_qwen3_torch")
-        fake_qwen.configure_from_settings = lambda: None
+        fake_qwen.configure_from_settings = lambda _pool: None
+        fake_qwen.streaming_supported = lambda: True
         fake_qwen.synth_tts = lambda _text: b""
         fake_qwen.synth_tts_http = lambda _text: (b"", "audio/wav")
+        fake_qwen.synth_tts_stream = lambda _text: None
         previous_qwen = sys.modules.get("tts_qwen3_torch")
         previous_run = common.run
         sys.modules["tts_qwen3_torch"] = fake_qwen
         common.run = lambda **kwargs: captured.update(kwargs)
         try:
             server._run_torch()
-            self.assertNotIn("synth_tts_stream", captured)
+            self.assertIsNone(captured["synth_tts_stream"])
+            common._synth_tts_stream = None
+            captured["prepare"]()
+            self.assertIs(common._synth_tts_stream, fake_qwen.synth_tts_stream)
             captured["tts_pool"].shutdown(wait=True)
         finally:
+            asr_pool.shutdown(wait=True)
+            common._mlx_pool = previous_mlx_pool
             common.run = previous_run
             if previous_qwen is None:
                 sys.modules.pop("tts_qwen3_torch", None)
@@ -394,7 +485,7 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
     def test_windows_torch_default_prefers_low_latency_06b_model(self):
         self.assertEqual(
             torch_backend.WINDOWS_DEFAULT_MODEL,
-            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         )
         self.assertEqual(
             torch_backend.DEFAULT_MODEL,
@@ -402,6 +493,317 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
             if sys.platform == "win32"
             else torch_backend.LINUX_DEFAULT_MODEL,
         )
+
+
+class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-fast-test")
+        self.model = types.SimpleNamespace(generate_voice_clone_streaming=lambda **_kwargs: None)
+        torch_backend._tts_executor = self.pool
+        torch_backend._faster_streaming = True
+        torch_backend._model = self.model
+        torch_backend._ref_wav = Path("/fake/ref.wav")
+        torch_backend._ref_text = "reference"
+        torch_backend._language = "Chinese"
+        torch_backend._model_gate = threading.BoundedSemaphore(1)
+
+    def tearDown(self):
+        self.pool.shutdown(wait=True)
+
+    def assert_gate_released(self):
+        self.assertTrue(torch_backend._model_gate.acquire(blocking=False))
+        torch_backend._model_gate.release()
+
+    def test_capability_requires_model_executor_and_public_iterator(self):
+        self.assertTrue(torch_backend.streaming_supported())
+        torch_backend._faster_streaming = False
+        self.assertFalse(torch_backend.streaming_supported())
+        torch_backend._faster_streaming = True
+        torch_backend._tts_executor = None
+        self.assertFalse(torch_backend.streaming_supported())
+        torch_backend._tts_executor = self.pool
+        torch_backend._model = object()
+        self.assertFalse(torch_backend.streaming_supported())
+
+    def test_create_stream_uses_fixed_public_generation_parameters(self):
+        calls = []
+        provider = PullGenerator([])
+        self.model.generate_voice_clone_streaming = lambda **kwargs: (
+            calls.append(kwargs) or provider
+        )
+
+        self.assertIs(torch_backend._create_faster_stream("你好"), provider)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "text": "你好",
+                    "language": "Chinese",
+                    "ref_audio": str(torch_backend._ref_wav),
+                    "ref_text": "reference",
+                    "max_new_tokens": torch_backend.FASTER_MAX_NEW_TOKENS,
+                    "non_streaming_mode": True,
+                    "chunk_size": torch_backend.FASTER_STREAMING_CHUNK_STEPS,
+                    "parity_mode": False,
+                }
+            ],
+        )
+
+    def test_reference_cache_warmup_uses_short_public_stream_and_closes_it(self):
+        calls = []
+        provider = PullGenerator(
+            [
+                ("warm-1", 24000, {"chunk_index": 0}),
+                ("warm-2", 24000, {"chunk_index": 1}),
+            ]
+        )
+        self.model.generate_voice_clone_streaming = lambda **kwargs: (
+            calls.append(kwargs) or provider
+        )
+        original_convert = torch_backend._convert_faster_chunk
+        torch_backend._convert_faster_chunk = lambda _audio, _rate: (b"warm",)
+        try:
+            torch_backend._warm_faster_reference_cache(self.model)
+        finally:
+            torch_backend._convert_faster_chunk = original_convert
+
+        self.assertTrue(provider.closed)
+        self.assertEqual(provider.next_calls, 3)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "text": "你好",
+                    "language": "Chinese",
+                    "ref_audio": str(torch_backend._ref_wav),
+                    "ref_text": "reference",
+                    "max_new_tokens": torch_backend.FASTER_WARMUP_MAX_NEW_TOKENS,
+                    "non_streaming_mode": True,
+                    "chunk_size": torch_backend.FASTER_WARMUP_CHUNK_STEPS,
+                    "parity_mode": False,
+                }
+            ],
+        )
+
+    async def test_stream_is_pull_based_without_prefetch(self):
+        provider = PullGenerator(
+            [
+                ("provider-1", 24000, {"chunk_index": 0}),
+                ("provider-2", 24000, {"chunk_index": 1}),
+            ]
+        )
+        self.model.generate_voice_clone_streaming = lambda **_kwargs: provider
+        original_convert = torch_backend._convert_faster_chunk
+        torch_backend._convert_faster_chunk = lambda audio, _rate: (
+            str(audio).encode("ascii"),
+        )
+        stream = torch_backend.synth_tts_stream("hello")
+        try:
+            self.assertEqual(
+                await anext(stream), {"type": "audio", "pcm": b"provider-1"}
+            )
+            self.assertEqual(provider.next_calls, 1)
+            await asyncio.sleep(0.02)
+            self.assertEqual(provider.next_calls, 1)
+
+            self.assertEqual(
+                await anext(stream), {"type": "audio", "pcm": b"provider-2"}
+            )
+            self.assertEqual(provider.next_calls, 2)
+            with self.assertRaises(StopAsyncIteration):
+                await anext(stream)
+            self.assertTrue(provider.closed)
+            self.assert_gate_released()
+        finally:
+            torch_backend._convert_faster_chunk = original_convert
+            await stream.aclose()
+
+    async def test_stream_rejects_pathological_duration_for_text_length(self):
+        provider = PullGenerator([])
+        self.model.generate_voice_clone_streaming = lambda **_kwargs: provider
+        original_pull = torch_backend._pull_faster_stream
+        oversized = b"\x00\x00" * (
+            torch_backend._stream_sample_limit("short text") + 1
+        )
+        torch_backend._pull_faster_stream = lambda _generator: (oversized,)
+        stream = torch_backend.synth_tts_stream("short text")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "输出时长异常"):
+                await anext(stream)
+            self.assertTrue(provider.closed)
+            self.assert_gate_released()
+        finally:
+            torch_backend._pull_faster_stream = original_pull
+            await stream.aclose()
+
+    async def test_stream_trims_long_silence_and_keeps_two_chunk_preroll(self):
+        silent = b"\x00\x00" * 1920
+        quiet = (100).to_bytes(2, "little", signed=True) * 1920
+        speech = (10000).to_bytes(2, "little", signed=True) * 1920
+        provider = PullGenerator([])
+        self.model.generate_voice_clone_streaming = lambda **_kwargs: provider
+        original_pull = torch_backend._pull_faster_stream
+        pulls = iter(
+            [
+                (silent,),
+                (silent,),
+                (quiet,),
+                (quiet,),
+                (speech,),
+                torch_backend._FASTER_STREAM_DONE,
+            ]
+        )
+        torch_backend._pull_faster_stream = lambda _generator: next(pulls)
+        stream = torch_backend.synth_tts_stream("hello")
+        try:
+            emitted = []
+            async for event in stream:
+                emitted.append(event["pcm"])
+            self.assertEqual(emitted, [quiet, quiet, speech])
+            self.assert_gate_released()
+        finally:
+            torch_backend._pull_faster_stream = original_pull
+            await stream.aclose()
+
+    async def test_stream_rejects_provider_output_with_no_detectable_voice(self):
+        silent = b"\x00\x00" * 1920
+        provider = PullGenerator([])
+        self.model.generate_voice_clone_streaming = lambda **_kwargs: provider
+        original_pull = torch_backend._pull_faster_stream
+        pulls = iter([(silent,), (silent,), torch_backend._FASTER_STREAM_DONE])
+        torch_backend._pull_faster_stream = lambda _generator: next(pulls)
+        stream = torch_backend.synth_tts_stream("hello")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "未检测到有效语音"):
+                await anext(stream)
+            self.assert_gate_released()
+        finally:
+            torch_backend._pull_faster_stream = original_pull
+            await stream.aclose()
+
+    def test_stream_duration_guard_allows_normal_long_sentence_but_caps_gibberish(self):
+        self.assertEqual(
+            torch_backend._stream_sample_limit("短句"),
+            common.OUTPUT_RATE * 20,
+        )
+        self.assertLess(
+            torch_backend._stream_sample_limit("字" * 39),
+            common.OUTPUT_RATE * 48,
+        )
+
+    async def test_cancel_waits_for_real_pull_before_close_and_gate_release(self):
+        provider = PullGenerator([])
+        pull_started = threading.Event()
+        allow_pull_to_finish = threading.Event()
+        self.model.generate_voice_clone_streaming = lambda **_kwargs: provider
+        original_pull = torch_backend._pull_faster_stream
+
+        def blocking_pull(_generator):
+            pull_started.set()
+            allow_pull_to_finish.wait(timeout=2)
+            return (b"late",)
+
+        torch_backend._pull_faster_stream = blocking_pull
+        stream = torch_backend.synth_tts_stream("hello")
+        task = asyncio.create_task(anext(stream))
+        try:
+            started = await asyncio.get_running_loop().run_in_executor(
+                None, pull_started.wait, 2
+            )
+            self.assertTrue(started)
+            self.assertFalse(torch_backend._model_gate.acquire(blocking=False))
+
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(provider.closed)
+            allow_pull_to_finish.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertTrue(provider.closed)
+            self.assert_gate_released()
+        finally:
+            allow_pull_to_finish.set()
+            torch_backend._pull_faster_stream = original_pull
+            await stream.aclose()
+
+    def test_provider_chunk_is_rechunked_to_project_80ms_frames(self):
+        class FakeValues:
+            size = 12000
+
+            def reshape(self, _shape):
+                return self
+
+        fake_numpy = types.ModuleType("numpy")
+        fake_numpy.float32 = object()
+        fake_numpy.asarray = lambda _audio, dtype: FakeValues()
+        fake_numpy.isfinite = lambda _audio: types.SimpleNamespace(all=lambda: True)
+        previous_numpy = sys.modules.get("numpy")
+        original_convert = torch_backend._wav_to_pcm24k
+        original_chunk = common.chunk_pcm
+        sys.modules["numpy"] = fake_numpy
+        torch_backend._wav_to_pcm24k = lambda _audio, _rate: b"abcdefgh"
+        common.chunk_pcm = lambda pcm, milliseconds: (
+            pcm[:4],
+            pcm[4:],
+            milliseconds,
+        )
+        try:
+            self.assertEqual(
+                torch_backend._convert_faster_chunk(object(), 24000),
+                (b"abcd", b"efgh", 80),
+            )
+        finally:
+            common.chunk_pcm = original_chunk
+            torch_backend._wav_to_pcm24k = original_convert
+            if previous_numpy is None:
+                sys.modules.pop("numpy", None)
+            else:
+                sys.modules["numpy"] = previous_numpy
+
+    def test_provider_chunk_rejects_non_finite_samples(self):
+        class FakeValues:
+            size = 10
+
+            def reshape(self, _shape):
+                return self
+
+        fake_numpy = types.ModuleType("numpy")
+        fake_numpy.float32 = object()
+        fake_numpy.asarray = lambda _audio, dtype: FakeValues()
+        fake_numpy.isfinite = lambda _audio: types.SimpleNamespace(all=lambda: False)
+        previous_numpy = sys.modules.get("numpy")
+        sys.modules["numpy"] = fake_numpy
+        try:
+            with self.assertRaisesRegex(RuntimeError, "无效采样"):
+                torch_backend._convert_faster_chunk(object(), 24000)
+        finally:
+            if previous_numpy is None:
+                sys.modules.pop("numpy", None)
+            else:
+                sys.modules["numpy"] = previous_numpy
+
+    def test_provider_chunk_rejects_more_than_two_seconds(self):
+        class FakeValues:
+            size = torch_backend.FASTER_STREAMING_RESULT_MAX_SAMPLES + 1
+
+            def reshape(self, _shape):
+                return self
+
+        fake_numpy = types.ModuleType("numpy")
+        fake_numpy.float32 = object()
+        fake_numpy.asarray = lambda _audio, dtype: FakeValues()
+        fake_numpy.isfinite = lambda _audio: types.SimpleNamespace(all=lambda: True)
+        previous_numpy = sys.modules.get("numpy")
+        sys.modules["numpy"] = fake_numpy
+        try:
+            with self.assertRaisesRegex(RuntimeError, "输出块过长"):
+                torch_backend._convert_faster_chunk(object(), 24000)
+        finally:
+            if previous_numpy is None:
+                sys.modules.pop("numpy", None)
+            else:
+                sys.modules["numpy"] = previous_numpy
 
 
 if __name__ == "__main__":

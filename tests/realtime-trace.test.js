@@ -980,7 +980,12 @@ test("streamed managed segments require explicit negotiation and exact final tot
     return { session, commands };
   };
 
-  const unnegotiated = createSession(null).session;
+  const unnegotiatedState = createSession(null);
+  assert.deepEqual(unnegotiatedState.commands[0], {
+    type: "startup_buffer",
+    milliseconds: 0,
+  });
+  const unnegotiated = unnegotiatedState.session;
   unnegotiated._onMessage({
     data: JSON.stringify({
       type: "audio_segment_start",
@@ -993,6 +998,10 @@ test("streamed managed segments require explicit negotiation and exact final tot
   assert.equal(unnegotiated._currentAudioSegment, null);
 
   const { session, commands } = createSession();
+  assert.deepEqual(commands[0], {
+    type: "startup_buffer",
+    milliseconds: 240,
+  });
   session._onMessage({
     data: JSON.stringify({
       type: "audio_segment_start",
@@ -1279,7 +1288,7 @@ test("managed cascade accepts only current ordered identified audio", async () =
     data: JSON.stringify({ type: "audio_segment_end", generation: 3, segmentId: 1 }),
   });
   assert.equal(session._audioSegments.get("3:1").dropped, false);
-  assert.deepEqual(commands.map((message) => message.type), ["segment_start"]);
+  assert.deepEqual(commands.map((message) => message.type), ["startup_buffer", "segment_start"]);
 });
 
 test("managed sequence gaps and declared sample mismatch suppress completion receipts", async () => {
@@ -1426,7 +1435,7 @@ test("managed suspended-queue overflow never delivers partial segment audio", as
   assert.equal(session._audioSegments.get("1:1").dropped, true);
   session.audioCtx.state = "running";
   session._flushPendingPcm();
-  assert.deepEqual(commands.map((message) => message.type), ["segment_start", "segment_end"]);
+  assert.deepEqual(commands.map((message) => message.type), ["startup_buffer", "segment_start", "segment_end"]);
 });
 
 test("managed malformed and duplicate segment starts cannot replace the active ledger", async () => {
@@ -1469,7 +1478,7 @@ test("managed malformed and duplicate segment starts cannot replace the active l
 
   assert.equal(session._currentAudioSegment, active);
   assert.equal(session._audioSegments.size, 1);
-  assert.deepEqual(commands.map((message) => message.type), ["segment_start"]);
+  assert.deepEqual(commands.map((message) => message.type), ["startup_buffer", "segment_start"]);
   session._onMessage({ data: managedAudioFrame({ generation: 1 }) });
   assert.equal(active.receivedSamples, 3);
 });
@@ -1884,6 +1893,48 @@ test("local response stays active across stable-sentence TTS gaps", async () => 
   session._onMessage({ data: JSON.stringify({ type: "tts_end", generation: 1 }) });
   await new Promise((resolve) => setTimeout(resolve, 350));
   assert.equal(session.trace.state.response, "completed");
+});
+
+test("a recoverable local response error clears only that response and keeps the session", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const responseErrors = [];
+  const fatalErrors = [];
+  const playbackCommands = [];
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onResponseError: (error) => responseErrors.push(error.message),
+    onError: (error) => fatalErrors.push(error.message),
+  });
+  session.ws = {
+    readyState: 1,
+    send: (payload) => sent.push(JSON.parse(payload)),
+  };
+  session.playbackNode = {
+    port: { postMessage: (message) => playbackCommands.push(message) },
+  };
+  session.trace.startSession();
+  session.trace.startResponse();
+  session._backendAudioPending = true;
+  session._assistantActive = true;
+  session._playbackQueuedMs = 80;
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "error",
+      message: "本地实时语音处理失败，请稍后重试",
+      recoverable: true,
+    }),
+  });
+
+  assert.deepEqual(responseErrors, ["本地实时语音处理失败，请稍后重试"]);
+  assert.deepEqual(fatalErrors, []);
+  assert.equal(session.stopped, false);
+  assert.equal(session._assistantActive, false);
+  assert.equal(session._backendAudioPending, false);
+  assert.equal(playbackCommands.at(-1).type, "clear");
+  assert.equal(sent.at(-1).type, "playback_reset");
 });
 
 test("desktop session retains only the latest sanitized VAD shadow summary outside trace", async () => {
