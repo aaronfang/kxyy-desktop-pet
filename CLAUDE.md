@@ -115,4 +115,4 @@ If upstream changes the `/api/chat` request/response contract, manually update *
 
 ## Release
 
-Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml` for Windows NSIS only. To append macOS aarch64/x64 DMGs to the same release, manually dispatch that tag with `include_macos=true`. Keep `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` versions in sync. App icons are generated via `npx tauri icon build/icon-square.png` (苗疆元元头部特写源图；`src-tauri/icons/` is the generated set — commit both when regenerating).
+Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml` for Windows NSIS plus macOS aarch64/x64 DMGs. Manual dispatch remains a repair path: `include_macos=true` appends only the two macOS DMGs; false rebuilds only Windows. Keep `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`, and `Cargo.lock` versions in sync. App icons are generated via `npx tauri icon build/icon-square.png` (苗疆元元头部特写源图；`src-tauri/icons/` is the generated set — commit both when regenerating).

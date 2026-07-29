@@ -206,7 +206,7 @@ npm run encrypt-assets
 
 1. 同步修改 `package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 和 `Cargo.lock` 的版本号。
 2. 提交 `chore(release): vX.Y.Z`，先推 commit，再推 `vX.Y.Z` tag。
-3. 推送 tag 后 GitHub Actions 先校验版本并构建 Windows x64；需要 macOS 时，在同一 tag 上手动运行 Release workflow 并勾选 `include_macos`，追加 ARM64 和 Intel DMG。
+3. 推送 tag 后 GitHub Actions 校验版本，并同时构建 Windows x64、macOS ARM64 和 macOS Intel 安装包。
 4. Changelog 根据 Conventional Commits 自动生成，完整历史见 [GitHub Releases](https://github.com/aaronfang/kxyy-desktop-pet/releases)。
 
 CI 与发布职责：
@@ -214,8 +214,8 @@ CI 与发布职责：
 | 触发 | 工作流 | 结果 |
 |---|---|---|
 | push / PR → `main` | [CI](.github/workflows/ci.yml) | Windows x64 + macOS ARM64 检查，不发布 |
-| push `v*` tag | [Release](.github/workflows/release.yml) | 校验五个版本文件，构建 Windows 并上传 Release |
-| 手动 Release + `include_macos` | [Release](.github/workflows/release.yml) | 为同一 tag 追加 macOS ARM64 / Intel DMG |
+| push `v*` tag | [Release](.github/workflows/release.yml) | 校验六处版本号，构建 Windows x64 与 macOS ARM64 / Intel 并上传 Release |
+| 手动 Release + `include_macos` | [Release](.github/workflows/release.yml) | 修复既有 Release：勾选时仅追加 macOS 双架构，否则仅重建 Windows |
 
 ## 项目文档
 

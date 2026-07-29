@@ -1,15 +1,14 @@
 name: Release
 
 # 触发方式：
-#   1) 推送形如 v0.2.0 的 tag（主路径）—— 仅自动构建 Windows，省额度
-#   2) 手动 workflow_dispatch —— 可勾选 include_macos 追加构建 macOS（.dmg）
+#   1) 推送形如 v0.2.0 的 tag（主路径）—— 自动构建 Windows 与 macOS 双架构
+#   2) 手动 workflow_dispatch —— 可仅重建 Windows，或勾选 include_macos 追加 macOS
 #
-# 为什么这么设计：私有仓库 Actions 计费倍率 macOS ×10、Windows ×2、Linux ×1，
-# macOS 占了单次发版约九成的额度。故日常推 tag 只出 Windows；需要 macOS 版时，
-# 在 Actions 页面对该 tag 手动 Run workflow 并勾选 include_macos 即可（会追加 dmg
-# 到同一个 Release）。
+# 正式 tag 必须同时提供 Windows NSIS、macOS ARM64 DMG 和 macOS Intel DMG。
+# 手动入口用于修复既有 Release：默认仅重建 Windows，勾选 include_macos 时仅追加
+# 两个 macOS DMG，避免覆盖无关平台的现有资产。
 #
-# 流程：verify（校验 tag 已在 main 且五个版本表面一致）→ quality（Windows 确定性测试与
+# 流程：verify（校验 tag 已在 main 且六个版本表面一致）→ quality（Windows 确定性测试与
 # 真实可选 ORT smoke）+ setup-matrix（按触发方式决定构建平台）→ release（按矩阵并行
 # 构建 + 自动从 git log 生成 changelog + 上传到 GitHub Release）。
 #
@@ -19,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       include_macos:
-        description: "同时构建 macOS (.dmg)？会额外消耗约 10x 的 Actions 额度"
+        description: "仅追加 macOS ARM64/Intel DMG（不重建 Windows）"
         type: boolean
         default: false
   push:
@@ -161,8 +160,8 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python scripts/local-realtime/install_sensevoice_runtime.py
 
-  # 第二关：决定构建矩阵。默认（推 tag）只构建 Windows；手动触发且勾选
-  # include_macos 时只追加两个 macOS 目标，绝不删除/重传已有 Windows asset。
+  # 第二关：决定构建矩阵。推 tag 默认构建 Windows 与两个 macOS 目标；手动触发时
+  # include_macos 只追加两个 macOS 目标，否则只重建 Windows。
   setup-matrix:
     needs: verify
     runs-on: ubuntu-latest
@@ -175,12 +174,17 @@ jobs:
           WIN='{"platform":"windows-latest","args":"--bundles nsis -- --locked"}'
           MAC_ARM='{"platform":"macos-latest","args":"--target aarch64-apple-darwin --bundles dmg -- --locked"}'
           MAC_X64='{"platform":"macos-latest","args":"--target x86_64-apple-darwin --bundles dmg -- --locked"}'
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_macos }}" = "true" ]; then
-            echo "matrix={\"include\":[$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
-            echo "构建平台：仅追加 macOS(aarch64/x64)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.include_macos }}" = "true" ]; then
+              echo "matrix={\"include\":[$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
+              echo "构建平台：仅追加 macOS(aarch64/x64)"
+            else
+              echo "matrix={\"include\":[$WIN]}" >> "$GITHUB_OUTPUT"
+              echo "构建平台：仅 Windows"
+            fi
           else
-            echo "matrix={\"include\":[$WIN]}" >> "$GITHUB_OUTPUT"
-            echo "构建平台：仅 Windows（如需 macOS 请手动触发并勾选 include_macos）"
+            echo "matrix={\"include\":[$WIN,$MAC_ARM,$MAC_X64]}" >> "$GITHUB_OUTPUT"
+            echo "构建平台：Windows + macOS(aarch64/x64)"
           fi
 
   # 第三关：构建并发布。changelog 在这一步自动从 git log 生成，
