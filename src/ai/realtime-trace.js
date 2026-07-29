@@ -5,7 +5,7 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 6;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 8;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
@@ -670,6 +670,49 @@ function sanitizeRuntimeSummary(runtime) {
   };
 }
 
+function sanitizeProactiveSummary(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const count = (name) =>
+    Number.isSafeInteger(value[name]) && value[name] >= 0 ? value[name] : 0;
+  const fixedCounts = (source, names) => {
+    const input = source && typeof source === "object" ? source : {};
+    return Object.fromEntries(
+      names.map((name) => [
+        name,
+        Number.isSafeInteger(input[name]) && input[name] >= 0 ? input[name] : 0,
+      ]),
+    );
+  };
+  return Object.freeze({
+    mode: safeEnum(value.mode, ["follow-user", "balanced", "ai-leads"], "follow-user"),
+    capability: safeEnum(value.capability, ["local-v1", "none"], "none"),
+    paused: value.paused === true,
+    candidates: count("candidates"),
+    accepted: count("accepted"),
+    vetoed: count("vetoed"),
+    cancelled: count("cancelled"),
+    preAudioUserReclaims: count("preAudioUserReclaims"),
+    earlyPlaybackInterruptions: count("earlyPlaybackInterruptions"),
+    proactiveTurns: count("proactiveTurns"),
+    topicSwitches: count("topicSwitches"),
+    triggerKinds: fixedCounts(value.triggerKinds, [
+      "welcome", "followup", "idle", "memory", "commitment",
+    ]),
+    engagementCategories: fixedCounts(value.engagementCategories, [
+      "acknowledge", "amused", "curious", "agree", "pause", "redirect", "resume",
+      "substantive", "silence",
+    ]),
+    vetoReasons: fixedCounts(value.vetoReasons, [
+      "speech", "asr", "reply", "playback", "receipt", "cooldown", "limit",
+    ]),
+    rhythm: {
+      backoffs: count("rhythmBackoffs"),
+      stops: count("rhythmStops"),
+      stopped: value.rhythmStopped === true,
+    },
+  });
+}
+
 function sanitizeLatencySummary(summary) {
   if (!summary || !Number.isSafeInteger(summary.generationId) || summary.generationId < 0) {
     return null;
@@ -761,6 +804,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
       latency,
       interruptions: summarizeCandidateOutcomes(events),
       memoryContext: summarizeMemoryContext(events),
+      proactive: sanitizeProactiveSummary(source.proactiveSummary),
       vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),
       playback: {
         maxSampledQueuedMs:

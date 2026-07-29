@@ -22,6 +22,8 @@ const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 // tokenizer dependency in the desktop bundle.
 const RECALL_CHAR_BUDGET: usize = 500;
 const MAX_RECALL_ITEMS: usize = 6;
+const PROACTIVE_RECALL_CHAR_BUDGET: usize = 300;
+const PROACTIVE_RECALL_MAX_ITEMS: usize = 3;
 const MAX_LISTED_BACKUPS: usize = 100;
 
 pub struct MemoryState {
@@ -927,6 +929,8 @@ pub struct MemoryRecallRequest {
     pub nickname: String,
     #[serde(default)]
     pub query: String,
+    #[serde(default)]
+    pub reason: String,
     #[serde(default)]
     pub image_caption: String,
     #[serde(default)]
@@ -3163,6 +3167,7 @@ fn recall_memory(
     let query = format!("{} {}", request.query, request.image_caption)
         .trim()
         .to_string();
+    let proactive_topic = request.reason.trim().eq_ignore_ascii_case("proactive-topic");
     if request.nickname.trim().is_empty() {
         return Ok(MemoryRecallResponse {
             items: vec![],
@@ -3219,12 +3224,19 @@ fn recall_memory(
             if c.status == "superseded" || c.status == "forgotten" || c.status == "expired" {
                 return None;
             }
+            if is_sensitive(&c.text) {
+                return None;
+            }
             let lexical = if has_query {
                 jaccard(&qgrams, &grams(&format!("{} {}", c.text, c.tags)))
             } else {
                 0.0
             };
             let age_days = (now - c.occurred_at.unwrap_or(c.updated_at)).max(0) as f64 / 86_400.0;
+            let proactive_episode = proactive_topic
+                && !has_query
+                && c.kind == "episode"
+                && age_days <= 30.0;
             let half_life = if c.kind == "episode" { 30.0 } else { 180.0 };
             let recency = 0.5_f64.powf(age_days / half_life);
             let special = if c.pinned || c.kind == "commitment" {
@@ -3243,6 +3255,7 @@ fn recall_memory(
             if lexical < 0.02
                 && !c.pinned
                 && !(c.kind == "commitment" && !has_query)
+                && !proactive_episode
                 && !is_contextual_fallback
             {
                 return None;
@@ -3255,10 +3268,20 @@ fn recall_memory(
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-    let limit = request
+    let requested_limit = request
         .max_items
         .unwrap_or(MAX_RECALL_ITEMS)
         .clamp(1, MAX_RECALL_ITEMS);
+    let limit = if proactive_topic && !has_query {
+        requested_limit.min(PROACTIVE_RECALL_MAX_ITEMS)
+    } else {
+        requested_limit
+    };
+    let char_budget = if proactive_topic && !has_query {
+        PROACTIVE_RECALL_CHAR_BUDGET
+    } else {
+        RECALL_CHAR_BUDGET
+    };
     let mut selected = Vec::new();
     let mut chars = 0usize;
     let mut pinned_count = 0usize;
@@ -3277,7 +3300,7 @@ fn recall_memory(
             continue;
         }
         let len = candidate.text.chars().count();
-        if chars + len > RECALL_CHAR_BUDGET || selected.len() >= limit {
+        if chars + len > char_budget || selected.len() >= limit {
             continue;
         }
         if candidate.pinned {
@@ -5502,6 +5525,7 @@ mod tests {
                 card_id: "card".into(),
                 nickname: "小明".into(),
                 query: "喜欢辣".into(),
+                reason: String::new(),
                 image_caption: String::new(),
                 max_items: Some(6),
             },
@@ -5548,6 +5572,7 @@ mod tests {
                     card_id: "card".into(),
                     nickname: "小明".into(),
                     query: "测试项".into(),
+                    reason: String::new(),
                     image_caption: String::new(),
                     max_items: Some(6),
                 },
@@ -7003,6 +7028,7 @@ mod tests {
                 card_id: "card-a".into(),
                 nickname: "小明".into(),
                 query: "产品经理面试该怎么准备".into(),
+                reason: String::new(),
                 image_caption: String::new(),
                 max_items: Some(6),
             },
@@ -7028,6 +7054,7 @@ mod tests {
                 card_id: "card-a".into(),
                 nickname: "小明".into(),
                 query: "Rust 所有权和生命周期".into(),
+                reason: String::new(),
                 image_caption: String::new(),
                 max_items: Some(6),
             },
@@ -7060,6 +7087,7 @@ mod tests {
                 card_id: "card".into(),
                 nickname: "元宝".into(),
                 query: "明天有点紧张".into(),
+                reason: String::new(),
                 image_caption: String::new(),
                 max_items: Some(6),
             },
@@ -7106,6 +7134,12 @@ mod tests {
             now_ts(),
         )
         .unwrap();
+        tx.execute(
+            "INSERT INTO memory_episodes(id,user_id,summary,importance,topics_json,entities_json,occurred_at,created_at,updated_at)
+             VALUES('recent-chat-topic',?1,'元宝最近开始学习吉他',0.8,'[\"吉他\"]','[]',?2,?2,?2)",
+            params![&user, now_ts()],
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let result = recall_memory(
@@ -7114,8 +7148,9 @@ mod tests {
                 card_id: "card".into(),
                 nickname: "元宝".into(),
                 query: String::new(),
+                reason: String::new(),
                 image_caption: String::new(),
-                max_items: Some(3),
+                max_items: Some(6),
             },
         )
         .unwrap();
@@ -7126,6 +7161,25 @@ mod tests {
             .items
             .iter()
             .all(|item| !item.text.contains("准备面试")));
+
+        let proactive = recall_memory(
+            &mut conn,
+            &MemoryRecallRequest {
+                card_id: "card".into(),
+                nickname: "元宝".into(),
+                query: String::new(),
+                reason: "proactive-topic".into(),
+                image_caption: String::new(),
+                max_items: Some(3),
+            },
+        )
+        .unwrap();
+        assert!(proactive
+            .items
+            .iter()
+            .any(|item| item.id == "recent-chat-topic"));
+        assert!(proactive.items.len() <= 3);
+        assert!(proactive.total_chars <= 300);
     }
 
     #[test]

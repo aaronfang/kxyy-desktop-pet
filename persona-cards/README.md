@@ -86,13 +86,9 @@ python scripts/persona-distill/tools/validate_card.py --all persona-cards/
 
 ### 在 App 中使用人格卡
 
-> **注意**：当前 App 尚不支持动态加载人格卡（规划中）。以下为未来集成路径。
+当前 App 已支持在设置页导入、选择、热切换、导出和删除本地人格卡，无需重新编译。Rust 端从 App 资源目录和用户卡片目录列出卡片，加载后通过 `/api/assets` 向聊天窗口提供 `system_prompt`、`few_shot`、`lore` 与 `corrections`；默认开心元元仍使用编译期加密资源作为兜底。
 
-1. **加载**：App 读取 `persona-card.json` → 提取 `system_prompt` + `few_shot` + `lore` + `corrections`
-2. **注入**：替换 LLM 调用的 messages[0].content
-3. **切换**：用户可在设置中选择不同人格卡，无需重新编译
-
-详细集成方案见 `docs/roadmap-ai-roleplay.md` 第 8 节。
+开发内置卡时，应先修改 `persona-cards/<card-id>/persona-card.json`，通过校验后再重建所需资源。默认元元的内容治理、同步边界和验收标准见 [AI 角色扮演路线图 2.1.1](../docs/roadmap-ai-roleplay.md#211-元元日常人设改进基线与权威方案2026-07-29)。
 
 ## 分享人格卡
 
@@ -104,7 +100,7 @@ my-character/
 └── README.md            # 说明文档
 ```
 
-接收方将目录放入自己的 `persona-cards/` 即可使用。
+接收方可以在 App 设置页直接导入 `persona-card.json`。仓库开发者也可以把完整目录放入 `persona-cards/` 作为受版本控制的卡片来源。
 
 ## Schema 版本
 

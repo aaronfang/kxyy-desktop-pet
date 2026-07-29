@@ -377,12 +377,47 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       rawProbability: [0.1, 0.9],
       transcript: "forbidden-shadow-transcript",
     }),
+    proactiveSummary: {
+      mode: "ai-leads",
+      capability: "local-v1",
+      paused: true,
+      candidates: 4,
+      accepted: 3,
+      vetoed: 1,
+      cancelled: 2,
+      preAudioUserReclaims: 1,
+      earlyPlaybackInterruptions: 1,
+      proactiveTurns: 3,
+      topicSwitches: 1,
+      triggerKinds: {
+        welcome: 1,
+        followup: 2,
+        idle: 1,
+        secret: "forbidden-trigger-secret",
+      },
+      engagementCategories: {
+        acknowledge: 2,
+        amused: 1,
+        curious: 3,
+        agree: 4,
+        transcript: "forbidden-engagement-transcript",
+      },
+      vetoReasons: {
+        speech: 1,
+        receipt: 2,
+        rawReason: "forbidden-veto-reason",
+      },
+      rhythmBackoffs: 1,
+      rhythmStops: 1,
+      rhythmStopped: true,
+      topicText: "forbidden-topic",
+    },
     events,
     latencies: [summarizeTraceLatency(events, 0)],
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 6);
+  assert.equal(report.diagnosticSchemaVersion, 8);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -408,6 +443,47 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     report.aggregate.vadShadow,
     fixtureVadShadowSummary({ inferenceP50Ms: 1.234, inferenceP95Ms: 2.346 }),
   );
+  assert.deepEqual(report.aggregate.proactive, {
+    mode: "ai-leads",
+    capability: "local-v1",
+    paused: true,
+    candidates: 4,
+    accepted: 3,
+    vetoed: 1,
+    cancelled: 2,
+    preAudioUserReclaims: 1,
+    earlyPlaybackInterruptions: 1,
+    proactiveTurns: 3,
+    topicSwitches: 1,
+    triggerKinds: {
+      welcome: 1,
+      followup: 2,
+      idle: 1,
+      memory: 0,
+      commitment: 0,
+    },
+    engagementCategories: {
+      acknowledge: 2,
+      amused: 1,
+      curious: 3,
+      agree: 4,
+      pause: 0,
+      redirect: 0,
+      resume: 0,
+      substantive: 0,
+      silence: 0,
+    },
+    vetoReasons: {
+      speech: 1,
+      asr: 0,
+      reply: 0,
+      playback: 0,
+      receipt: 2,
+      cooldown: 0,
+      limit: 0,
+    },
+    rhythm: { backoffs: 1, stops: 1, stopped: true },
+  });
   assert.equal(report.appVersion, "0.2.23");
   assert.equal(report.events.length, 255);
   assert.equal(report.events.at(-1).metrics.audioBytes, 259);
@@ -431,8 +507,12 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "private-path-marker",
     "forbidden-shadow-secret",
     "forbidden-shadow-transcript",
+    "forbidden-trigger-secret",
+    "forbidden-engagement-transcript",
+    "forbidden-veto-reason",
     "rawProbability",
     "forbidden-model-path",
+    "forbidden-topic",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -801,7 +881,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
       generation: 7,
     }),
   });
-  assert.deepEqual(memoryRequests, [{ generation: 7 }]);
+  assert.deepEqual(memoryRequests, [{ generation: 7, reason: "turn" }]);
   local._backendGeneration = 7;
   assert.equal(
     local.sendMemoryContext({
@@ -930,6 +1010,30 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   active.session._scheduleProactiveWelcome();
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(active.socket.sent.filter((message) => message.type === "proactive_turn").length, 1);
+  active.session._onMessage({
+    data: JSON.stringify({
+      type: "proactive_turn_status",
+      triggerId: 1,
+      state: "accepted",
+      generation: 1,
+    }),
+  });
+  active.session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 1 }),
+  });
+  active.session._onMessage({
+    data: JSON.stringify({
+      type: "proactive_turn_status",
+      triggerId: 1,
+      state: "cancelled",
+      generation: 1,
+    }),
+  });
+  active.session._onMessage({
+    data: JSON.stringify({ type: "speech_confirmed", candidateId: 1 }),
+  });
+  assert.equal(active.session.getTraceSnapshot().proactiveSummary.cancelled, 1);
+  assert.equal(active.session.getTraceSnapshot().proactiveSummary.preAudioUserReclaims, 1);
 
   const interrupted = await open(
     { provider: "cosyvoice", conversationMode: "balanced", proactiveGreetingDelayMs: 20 },
@@ -957,6 +1061,216 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   const oldServer = await open({ provider: "local", conversationMode: "ai-leads" });
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(oldServer.socket.sent.filter((message) => message.type === "proactive_turn").length, 0);
+});
+
+test("realtime proactive policy classifies explicit controls without model inference", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { classifyRealtimeConversationTurn } = await import("../src/ai/realtime.js");
+  const cases = [
+    ["安静一会儿", "pause"], ["先别说话", "pause"], ["暂停一下", "pause"],
+    ["让我想想", "pause"], ["我想静静", "pause"], ["稍等一下", "pause"],
+    ["换个话题吧", "redirect"], ["聊点别的", "redirect"], ["别聊这个", "redirect"],
+    ["跳过这个吧", "redirect"], ["不说这个了", "redirect"],
+    ["你继续", "resume"], ["继续说吧", "resume"], ["接着讲", "resume"],
+    ["你说吧", "resume"], ["可以继续了", "resume"],
+    ["嗯嗯", "acknowledge"], ["哦", "acknowledge"], ["好的", "acknowledge"],
+    ["明白了", "acknowledge"], ["原来如此", "acknowledge"],
+    ["哈哈哈", "amused"], ["嘿嘿", "amused"], ["笑死我了", "amused"],
+    ["太逗了", "amused"], ["真好笑", "amused"],
+    ["是吗", "curious"], ["真的啊", "curious"], ["然后呢？", "curious"],
+    ["后来呢", "curious"], ["怎么说", "curious"], ["为什么呀", "curious"],
+    ["对啊", "agree"], ["是的", "agree"], ["没错", "agree"],
+    ["确实", "agree"], ["我也觉得", "agree"], ["有道理", "agree"],
+    ["我今天完成了一个新项目", "substantive"], ["", "silence"],
+  ];
+  for (const [text, expected] of cases) {
+    assert.equal(classifyRealtimeConversationTurn(text), expected, text);
+  }
+});
+
+test("ai-leads schedules bounded followup and topic switch from audible playback", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    proactiveFollowupDelayMs: 0,
+    proactiveIdleDelayMs: 0,
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+  session._proactiveWelcomeSent = true;
+
+  session._proactivePending.set(1, "welcome");
+  session._noteProactiveStatus({ triggerId: 1, state: "accepted", generation: 1 });
+  session._assistantActive = false;
+  session._scheduleTopicLeadAfterPlayback(1);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.at(-1).kind, "followup");
+
+  session._noteProactiveStatus({
+    triggerId: sent.at(-1).triggerId,
+    state: "accepted",
+    generation: 2,
+  });
+  session._assistantActive = false;
+  session._scheduleTopicLeadAfterPlayback(2);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.at(-1).kind, "idle");
+
+  session._noteProactiveStatus({
+    triggerId: sent.at(-1).triggerId,
+    state: "accepted",
+    generation: 3,
+  });
+  session._assistantActive = false;
+  session._scheduleTopicLeadAfterPlayback(3);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 2);
+  assert.equal(session.getTraceSnapshot().proactiveSummary.topicSwitches, 1);
+
+  session._applyUserTurnPolicy("pause");
+  session._scheduleTopicLeadAfterPlayback(4);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 2);
+});
+
+test("balanced allows one proactive turn after user engagement", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "balanced",
+    proactiveFollowupDelayMs: 0,
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+  session._proactivePending.set(1, "welcome");
+  session._noteProactiveStatus({ triggerId: 1, state: "accepted", generation: 1 });
+  session._scheduleTopicLeadAfterPlayback(1);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 0);
+
+  session._applyUserTurnPolicy("substantive");
+  session._assistantActive = false;
+  session._scheduleTopicLeadAfterPlayback(2);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, "followup");
+});
+
+test("topic keys are stable bounded session-only identifiers", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { deriveRealtimeTopicKey } = await import("../src/ai/realtime.js");
+  assert.equal(deriveRealtimeTopicKey("（开心）最近在学吉他！"), "最近在学吉他");
+  assert.equal(deriveRealtimeTopicKey("最近在学吉他。"), "最近在学吉他");
+  assert.equal(deriveRealtimeTopicKey("哈"), "");
+  assert.ok(deriveRealtimeTopicKey("很长的话题".repeat(30)).length <= 64);
+});
+
+test("topic history stays bounded and suppresses a repeated audible topic", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    proactiveFollowupDelayMs: 0,
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+  for (let index = 0; index < 10; index += 1) session._rememberTopicKey(`话题${index}`);
+  assert.deepEqual(session._topicLead.topicsUsed, [
+    "话题2", "话题3", "话题4", "话题5", "话题6", "话题7", "话题8", "话题9",
+  ]);
+  session._topicLead.topicKey = "";
+  session._noteAudibleTopic("话题9");
+  assert.equal(session._topicLead.repeatedTopic, true);
+  session._scheduleTopicLeadAfterPlayback(1);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.length, 0);
+});
+
+test("proactive rhythm backs off once, stops after two negative signals, and resumes explicitly", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    proactiveFollowupDelayMs: 1000,
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+  session.trace.startSession();
+
+  session._proactivePending.set(1, "welcome");
+  session._noteProactiveStatus({ triggerId: 1, state: "accepted", generation: 1 });
+  session._beginSpeechCandidate({ candidateId: 1 });
+  session._rejectSpeech();
+  assert.equal(session._proactiveRhythm.negativeSignals, 0);
+  session._beginSpeechCandidate({ candidateId: 2 });
+  session._confirmSpeech({ candidateId: 2 });
+  assert.equal(session._proactiveRhythm.delayMultiplier, 1.5);
+  assert.equal(session._proactiveDelayMs("followup"), 1500);
+  session._userTurnOpen = false;
+  session._noteProactiveStatus({ triggerId: 1, state: "cancelled" });
+
+  session._proactivePending.set(2, "followup");
+  session._noteProactiveStatus({ triggerId: 2, state: "accepted", generation: 2 });
+  session._activeProactiveFirstAudioAt = performance.now();
+  session._beginSpeechCandidate({ candidateId: 3 });
+  session._confirmSpeech({ candidateId: 3 });
+  assert.equal(session._proactiveRhythm.stopped, true);
+  session._userTurnOpen = false;
+  session._scheduleTopicLeadAfterPlayback(2);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 0);
+
+  session._applyUserTurnPolicy("resume");
+  assert.equal(session._proactiveRhythm.stopped, false);
+  assert.equal(session._proactiveRhythm.delayMultiplier, 1);
+  session._activeProactiveGeneration = null;
+  session._assistantActive = false;
+  session._scheduleTopicLeadAfterPlayback(3);
+  assert.notEqual(session._proactiveLeadTimer, 0);
+  clearTimeout(session._proactiveLeadTimer);
+});
+
+test("topic lead timer starts only after the final audible segment", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    proactiveFollowupDelayMs: 1000,
+  });
+  session.ws = { readyState: 1, send: () => {} };
+  session._proactiveTurnMode = "local-v1";
+  session._backendGeneration = 1;
+  session._backendAudioPending = true;
+  for (const segmentId of [1, 2]) {
+    session._audioSegments.set(`1:${segmentId}`, {
+      generation: 1,
+      segmentId,
+      text: `句段${segmentId}`,
+      dropped: false,
+      completed: false,
+    });
+  }
+  session._handleSegmentCompleted({ generation: 1, segmentId: 1 });
+  assert.equal(session._proactiveLeadTimer, 0);
+  session._backendAudioPending = false;
+  session._handleSegmentCompleted({ generation: 1, segmentId: 2 });
+  assert.notEqual(session._proactiveLeadTimer, 0);
+  clearTimeout(session._proactiveLeadTimer);
 });
 
 test("streamed managed segments require explicit negotiation and exact final totals", async () => {

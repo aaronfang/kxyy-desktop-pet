@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 
 import {
   REALTIME_MEMORY_TIMEOUT_MS,
+  REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX,
   formatRealtimeMemoryHints,
   recallRealtimeMemory,
+  takeFreshRealtimeMemoryItems,
 } from "../src/realtime-memory.js";
 
 test("realtime memory formatting keeps the bounded internal hint shape", () => {
@@ -75,4 +77,43 @@ test("recall adapter sends the existing Tauri memory_recall command", async () =
     maxItems: 3,
   });
   assert.equal(REALTIME_MEMORY_TIMEOUT_MS, 120);
+});
+
+test("proactive recall reason is passed through without changing legacy requests", async () => {
+  const calls = [];
+  await recallRealtimeMemory(async (...args) => {
+    calls.push(args);
+    return { items: [] };
+  }, {
+    cardId: "card-a",
+    nickname: "元宝",
+    query: "",
+    reason: "proactive-topic",
+    maxItems: 3,
+  });
+  assert.equal(calls[0][1].request.reason, "proactive-topic");
+});
+
+test("proactive Memory id cooldown is call-local, duplicate-free and bounded", () => {
+  const usedIds = new Set();
+  const initial = Array.from({ length: 10 }, (_, index) => ({
+    id: `memory-${index + 1}`,
+    text: `候选${index + 1}`,
+  }));
+  assert.equal(takeFreshRealtimeMemoryItems(initial, usedIds).length, 10);
+  assert.equal(usedIds.size, REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX);
+  assert.deepEqual([...usedIds], [
+    "memory-3", "memory-4", "memory-5", "memory-6",
+    "memory-7", "memory-8", "memory-9", "memory-10",
+  ]);
+  const next = takeFreshRealtimeMemoryItems([
+    { id: "memory-2", text: "已滚出冷却" },
+    { id: "memory-9", text: "仍在冷却" },
+    { id: "memory-10", text: "仍在冷却" },
+    { id: "memory-11", text: "新候选" },
+    { id: "memory-11", text: "同批重复" },
+    { id: "", text: "无标识" },
+  ], usedIds);
+  assert.deepEqual(next.map((item) => item.id), ["memory-2", "memory-11"]);
+  assert.equal(usedIds.size, REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX);
 });

@@ -52,12 +52,50 @@ const STREAMING_PLAYBACK_STARTUP_MS = 240;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
+const TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1";
 const PROACTIVE_TURN_CAPABILITY = "local-v1";
 const MAX_TURN_MEMORY_ITEMS = 3;
 const MAX_TURN_MEMORY_CHARS = 700;
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 const VAD_SHADOW_FINAL_WAIT_MS = 50;
+const MAX_TOPIC_KEY_CHARS = 64;
+const MAX_TOPICS_USED = 8;
+const PROACTIVE_KINDS = new Set(["welcome", "followup", "idle", "memory", "commitment"]);
+
+const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?)$/;
+const REDIRECT_TURN_RE = /(?:换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个)/;
+const RESUME_TURN_RE = /^(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)$/;
+const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
+const AMUSED_TURN_RE = /^(?:哈{2,}|嘿{2,}|呵{2,}|笑死(?:我了)?|太逗了|有意思|真好笑)$/;
+const CURIOUS_TURN_RE = /^(?:是吗|真的(?:啊|吗)?|然后呢|后来呢|还有呢|怎么说|为什么(?:呀|啊)?)$/;
+const AGREE_TURN_RE = /^(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理)$/;
+const ENGAGEMENT_POLICIES = new Set(["acknowledge", "amused", "curious", "agree"]);
+
+/** Fixed, local-only policy. It never asks a model to decide whether proactive speech is allowed. */
+export function classifyRealtimeConversationTurn(text) {
+  const value = String(text || "").trim();
+  if (!value) return "silence";
+  const compact = value.replace(/[。！!？?，,\s]+$/gu, "");
+  if (PAUSE_TURN_RE.test(compact)) return "pause";
+  if (REDIRECT_TURN_RE.test(compact)) return "redirect";
+  if (RESUME_TURN_RE.test(compact)) return "resume";
+  if (ACKNOWLEDGE_TURN_RE.test(compact)) return "acknowledge";
+  if (AMUSED_TURN_RE.test(compact)) return "amused";
+  if (CURIOUS_TURN_RE.test(compact)) return "curious";
+  if (AGREE_TURN_RE.test(compact)) return "agree";
+  return "substantive";
+}
+
+/** Session-only topic identity. It is never sent over the wire or exposed in diagnostics. */
+export function deriveRealtimeTopicKey(text) {
+  const normalized = String(text || "")
+    .toLowerCase()
+    .replace(/（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+  const chars = Array.from(normalized).slice(0, MAX_TOPIC_KEY_CHARS);
+  return chars.length >= 2 ? chars.join("") : "";
+}
 
 function usesManagedCascade(provider) {
   return provider === "local" || provider === "cosyvoice";
@@ -146,6 +184,8 @@ export class RealtimeSession {
     provider = "unknown",
     conversationMode = "follow-user",
     proactiveGreetingDelayMs,
+    proactiveFollowupDelayMs,
+    proactiveIdleDelayMs,
     maxTraceEvents = 256,
     onTrace,
   } = {}) {
@@ -206,6 +246,7 @@ export class RealtimeSession {
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
     this._memoryContextMode = "none";
+    this._temporalContextMode = "none";
     this._memoryContextRequestedAt = 0;
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
@@ -223,6 +264,66 @@ export class RealtimeSession {
     this._proactiveTriggerId = 0;
     this._proactiveWelcomeSent = false;
     this._proactiveGreetingTimer = 0;
+    this._proactiveLeadTimer = 0;
+    this._proactivePending = new Map();
+    this._activeProactiveTriggerId = null;
+    this._activeProactiveGeneration = null;
+    this._activeProactiveFirstAudioAt = 0;
+    this._pendingProactiveRhythmSignal = null;
+    this._latestFinalAsr = "";
+    this._lastAudibleGeneration = null;
+    this._topicLead = {
+      phase: "opening",
+      aiTurnsOnTopic: 0,
+      consecutiveShortReplies: 0,
+      userEngagement: "none",
+      proactiveTurns: 0,
+      topicSwitches: 0,
+      paused: false,
+      lastProactiveKind: "none",
+      topicKey: "",
+      topicsUsed: [],
+      repeatedTopic: false,
+    };
+    this._proactiveRhythm = {
+      delayMultiplier: 1,
+      negativeSignals: 0,
+      stopped: false,
+      lastNegativeTriggerId: null,
+    };
+    this._proactiveSummary = {
+      candidates: 0,
+      accepted: 0,
+      vetoed: 0,
+      cancelled: 0,
+      preAudioUserReclaims: 0,
+      earlyPlaybackInterruptions: 0,
+      proactiveTurns: 0,
+      topicSwitches: 0,
+      triggerKinds: { welcome: 0, followup: 0, idle: 0, memory: 0, commitment: 0 },
+      engagementCategories: {
+        acknowledge: 0,
+        amused: 0,
+        curious: 0,
+        agree: 0,
+        pause: 0,
+        redirect: 0,
+        resume: 0,
+        substantive: 0,
+        silence: 0,
+      },
+      vetoReasons: {
+        speech: 0,
+        asr: 0,
+        reply: 0,
+        playback: 0,
+        receipt: 0,
+        cooldown: 0,
+        limit: 0,
+      },
+      rhythmBackoffs: 0,
+      rhythmStops: 0,
+    };
     this._sessionStarted = false;
     this._micReady = false;
     this._proactiveGreetingDelayMs = Number.isFinite(proactiveGreetingDelayMs)
@@ -230,6 +331,16 @@ export class RealtimeSession {
       : this._conversationMode === "ai-leads"
         ? 600
         : 1200;
+    this._proactiveFollowupDelayMs = Number.isFinite(proactiveFollowupDelayMs)
+      ? Math.max(0, proactiveFollowupDelayMs)
+      : this._conversationMode === "ai-leads"
+        ? 4500
+        : 10000;
+    this._proactiveIdleDelayMs = Number.isFinite(proactiveIdleDelayMs)
+      ? Math.max(0, proactiveIdleDelayMs)
+      : this._conversationMode === "ai-leads"
+        ? 14000
+        : 32000;
   }
 
   /**
@@ -304,6 +415,9 @@ export class RealtimeSession {
         cascadeCapabilities.memoryContext = usesManagedCascade(this.trace.provider)
           ? [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY]
           : [SESSION_MEMORY_CAPABILITY];
+        if (usesManagedCascade(this.trace.provider)) {
+          cascadeCapabilities.temporalContext = [TEMPORAL_CONTEXT_CAPABILITY];
+        }
         if (
           usesManagedCascade(this.trace.provider) &&
           this._conversationMode !== "follow-user"
@@ -360,6 +474,13 @@ export class RealtimeSession {
       this.trace.recordOnce("tts_first_audio", TRACE_EVENT.TTS_FIRST_AUDIO, {
         metrics: { audioBytes: pcm?.byteLength || 0 },
       });
+      if (
+        segment &&
+        segment.generation === this._activeProactiveGeneration &&
+        this._activeProactiveFirstAudioAt === 0
+      ) {
+        this._activeProactiveFirstAudioAt = performance.now();
+      }
       this.trace.recordOnce("playback_queued", TRACE_EVENT.PLAYBACK_QUEUED, {
         metrics: { audioBytes: pcm?.byteLength || 0 },
       });
@@ -384,6 +505,12 @@ export class RealtimeSession {
           this._memoryContextMode =
             [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY].includes(msg.memoryContext)
               ? msg.memoryContext
+              : "none";
+          this._temporalContextMode =
+            usesManagedCascade(this.trace.provider) &&
+            msg.downlinkAudio === MANAGED_AUDIO_CAPABILITY &&
+            msg.temporalContext === TEMPORAL_CONTEXT_CAPABILITY
+              ? TEMPORAL_CONTEXT_CAPABILITY
               : "none";
         }
         if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
@@ -479,7 +606,11 @@ export class RealtimeSession {
           msg.interim === false ? TRACE_EVENT.ASR_FINAL : TRACE_EVENT.ASR_PARTIAL,
           { metrics: { interim: msg.interim !== false } },
         );
-        if (msg.interim === false) this._traceAsrFinalSeen = true;
+        if (msg.interim === false) {
+          this._traceAsrFinalSeen = true;
+          this._latestFinalAsr = msg.text || "";
+          this._applyUserTurnPolicy(classifyRealtimeConversationTurn(this._latestFinalAsr));
+        }
         this.cb.onAsr?.(msg.text || "", { interim: msg.interim !== false });
         break;
       case "asr_end": {
@@ -508,7 +639,10 @@ export class RealtimeSession {
         ) {
           this._memoryContextRequestedAt = performance.now();
           this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
-          this.cb.onMemoryContextRequest?.({ generation: msg.generation });
+          this.cb.onMemoryContextRequest?.({
+            generation: msg.generation,
+            reason: msg.reason === "proactive-topic" ? "proactive-topic" : "turn",
+          });
         }
         break;
       case "memory_context_timeout":
@@ -548,10 +682,13 @@ export class RealtimeSession {
         break;
       case "proactive_turn_status":
         if (
-          usesManagedCascade(this.trace.provider) &&
-          this._proactiveTurnMode === PROACTIVE_TURN_CAPABILITY &&
-          msg.state === "cancelled"
-        ) {
+          !usesManagedCascade(this.trace.provider) ||
+          this._proactiveTurnMode !== PROACTIVE_TURN_CAPABILITY
+        ) break;
+        if (["accepted", "vetoed", "cancelled"].includes(msg.state)) {
+          this._noteProactiveStatus(msg);
+        }
+        if (msg.state === "cancelled") {
           this._backendAudioPending = false;
           this._assistantActive = false;
           this._flushPlayback("speech_candidate");
@@ -564,6 +701,9 @@ export class RealtimeSession {
       case "tts_end":
         this._backendAudioPending = false;
         if (!this._hasPlayback()) this._schedulePlaybackCompletion();
+        if (this._lastAudibleGeneration !== null) {
+          this._maybeScheduleTopicLeadAfterPlayback(this._lastAudibleGeneration);
+        }
         break;
       case "audio_segment_start":
         this._beginAudioSegment(msg);
@@ -602,7 +742,7 @@ export class RealtimeSession {
   }
 
   /** 回传当前 final turn 的有界记忆卡片；旧 generation、旧服务或火山路径拒绝发送。 */
-  sendMemoryContext({ generation, items } = {}) {
+  sendMemoryContext({ generation, items, temporalContext } = {}) {
     if (
       this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
       Number.isSafeInteger(generation) &&
@@ -639,7 +779,21 @@ export class RealtimeSession {
       chars += text.length;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "memory_context", generation, items: safe }));
+      const temporal = this._temporalContextMode === TEMPORAL_CONTEXT_CAPABILITY &&
+        temporalContext && typeof temporalContext === "object"
+        ? {
+            date: String(temporalContext.date || "").slice(0, 10),
+            weekday: String(temporalContext.weekday || "").slice(0, 3),
+            time: String(temporalContext.time || "").slice(0, 5),
+            timeZone: String(temporalContext.timeZone || "").slice(0, 64),
+          }
+        : undefined;
+      this.ws.send(JSON.stringify({
+        type: "memory_context",
+        generation,
+        items: safe,
+        ...(temporal ? { temporalContext: temporal } : {}),
+      }));
     } catch {
       this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
         metrics: { accepted: false, itemCount: 0, memoryChars: 0 },
@@ -776,7 +930,11 @@ export class RealtimeSession {
   _beginSpeechCandidate(msg = {}) {
     if (this._speechCandidate || this._userTurnOpen) return false;
     this._resetInterruptionCandidate();
-    this._cancelProactiveWelcome();
+    if (this._proactiveGreetingTimer || this._proactiveLeadTimer) {
+      this._noteProactiveVeto("speech");
+    }
+    this._pendingProactiveRhythmSignal = this._captureProactiveRhythmSignal();
+    this._cancelProactiveTimers();
     this._speechCandidate = true;
     this._candidateInterruptsResponse = this._assistantActive || this._hasPlayback();
     const candidateId = msg.candidateId;
@@ -828,30 +986,272 @@ export class RealtimeSession {
       this._proactiveGreetingTimer = 0;
       if (
         this.stopped ||
-        this._speechCandidate ||
-        this._userTurnOpen ||
-        this._assistantActive ||
-        this._hasPlayback() ||
         !this.ws ||
         this.ws.readyState !== WebSocket.OPEN
       ) {
         return;
       }
+      if (this._speechCandidate) return this._noteProactiveVeto("speech");
+      if (this._userTurnOpen) return this._noteProactiveVeto("asr");
+      if (this._assistantActive) return this._noteProactiveVeto("reply");
+      if (this._hasPlayback()) return this._noteProactiveVeto("playback");
       this._proactiveWelcomeSent = true;
-      this._proactiveTriggerId += 1;
-      this.ws.send(
-        JSON.stringify({
-          type: "proactive_turn",
-          triggerId: this._proactiveTriggerId,
-          kind: "welcome",
-        }),
-      );
+      this._sendProactiveTurn("welcome");
     }, this._proactiveGreetingDelayMs);
   }
 
   _cancelProactiveWelcome() {
     if (this._proactiveGreetingTimer) clearTimeout(this._proactiveGreetingTimer);
     this._proactiveGreetingTimer = 0;
+  }
+
+  _cancelProactiveTimers() {
+    this._cancelProactiveWelcome();
+    if (this._proactiveLeadTimer) clearTimeout(this._proactiveLeadTimer);
+    this._proactiveLeadTimer = 0;
+  }
+
+  _sendProactiveTurn(kind) {
+    if (
+      !PROACTIVE_KINDS.has(kind) ||
+      this.stopped ||
+      this._proactiveTurnMode !== PROACTIVE_TURN_CAPABILITY ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) return false;
+    this._proactiveTriggerId += 1;
+    const triggerId = this._proactiveTriggerId;
+    this._proactivePending.set(triggerId, kind);
+    while (this._proactivePending.size > 8) {
+      this._proactivePending.delete(this._proactivePending.keys().next().value);
+    }
+    this._proactiveSummary.candidates += 1;
+    this._proactiveSummary.triggerKinds[kind] += 1;
+    this.ws.send(JSON.stringify({ type: "proactive_turn", triggerId, kind }));
+    return true;
+  }
+
+  _noteProactiveVeto(reason) {
+    if (Object.hasOwn(this._proactiveSummary.vetoReasons, reason)) {
+      this._proactiveSummary.vetoReasons[reason] += 1;
+    }
+  }
+
+  _captureProactiveRhythmSignal() {
+    const triggerId = this._activeProactiveTriggerId;
+    if (
+      triggerId === null ||
+      triggerId === this._proactiveRhythm.lastNegativeTriggerId ||
+      this._activeProactiveGeneration === null
+    ) return null;
+    const beforeAudio = this._activeProactiveFirstAudioAt === 0;
+    const duringOpening =
+      !beforeAudio && performance.now() - this._activeProactiveFirstAudioAt <= 1000;
+    if (!beforeAudio && !duringOpening) return null;
+    return { triggerId, beforeAudio };
+  }
+
+  _commitProactiveRhythmSignal() {
+    const signal = this._pendingProactiveRhythmSignal;
+    this._pendingProactiveRhythmSignal = null;
+    if (!signal || signal.triggerId === this._proactiveRhythm.lastNegativeTriggerId) return;
+    const { triggerId, beforeAudio } = signal;
+    this._proactiveRhythm.lastNegativeTriggerId = triggerId;
+    this._proactiveRhythm.negativeSignals += 1;
+    if (beforeAudio) this._proactiveSummary.preAudioUserReclaims += 1;
+    else this._proactiveSummary.earlyPlaybackInterruptions += 1;
+    if (this._proactiveRhythm.negativeSignals === 1) {
+      this._proactiveRhythm.delayMultiplier = 1.5;
+      this._proactiveSummary.rhythmBackoffs += 1;
+    } else if (this._proactiveRhythm.negativeSignals >= 2 && !this._proactiveRhythm.stopped) {
+      this._proactiveRhythm.stopped = true;
+      this._proactiveSummary.rhythmStops += 1;
+    }
+  }
+
+  _noteProactiveStatus(msg) {
+    const kind =
+      this._proactivePending.get(msg.triggerId) ||
+      (msg.triggerId === this._activeProactiveTriggerId
+        ? this._topicLead.lastProactiveKind
+        : null);
+    if (!kind) return;
+    if (msg.state === "vetoed") {
+      this._proactivePending.delete(msg.triggerId);
+      this._noteProactiveVeto(msg.reason);
+    }
+    this._proactiveSummary[msg.state] += 1;
+    if (msg.state === "accepted") {
+      this._proactivePending.delete(msg.triggerId);
+      this._activeProactiveTriggerId = msg.triggerId;
+      if (Number.isSafeInteger(msg.generation)) {
+        this._activeProactiveGeneration = msg.generation;
+        this._activeProactiveFirstAudioAt = 0;
+      }
+      this._topicLead.proactiveTurns += 1;
+      this._topicLead.aiTurnsOnTopic += 1;
+      this._topicLead.lastProactiveKind = kind;
+      this._topicLead.phase = kind === "idle" ? "opening" : "expanding";
+      this._proactiveSummary.proactiveTurns += 1;
+      if (kind === "idle") {
+        this._rememberTopicKey(this._topicLead.topicKey);
+        this._topicLead.topicKey = "";
+        this._topicLead.repeatedTopic = false;
+        this._topicLead.topicSwitches += 1;
+        this._proactiveSummary.topicSwitches += 1;
+      }
+    }
+    if (msg.state === "cancelled") {
+      this._proactivePending.delete(msg.triggerId);
+      this._activeProactiveTriggerId = null;
+      this._activeProactiveGeneration = null;
+      this._activeProactiveFirstAudioAt = 0;
+    }
+  }
+
+  _applyUserTurnPolicy(policy) {
+    if (this._proactiveLeadTimer) this._noteProactiveVeto("asr");
+    this._cancelProactiveTimers();
+    this._activeProactiveGeneration = null;
+    this._activeProactiveFirstAudioAt = 0;
+    this._topicLead.userEngagement = policy;
+    if (Object.hasOwn(this._proactiveSummary.engagementCategories, policy)) {
+      this._proactiveSummary.engagementCategories[policy] += 1;
+    }
+    if (policy === "pause") {
+      this._topicLead.paused = true;
+      this._topicLead.phase = "closing";
+      return;
+    }
+    if (policy === "redirect") {
+      this._rememberTopicKey(this._topicLead.topicKey);
+      this._topicLead.topicKey = deriveRealtimeTopicKey(this._latestFinalAsr);
+      this._topicLead.repeatedTopic = false;
+      this._topicLead.paused = false;
+      this._topicLead.phase = "opening";
+      this._topicLead.aiTurnsOnTopic = 0;
+      this._topicLead.proactiveTurns = 0;
+      this._topicLead.consecutiveShortReplies = 0;
+      this._topicLead.lastProactiveKind = "none";
+      return;
+    }
+    if (policy === "resume") {
+      this._topicLead.paused = false;
+      this._topicLead.phase = "expanding";
+      this._topicLead.proactiveTurns = 0;
+      this._topicLead.lastProactiveKind = "none";
+      this._topicLead.consecutiveShortReplies = 0;
+      this._proactiveRhythm.delayMultiplier = 1;
+      this._proactiveRhythm.negativeSignals = 0;
+      this._proactiveRhythm.stopped = false;
+      this._proactiveRhythm.lastNegativeTriggerId = null;
+      return;
+    }
+    if (ENGAGEMENT_POLICIES.has(policy)) {
+      this._topicLead.paused = false;
+      this._topicLead.phase = "expanding";
+      this._topicLead.proactiveTurns = 0;
+      this._topicLead.lastProactiveKind = "none";
+      this._topicLead.consecutiveShortReplies = Math.min(
+        3,
+        this._topicLead.consecutiveShortReplies + 1,
+      );
+      return;
+    }
+    if (policy === "substantive") {
+      const nextTopicKey = deriveRealtimeTopicKey(this._latestFinalAsr);
+      if (nextTopicKey && nextTopicKey !== this._topicLead.topicKey) {
+        this._rememberTopicKey(this._topicLead.topicKey);
+        this._topicLead.topicKey = nextTopicKey;
+      }
+      this._topicLead.repeatedTopic = false;
+      this._topicLead.paused = false;
+      this._topicLead.phase = "inviting";
+      this._topicLead.proactiveTurns = 0;
+      this._topicLead.consecutiveShortReplies = 0;
+      this._topicLead.lastProactiveKind = "none";
+    }
+  }
+
+  _rememberTopicKey(topicKey) {
+    if (!topicKey || this._topicLead.topicsUsed.includes(topicKey)) return;
+    this._topicLead.topicsUsed.push(topicKey);
+    while (this._topicLead.topicsUsed.length > MAX_TOPICS_USED) {
+      this._topicLead.topicsUsed.shift();
+    }
+  }
+
+  _noteAudibleTopic(text) {
+    const topicKey = deriveRealtimeTopicKey(text);
+    if (!topicKey) return;
+    if (!this._topicLead.topicKey) {
+      this._topicLead.topicKey = topicKey;
+      this._topicLead.repeatedTopic = this._topicLead.topicsUsed.includes(topicKey);
+    }
+  }
+
+  _scheduleTopicLeadAfterPlayback(generation) {
+    if (
+      this.stopped ||
+      this._conversationMode === "follow-user" ||
+      this._proactiveTurnMode !== PROACTIVE_TURN_CAPABILITY ||
+      this._topicLead.paused ||
+      this._topicLead.repeatedTopic ||
+      this._proactiveRhythm.stopped
+    ) {
+      if (
+        this._proactiveTurnMode === PROACTIVE_TURN_CAPABILITY &&
+        (this._topicLead.paused || this._topicLead.repeatedTopic || this._proactiveRhythm.stopped)
+      ) this._noteProactiveVeto("cooldown");
+      return;
+    }
+    if (this._proactiveLeadTimer) clearTimeout(this._proactiveLeadTimer);
+    const maxTurns = this._conversationMode === "ai-leads" ? 3 : 1;
+    if (this._topicLead.proactiveTurns >= maxTurns) {
+      this._noteProactiveVeto("limit");
+      return;
+    }
+    const canSwitchTopic =
+      this._conversationMode === "ai-leads" &&
+      this._topicLead.lastProactiveKind === "followup" &&
+      this._topicLead.topicSwitches < 1;
+    const kind = canSwitchTopic ? "idle" : "followup";
+    const delay = this._proactiveDelayMs(kind);
+    this._proactiveLeadTimer = setTimeout(() => {
+      this._proactiveLeadTimer = 0;
+      if (
+        this.stopped ||
+        this._topicLead.paused ||
+        this._proactiveRhythm.stopped
+      ) return this._noteProactiveVeto("cooldown");
+      if (this._speechCandidate) return this._noteProactiveVeto("speech");
+      if (this._userTurnOpen) return this._noteProactiveVeto("asr");
+      if (this._assistantActive) return this._noteProactiveVeto("reply");
+      if (this._hasPlayback()) return this._noteProactiveVeto("playback");
+      this._sendProactiveTurn(kind);
+    }, delay);
+  }
+
+  _proactiveDelayMs(kind) {
+    const baseDelay =
+      kind === "idle" ? this._proactiveIdleDelayMs : this._proactiveFollowupDelayMs;
+    return baseDelay * this._proactiveRhythm.delayMultiplier;
+  }
+
+  _maybeScheduleTopicLeadAfterPlayback(generation) {
+    if (this._backendAudioPending) {
+      this._noteProactiveVeto("receipt");
+      return;
+    }
+    const hasIncompleteSegment = [...this._audioSegments.values()].some(
+      (segment) =>
+        segment.generation === generation && !segment.dropped && !segment.completed,
+    );
+    if (hasIncompleteSegment) {
+      this._noteProactiveVeto("receipt");
+      return;
+    }
+    this._scheduleTopicLeadAfterPlayback(generation);
   }
 
   _acceptCandidateSnapshot(message) {
@@ -1140,6 +1540,9 @@ export class RealtimeSession {
       );
     }
     this.cb.onAudibleAssistant?.(segment.text, { generation, segmentId });
+    this._noteAudibleTopic(segment.text);
+    this._lastAudibleGeneration = generation;
+    this._maybeScheduleTopicLeadAfterPlayback(generation);
   }
 
   _commitDeferredAudioSegments() {
@@ -1191,6 +1594,7 @@ export class RealtimeSession {
       confirmedCandidateId === this._candidateId;
     const snapshot = candidateMatches ? this._candidateSnapshot : null;
     const segmentKeys = candidateMatches ? this._candidateSegmentKeys : null;
+    this._commitProactiveRhythmSignal();
     this._speechCandidate = false;
     this._candidateInterruptsResponse = false;
     this._candidateId = null;
@@ -1218,11 +1622,15 @@ export class RealtimeSession {
   _rejectSpeech(reason = "voice_rejected") {
     if (!this._speechCandidate) return false;
     this._speechCandidate = false;
+    this._pendingProactiveRhythmSignal = null;
     this._candidateInterruptsResponse = false;
     this._resetInterruptionCandidate();
     this.trace.record(TRACE_EVENT.SPEECH_REJECTED, { reason });
     this._resumePlayback();
     this._commitDeferredAudioSegments();
+    if (this._lastAudibleGeneration !== null) {
+      this._maybeScheduleTopicLeadAfterPlayback(this._lastAudibleGeneration);
+    }
     this.cb.onSpeechRejected?.();
     return true;
   }
@@ -1547,7 +1955,8 @@ export class RealtimeSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
-    this._cancelProactiveWelcome();
+    this._cancelProactiveTimers();
+    this._pendingProactiveRhythmSignal = null;
     this._backendAudioPending = false;
     if (this._levelRaf) cancelAnimationFrame(this._levelRaf);
     this._levelRaf = 0;
@@ -1629,6 +2038,16 @@ export class RealtimeSession {
         asr: { ...this._asrRuntime },
       },
       vadShadowSummary: { ...this._vadShadowSummary },
+      proactiveSummary: {
+        mode: this._conversationMode,
+        capability: this._proactiveTurnMode,
+        paused: this._topicLead.paused,
+        rhythmStopped: this._proactiveRhythm.stopped,
+        ...this._proactiveSummary,
+        triggerKinds: { ...this._proactiveSummary.triggerKinds },
+        engagementCategories: { ...this._proactiveSummary.engagementCategories },
+        vetoReasons: { ...this._proactiveSummary.vetoReasons },
+      },
     };
   }
 }

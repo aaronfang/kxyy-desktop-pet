@@ -25,6 +25,7 @@ const FIELDS = [
   "realtimeConversationMode",
   "voiceVolume",
   "textProvider",
+  "webGroundingProvider",
   "textModel",
   "localTextModel",
   "localVlModel",
@@ -197,6 +198,8 @@ function fill(s) {
   el("personaCardId").value = s.personaCardId || "";
   if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
+  el("webGroundingEnabled").checked = s.webGroundingEnabled === true;
+  el("webGroundingProvider").value = "none";
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
   el("localVlModel").value = s.localVlModel || "";
@@ -581,6 +584,8 @@ function collect() {
     showChatDebug: el("showChatDebug").checked,
     vadShadowEnabled: el("vadShadowEnabled").checked,
     textProvider: currentTextProvider(),
+    webGroundingEnabled: el("webGroundingEnabled").checked,
+    webGroundingProvider: "none",
     textModel: el("textModel").value,
     localTextModel: el("localTextModel").value.trim(),
     localVlModel: el("localVlModel").value.trim(),
