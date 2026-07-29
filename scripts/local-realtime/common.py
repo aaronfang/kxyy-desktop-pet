@@ -566,8 +566,25 @@ PROACTIVE_WELCOME_PROMPT = (
     "（内部控制：实时通话刚接通，用户还没开口。请按当前人设自然地先打招呼，"
     "顺手抛一个轻松、很容易回应的小话题。只说一到两句，不要解释任务，不要催促用户。）"
 )
+PROACTIVE_FOLLOWUP_PROMPT = (
+    "（内部控制：用户暂时没有接话。沿着上一段实际播完的话题自然续说一小步，"
+    "先补充一个具体观点或细节，再留一个低负担回应口。只说一到两句，不要复述任务，"
+    "不要连续追问，也不要假装用户说过任何话。）"
+)
+PROACTIVE_IDLE_PROMPT = (
+    "（内部控制：当前话题已自然停顿较久。结合已有可听对话和系统提供的记忆线索，"
+    "换到一个轻松、安全且尚未重复的小话题；自己先分享观点或细节，再留一个容易回应的口。"
+    "只说一到两句，不要展示档案，不要把不确定记忆说成事实，不要假装用户说过任何话。）"
+)
+PROACTIVE_PROMPTS = {
+    "welcome": PROACTIVE_WELCOME_PROMPT,
+    "followup": PROACTIVE_FOLLOWUP_PROMPT,
+    "idle": PROACTIVE_IDLE_PROMPT,
+}
+PROACTIVE_KINDS = frozenset(("welcome", "followup", "idle", "memory", "commitment"))
 MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
 TURN_MEMORY_CAPABILITY = "turn-final-v1"
+TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1"
 
 
 def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> float:
@@ -577,6 +594,27 @@ def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> f
 TURN_MEMORY_WAIT_SECONDS = 0.1
 TURN_MEMORY_MAX_ITEMS = 3
 TURN_MEMORY_MAX_CHARS = 300
+
+
+def format_turn_temporal_context(value) -> str:
+    if not isinstance(value, dict):
+        return ""
+    date = value.get("date")
+    clock = value.get("time")
+    weekday = value.get("weekday")
+    timezone = value.get("timeZone")
+    if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return ""
+    if not isinstance(clock, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock):
+        return ""
+    if weekday not in ("周一", "周二", "周三", "周四", "周五", "周六", "周日"):
+        return ""
+    if not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+:/-]{1,64}", timezone):
+        return ""
+    return (
+        f"当前设备本地时间：{date} {weekday} {clock}（{timezone}）。"
+        "这是本轮新鲜时间；只用于回答日期时间和理解时段，不据此编造天气、位置或正在进行的活动。"
+    )
 INTERRUPTION_HINT_MIN_SAMPLES = OUTPUT_RATE
 INTERRUPTION_RECEIPT_WAIT_SECONDS = 0.05
 INTERRUPTION_HINT_TEXT = (
@@ -592,9 +630,57 @@ CONTINUATION_HINT_TEXT = (
     "用户刚才是在停顿后继续补充同一轮内容。结合上一条用户消息理解完整意图，"
     "只回答一次，不要分别回答或提及系统取消了上一版回复。"
 )
+ACKNOWLEDGE_HINT_TEXT = (
+    "用户只是简短表示听到了。沿当前话题自然补一个具体细节，不要把这句当成新事实，"
+    "也不要立刻连发问题。"
+)
+AMUSED_HINT_TEXT = (
+    "用户表现出轻松或被逗乐。顺着这个情绪自然接一句，再推进当前话题一点；"
+    "不要夸大用户情绪，也不要重复笑声凑回应。"
+)
+CURIOUS_HINT_TEXT = (
+    "用户在简短地表示好奇。直接补充最相关的具体信息，再留一个低负担回应口；"
+    "不要把简短追问误判成换话题。"
+)
+AGREE_HINT_TEXT = (
+    "用户在简短表示认同。自然承接并推进一个新细节，不要反复确认认同，"
+    "也不要把认同扩写成用户没有说过的观点。"
+)
+RESUME_HINT_TEXT = (
+    "用户明确邀请你恢复或继续陪聊。自然接回当前话题，多说一个具体细节；"
+    "不要解释暂停机制，也不要为刚才安静而道歉。"
+)
+REDIRECT_HINT_TEXT = "用户明确要求换话题。立即停止原话题，跟随用户的新方向，不要追问为什么。"
+PAUSE_HINT_TEXT = (
+    "用户明确要求暂停主动陪聊。只用一句很短的话确认你会安静等待，不要展开话题或继续提问。"
+)
 CONTINUATION_WINDOW_SECONDS = 8.0
 LLM_REPLY_MAX_CHARS = 4096
 STABLE_SENTENCE_MIN_CHARS = 6
+
+
+def classify_realtime_conversation_turn(text: str) -> str:
+    """Fixed local policy for proactive controls; never delegates permission to the LLM."""
+
+    value = str(text or "").strip()
+    if not value:
+        return "silence"
+    compact = re.sub(r"[。！!？?，,\s]+$", "", value)
+    if re.fullmatch(r"(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?)", compact):
+        return "pause"
+    if re.search(r"换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个", compact):
+        return "redirect"
+    if re.fullmatch(r"(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)", compact):
+        return "resume"
+    if re.fullmatch(r"(?:嗯+|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)", compact):
+        return "acknowledge"
+    if re.fullmatch(r"(?:哈{2,}|嘿{2,}|呵{2,}|笑死(?:我了)?|太逗了|有意思|真好笑)", compact):
+        return "amused"
+    if re.fullmatch(r"(?:是吗|真的(?:啊|吗)?|然后呢|后来呢|还有呢|怎么说|为什么(?:呀|啊)?)", compact):
+        return "curious"
+    if re.fullmatch(r"(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理)", compact):
+        return "agree"
+    return "substantive"
 
 
 def format_turn_memory_context(items) -> str:
@@ -2261,6 +2347,8 @@ class Session:
         self.tts_streaming = "none"
         self.interruption_hint = "none"
         self.memory_context = "none"
+        self.temporal_context = "none"
+        self._turn_temporal_context = ""
         self.proactive_turn = "none"
         self._last_proactive_trigger_id = 0
         self._proactive_response_generation: int | None = None
@@ -2634,6 +2722,14 @@ class Session:
                 else "none"
             )
         )
+        offered_temporal_context = msg.get("temporalContext")
+        self.temporal_context = (
+            TEMPORAL_CONTEXT_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and isinstance(offered_temporal_context, list)
+            and TEMPORAL_CONTEXT_CAPABILITY in offered_temporal_context
+            else "none"
+        )
         offered_proactive_turn = msg.get("proactiveTurn")
         self.proactive_turn = (
             PROACTIVE_TURN_CAPABILITY
@@ -2652,6 +2748,7 @@ class Session:
                 "ttsStream": self.tts_streaming,
                 "interruptionHint": self.interruption_hint,
                 "memoryContext": self.memory_context,
+                "temporalContext": self.temporal_context,
                 "proactiveTurn": self.proactive_turn,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
@@ -2662,16 +2759,29 @@ class Session:
 
     async def on_proactive_turn(self, msg: dict) -> None:
         trigger_id = msg.get("triggerId")
+        kind = msg.get("kind")
         valid_id = (
             isinstance(trigger_id, int)
             and not isinstance(trigger_id, bool)
             and 1 <= trigger_id <= 0xFFFFFFFF
             and trigger_id > self._last_proactive_trigger_id
         )
+        veto_reason = "limit"
+        if self.in_speech or self.candidate_emitted:
+            veto_reason = "speech"
+        elif self.asr_scope is not None or (self.asr_task is not None and not self.asr_task.done()):
+            veto_reason = "asr"
+        elif self._busy():
+            veto_reason = "reply"
+        elif self.playing:
+            veto_reason = "playback"
+        elif self._pending_playback_segments:
+            veto_reason = "receipt"
         accepted = bool(
             self.proactive_turn == PROACTIVE_TURN_CAPABILITY
             and valid_id
-            and msg.get("kind") == "welcome"
+            and kind in PROACTIVE_KINDS
+            and kind in PROACTIVE_PROMPTS
             and not self.closed
             and not self.in_speech
             and not self.candidate_emitted
@@ -2690,6 +2800,7 @@ class Session:
                         "type": "proactive_turn_status",
                         "triggerId": trigger_id,
                         "state": "vetoed",
+                        "reason": veto_reason,
                     }
                 )
             return
@@ -2706,10 +2817,28 @@ class Session:
                 "type": "proactive_turn_status",
                 "triggerId": trigger_id,
                 "state": "accepted",
+                "generation": scope.generation,
             }
         )
         self.reply_task = asyncio.create_task(
-            self._reply_pipeline("", scope, proactive_kind="welcome")
+            self._proactive_reply_pipeline(scope, kind)
+        )
+
+    async def _proactive_reply_pipeline(
+        self, scope: GenerationCancelScope, kind: str
+    ) -> None:
+        memory_context = await self._request_turn_memory(
+            scope,
+            reason="proactive-topic" if kind in ("idle", "memory", "commitment") else "turn",
+        )
+        if not scope.active:
+            return
+        await self._reply_pipeline(
+            "",
+            scope,
+            proactive_kind=kind,
+            memory_context=memory_context,
+            temporal_context=self._turn_temporal_context,
         )
 
     async def send_vad_shadow_summary(self, *, final: bool) -> bool:
@@ -2771,16 +2900,28 @@ class Session:
             or waiter[1].done()
         ):
             return
+        self._turn_temporal_context = (
+            format_turn_temporal_context(msg.get("temporalContext"))
+            if self.temporal_context == TEMPORAL_CONTEXT_CAPABILITY
+            else ""
+        )
         waiter[1].set_result(format_turn_memory_context(msg.get("items")))
 
-    async def _request_turn_memory(self, scope: GenerationCancelScope) -> str:
+    async def _request_turn_memory(
+        self, scope: GenerationCancelScope, *, reason: str = "turn"
+    ) -> str:
         if self.memory_context != TURN_MEMORY_CAPABILITY or not scope.active:
             return ""
+        self._turn_temporal_context = ""
         future = self.loop.create_future()
         self._memory_context_waiter = (scope.generation, future)
         try:
             if not await self.send_json(
-                {"type": "memory_context_request"}, scope=scope
+                {
+                    "type": "memory_context_request",
+                    "reason": "proactive-topic" if reason == "proactive-topic" else "turn",
+                },
+                scope=scope,
             ):
                 return ""
             try:
@@ -3146,6 +3287,7 @@ class Session:
             turn_memory_context = await self._request_turn_memory(scope)
             if not scope.active:
                 return
+            turn_temporal_context = self._turn_temporal_context
             scope.promote("response")
             if self.asr_scope is scope:
                 self.asr_scope = None
@@ -3161,6 +3303,11 @@ class Session:
                 )
             if turn_memory_context:
                 reply_kwargs["memory_context"] = turn_memory_context
+            if turn_temporal_context:
+                reply_kwargs["temporal_context"] = turn_temporal_context
+            turn_policy = classify_realtime_conversation_turn(cleaned)
+            if turn_policy != "substantive":
+                reply_kwargs["turn_policy"] = turn_policy
             reply_coro = self._reply_pipeline(cleaned, scope, **reply_kwargs)
             self.reply_task = asyncio.create_task(reply_coro)
         except asyncio.CancelledError:
@@ -3200,7 +3347,9 @@ class Session:
         interruption_hint: bool = False,
         continuation_hint: bool = False,
         memory_context: str = "",
+        temporal_context: str = "",
         proactive_kind: str = "",
+        turn_policy: str = "substantive",
     ) -> None:
         sentences = StableSentenceBuffer(min_chars=REALTIME_TTS_MIN_CHARS)
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
@@ -3209,11 +3358,13 @@ class Session:
             t1 = time.perf_counter()
             history_snapshot = (
                 self._audible_history.begin_proactive_turn(scope.generation)
-                if proactive_kind == "welcome"
+                if proactive_kind
                 else self._audible_history.begin_turn(scope.generation, text)
             )
             if memory_context:
                 history_snapshot.append({"role": "system", "content": memory_context})
+            if temporal_context:
+                history_snapshot.append({"role": "system", "content": temporal_context})
             if interruption_hint:
                 history_snapshot.append(
                     {"role": "system", "content": INTERRUPTION_HINT_TEXT}
@@ -3222,8 +3373,19 @@ class Session:
                 history_snapshot.append(
                     {"role": "system", "content": CONTINUATION_HINT_TEXT}
                 )
+            policy_hint = {
+                "acknowledge": ACKNOWLEDGE_HINT_TEXT,
+                "amused": AMUSED_HINT_TEXT,
+                "curious": CURIOUS_HINT_TEXT,
+                "agree": AGREE_HINT_TEXT,
+                "resume": RESUME_HINT_TEXT,
+                "redirect": REDIRECT_HINT_TEXT,
+                "pause": PAUSE_HINT_TEXT,
+            }.get(turn_policy)
+            if policy_hint:
+                history_snapshot.append({"role": "system", "content": policy_hint})
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
-            request_text = PROACTIVE_WELCOME_PROMPT if proactive_kind == "welcome" else text
+            request_text = PROACTIVE_PROMPTS.get(proactive_kind, text)
             start_llm_stream_producer(
                 self.system_role,
                 history_snapshot,

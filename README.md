@@ -2,7 +2,7 @@
 
 一个会在桌面散步、攀爬、陪你聊天的跨平台桌宠。支持 **Windows / macOS**，基于 **Tauri 2 + Rust + WebView**。
 
-当前正式版：[`v0.2.45`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.45)
+当前正式版：[`v0.2.46`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.46)
 
 ## 先用起来
 

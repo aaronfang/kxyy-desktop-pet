@@ -31,7 +31,10 @@ import {
   getFollowupUserTrigger,
   isBadFollowupReply,
   detectDeepIntent,
+  detectShortTermConversationMood,
+  buildRelationshipMoodHint,
   computeLiveContext,
+  computeTemporalContextData,
   parseBilingualReply,
   stripSpeakBlockForDisplay,
   needsBilingualTts,
@@ -50,6 +53,7 @@ import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlayback
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
+import { fetchWebObservations, renderWebObservationBlock } from "./ai/web-observations.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
@@ -58,6 +62,7 @@ import {
   recallRealtimeMemory,
   formatRealtimeMemoryHints,
   selectRealtimeMemoryItems,
+  takeFreshRealtimeMemoryItems,
   REALTIME_TURN_MEMORY_TIMEOUT_MS,
 } from "./realtime-memory.js";
 import {
@@ -1377,6 +1382,10 @@ async function buildRequestMessages(opts = {}) {
     memory: null,
     profile,
   });
+  const relationshipMoodPrompt = buildRelationshipMoodHint(
+    profile,
+    detectShortTermConversationMood(lastRealUserMessage()?.content || ""),
+  );
   let memoryPrompt = "";
   if (!opts.proactiveKind && activeName) {
     const last = lastRealUserMessage();
@@ -1427,13 +1436,25 @@ async function buildRequestMessages(opts = {}) {
       if (chatDebugEnabled()) console.warn("[memory] recall unavailable", e);
     }
   }
+  let webPrompt = "";
+  if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
+    const query = lastRealUserMessage()?.content || "";
+    const observations = await fetchWebObservations({
+      enabled: true,
+      provider: settings.webGroundingProvider || "none",
+      query,
+      apiBase,
+    });
+    webPrompt = renderWebObservationBlock(observations);
+    if (chatDebugEnabled()) console.log("[web-observations]", { count: observations.length });
+  }
   const maxTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
   const stickerFreq = isKxyyPersona(settings.personaCardId) ? STICKER_FREQUENCY : "off";
   const reqDebug = `cardId=${settings.personaCardId} sticker=${stickerFreq} sys=${(systemPrompt || "").substring(0,60)}`;
   console.log("[buildRequestMessages]", reqDebug);
   if (apiDebugMetaEl) { apiDebugMetaEl.textContent = "REQ " + reqDebug; apiDebugMetaEl.title = reqDebug; }
   return buildMessages({
-    systemPrompt: systemPrompt + memoryPrompt,
+    systemPrompt: systemPrompt + relationshipMoodPrompt + memoryPrompt + webPrompt,
     fewShot: assets.fewShot,
     history,
     maxTurns,
@@ -1877,6 +1898,7 @@ let callAsstText = "";
 let callAsstGeneration = null;
 let callLastUserMessageId = "";
 let callAudibleTurns = new Map();
+let callProactiveMemoryIds = new Set();
 let callWaveSpeaking = false;
 const MAX_CALL_AUDIBLE_TURNS = 4;
 const CALL_CLEANUP_WAIT_MS = 1500;
@@ -2216,14 +2238,19 @@ function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
   void maybeUpdateRecap();
 }
 
-async function provideTurnMemoryContext(session, generation) {
+async function provideTurnMemoryContext(session, generation, reason = "turn") {
+  const temporalContext = computeTemporalContextData(new Date());
   if (!session || !activeName || !Number.isSafeInteger(generation)) {
-    session?.sendMemoryContext?.({ generation, items: [] });
+    session?.sendMemoryContext?.({ generation, items: [], temporalContext });
     return;
   }
   const last = history.find((message) => message.id === callLastUserMessageId);
-  if (!last || last.role !== "user" || !last.call || !(last.content || "").trim()) {
-    session.sendMemoryContext({ generation, items: [] });
+  const proactiveTopic = reason === "proactive-topic";
+  if (
+    !proactiveTopic &&
+    (!last || last.role !== "user" || !last.call || !(last.content || "").trim())
+  ) {
+    session.sendMemoryContext({ generation, items: [], temporalContext });
     return;
   }
   const items = await recallRealtimeMemory(
@@ -2231,16 +2258,21 @@ async function provideTurnMemoryContext(session, generation) {
     {
       cardId: settings.personaCardId || "",
       nickname: activeName,
-      query: last.content,
+      query: proactiveTopic ? "" : last.content,
+      reason: proactiveTopic ? "proactive-topic" : "turn",
       imageCaption: "",
       maxItems: 3,
     },
     { timeoutMs: REALTIME_TURN_MEMORY_TIMEOUT_MS },
   );
   if (!callActive || callSession !== session) return;
+  const freshItems = proactiveTopic
+    ? takeFreshRealtimeMemoryItems(items, callProactiveMemoryIds)
+    : items;
   session.sendMemoryContext({
     generation,
-    items: selectRealtimeMemoryItems(items),
+    items: selectRealtimeMemoryItems(freshItems),
+    temporalContext,
   });
 }
 
@@ -2261,6 +2293,7 @@ async function startCall() {
   callAsstGeneration = null;
   callLastUserMessageId = "";
   callAudibleTurns = new Map();
+  callProactiveMemoryIds = new Set();
   lastCallTraceSnapshot = null;
   if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "";
 
@@ -2290,8 +2323,8 @@ async function startCall() {
     // ASR 全文是覆盖式更新；只在 asr_end 定稿，避免中间态被标成 final 时切成多条。
     onAsr: (text) => upsertCallUserBubble(text, { interim: true }),
     onAsrEnd: () => finalizeCallUserBubble(),
-    onMemoryContextRequest: ({ generation }) => {
-      void provideTurnMemoryContext(session, generation);
+    onMemoryContextRequest: ({ generation, reason }) => {
+      void provideTurnMemoryContext(session, generation, reason);
     },
     onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
     onAssistantEnd: () => finalizeCallAsstBubble(),

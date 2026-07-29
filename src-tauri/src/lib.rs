@@ -128,6 +128,12 @@ struct Settings {
     /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
     #[serde(default = "default_text_provider")]
     text_provider: String,
+    /// 时下信息网页观察；默认关闭。当前仅预留 provider-neutral 契约。
+    #[serde(default)]
+    web_grounding_enabled: bool,
+    /// 网页观察 provider；无已配置 adapter 时固定为 `none`。
+    #[serde(default)]
+    web_grounding_provider: String,
     /// 本地文字模型 tag（Ollama），空则用推荐默认 `qwen3:14b`。
     #[serde(default)]
     local_text_model: String,
@@ -295,6 +301,8 @@ impl Settings {
             realtime_conversation_mode: default_realtime_conversation_mode(),
             text_model: String::new(),
             text_provider: default_text_provider(),
+            web_grounding_enabled: false,
+            web_grounding_provider: String::new(),
             local_text_model: String::new(),
             local_vl_model: String::new(),
             vl_provider: default_vl_provider(),
@@ -342,6 +350,8 @@ pub(crate) struct AiConfig {
     pub text_model: String,
     /// 文字服务商：`deepseek` / `local`（Ollama）。
     pub text_provider: String,
+    pub web_grounding_enabled: bool,
+    pub web_grounding_provider: String,
     /// 本地文字模型 tag（Ollama），空则由 api.rs 兜底 `local_text::DEFAULT_MODEL`。
     pub local_text_model: String,
     /// 本地看图 VL 模型 tag（Ollama），空则由 api.rs 兜底默认 `minicpm-v:8b`。
@@ -372,6 +382,8 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
         qwen_vl_key: s.qwen_vl_key,
         text_model: s.text_model,
         text_provider: s.text_provider,
+        web_grounding_enabled: s.web_grounding_enabled,
+        web_grounding_provider: s.web_grounding_provider,
         local_text_model: s.local_text_model,
         local_vl_model: s.local_vl_model,
         vl_provider: s.vl_provider,
@@ -1333,6 +1345,10 @@ struct AiSettingsInput {
     #[serde(default = "default_text_provider")]
     text_provider: String,
     #[serde(default)]
+    web_grounding_enabled: bool,
+    #[serde(default)]
+    web_grounding_provider: String,
+    #[serde(default)]
     local_text_model: String,
     #[serde(default)]
     local_vl_model: String,
@@ -1428,6 +1444,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
             _ => "deepseek".into(),
+        };
+        s.web_grounding_enabled = settings.web_grounding_enabled;
+        s.web_grounding_provider = match settings.web_grounding_provider.trim() {
+            "none" | "" => "none".into(),
+            _ => "none".into(),
         };
         s.local_text_model = settings.local_text_model.trim().to_string();
         s.local_vl_model = settings.local_vl_model.trim().to_string();

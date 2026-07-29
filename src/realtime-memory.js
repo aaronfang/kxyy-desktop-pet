@@ -12,6 +12,7 @@ export const REALTIME_MEMORY_MAX_ITEMS = 3;
 export const REALTIME_MEMORY_MAX_CHARS = 300;
 export const REALTIME_MEMORY_TIMEOUT_MS = 120;
 export const REALTIME_TURN_MEMORY_TIMEOUT_MS = 80;
+export const REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX = 8;
 
 const LABELS = Object.freeze({
   fact: "事实",
@@ -46,6 +47,22 @@ function itemPriority(item) {
   const pinned = item?.pinned ? 2 : 0;
   const commitment = item?.kind === "commitment" ? 1 : 0;
   return pinned + commitment;
+}
+
+/** Keep proactive topic candidates fresh within one call without persisting their ids. */
+export function takeFreshRealtimeMemoryItems(items, usedIds) {
+  if (!Array.isArray(items) || !(usedIds instanceof Set)) return [];
+  const fresh = [];
+  for (const item of items) {
+    const id = typeof item?.id === "string" ? item.id.trim() : "";
+    if (!id || usedIds.has(id)) continue;
+    fresh.push(item);
+    usedIds.add(id);
+    while (usedIds.size > REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX) {
+      usedIds.delete(usedIds.values().next().value);
+    }
+  }
+  return fresh;
 }
 
 /** 生成可经实时私有协议传递的有界记忆卡片，不传来源正文、分数或其它字段。 */

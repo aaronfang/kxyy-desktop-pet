@@ -206,6 +206,18 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         (Method::Post, "/api/chat") => {
             proxy_chat(app, client, request);
         }
+        (Method::Post, "/api/web-observations") => {
+            let cfg = crate::ai_config(app);
+            let status =
+                web_observation_status(cfg.web_grounding_enabled, &cfg.web_grounding_provider);
+            let body = serde_json::json!({
+                "status": status,
+                "provider": "none",
+                "items": []
+            })
+            .to_string();
+            respond_json(request, 200, body);
+        }
         // 阶段 2·D：火山引擎语音合成，前端 tts.js POST 文本，回 audio/mpeg。
         (Method::Post, "/api/tts") => {
             proxy_tts(app, client, request);
@@ -784,12 +796,22 @@ fn should_passthrough_internal_sse(
     stream && force == Some("text") && !use_vision && trusted
 }
 
+fn web_observation_status(enabled: bool, provider: &str) -> &'static str {
+    if !enabled {
+        "disabled"
+    } else if provider.trim().eq_ignore_ascii_case("none") || provider.trim().is_empty() {
+        "unconfigured"
+    } else {
+        "unconfigured"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         apply_deepseek_generation_options, header, internal_secret_matches,
         normalize_deepseek_model, req_header, should_passthrough_internal_sse,
-        DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
+        web_observation_status, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
     };
     use std::io::Cursor;
     use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
@@ -832,6 +854,17 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn web_observations_fail_closed_without_a_configured_adapter() {
+        assert_eq!(web_observation_status(false, "none"), "disabled");
+        assert_eq!(web_observation_status(true, ""), "unconfigured");
+        assert_eq!(web_observation_status(true, "none"), "unconfigured");
+        assert_eq!(
+            web_observation_status(true, "future-provider"),
+            "unconfigured"
+        );
     }
 
     #[test]
