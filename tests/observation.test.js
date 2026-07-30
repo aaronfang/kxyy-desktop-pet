@@ -42,6 +42,7 @@ test("web observations require source, timestamp and safe non-executable text", 
 
 test("current-information detection is narrow and deterministic", () => {
   assert.equal(needsCurrentWebInformation("今天上海天气怎么样"), true);
+  assert.equal(needsCurrentWebInformation("帮我查一下上海周末的展览"), true);
   assert.equal(needsCurrentWebInformation("你喜欢吃什么"), false);
 });
 
@@ -49,25 +50,27 @@ test("web adapter is disabled by default and failures fail closed", async () => 
   let calls = 0;
   const fetchImpl = async () => {
     calls += 1;
-    return { ok: true, json: async () => ({ items: [{ title: "新闻", sourceUrl: "https://example.com/n", fetchedAt: "2026-07-29T12:00:00Z", text: "一条新闻" }] }) };
+    return { ok: true, json: async () => ({ status: "ok", provider: "tavily", items: [{ title: "新闻", sourceUrl: "https://example.com/n", fetchedAt: "2026-07-29T12:00:00Z", text: "一条新闻" }] }) };
   };
   assert.deepEqual(await fetchWebObservations({ query: "最新新闻", fetchImpl }), []);
   assert.equal(calls, 0);
-  const items = await fetchWebObservations({ enabled: true, provider: "fixture", query: "最新新闻", apiBase: "http://127.0.0.1:1234", fetchImpl });
+  const items = await fetchWebObservations({ enabled: true, provider: "tavily", query: "最新新闻", apiBase: "http://127.0.0.1:1234", fetchImpl });
   assert.equal(items.length, 1);
   assert.equal(calls, 1);
-  assert.deepEqual(await fetchWebObservations({ enabled: true, provider: "fixture", query: "最新新闻", apiBase: "https://remote.example", fetchImpl }), []);
+  assert.deepEqual(await fetchWebObservations({ enabled: true, provider: "tavily", query: "最新新闻", apiBase: "https://remote.example", fetchImpl }), []);
 });
 
 test("fake adapter data reaches a bounded source-and-time prompt block", async () => {
   const items = await fetchWebObservations({
     enabled: true,
-    provider: "fixture",
+    provider: "tavily",
     query: "今天上海天气怎么样",
     apiBase: "http://127.0.0.1:4321",
     fetchImpl: async () => ({
       ok: true,
       json: async () => ({
+        status: "ok",
+        provider: "tavily",
         items: [{
           title: "上海气象服务",
           sourceUrl: "https://example.com/shanghai-weather",

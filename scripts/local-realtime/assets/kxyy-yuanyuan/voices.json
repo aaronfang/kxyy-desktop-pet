@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "voices": [
+    {
+      "id": "top-01-utt_9627ec90ea95",
+      "label": "音色 01 · 最高相似度",
+      "referenceId": "utt_9627ec90ea95",
+      "audio": "utt_9627ec90ea95.wav",
+      "text": "你看这假发它一直很多小碎发你们知道吗，不是这样真头发不这样是吗，我是头发，塞了一升菌，我有一个那个一升菌那个奶",
+      "score": 0.705453,
+      "source": "src_05",
+      "sha256": "36cb5754af0cec5335c617152e8e60ce30ff113dd75a2325cb8b5428897ea8f1"
+    },
+    {
+      "id": "top-02-utt_6c1df874b5cf",
+      "label": "音色 02 · 高相似度",
+      "referenceId": "utt_6c1df874b5cf",
+      "audio": "utt_6c1df874b5cf.wav",
+      "text": "我哭哭一顿整了,一顿迅速啊，谢谢妈妈桑，谢谢礼西宝贝,谢谢宝贝,谢谢宝贝",
+      "score": 0.695162,
+      "source": "src_03",
+      "sha256": "c10c5c81ada2ee1e4ff95a1474c1e6f093e35a1b7fccbb3e379ed106e7c7d6a5"
+    },
+    {
+      "id": "top-03-utt_5ddd742c7b76",
+      "label": "音色 03 · 高相似度",
+      "referenceId": "utt_5ddd742c7b76",
+      "audio": "utt_5ddd742c7b76.wav",
+      "text": "他這個重粉技是什麼東西，現在已經開始PK了，我看我現在他已經開始好像已經比上賽了",
+      "score": 0.675161,
+      "source": "src_14",
+      "sha256": "418711758d606987babdca597509c4177a1166255ee2e0536843b067b042b8ac"
+    },
+    {
+      "id": "top-04-utt_556f6e551772",
+      "label": "音色 04 · 高相似度",
+      "referenceId": "utt_556f6e551772",
+      "audio": "utt_556f6e551772.wav",
+      "text": "啊1.2倍1.2倍，这一套的话，其实不用太长时间，成绩都温柔了，现在现在是半决赛",
+      "score": 0.67356,
+      "source": "src_10",
+      "sha256": "6f4dab78eddeddeb8002407a7a36ae09a201d97e10f9d067b5422999060abeee"
+    },
+    {
+      "id": "top-05-utt_b26b8f2ec4ac",
+      "label": "音色 05 · 高相似度",
+      "referenceId": "utt_b26b8f2ec4ac",
+      "audio": "utt_b26b8f2ec4ac.wav",
+      "text": "咱们现在上随便上随便上了咱们现在，咱们还有还有五分钟还有五分半的，有机会赢吗，有机会赢呢当然有机会赢了",
+      "score": 0.654834,
+      "source": "src_04",
+      "sha256": "7362ef8153e57a0b1223d95d456b6f596a9bece055cca84bdd984514065c6380"
+    },
+    {
+      "id": "legacy-12s",
+      "label": "旧参考音 · 最早基线",
+      "referenceId": "control-current",
+      "audio": "ref.wav",
+      "text": "对的，这是先实验一个小聚会，然后这个要是成功了的话，咱们之后就可以再换一个地方，然后之后咱们办一个稍微大一点的，然后去的可以稍微多一点，因为现在太敏感了。现在的话, 这个时候, 嗯这两天就很敏感",
+      "score": null,
+      "source": "legacy",
+      "legacy": true,
+      "sha256": "db9d3eefcffb36e09396326a7ab842d08fdd10ae73aefab2adbefb0cd399ef34"
+    }
+  ]
+}
