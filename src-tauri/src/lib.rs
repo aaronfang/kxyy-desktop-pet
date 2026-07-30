@@ -104,6 +104,9 @@ struct Settings {
     /// 参考音频对应文案（可留空）。
     #[serde(default)]
     local_ref_text: String,
+    /// 本地发布音色 preset；由 Python 在每句合成前热加载，不触发服务重启。
+    #[serde(default)]
+    local_voice_preset: String,
     /// AI 语音播放音量（0–200，100 = 原音量）；作用于朗读与实时通话下行。
     #[serde(default = "default_voice_volume")]
     voice_volume: u32,
@@ -128,12 +131,15 @@ struct Settings {
     /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
     #[serde(default = "default_text_provider")]
     text_provider: String,
-    /// 时下信息网页观察；默认关闭。当前仅预留 provider-neutral 契约。
+    /// 时下信息网页观察；默认关闭，仅在用户明确选择 provider 后生效。
     #[serde(default)]
     web_grounding_enabled: bool,
-    /// 网页观察 provider；无已配置 adapter 时固定为 `none`。
+    /// 网页观察 provider：`none` / `tavily`。
     #[serde(default)]
     web_grounding_provider: String,
+    /// Tavily Search API Key。持久化在本机，由 Rust 代理用于固定搜索端点。
+    #[serde(default)]
+    tavily_api_key: String,
     /// 本地文字模型 tag（Ollama），空则用推荐默认 `qwen3:14b`。
     #[serde(default)]
     local_text_model: String,
@@ -246,6 +252,18 @@ fn default_voice_volume() -> u32 {
     100
 }
 
+fn normalize_local_voice_preset(value: &str) -> String {
+    match value.trim() {
+        "top-01-utt_9627ec90ea95"
+        | "top-02-utt_6c1df874b5cf"
+        | "top-03-utt_5ddd742c7b76"
+        | "top-04-utt_556f6e551772"
+        | "top-05-utt_b26b8f2ec4ac"
+        | "legacy-12s" => value.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
 /// 本地语音服务端口（scripts/local-realtime/）：WS 通话 + HTTP 朗读（port+100）。
 /// 端口选择 19876-19877（>15000）以避开 Windows 动态端口范围（1024-15000），
 /// 避免与系统临时客户端端口（如 RabbitMQ）冲突导致 WinError 10013。
@@ -293,6 +311,7 @@ impl Settings {
             cosyvoice_model: String::new(),
             local_ref_wav: String::new(),
             local_ref_text: String::new(),
+            local_voice_preset: String::new(),
             voice_volume: default_voice_volume(),
             show_chat_debug: false,
             vad_shadow_enabled: false,
@@ -303,6 +322,7 @@ impl Settings {
             text_provider: default_text_provider(),
             web_grounding_enabled: false,
             web_grounding_provider: String::new(),
+            tavily_api_key: String::new(),
             local_text_model: String::new(),
             local_vl_model: String::new(),
             vl_provider: default_vl_provider(),
@@ -352,6 +372,7 @@ pub(crate) struct AiConfig {
     pub text_provider: String,
     pub web_grounding_enabled: bool,
     pub web_grounding_provider: String,
+    pub tavily_api_key: String,
     /// 本地文字模型 tag（Ollama），空则由 api.rs 兜底 `local_text::DEFAULT_MODEL`。
     pub local_text_model: String,
     /// 本地看图 VL 模型 tag（Ollama），空则由 api.rs 兜底默认 `minicpm-v:8b`。
@@ -384,6 +405,7 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
         text_provider: s.text_provider,
         web_grounding_enabled: s.web_grounding_enabled,
         web_grounding_provider: s.web_grounding_provider,
+        tavily_api_key: s.tavily_api_key,
         local_text_model: s.local_text_model,
         local_vl_model: s.local_vl_model,
         vl_provider: s.vl_provider,
@@ -1329,6 +1351,8 @@ struct AiSettingsInput {
     local_ref_wav: String,
     #[serde(default)]
     local_ref_text: String,
+    #[serde(default)]
+    local_voice_preset: String,
     #[serde(default = "default_voice_volume")]
     voice_volume: u32,
     #[serde(default = "default_true")]
@@ -1348,6 +1372,8 @@ struct AiSettingsInput {
     web_grounding_enabled: bool,
     #[serde(default)]
     web_grounding_provider: String,
+    #[serde(default)]
+    tavily_api_key: String,
     #[serde(default)]
     local_text_model: String,
     #[serde(default)]
@@ -1432,6 +1458,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.cosyvoice_model = settings.cosyvoice_model.trim().to_string();
         s.local_ref_wav = settings.local_ref_wav.trim().to_string();
         s.local_ref_text = settings.local_ref_text.trim().to_string();
+        s.local_voice_preset = normalize_local_voice_preset(&settings.local_voice_preset);
         s.voice_volume = settings.voice_volume.min(200);
         s.show_chat_debug = settings.show_chat_debug;
         s.vad_shadow_enabled = settings.vad_shadow_enabled;
@@ -1446,10 +1473,16 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             _ => "deepseek".into(),
         };
         s.web_grounding_enabled = settings.web_grounding_enabled;
-        s.web_grounding_provider = match settings.web_grounding_provider.trim() {
-            "none" | "" => "none".into(),
+        s.web_grounding_provider = match settings
+            .web_grounding_provider
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tavily" => "tavily".into(),
             _ => "none".into(),
         };
+        s.tavily_api_key = settings.tavily_api_key.trim().to_string();
         s.local_text_model = settings.local_text_model.trim().to_string();
         s.local_vl_model = settings.local_vl_model.trim().to_string();
         s.vl_provider = match settings.vl_provider.trim().to_ascii_lowercase().as_str() {
@@ -1789,8 +1822,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_asr_provider, normalize_realtime_conversation_mode,
-        normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
+        normalize_asr_provider, normalize_local_voice_preset,
+        normalize_realtime_conversation_mode, normalize_turn_pause_tolerance,
+        voice_config_fingerprint, Settings,
     };
 
     #[test]
@@ -1853,5 +1887,20 @@ mod tests {
         let follow_user = voice_config_fingerprint(&settings);
         settings.realtime_conversation_mode = "ai-leads".into();
         assert_eq!(follow_user, voice_config_fingerprint(&settings));
+    }
+
+    #[test]
+    fn local_voice_preset_is_allowlisted_without_restarting_voice_service() {
+        assert_eq!(
+            normalize_local_voice_preset(" top-01-utt_9627ec90ea95 "),
+            "top-01-utt_9627ec90ea95"
+        );
+        assert_eq!(normalize_local_voice_preset("legacy-12s"), "legacy-12s");
+        assert!(normalize_local_voice_preset("unknown").is_empty());
+
+        let mut settings = Settings::defaults();
+        let baseline = voice_config_fingerprint(&settings);
+        settings.local_voice_preset = "top-01-utt_9627ec90ea95".into();
+        assert_eq!(baseline, voice_config_fingerprint(&settings));
     }
 }

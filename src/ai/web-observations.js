@@ -3,9 +3,10 @@ import { sanitizeObservationText } from "./observation.js";
 export const WEB_OBSERVATION_MAX_ITEMS = 4;
 export const WEB_OBSERVATION_ITEM_MAX_CHARS = 600;
 export const WEB_OBSERVATION_BLOCK_MAX_CHARS = 1800;
-export const WEB_OBSERVATION_TIMEOUT_MS = 800;
+export const WEB_OBSERVATION_TIMEOUT_MS = 5000;
 
-const CURRENT_INFO_RE = /今天|现在|刚刚|最新|近期|最近|新闻|热搜|天气|气温|比赛|比分|赛程|票房|价格|汇率|股价|发布|更新|政策|节日|哪天|几号/;
+const CURRENT_INFO_RE = /今天|现在|刚刚|最新|近期|最近|新闻|热搜|天气|气温|比赛|比分|赛程|票房|价格|汇率|股价|发布|更新|政策|节日|哪天|几号|查一下|查查|搜索|搜一下|联网|网上|网页/;
+const SUPPORTED_PROVIDERS = new Set(["tavily"]);
 
 export function needsCurrentWebInformation(text) {
   return CURRENT_INFO_RE.test(String(text || "").trim());
@@ -72,10 +73,10 @@ export async function fetchWebObservations({
   fetchImpl = globalThis.fetch,
   timeoutMs = WEB_OBSERVATION_TIMEOUT_MS,
 } = {}) {
-  if (!enabled || provider === "none" || !needsCurrentWebInformation(query)) return [];
+  if (!enabled || !SUPPORTED_PROVIDERS.has(provider) || !needsCurrentWebInformation(query)) return [];
   if (!apiBase.startsWith("http://127.0.0.1:") && !apiBase.startsWith("http://localhost:")) return [];
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(50, Math.min(2000, timeoutMs)));
+  const timer = setTimeout(() => controller.abort(), Math.max(50, Math.min(6000, timeoutMs)));
   try {
     const response = await fetchImpl(`${apiBase}/api/web-observations`, {
       method: "POST",
@@ -85,6 +86,7 @@ export async function fetchWebObservations({
     });
     if (!response?.ok) return [];
     const payload = await response.json();
+    if (payload?.status !== "ok" || payload?.provider !== provider) return [];
     return normalizeWebObservations(payload?.items);
   } catch {
     return [];

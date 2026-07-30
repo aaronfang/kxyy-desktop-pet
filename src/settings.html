@@ -102,15 +102,25 @@
 
           <label class="row-inline">
             <input id="webGroundingEnabled" type="checkbox" />
-            <span>允许时下信息观察<small>默认关闭；仅在配置受支持的搜索 adapter 后生效</small></span>
+            <span>允许时下信息观察<small>默认关闭；只在问题明确需要最新信息或要求搜索时联网</small></span>
           </label>
           <label>
             <span>网页观察服务</span>
             <select id="webGroundingProvider">
               <option value="none">未配置</option>
+              <option value="tavily">Tavily Search</option>
             </select>
           </label>
-          <p class="hint">当前版本只提供带来源、时间和大小上限的安全接口，不会自动选择或调用收费搜索服务。未配置时会明确降级为空观察。</p>
+          <div id="webGroundingFieldsTavily" hidden>
+            <label>
+              <span>Tavily API Key<small>搜索内容会发送给 Tavily；Key 仅保存在本机，<a href="https://app.tavily.com/home" target="_blank" rel="noreferrer">获取 Key</a></small></span>
+              <div class="pw-field">
+                <input id="tavilyApiKey" type="password" placeholder="tvly-..." autocomplete="off" />
+                <button type="button" class="pw-toggle" data-target="tavilyApiKey" aria-label="显示 / 隐藏">👁</button>
+              </div>
+            </label>
+          </div>
+          <p class="hint">每次最多取 4 条基础搜索摘要，并限制来源、抓取时间和注入长度；网页内容只作为不可信资料，不会写入长期记忆或改变人设。搜索失败时继续普通对话。</p>
 
           <div class="memory-actions">
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
@@ -187,6 +197,13 @@
 
           <div id="voiceFieldsRef" class="voice-backend-fields" hidden>
             <label>
+              <span>发布音色<small>5 个自动评分最高音色 + 最早旧基线；保存后下一句热加载</small></span>
+              <select id="localVoicePreset">
+                <option value="">默认参考音（按人设卡）</option>
+              </select>
+            </label>
+            <p id="localVoicePresetMeta" class="hint">未选择发布音色时，使用当前人设卡的内置参考音。手动填写参考音频会覆盖菜单选择。</p>
+            <label>
               <span>参考音频<small>本地克隆音色用；10~20s 单人清晰录音，wav/mp3</small></span>
               <div class="file-field">
                 <input id="localRefWav" type="text" placeholder="/路径/voice.wav（或相对仓库根路径）" />
@@ -197,7 +214,7 @@
               <span>参考音文案<small>与录音内容一致，可留空（留空克隆质量略降）</small></span>
               <input id="localRefText" type="text" placeholder="录音里说的那句话" />
             </label>
-            <p class="hint">本地 Qwen3-TTS 为<strong>零样本克隆，不训练音色</strong>：填入录音后<strong>保存</strong>即按此录音克隆（会重启语音服务）。<strong>留空则使用当前人设卡的内置参考音色</strong>（随人设切换自动更换）。</p>
+            <p class="hint">本地 Qwen3-TTS 为<strong>零样本克隆，不训练音色</strong>。选择上方发布音色后，Python 服务会在下一句合成前读取新参考音，不重启服务；手动填写参考音频仍会覆盖菜单选择。</p>
           </div>
 
           <div id="voiceFieldsVolc" class="voice-backend-fields" hidden>

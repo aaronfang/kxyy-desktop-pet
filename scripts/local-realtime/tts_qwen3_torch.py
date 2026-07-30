@@ -17,13 +17,16 @@ settings.json（可选）：
   qwen3ModelDir   本地权重目录，或 HF/ModelScope 模型 id（空值使用平台默认）
   qwen3Language   合成语言（Auto / Chinese / English …），默认 Auto
 
-参考音：优先 settings.localRefWav / localRefText；留空则按 settings.personaCardId
-从 scripts/local-realtime/assets/<cardId>/ref.* 加载（默认卡 kxyy-yuanyuan）。
+参考音：优先 settings.localRefWav / localRefText；其次使用设置页 allow-list 的
+settings.localVoicePreset，从 scripts/local-realtime/assets/kxyy-yuanyuan/voices.json
+按 SHA-256 加载；留空则按 settings.personaCardId 从 assets/<cardId>/ref.* 加载。
 """
 
 from __future__ import annotations
 
 from collections import deque
+import hashlib
+import json
 import os
 import sys
 from concurrent.futures import Executor
@@ -45,6 +48,9 @@ _ref_wav: "Path | None" = None
 _ref_text = ""
 _language = "Auto"
 _faster_streaming = False
+_custom_speaker: "str | None" = None
+_auto_reference_mtime_ns: "int | None" = None
+_reference_selection_key: "str | None" = None
 _tts_executor: "Executor | None" = None
 _model_gate = BoundedSemaphore(1)
 
@@ -61,10 +67,135 @@ FASTER_STREAM_RAW_MAX_SECONDS = 60
 FASTER_LEADING_RMS_THRESHOLD = 0.006
 FASTER_LEADING_PREROLL_CHUNKS = 2
 _FASTER_STREAM_DONE = object()
+AUTO_REFERENCE_MANIFEST = (
+    common.REPO / "scripts" / "qwen3-finetune" / "work" / "active-reference.json"
+)
+VOICE_PRESET_CATALOG = (
+    common.REPO / "scripts" / "local-realtime" / "assets" / "kxyy-yuanyuan" / "voices.json"
+)
+VOICE_PRESET_IDS = frozenset(
+    {
+        "top-01-utt_9627ec90ea95",
+        "top-02-utt_6c1df874b5cf",
+        "top-03-utt_5ddd742c7b76",
+        "top-04-utt_556f6e551772",
+        "top-05-utt_b26b8f2ec4ac",
+        "legacy-12s",
+    }
+)
 
 # 朗读文本清洗（去神态括号、规范省略号）与 common 共用；Base 模型不支持情绪指令，
 # 故仅做文本清洗，不注入情绪描述。
 text_for_speech = common.text_for_speech
+
+
+def _validated_auto_reference(settings: dict) -> "tuple[Path, str] | None":
+    """Load the locally promoted reference without overriding an explicit setting."""
+    if (settings.get("localRefWav") or "").strip() or not AUTO_REFERENCE_MANIFEST.is_file():
+        return None
+    try:
+        item = json.loads(AUTO_REFERENCE_MANIFEST.read_text(encoding="utf-8"))
+        if (
+            item.get("schemaVersion") != 1
+            or item.get("validationPasses") is not True
+            or item.get("selectionMode") not in (None, "manual-gallery")
+        ):
+            return None
+        audio = Path(item["audio"]).resolve()
+        allowed = (common.REPO / "scripts" / "qwen3-finetune" / "work").resolve()
+        audio.relative_to(allowed)
+        text = str(item.get("text") or "").strip()
+        expected_hash = str(item.get("audioSha256") or "")
+        if not audio.is_file() or not 8 <= len(text) <= 200 or len(expected_hash) != 64:
+            return None
+        if hashlib.sha256(audio.read_bytes()).hexdigest() != expected_hash:
+            return None
+        return audio, text
+    except (KeyError, OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _validated_voice_preset(settings: dict) -> "tuple[Path, str] | None":
+    """Load one of the six bundled, hash-locked references."""
+    if (settings.get("localRefWav") or "").strip():
+        return None
+    preset_id = str(settings.get("localVoicePreset") or "").strip()
+    if not preset_id or preset_id not in VOICE_PRESET_IDS or not VOICE_PRESET_CATALOG.is_file():
+        return None
+    try:
+        catalog = json.loads(VOICE_PRESET_CATALOG.read_text(encoding="utf-8"))
+        if catalog.get("schemaVersion") != 1:
+            return None
+        entries = catalog.get("voices")
+        if not isinstance(entries, list) or len(entries) > len(VOICE_PRESET_IDS):
+            return None
+        item = next((entry for entry in entries if entry.get("id") == preset_id), None)
+        if not isinstance(item, dict):
+            return None
+        audio_root = VOICE_PRESET_CATALOG.parent
+        audio = (audio_root / str(item.get("audio") or "")).resolve()
+        audio.relative_to(audio_root.resolve())
+        text = str(item.get("text") or "").strip()
+        expected_hash = str(item.get("sha256") or "").lower()
+        if (
+            audio.suffix.lower() != ".wav"
+            or not audio.is_file()
+            or not 8 <= len(text) <= 200
+            or len(expected_hash) != 64
+        ):
+            return None
+        if hashlib.sha256(audio.read_bytes()).hexdigest() != expected_hash:
+            return None
+        return audio, text
+    except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _refresh_auto_reference() -> None:
+    """Pick up a preset/gallery selection between utterances without restarting."""
+    global _ref_wav, _ref_text, _prompt, _auto_reference_mtime_ns, _reference_selection_key
+    if _custom_speaker:
+        return
+    settings = common.load_settings()
+    if (settings.get("localRefWav") or "").strip():
+        return
+
+    preset_id = str(settings.get("localVoicePreset") or "").strip()
+    selected = None
+    selection_key = None
+    if "localVoicePreset" in settings:
+        if preset_id:
+            selected = _validated_voice_preset(settings)
+            if selected is None:
+                common.log(f"发布音色 preset 校验失败，保留当前音色: {preset_id}")
+                return
+            selection_key = f"preset:{preset_id}"
+        else:
+            # 用户显式选回默认时，忽略旧的 gallery manifest，恢复人设卡内置参考音。
+            try:
+                selected = common.ensure_ref_wav()
+            except (OSError, RuntimeError, SystemExit):
+                return
+            selection_key = f"builtin:{selected[0].resolve()}"
+    elif AUTO_REFERENCE_MANIFEST.is_file():
+        try:
+            mtime_ns = AUTO_REFERENCE_MANIFEST.stat().st_mtime_ns
+        except OSError:
+            return
+        selected = _validated_auto_reference(settings)
+        if selected is None:
+            return
+        _auto_reference_mtime_ns = mtime_ns
+        selection_key = f"gallery:{mtime_ns}"
+    else:
+        return
+
+    if selection_key == _reference_selection_key:
+        return
+    _reference_selection_key = selection_key
+    _ref_wav, _ref_text = selected
+    _prompt = None
+    common.log(f"已刷新参考音 ({len(_ref_text)} chars)")
 
 
 def _resolve_model() -> str:
@@ -84,13 +215,33 @@ def _resolve_model() -> str:
     return raw
 
 
+def _custom_speaker_from_model(model_id: str) -> "str | None":
+    """Return the sole local custom speaker; Base/remote models remain clone mode."""
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("tts_model_type") != "custom_voice":
+        return None
+    speakers = (config.get("talker_config") or {}).get("spk_id") or {}
+    if not isinstance(speakers, dict) or len(speakers) != 1:
+        raise RuntimeError("Qwen3-TTS custom checkpoint 必须且只能包含一个 speaker")
+    speaker = next(iter(speakers))
+    if not isinstance(speaker, str) or not speaker.strip():
+        raise RuntimeError("Qwen3-TTS custom checkpoint speaker 无效")
+    return speaker.strip()
+
+
 def configure_from_settings(tts_executor: "Executor | None" = None) -> None:
-    global _model, _prompt, _ref_wav, _ref_text, _language
-    global _faster_streaming, _tts_executor
+    global _model, _prompt, _ref_wav, _ref_text, _language, _auto_reference_mtime_ns, _reference_selection_key
+    global _faster_streaming, _tts_executor, _custom_speaker
     s = common.load_settings()
     _tts_executor = tts_executor
     _faster_streaming = False
+    _custom_speaker = None
     _prompt = None
+    _auto_reference_mtime_ns = None
+    _reference_selection_key = None
     _language = (
         (s.get("qwen3Language") or os.environ.get("QWEN3_TTS_LANG") or "Auto").strip()
         or "Auto"
@@ -109,8 +260,27 @@ def configure_from_settings(tts_executor: "Executor | None" = None) -> None:
         ) from e
 
     model_id = _resolve_model()
+    _custom_speaker = _custom_speaker_from_model(model_id)
     _ref_wav, _ref_text = common.ensure_ref_wav()
-    common.log(f"参考音已就绪 ({len(_ref_text)} chars)")
+    automatic_reference = _validated_voice_preset(s)
+    automatic_key = f"preset:{str(s.get('localVoicePreset') or '').strip()}" if automatic_reference is not None else None
+    if automatic_reference is None and "localVoicePreset" not in s:
+        automatic_reference = _validated_auto_reference(s)
+        if automatic_reference is not None:
+            try:
+                automatic_key = f"gallery:{AUTO_REFERENCE_MANIFEST.stat().st_mtime_ns}"
+            except OSError:
+                automatic_key = "gallery:initial"
+    if automatic_reference is not None and not _custom_speaker:
+        _ref_wav, _ref_text = automatic_reference
+        _reference_selection_key = automatic_key
+        try:
+            _auto_reference_mtime_ns = AUTO_REFERENCE_MANIFEST.stat().st_mtime_ns
+        except OSError:
+            _auto_reference_mtime_ns = None
+        common.log(f"已启用自动验证参考音 ({len(_ref_text)} chars)")
+    else:
+        common.log(f"参考音已就绪 ({len(_ref_text)} chars)")
 
     has_cuda = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
     if has_cuda:
@@ -142,10 +312,15 @@ def configure_from_settings(tts_executor: "Executor | None" = None) -> None:
                 attn_implementation=attn,
                 backend="torch",
             )
-            stream_method = getattr(_model, "generate_voice_clone_streaming", None)
+            stream_name = (
+                "generate_custom_voice_streaming"
+                if _custom_speaker
+                else "generate_voice_clone_streaming"
+            )
+            stream_method = getattr(_model, stream_name, None)
             if not callable(stream_method):
                 raise RuntimeError("faster-qwen3-tts 缺少公开流式 API")
-            _warm_faster_reference_cache(_model)
+            _warm_faster_cache(_model)
             _prompt = None
             _faster_streaming = True
             common.log(
@@ -198,33 +373,41 @@ def configure_from_settings(tts_executor: "Executor | None" = None) -> None:
             dtype=dtype,
         )
 
-    # 预构建参考音 prompt，避免每次合成重复提取说话人特征。
-    try:
-        _prompt = _model.create_voice_clone_prompt(
-            ref_audio=str(_ref_wav),
-            ref_text=_ref_text,
-            x_vector_only_mode=not bool(_ref_text),
-        )
-        common.log("参考音 prompt 就绪")
-    except Exception as e:
-        _prompt = None
-        common.log(f"预构建参考音 prompt 失败（改为每次合成时传参）：{e}")
+    # 预构建参考音 prompt，避免 Base 模型每次合成重复提取说话人特征。
+    if not _custom_speaker:
+        try:
+            _prompt = _model.create_voice_clone_prompt(
+                ref_audio=str(_ref_wav),
+                ref_text=_ref_text,
+                x_vector_only_mode=not bool(_ref_text),
+            )
+            common.log("参考音 prompt 就绪")
+        except Exception as e:
+            _prompt = None
+            common.log(f"预构建参考音 prompt 失败（改为每次合成时传参）：{e}")
 
     common.log(f"Qwen3-TTS 就绪 (official buffered) model={model_id} lang={_language}")
 
 
-def _warm_faster_reference_cache(model) -> None:
-    """Prime reference extraction and fully drain one short same-mode generation."""
-    generator = model.generate_voice_clone_streaming(
+def _warm_faster_cache(model) -> None:
+    """Prime the active generation mode and fully drain one short result."""
+    kwargs = dict(
         text="你好",
         language=_language,
-        ref_audio=str(_ref_wav),
-        ref_text=_ref_text,
         max_new_tokens=FASTER_WARMUP_MAX_NEW_TOKENS,
         non_streaming_mode=True,
         chunk_size=FASTER_WARMUP_CHUNK_STEPS,
-        parity_mode=FASTER_PARITY_MODE,
     )
+    if _custom_speaker:
+        kwargs["speaker"] = _custom_speaker
+        generator = model.generate_custom_voice_streaming(**kwargs)
+    else:
+        kwargs.update(
+            ref_audio=str(_ref_wav),
+            ref_text=_ref_text,
+            parity_mode=FASTER_PARITY_MODE,
+        )
+        generator = model.generate_voice_clone_streaming(**kwargs)
     try:
         audio_chunks = 0
         while True:
@@ -255,16 +438,29 @@ def _wav_to_pcm24k(audio, sr: int) -> bytes:
 
 
 def streaming_supported() -> bool:
+    method_name = (
+        "generate_custom_voice_streaming"
+        if _custom_speaker
+        else "generate_voice_clone_streaming"
+    )
     return bool(
         _faster_streaming
         and _model is not None
         and _tts_executor is not None
-        and callable(getattr(_model, "generate_voice_clone_streaming", None))
+        and callable(getattr(_model, method_name, None))
     )
 
 
 def _voice_clone_kwargs(spoken: str) -> dict:
     kwargs = dict(text=spoken, language=_language)
+    if _custom_speaker:
+        kwargs["speaker"] = _custom_speaker
+        if _faster_streaming:
+            kwargs.update(
+                max_new_tokens=FASTER_MAX_NEW_TOKENS,
+                non_streaming_mode=True,
+            )
+        return kwargs
     if _faster_streaming:
         kwargs.update(
             ref_audio=str(_ref_wav),
@@ -281,6 +477,7 @@ def _voice_clone_kwargs(spoken: str) -> dict:
 
 
 def synth_tts(text: str) -> bytes:
+    _refresh_auto_reference()
     if _model is None or _ref_wav is None:
         raise RuntimeError("Qwen3-TTS 未加载")
     spoken = text_for_speech(text) or (text or "").strip()
@@ -292,7 +489,10 @@ def synth_tts(text: str) -> bytes:
         raise RuntimeError("Qwen3-TTS 正忙，请稍后再试")
     try:
         common.log(f"Qwen3-TTS chars={len(spoken)} lang={_language}")
-        wavs, sr = _model.generate_voice_clone(**_voice_clone_kwargs(spoken))
+        if _custom_speaker:
+            wavs, sr = _model.generate_custom_voice(**_voice_clone_kwargs(spoken))
+        else:
+            wavs, sr = _model.generate_voice_clone(**_voice_clone_kwargs(spoken))
     finally:
         _model_gate.release()
     if not wavs:
@@ -303,6 +503,8 @@ def synth_tts(text: str) -> bytes:
 def _create_faster_stream(spoken: str):
     kwargs = _voice_clone_kwargs(spoken)
     kwargs["chunk_size"] = FASTER_STREAMING_CHUNK_STEPS
+    if _custom_speaker:
+        return _model.generate_custom_voice_streaming(**kwargs)
     kwargs["parity_mode"] = FASTER_PARITY_MODE
     return _model.generate_voice_clone_streaming(**kwargs)
 
@@ -389,6 +591,7 @@ async def synth_tts_stream(text: str):
     """Pull the public faster-qwen3-tts iterator one provider chunk at a time."""
     import asyncio
 
+    _refresh_auto_reference()
     if not streaming_supported() or _ref_wav is None:
         raise RuntimeError("Qwen3-TTS 流式输出当前不可用")
     spoken = text_for_speech(text) or (text or "").strip()

@@ -1,7 +1,10 @@
 import asyncio
 import array
+import hashlib
 import importlib.util
+import json
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -487,6 +490,23 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
             torch_backend.WINDOWS_DEFAULT_MODEL,
             "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         )
+
+    def test_custom_checkpoint_requires_exactly_one_named_speaker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(
+                '{"tts_model_type":"custom_voice","talker_config":{"spk_id":{"yuanyuan":3000}}}',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                torch_backend._custom_speaker_from_model(str(root)), "yuanyuan"
+            )
+            (root / "config.json").write_text(
+                '{"tts_model_type":"custom_voice","talker_config":{"spk_id":{}}}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "只能包含一个 speaker"):
+                torch_backend._custom_speaker_from_model(str(root))
         self.assertEqual(
             torch_backend.DEFAULT_MODEL,
             torch_backend.WINDOWS_DEFAULT_MODEL
@@ -501,6 +521,7 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
         self.model = types.SimpleNamespace(generate_voice_clone_streaming=lambda **_kwargs: None)
         torch_backend._tts_executor = self.pool
         torch_backend._faster_streaming = True
+        torch_backend._custom_speaker = None
         torch_backend._model = self.model
         torch_backend._ref_wav = Path("/fake/ref.wav")
         torch_backend._ref_text = "reference"
@@ -563,7 +584,7 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
         original_convert = torch_backend._convert_faster_chunk
         torch_backend._convert_faster_chunk = lambda _audio, _rate: (b"warm",)
         try:
-            torch_backend._warm_faster_reference_cache(self.model)
+            torch_backend._warm_faster_cache(self.model)
         finally:
             torch_backend._convert_faster_chunk = original_convert
 
@@ -584,6 +605,182 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
+
+    def test_auto_reference_requires_validation_hash_and_yields_to_explicit_setting(self):
+        original_repo = common.REPO
+        original_manifest = torch_backend.AUTO_REFERENCE_MANIFEST
+        original_ref_wav = torch_backend._ref_wav
+        original_ref_text = torch_backend._ref_text
+        original_prompt = torch_backend._prompt
+        original_mtime = torch_backend._auto_reference_mtime_ns
+        original_custom = torch_backend._custom_speaker
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            work = repo / "scripts" / "qwen3-finetune" / "work"
+            work.mkdir(parents=True)
+            audio = work / "winner.wav"
+            audio.write_bytes(b"validated-reference")
+            manifest = work / "active-reference.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "validationPasses": True,
+                        "audio": str(audio),
+                        "text": "这是一条通过自动验收的参考音文案",
+                        "audioSha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            common.REPO = repo
+            torch_backend.AUTO_REFERENCE_MANIFEST = manifest
+            try:
+                selected_audio, selected_text = torch_backend._validated_auto_reference({})
+                self.assertTrue(selected_audio.samefile(audio))
+                self.assertEqual(selected_text, "这是一条通过自动验收的参考音文案")
+                torch_backend._custom_speaker = None
+                torch_backend._ref_wav = Path("/old/ref.wav")
+                torch_backend._ref_text = "old"
+                torch_backend._prompt = object()
+                torch_backend._auto_reference_mtime_ns = -1
+                torch_backend._refresh_auto_reference()
+                self.assertTrue(torch_backend._ref_wav.samefile(audio))
+                self.assertEqual(torch_backend._ref_text, "这是一条通过自动验收的参考音文案")
+                self.assertIsNone(torch_backend._prompt)
+                self.assertIsNone(
+                    torch_backend._validated_auto_reference({"localRefWav": "manual.wav"})
+                )
+                item = json.loads(manifest.read_text(encoding="utf-8"))
+                item["selectionMode"] = "manual-gallery"
+                manifest.write_text(json.dumps(item), encoding="utf-8")
+                self.assertTrue(
+                    torch_backend._validated_auto_reference({})[0].samefile(audio)
+                )
+                item["selectionMode"] = "untrusted"
+                manifest.write_text(json.dumps(item), encoding="utf-8")
+                self.assertIsNone(torch_backend._validated_auto_reference({}))
+                item["selectionMode"] = "manual-gallery"
+                item["audioSha256"] = "0" * 64
+                manifest.write_text(json.dumps(item), encoding="utf-8")
+                self.assertIsNone(torch_backend._validated_auto_reference({}))
+            finally:
+                common.REPO = original_repo
+                torch_backend.AUTO_REFERENCE_MANIFEST = original_manifest
+                torch_backend._ref_wav = original_ref_wav
+                torch_backend._ref_text = original_ref_text
+                torch_backend._prompt = original_prompt
+                torch_backend._auto_reference_mtime_ns = original_mtime
+                torch_backend._custom_speaker = original_custom
+
+    def test_bundled_voice_preset_is_hash_locked_and_hot_swappable(self):
+        original_catalog = torch_backend.VOICE_PRESET_CATALOG
+        original_load_settings = common.load_settings
+        original_ref_wav = torch_backend._ref_wav
+        original_ref_text = torch_backend._ref_text
+        original_prompt = torch_backend._prompt
+        original_selection_key = torch_backend._reference_selection_key
+        original_custom = torch_backend._custom_speaker
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_root = root / "scripts" / "local-realtime" / "assets" / "kxyy-yuanyuan"
+            audio_root.mkdir(parents=True)
+            first_audio = audio_root / "first.wav"
+            second_audio = audio_root / "second.wav"
+            first_audio.write_bytes(b"first-reference")
+            second_audio.write_bytes(b"second-reference")
+            catalog = audio_root / "voices.json"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "voices": [
+                            {
+                                "id": "top-01-utt_9627ec90ea95",
+                                "audio": first_audio.name,
+                                "text": "第一条发布参考音文案足够长",
+                                "sha256": hashlib.sha256(first_audio.read_bytes()).hexdigest(),
+                            },
+                            {
+                                "id": "top-02-utt_6c1df874b5cf",
+                                "audio": second_audio.name,
+                                "text": "第二条发布参考音文案足够长",
+                                "sha256": hashlib.sha256(second_audio.read_bytes()).hexdigest(),
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            settings = {"localVoicePreset": "top-01-utt_9627ec90ea95"}
+            torch_backend.VOICE_PRESET_CATALOG = catalog
+            common.load_settings = lambda: dict(settings)
+            torch_backend._custom_speaker = None
+            torch_backend._ref_wav = Path("/old/ref.wav")
+            torch_backend._ref_text = "old"
+            torch_backend._prompt = object()
+            torch_backend._reference_selection_key = None
+
+            selected = torch_backend._validated_voice_preset(settings)
+            self.assertIsNotNone(selected)
+            self.assertTrue(selected[0].samefile(first_audio))
+            self.assertIsNone(
+                torch_backend._validated_voice_preset(
+                    {"localVoicePreset": "not-allowlisted"}
+                )
+            )
+            self.assertIsNone(
+                torch_backend._validated_voice_preset(
+                    {
+                        "localVoicePreset": "top-01-utt_9627ec90ea95",
+                        "localRefWav": "manual.wav",
+                    }
+                )
+            )
+            first_audio.write_bytes(b"tampered-reference")
+            self.assertIsNone(torch_backend._validated_voice_preset(settings))
+            first_audio.write_bytes(b"first-reference")
+
+            torch_backend._refresh_auto_reference()
+            self.assertTrue(torch_backend._ref_wav.samefile(first_audio))
+            self.assertIsNone(torch_backend._prompt)
+            settings["localVoicePreset"] = "top-02-utt_6c1df874b5cf"
+            torch_backend._prompt = object()
+            torch_backend._refresh_auto_reference()
+            self.assertTrue(torch_backend._ref_wav.samefile(second_audio))
+            self.assertIsNone(torch_backend._prompt)
+        torch_backend.VOICE_PRESET_CATALOG = original_catalog
+        common.load_settings = original_load_settings
+        torch_backend._ref_wav = original_ref_wav
+        torch_backend._ref_text = original_ref_text
+        torch_backend._prompt = original_prompt
+        torch_backend._reference_selection_key = original_selection_key
+        torch_backend._custom_speaker = original_custom
+
+    def test_custom_stream_uses_unique_speaker_without_reference_or_parity(self):
+        calls = []
+        provider = PullGenerator([])
+        self.model.generate_custom_voice_streaming = lambda **kwargs: (
+            calls.append(kwargs) or provider
+        )
+        torch_backend._custom_speaker = "yuanyuan"
+
+        self.assertIs(torch_backend._create_faster_stream("你好"), provider)
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "text": "你好",
+                    "language": "Chinese",
+                    "speaker": "yuanyuan",
+                    "max_new_tokens": torch_backend.FASTER_MAX_NEW_TOKENS,
+                    "non_streaming_mode": True,
+                    "chunk_size": torch_backend.FASTER_STREAMING_CHUNK_STEPS,
+                }
+            ],
+        )
+        self.assertTrue(torch_backend.streaming_supported())
 
     async def test_stream_is_pull_based_without_prefetch(self):
         provider = PullGenerator(
