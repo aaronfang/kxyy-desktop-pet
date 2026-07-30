@@ -4,6 +4,8 @@
 //!
 //! 只做「薄代理」：不落地、不缓存、不改协议——上游改了契约时改这里即可，改动面小。
 
+use std::io::Read;
+
 use tauri::AppHandle;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -16,6 +18,11 @@ const VL_MODEL: &str = "qwen3-vl-plus";
 const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 // 仅受托管本地语音子进程携带；普通 WebView 请求不得用它绕过 Windows SSE 缓冲路径。
 const INTERNAL_SECRET_HEADER: &str = "X-Kxyy-Internal-Secret";
+const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
+const WEB_QUERY_MAX_CHARS: usize = 300;
+const WEB_RESPONSE_MAX_BYTES: u64 = 256 * 1024;
+const WEB_RESULT_MAX_ITEMS: usize = 4;
+const WEB_RESULT_TEXT_MAX_CHARS: usize = 700;
 
 /// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
 fn normalize_deepseek_model(configured: &str, thinking: bool) -> &'static str {
@@ -207,16 +214,7 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
             proxy_chat(app, client, request);
         }
         (Method::Post, "/api/web-observations") => {
-            let cfg = crate::ai_config(app);
-            let status =
-                web_observation_status(cfg.web_grounding_enabled, &cfg.web_grounding_provider);
-            let body = serde_json::json!({
-                "status": status,
-                "provider": "none",
-                "items": []
-            })
-            .to_string();
-            respond_json(request, 200, body);
+            proxy_web_observations(app, client, request);
         }
         // 阶段 2·D：火山引擎语音合成，前端 tts.js POST 文本，回 audio/mpeg。
         (Method::Post, "/api/tts") => {
@@ -796,22 +794,200 @@ fn should_passthrough_internal_sse(
     stream && force == Some("text") && !use_vision && trusted
 }
 
-fn web_observation_status(enabled: bool, provider: &str) -> &'static str {
+fn web_observation_status(enabled: bool, provider: &str, has_key: bool) -> &'static str {
     if !enabled {
         "disabled"
-    } else if provider.trim().eq_ignore_ascii_case("none") || provider.trim().is_empty() {
+    } else if !provider.trim().eq_ignore_ascii_case("tavily") || !has_key {
         "unconfigured"
     } else {
-        "unconfigured"
+        "ready"
     }
+}
+
+fn web_observation_json(status: &str, provider: &str, items: serde_json::Value) -> String {
+    serde_json::json!({
+        "status": status,
+        "provider": provider,
+        "items": items,
+    })
+    .to_string()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn normalize_web_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(compact.trim(), max_chars)
+}
+
+fn safe_web_source_url(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    if url.as_str().chars().count() > 512 {
+        return None;
+    }
+    Some(url.into())
+}
+
+fn normalize_tavily_items(payload: &serde_json::Value, fetched_at: &str) -> serde_json::Value {
+    let mut items = Vec::new();
+    for result in payload
+        .get("results")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .take(WEB_RESULT_MAX_ITEMS)
+    {
+        let title = result
+            .get("title")
+            .and_then(|value| value.as_str())
+            .map(|value| normalize_web_text(value, 120))
+            .unwrap_or_default();
+        let text = result
+            .get("content")
+            .and_then(|value| value.as_str())
+            .map(|value| normalize_web_text(value, WEB_RESULT_TEXT_MAX_CHARS))
+            .unwrap_or_default();
+        let source_url = result
+            .get("url")
+            .and_then(|value| value.as_str())
+            .and_then(safe_web_source_url);
+        if title.is_empty() || text.is_empty() || source_url.is_none() {
+            continue;
+        }
+        items.push(serde_json::json!({
+            "title": title,
+            "sourceUrl": source_url.unwrap_or_default(),
+            "fetchedAt": fetched_at,
+            "text": text,
+        }));
+    }
+    serde_json::Value::Array(items)
+}
+
+fn proxy_web_observations(
+    app: &AppHandle,
+    client: &reqwest::blocking::Client,
+    mut request: tiny_http::Request,
+) {
+    let cfg = crate::ai_config(app);
+    let status = web_observation_status(
+        cfg.web_grounding_enabled,
+        &cfg.web_grounding_provider,
+        !cfg.tavily_api_key.is_empty(),
+    );
+    if status != "ready" {
+        return respond_json(
+            request,
+            200,
+            web_observation_json(status, "none", serde_json::json!([])),
+        );
+    }
+
+    // 回环端点仍按不可信输入处理，限制请求体，且绝不接受任意上游 URL。
+    let mut raw = String::new();
+    if request
+        .as_reader()
+        .take(4097)
+        .read_to_string(&mut raw)
+        .is_err()
+        || raw.len() > 4096
+    {
+        return error_json(request, 400, "网页观察请求过大");
+    }
+    let body: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return error_json(request, 400, "网页观察请求不是合法 JSON"),
+    };
+    if body.get("provider").and_then(|value| value.as_str()) != Some("tavily") {
+        return error_json(request, 400, "网页观察服务不匹配");
+    }
+    let query = body
+        .get("query")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if query.is_empty() {
+        return error_json(request, 400, "网页观察查询不能为空");
+    }
+    let query = truncate_chars(query, WEB_QUERY_MAX_CHARS);
+    let upstream = client
+        .post(TAVILY_SEARCH_URL)
+        .timeout(std::time::Duration::from_secs(4))
+        .bearer_auth(&cfg.tavily_api_key)
+        .json(&serde_json::json!({
+            "query": query,
+            "topic": "general",
+            "search_depth": "basic",
+            "max_results": WEB_RESULT_MAX_ITEMS,
+            "include_answer": false,
+            "include_raw_content": false,
+            "include_images": false,
+        }))
+        .send();
+    let response = match upstream {
+        Ok(response) => response,
+        Err(_) => {
+            return respond_json(
+                request,
+                200,
+                web_observation_json("provider_error", "tavily", serde_json::json!([])),
+            )
+        }
+    };
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|len| len > WEB_RESPONSE_MAX_BYTES)
+    {
+        return respond_json(
+            request,
+            200,
+            web_observation_json("provider_error", "tavily", serde_json::json!([])),
+        );
+    }
+    let mut response_body = String::new();
+    if response
+        .take(WEB_RESPONSE_MAX_BYTES + 1)
+        .read_to_string(&mut response_body)
+        .is_err()
+        || response_body.len() as u64 > WEB_RESPONSE_MAX_BYTES
+    {
+        return respond_json(
+            request,
+            200,
+            web_observation_json("provider_error", "tavily", serde_json::json!([])),
+        );
+    }
+    let payload: serde_json::Value = match serde_json::from_str(&response_body) {
+        Ok(value) => value,
+        Err(_) => {
+            return respond_json(
+                request,
+                200,
+                web_observation_json("provider_error", "tavily", serde_json::json!([])),
+            )
+        }
+    };
+    let fetched_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let items = normalize_tavily_items(&payload, &fetched_at);
+    respond_json(request, 200, web_observation_json("ok", "tavily", items));
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         apply_deepseek_generation_options, header, internal_secret_matches,
-        normalize_deepseek_model, req_header, should_passthrough_internal_sse,
-        web_observation_status, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL,
+        normalize_deepseek_model, normalize_tavily_items, req_header, safe_web_source_url,
+        should_passthrough_internal_sse, web_observation_status, DEEPSEEK_FLASH_MODEL,
+        DEEPSEEK_PRO_MODEL,
     };
     use std::io::Cursor;
     use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
@@ -858,13 +1034,37 @@ mod tests {
 
     #[test]
     fn web_observations_fail_closed_without_a_configured_adapter() {
-        assert_eq!(web_observation_status(false, "none"), "disabled");
-        assert_eq!(web_observation_status(true, ""), "unconfigured");
-        assert_eq!(web_observation_status(true, "none"), "unconfigured");
+        assert_eq!(web_observation_status(false, "none", false), "disabled");
+        assert_eq!(web_observation_status(true, "", true), "unconfigured");
+        assert_eq!(web_observation_status(true, "none", true), "unconfigured");
         assert_eq!(
-            web_observation_status(true, "future-provider"),
+            web_observation_status(true, "future-provider", true),
             "unconfigured"
         );
+        assert_eq!(
+            web_observation_status(true, "tavily", false),
+            "unconfigured"
+        );
+        assert_eq!(web_observation_status(true, "tavily", true), "ready");
+    }
+
+    #[test]
+    fn tavily_results_are_bounded_and_drop_unsafe_urls() {
+        let payload = serde_json::json!({
+            "results": [
+                {"title": "  Example   News ", "url": "https://example.com/latest", "content": "fresh   summary"},
+                {"title": "Local", "url": "file:///etc/passwd", "content": "must drop"},
+                {"title": "Credentials", "url": "https://user:pass@example.com/", "content": "must drop"}
+            ]
+        });
+        let items = normalize_tavily_items(&payload, "2026-07-30T12:00:00.000Z");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["title"], "Example News");
+        assert_eq!(items[0]["text"], "fresh summary");
+        assert_eq!(items[0]["sourceUrl"], "https://example.com/latest");
+        assert!(safe_web_source_url("http://example.com/x").is_some());
+        assert!(safe_web_source_url("data:text/plain,no").is_none());
     }
 
     #[test]

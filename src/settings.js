@@ -1,6 +1,7 @@
 // 设置页：读取 / 写回 AI 与聊天配置（持久化在 settings.json）。
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { clearAllMemory, clearMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
+import { LOCAL_VOICE_PRESETS, localVoicePresetById } from "./ai/voice-presets.js";
 import { memoryHealthState } from "./memory-ui.js";
 
 const invoke = window.__TAURI__.core.invoke;
@@ -20,12 +21,14 @@ const FIELDS = [
   "cosyvoiceModel",
   "localRefWav",
   "localRefText",
+  "localVoicePreset",
   "asrProvider",
   "turnPauseTolerance",
   "realtimeConversationMode",
   "voiceVolume",
   "textProvider",
   "webGroundingProvider",
+  "tavilyApiKey",
   "textModel",
   "localTextModel",
   "localVlModel",
@@ -150,6 +153,41 @@ function syncTextFields() {
   }
 }
 
+function renderLocalVoicePresets() {
+  const select = el("localVoicePreset");
+  if (!select) return;
+  select.replaceChildren(new Option("默认参考音（按人设卡）", ""));
+  for (const preset of LOCAL_VOICE_PRESETS) {
+    const score = Number.isFinite(preset.score) ? ` · ${preset.score.toFixed(3)}` : "";
+    select.append(new Option(`${preset.label}${score}`, preset.id));
+  }
+}
+
+function syncLocalVoicePresetMeta() {
+  const select = el("localVoicePreset");
+  const meta = el("localVoicePresetMeta");
+  if (!select || !meta) return;
+  const preset = localVoicePresetById(select.value);
+  if (!preset) {
+    meta.textContent = "未选择发布音色时，使用当前人设卡的内置参考音。手动填写参考音频会覆盖菜单选择。";
+    return;
+  }
+  const score = Number.isFinite(preset.score) ? `CAM++ ${preset.score.toFixed(3)}` : "旧基线，无自动评分";
+  meta.textContent = `${preset.label} · ${score} · ${preset.legacy ? "最早内置参考" : `来源 ${preset.source}`} · 保存后下一句热加载`;
+}
+
+/** 网页观察只允许编译进 App 的固定 provider，不接受自定义端点。 */
+function currentWebGroundingProvider() {
+  return (el("webGroundingProvider")?.value || "none").toLowerCase() === "tavily"
+    ? "tavily"
+    : "none";
+}
+
+function syncWebGroundingFields() {
+  const fields = el("webGroundingFieldsTavily");
+  if (fields) fields.hidden = currentWebGroundingProvider() !== "tavily";
+}
+
 /** 视觉模型服务商：qwen（在线）/ local（本地 Ollama VL）。 */
 function currentVlProvider() {
   const v = (el("vlProvider").value || "qwen").toLowerCase();
@@ -176,6 +214,14 @@ function fill(s) {
   el("cosyvoiceModel").value = s.cosyvoiceModel || "";
   el("localRefWav").value = s.localRefWav || "";
   el("localRefText").value = s.localRefText || "";
+  renderLocalVoicePresets();
+  const selectedPreset = localVoicePresetById(s.localVoicePreset)?.id || "";
+  el("localVoicePreset").value = selectedPreset;
+  if (selectedPreset) {
+    el("localRefWav").value = "";
+    el("localRefText").value = "";
+  }
+  syncLocalVoicePresetMeta();
   el("asrProvider").value = s.asrProvider === "sensevoice" ? "sensevoice" : "whisper";
   el("turnPauseTolerance").value =
     s.turnPauseTolerance === "fast" || s.turnPauseTolerance === "long"
@@ -199,7 +245,9 @@ function fill(s) {
   if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("webGroundingEnabled").checked = s.webGroundingEnabled === true;
-  el("webGroundingProvider").value = "none";
+  el("webGroundingProvider").value = s.webGroundingProvider === "tavily" ? "tavily" : "none";
+  el("tavilyApiKey").value = s.tavilyApiKey || "";
+  syncWebGroundingFields();
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
   el("localVlModel").value = s.localVlModel || "";
@@ -311,7 +359,7 @@ const BUILTIN_LOCAL_VOICE_CARDS = new Set(["", "kxyy-yuanyuan", "bazi-persona", 
 /** 切人设时套用该卡语音：优先卡级覆盖，否则内置卡默认走 local 且参考音留空（后端按 personaCardId 解析）。 */
 function applyVoiceForCard(cardId) {
   const saved = loadCardVoice(cardId);
-  if (saved && (saved.backend || saved.voice || saved.refWav || saved.refText || saved.model)) {
+  if (saved && (saved.backend || saved.voice || saved.refWav || saved.refText || saved.preset || saved.model)) {
     el("realtimeBackend").value = normalizeBackend(saved.backend);
     el("ttsVoice").value = saved.voice || "";
     if (saved.backend === "volc" && saved.key) el("volcTtsKey").value = saved.key;
@@ -321,12 +369,20 @@ function applyVoiceForCard(cardId) {
     }
     el("localRefWav").value = saved.refWav || "";
     el("localRefText").value = saved.refText || "";
+    el("localVoicePreset").value = localVoicePresetById(saved.preset)?.id || "";
+    if (el("localVoicePreset").value) {
+      el("localRefWav").value = "";
+      el("localRefText").value = "";
+    }
+    syncLocalVoicePresetMeta();
     return;
   }
   if (BUILTIN_LOCAL_VOICE_CARDS.has(cardId || "")) {
     el("realtimeBackend").value = "local";
     el("localRefWav").value = "";
     el("localRefText").value = "";
+    el("localVoicePreset").value = "";
+    syncLocalVoicePresetMeta();
   }
 }
 
@@ -573,6 +629,7 @@ function collect() {
     cosyvoiceModel: el("cosyvoiceModel").value.trim(),
     localRefWav: el("localRefWav").value.trim(),
     localRefText: el("localRefText").value.trim(),
+    localVoicePreset: localVoicePresetById(el("localVoicePreset")?.value)?.id || "",
     asrProvider: currentAsrProvider(),
     turnPauseTolerance: currentTurnPauseTolerance(),
     realtimeConversationMode: currentRealtimeConversationMode(),
@@ -585,7 +642,8 @@ function collect() {
     vadShadowEnabled: el("vadShadowEnabled").checked,
     textProvider: currentTextProvider(),
     webGroundingEnabled: el("webGroundingEnabled").checked,
-    webGroundingProvider: "none",
+    webGroundingProvider: currentWebGroundingProvider(),
+    tavilyApiKey: el("tavilyApiKey").value.trim(),
     textModel: el("textModel").value,
     localTextModel: el("localTextModel").value.trim(),
     localVlModel: el("localVlModel").value.trim(),
@@ -633,11 +691,18 @@ async function save() {
     cosyvoiceVoice: bk === "cosyvoice" ? el("cosyvoiceVoice").value.trim() : undefined,
     refWav: bk === "local" ? el("localRefWav").value.trim() : undefined,
     refText: bk === "local" ? el("localRefText").value.trim() : undefined,
+    preset: bk === "local" ? localVoicePresetById(el("localVoicePreset")?.value)?.id : undefined,
   });
   saveBtn.disabled = true;
   statusEl.textContent = "";
   try {
     const payload = collect();
+    if (payload.webGroundingEnabled && payload.webGroundingProvider === "none") {
+      throw new Error("请先选择网页观察服务");
+    }
+    if (payload.webGroundingEnabled && payload.webGroundingProvider === "tavily" && !payload.tavilyApiKey) {
+      throw new Error("请填写 Tavily API Key");
+    }
     await invoke("set_ai_settings", { settings: payload });
     // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
     emit("apply-settings", payload);
@@ -897,8 +962,22 @@ el("textProvider").addEventListener("change", () => {
   syncTextFields();
   probeLocalTextStatus();
 });
+el("webGroundingProvider")?.addEventListener("change", syncWebGroundingFields);
 el("vlProvider").addEventListener("change", syncVlFields);
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
+el("localVoicePreset")?.addEventListener("change", () => {
+  if (localVoicePresetById(el("localVoicePreset").value)) {
+    el("localRefWav").value = "";
+    el("localRefText").value = "";
+  }
+  syncLocalVoicePresetMeta();
+});
+el("localRefWav")?.addEventListener("input", () => {
+  if (el("localRefWav").value.trim()) {
+    el("localVoicePreset").value = "";
+    syncLocalVoicePresetMeta();
+  }
+});
 
 el("installVadShadow")?.addEventListener("click", async () => {
   const btn = el("installVadShadow");

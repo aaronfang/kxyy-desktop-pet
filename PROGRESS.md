@@ -1,0 +1,30 @@
+# Qwen3-TTS 单人微调进度
+
+- 目标：从已授权直播语音筛选 30–60 分钟，训练 0.6B 单人模型并接入真流式。
+- 顺序：数据审计 → 0.6B SFT → 与当前 1.7B 零样本盲测/指标比较 → custom voice 流式接入。
+- 环境：RTX 5080 16GB；torch 2.11.0+cu128/sm_120；qwen-tts 0.1.1；faster-qwen3-tts 0.3.2。
+- 素材：21 场合并 anchor，16kHz 单声道，总计约 11.8 小时；旧转写无可用时间对齐。
+- 基线：npm test 99/99；tests.test_qwen_mlx_stream 25/25；跳过 0。
+- 最大风险：官方 SFT 是全参数训练；0.6B 应可容纳，但必须先做短批次显存冒烟。
+- 首轮：16 场各 10 分钟得到 706 条/74.4 分钟候选；修正参考音后 CAM++ >=0.55 仅 118 条/793.1 秒，不足 30 分钟，未降低门槛。
+- 扩展转写：20 场、2255 条、14407.749 秒候选；faster-whisper small，逐场 checkpoint 可续跑。
+- CAM++：参考音为 sample_wav/kxyy-vocal-sample-12s.wav；>=0.55 为 480 条/3287.66 秒，覆盖 20 场。
+- 定稿：469 条/3208.46 秒（53.47 分钟），train 2629.2 秒/16 来源，validation 579.26 秒/4 来源；24kHz mono；来源与日期均隔离；verify 与日期泄漏反向自测通过。
+- 官方源码固定：Qwen3-TTS commit 022e286b98fbec7e1e916cb940cdf532cd9f488e；0.6B Base 已下载；codec 384 条已 checkpoint 编码。
+- 训练冒烟：最长样本单步通过，峰值 8.537 GiB，loss 13.2184。正式全量训练第 231 micro-step 在显存约 15.5 GiB 时发生 CUDA error unknown，未生成 checkpoint；需降低长期显存峰值并增加中途 checkpoint 后重跑。
+- 训练修复：启用 gradient checkpointing 后 `2e-5` 三轮/1152 micro-step 完成，峰值 8.511 GiB；但 epoch 2 严重退化（CAM++ 0.185、CER 4.142、6/12 触顶）。
+- 保守重训：`2e-6` 一轮完成；最佳为 step 64，CAM++ 0.649 vs 1.7B Base 0.670（5/12 提升），CER 0.050 vs 0.080，0 触顶；声纹硬指标未通过，未设为默认。
+- 流式兼容：本地 custom checkpoint 自动读取唯一 speaker；faster 真流式 smoke 3 chunks、TTFA 0.709s、RTF 0.35，通过。回归：npm test 99/99 skip 0；Python 27/27 skip 0。
+- 自动参考音：2255 条 CAM++ 聚类得到 1924 条主播主簇；24 个候选覆盖 13 场，候选对中心均值 0.868，旧参考音仅 0.630。
+- 淘汰赛：25 个参考音 × 3 条训练外探针全部生成成功；5 个过门槛，赢家 `utt_9627ec90ea95` 相似度 0.705 vs control 0.493，CER 都为 0。
+- 冻结 12 条复验：赢家 0.665 vs control 0.474，差值 +0.191，12/12 提升；CER 差值 +0.0117；音高/语速/停顿/能量风格距离 0.266 vs 0.722；无触顶/重复，硬门槛通过。
+- 提升与流式：`work/active-reference.json` 已原子生成；后端只接受 passes=true、work 内路径和 SHA-256 匹配的参考音，且不覆盖用户显式设置。1.7B clone 真流式 3 chunks、TTFA 0.788s、RTF 0.378。
+- 反向验证：空音频/触顶/高 CER/相似度不足/重复候选均被拒；未通过 validation 无法 promote；哈希篡改不会被后端加载。
+- 最终回归：npm test 99/99，fail/skip/todo 0；Python 28/28，fail/skip 0。自动参考音已明显过线，按止损规则不再尝试 1.7B 微调。
+- 主观复核纠偏：用户确认音色改善，但指出声音轻、语速快、缺少轻重缓急。复查发现 active reference 原始语速 6.44 字/秒（24 候选第 92 百分位），active RMS 0.036；旧参考音 active RMS 0.185。旧风格分数还错误计入尾静音，已判定不能代表主观语气。
+- 表现力淘汰赛：自动选 6 个 3.25–5.08 字/秒的慢速/动态参考并归一到 active RMS 0.12。初筛唯一赢家 `c556...` 在冻结 12 条上音色均值 +0.036、响度约 +9.7dB、语速慢 13.8%，但仅 7/12 逐句音色提升、CER +0.0226、句调增幅不足，未通过且未 promote。
+- 同音色变体止损：当前赢家的响度归一、保音高减速 12%/20%、动态/慢速拼接均未过线。减速版本 CAM++ 跌至 0.361/0.372；拼接版本 CER 0.315–0.585；active reference 保持不变。
+- 结论：低响度应在播放增益层独立处理；Qwen3-TTS Base 的语气不能靠单参考音可靠控制。下一条有效路线是自动构建高表现力金标集并做 1.7B 参数高效微调，或切换支持音色克隆+指令韵律的流式后端。
+- 试听工具：新增 `reference_gallery.py`，本地画廊加载首轮 75 条逐条评分/试听，筛选后可一键写入 manual-gallery active reference；后端按 manifest mtime 在下一句合成前热刷新，不需重启。HTTP/API 仅限 loopback，音频路径和替换路径均有目录约束。
+- 播放补偿：本机 settings `voiceVolume` 已从 100 调到现有播放层上限 200；不改变 Qwen 波形，普通朗读与实时通话共用该增益。
+- 发布音色菜单：新增 6 个 bundled preset（5 个自动评分最高参考音 + 现有最早 `ref.wav/ref.txt` 基线），设置页保存 `localVoicePreset` 后下一句合成热加载；Python 校验 allow-list、路径、文案和 SHA-256。仅这 5 个新 WAV 和清单进入资源包，75 条样例、其余候选、模型和报告仍被忽略。Debug 会显示当前 preset；语气表现力微调延期。

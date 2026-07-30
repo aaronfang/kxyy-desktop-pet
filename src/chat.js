@@ -58,6 +58,7 @@ import { fetchWebObservations, renderWebObservationBlock } from "./ai/web-observ
 import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
+import { localVoicePresetById } from "./ai/voice-presets.js";
 import {
   recallRealtimeMemory,
   formatRealtimeMemoryHints,
@@ -893,17 +894,25 @@ function updateVoiceDebug() {
   const volPct = Number.isFinite(vol) ? Math.max(0, Math.min(200, vol)) : 100;
   const voiceOff = !settings.realtimeBackend || !String(settings.realtimeBackend).trim();
   const lines = [`语音 · ${voiceBackendLabel()} · 音量 ${volPct}%`];
+  const backend = String(settings.realtimeBackend || "").trim().toLowerCase();
+  if (backend === "local") {
+    const preset = localVoicePresetById(settings.localVoicePreset);
+    const voiceLabel = preset
+      ? `${preset.label}（${preset.id}）`
+      : settings.localRefWav
+        ? "手动参考音"
+        : "默认参考音（人设卡内置）";
+    lines.push(`音色 · ${voiceLabel}`);
+  } else if (!voiceOff && String(settings.ttsVoice || settings.cosyvoiceVoice || "").trim()) {
+    lines.push(`音色 · ${String(settings.ttsVoice || settings.cosyvoiceVoice).trim()}`);
+  }
   // 语音关闭时隐藏 TTS 进度条区域（否则会残留上次 synthing/done/idle 的样式）
   if (voiceDebugTtsEl) voiceDebugTtsEl.hidden = voiceOff;
   if (settings.textProvider === "local") {
     lines.push(`文字 · 本地 ${localTextModelLabel()}`);
   }
   const text = lines.join("\n");
-  voiceDebugLabelEl.textContent = lines[0];
-  // 第二行挂在 label 上：本地文字后端一眼可见。
-  if (lines[1]) {
-    voiceDebugLabelEl.textContent = `${lines[0]}\n${lines[1]}`;
-  }
+  voiceDebugLabelEl.textContent = text;
   voiceDebugEl.title = text;
   if (textDebugGenEl && !textGenDebug.active && !textDebugMetaEl?.textContent) {
     textDebugGenEl.hidden = true;

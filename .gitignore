@@ -54,6 +54,18 @@ dist/
 /scripts/persona-distill/_test_*.py
 /scripts/persona-distill/_tse_*.txt
 
+# Qwen3-TTS 单人微调本地产物（含授权语音、转写和模型权重，勿提交）
+/scripts/qwen3-finetune/work/
+/scripts/qwen3-finetune/output*/
+/scripts/qwen3-finetune/reports/audio/
+/scripts/qwen3-finetune/reports/*.jsonl
+/scripts/qwen3-finetune/reports/*.json
+/scripts/qwen3-finetune/reports/*.html
+/scripts/qwen3-finetune/reports/*.md
+/scripts/qwen3-finetune/reports/results/
+/scripts/qwen3-finetune/.venv*/
+/scripts/qwen3-finetune/__pycache__/
+
 # 临时调试输出（根目录）
 /check-err.txt
 /dev-output.txt
