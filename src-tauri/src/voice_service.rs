@@ -1087,18 +1087,27 @@ fn run_macos_voxcpm_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Resul
         .map_err(|e| format!("无法启动 VoxCPM2 配置脚本：{e}"))?;
     let lines = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let mut handles = vec![];
-    for output in [child.stdout.take(), child.stderr.take()] {
-        if let Some(output) = output {
-            let app2 = app.clone();
-            let lines2 = Arc::clone(&lines);
-            handles.push(std::thread::spawn(move || {
-                for line in BufReader::new(output).lines().flatten() {
-                    if let Some(msg) = format_setup_line(&line) {
-                        emit_setup_progress(&app2, msg, &lines2, "voxcpm", port_for("voxcpm"));
-                    }
+    if let Some(output) = child.stdout.take() {
+        let app2 = app.clone();
+        let lines2 = Arc::clone(&lines);
+        handles.push(std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().flatten() {
+                if let Some(msg) = format_setup_line(&line) {
+                    emit_setup_progress(&app2, msg, &lines2, "voxcpm", port_for("voxcpm"));
                 }
-            }));
-        }
+            }
+        }));
+    }
+    if let Some(output) = child.stderr.take() {
+        let app2 = app.clone();
+        let lines2 = Arc::clone(&lines);
+        handles.push(std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().flatten() {
+                if let Some(msg) = format_setup_line(&line) {
+                    emit_setup_progress(&app2, msg, &lines2, "voxcpm", port_for("voxcpm"));
+                }
+            }
+        }));
     }
     let status = child
         .wait()
