@@ -65,6 +65,10 @@ dist/
 /scripts/qwen3-finetune/reports/results/
 /scripts/qwen3-finetune/.venv*/
 /scripts/qwen3-finetune/__pycache__/
+/scripts/voxcpm-ab/.venv/
+/scripts/voxcpm-ab/work/
+/scripts/voxcpm-ab/reports/
+/scripts/voxcpm-ab/__pycache__/
 
 # 临时调试输出（根目录）
 /check-err.txt

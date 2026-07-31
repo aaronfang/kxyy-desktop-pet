@@ -192,10 +192,19 @@ def _refresh_auto_reference() -> None:
 
     if selection_key == _reference_selection_key:
         return
+    previous = (_ref_wav, _ref_text, _prompt, _reference_selection_key)
     _reference_selection_key = selection_key
     _ref_wav, _ref_text = selected
     _prompt = None
     common.log(f"已刷新参考音 ({len(_ref_text)} chars)")
+    if _faster_streaming and _model is not None:
+        common.log("新参考音正在预热 realtime 流式声学缓存…")
+        try:
+            _warm_faster_cache(_model)
+        except Exception:
+            _ref_wav, _ref_text, _prompt, _reference_selection_key = previous
+            common.log("realtime 参考音预热失败，保留上一份已就绪参考音")
+            raise
 
 
 def _resolve_model() -> str:

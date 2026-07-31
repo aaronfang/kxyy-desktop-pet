@@ -3167,7 +3167,10 @@ fn recall_memory(
     let query = format!("{} {}", request.query, request.image_caption)
         .trim()
         .to_string();
-    let proactive_topic = request.reason.trim().eq_ignore_ascii_case("proactive-topic");
+    let proactive_topic = request
+        .reason
+        .trim()
+        .eq_ignore_ascii_case("proactive-topic");
     if request.nickname.trim().is_empty() {
         return Ok(MemoryRecallResponse {
             items: vec![],
@@ -3233,10 +3236,8 @@ fn recall_memory(
                 0.0
             };
             let age_days = (now - c.occurred_at.unwrap_or(c.updated_at)).max(0) as f64 / 86_400.0;
-            let proactive_episode = proactive_topic
-                && !has_query
-                && c.kind == "episode"
-                && age_days <= 30.0;
+            let proactive_episode =
+                proactive_topic && !has_query && c.kind == "episode" && age_days <= 30.0;
             let half_life = if c.kind == "episode" { 30.0 } else { 180.0 };
             let recency = 0.5_f64.powf(age_days / half_life);
             let special = if c.pinned || c.kind == "commitment" {

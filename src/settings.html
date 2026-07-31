@@ -190,6 +190,7 @@
               </optgroup>
               <optgroup label="本地服务">
                 <option value="local">Qwen3-TTS（本地）</option>
+                <option value="voxcpm">VoxCPM2（本地零样本）</option>
               </optgroup>
             </select>
           </label>
@@ -254,6 +255,14 @@
             </p>
           </div>
 
+          <div id="voiceFieldsVoxcpm" class="voice-backend-fields" hidden>
+            <p class="hint">
+              VoxCPM2 使用本地 Ultimate Cloning：参考音频与逐字文案共用上方设置，输出为 24 kHz 实时流。
+              当前为实验后端。Windows 首次使用需运行 <code>scripts/voxcpm-ab/setup.ps1</code>；macOS 会自动配置到
+              <code>~/Library/Application Support/…/voice-runtime</code>（仅 Apple Silicon，约 4.6 GiB，需网络）。服务端固定随机种子以减少偶发音色漂移。
+            </p>
+          </div>
+
           <div id="voiceFieldsCosyvoice" class="voice-backend-fields" hidden>
             <label>
               <span>CosyVoice 音色 id<small>cosyvoice- 开头</small></span>
@@ -268,7 +277,7 @@
 
           <div id="turnPauseFields" hidden>
             <label>
-              <span>说话停顿容忍度<small>仅本地 Qwen3 / CosyVoice 通话</small></span>
+              <span>说话停顿容忍度<small>仅本地 Qwen3 / VoxCPM2 / CosyVoice 通话</small></span>
               <select id="turnPauseTolerance">
                 <option value="fast">快速（约 1.05 秒）</option>
                 <option value="standard" selected>标准（约 1.65 秒）</option>

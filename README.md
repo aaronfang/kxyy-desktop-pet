@@ -2,7 +2,9 @@
 
 一个会在桌面散步、攀爬、陪你聊天的跨平台桌宠。支持 **Windows / macOS**，基于 **Tauri 2 + Rust + WebView**。
 
-当前正式版：[`v0.2.47`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.47)
+当前正式版：[`v0.2.48`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.48)
+
+VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安装到 Application Support，当前仅支持 Apple Silicon，属于实验功能；Intel 版本仍可安装但应使用 Qwen3/云端语音。
 
 ## 先用起来
 

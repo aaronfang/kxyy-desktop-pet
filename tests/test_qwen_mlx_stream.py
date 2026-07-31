@@ -614,6 +614,9 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
         original_prompt = torch_backend._prompt
         original_mtime = torch_backend._auto_reference_mtime_ns
         original_custom = torch_backend._custom_speaker
+        original_warm = torch_backend._warm_faster_cache
+        warm_calls = []
+        torch_backend._warm_faster_cache = lambda model: warm_calls.append(model)
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             work = repo / "scripts" / "qwen3-finetune" / "work"
@@ -648,6 +651,7 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(torch_backend._ref_wav.samefile(audio))
                 self.assertEqual(torch_backend._ref_text, "这是一条通过自动验收的参考音文案")
                 self.assertIsNone(torch_backend._prompt)
+                self.assertEqual(warm_calls, [self.model])
                 self.assertIsNone(
                     torch_backend._validated_auto_reference({"localRefWav": "manual.wav"})
                 )
@@ -672,6 +676,7 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
                 torch_backend._prompt = original_prompt
                 torch_backend._auto_reference_mtime_ns = original_mtime
                 torch_backend._custom_speaker = original_custom
+                torch_backend._warm_faster_cache = original_warm
 
     def test_bundled_voice_preset_is_hash_locked_and_hot_swappable(self):
         original_catalog = torch_backend.VOICE_PRESET_CATALOG
@@ -681,6 +686,9 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
         original_prompt = torch_backend._prompt
         original_selection_key = torch_backend._reference_selection_key
         original_custom = torch_backend._custom_speaker
+        original_warm = torch_backend._warm_faster_cache
+        warm_calls = []
+        torch_backend._warm_faster_cache = lambda model: warm_calls.append(model)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             audio_root = root / "scripts" / "local-realtime" / "assets" / "kxyy-yuanyuan"
@@ -750,6 +758,8 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
             torch_backend._refresh_auto_reference()
             self.assertTrue(torch_backend._ref_wav.samefile(second_audio))
             self.assertIsNone(torch_backend._prompt)
+            torch_backend._refresh_auto_reference()
+            self.assertEqual(warm_calls, [self.model, self.model])
         torch_backend.VOICE_PRESET_CATALOG = original_catalog
         common.load_settings = original_load_settings
         torch_backend._ref_wav = original_ref_wav
@@ -757,6 +767,44 @@ class FasterQwenStreamTests(unittest.IsolatedAsyncioTestCase):
         torch_backend._prompt = original_prompt
         torch_backend._reference_selection_key = original_selection_key
         torch_backend._custom_speaker = original_custom
+        torch_backend._warm_faster_cache = original_warm
+
+    def test_reference_refresh_rolls_back_when_realtime_warmup_fails(self):
+        original_load_settings = common.load_settings
+        original_validate = torch_backend._validated_voice_preset
+        original_warm = torch_backend._warm_faster_cache
+        original_ref_wav = torch_backend._ref_wav
+        original_ref_text = torch_backend._ref_text
+        original_prompt = torch_backend._prompt
+        original_selection_key = torch_backend._reference_selection_key
+        try:
+            common.load_settings = lambda: {"localVoicePreset": "top-01"}
+            torch_backend._validated_voice_preset = lambda _settings: (
+                Path("/new/reference.wav"),
+                "new reference",
+            )
+            torch_backend._warm_faster_cache = lambda _model: (_ for _ in ()).throw(
+                RuntimeError("warmup failed")
+            )
+            torch_backend._ref_wav = Path("/old/reference.wav")
+            torch_backend._ref_text = "old reference"
+            torch_backend._prompt = object()
+            torch_backend._reference_selection_key = "preset:old"
+
+            with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+                torch_backend._refresh_auto_reference()
+
+            self.assertEqual(torch_backend._ref_wav, Path("/old/reference.wav"))
+            self.assertEqual(torch_backend._ref_text, "old reference")
+            self.assertEqual(torch_backend._reference_selection_key, "preset:old")
+        finally:
+            common.load_settings = original_load_settings
+            torch_backend._validated_voice_preset = original_validate
+            torch_backend._warm_faster_cache = original_warm
+            torch_backend._ref_wav = original_ref_wav
+            torch_backend._ref_text = original_ref_text
+            torch_backend._prompt = original_prompt
+            torch_backend._reference_selection_key = original_selection_key
 
     def test_custom_stream_uses_unique_speaker_without_reference_or_parity(self):
         calls = []

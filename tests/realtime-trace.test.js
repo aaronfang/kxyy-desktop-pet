@@ -834,12 +834,19 @@ test("managed and proactive capabilities are explicitly offered only by eligible
       this.sent.push(JSON.parse(message));
     }
   };
-  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const { RealtimeSession, sanitizeRealtimeInitialHistory } = await import("../src/ai/realtime.js");
 
   const local = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
   local._playbackMode = "worklet";
   local.playbackNode = { port: { postMessage: () => {} } };
-  const localOpen = local._openSocket("ws://local", { systemRole: "role", botName: "元元" });
+  const localOpen = local._openSocket("ws://local", {
+    systemRole: "role",
+    botName: "元元",
+    initialHistory: [
+      { role: "user", content: "文字聊天里提到按摩椅" },
+      { role: "assistant", content: "那把椅子买回来没怎么用。" },
+    ],
+  });
   sockets[0].onopen();
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
@@ -847,6 +854,21 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
   assert.deepEqual(sockets[0].sent[0].proactiveTurn, ["local-v1"]);
+  assert.deepEqual(sockets[0].sent[0].initialHistory, [
+    { role: "user", content: "文字聊天里提到按摩椅" },
+    { role: "assistant", content: "那把椅子买回来没怎么用。" },
+  ]);
+  assert.deepEqual(
+    sanitizeRealtimeInitialHistory([
+      { role: "assistant", content: "孤立开头" },
+      { role: "user", content: "\u2063幕后触发" },
+      ...Array.from({ length: 20 }, (_, index) => ({
+        role: index % 2 ? "assistant" : "user",
+        content: `消息${index}`,
+      })),
+    ]).length,
+    12,
+  );
   local.trace.startSession();
   local._onMessage({
     data: JSON.stringify({
@@ -933,6 +955,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
   assert.equal("ttsStream" in sockets[3].sent[0], false);
   assert.equal("proactiveTurn" in sockets[3].sent[0], false);
+  assert.equal("initialHistory" in sockets[3].sent[0], false);
   assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
 });
 

@@ -67,3 +67,34 @@
 ## 发布音色清单
 
 发布资源位于 `scripts/local-realtime/assets/kxyy-yuanyuan/voices.json`：只收录 5 个通过 75 条训练外样例自动评分的最高参考音（最高 CAM++ 均值 `0.705453`）和现有最早 `ref.wav/ref.txt` 基线。设置页的 `localVoicePreset` 只保存这 6 个 allow-list id；Python 每句合成前校验目录、文案长度和 SHA-256 后热加载，未通过校验会保留当前音色。75 条生成样例、其余候选、模型和报告继续留在 `.gitignore` 覆盖的本地目录，不能提交或上传。语气表现力微调按当前验收结论延期。
+
+## 2026-07-31 声纹尾部稳定性实验
+
+偶发整句换人的验收不能只看 12 条单次生成均值。以下工具按 Windows
+生产路径重复生成同一文本，并统计主播中心 `min/p10/std` 与同句两两声纹一致性；
+音频和报告仍只写入被忽略的本地目录。
+
+```powershell
+& '.\scripts\local-realtime\.venv-qwen3\Scripts\python.exe' scripts\qwen3-finetune\run_voice_stability.py --model scripts\qwen3-finetune\work\models\Qwen3-TTS-12Hz-1.7B-Base --mode clone --reference-manifest scripts\qwen3-finetune\work\active-reference.json --run-name stability-current-clone --repeats 5 --limit 4 --reset
+& '.\scripts\persona-distill\.venv-distill\Scripts\python.exe' scripts\qwen3-finetune\score_voice_stability.py --input current-clone=scripts\qwen3-finetune\reports\stability-current-clone.jsonl --run-name stability-current-clone
+```
+
+旧 0.6B step-64 在 4 条 x 5 次生产流式 A/B 中未通过：相对当前零样本，主播中心
+均值 `0.681 -> 0.473`、最低值 `0.614 -> 0.378`，同句最差一致性
+`0.657 -> 0.654`，因此不复活旧 checkpoint。
+
+1.7B 实验改用 LoRA，只覆盖主 talker 的注意力投影，并将 LoRA 合并成 faster
+runtime 可直接加载的 custom checkpoint。训练时累计多条 Qwen speaker embedding，
+不再像旧全量 SFT 一样用随机第一条音频注册 `yuanyuan`。实验 venv 固定安装
+`peft==0.20.0`：
+
+```powershell
+& '.\scripts\local-realtime\.venv-qwen3\Scripts\python.exe' -m pip install peft==0.20.0
+& '.\scripts\local-realtime\.venv-qwen3\Scripts\python.exe' scripts\qwen3-finetune\train_lora.py --init-model-path scripts\qwen3-finetune\work\models\Qwen3-TTS-12Hz-1.7B-Base --output-model-path scripts\qwen3-finetune\output-lora17-smoke --max-micro-steps 1 --smoke-longest
+```
+
+单步冒烟与 faster 流式加载均通过（峰值显存 `4.239 GiB`，TTFA `0.710s`，RTF `0.353`）。
+但 32-step 候选的主播中心均值仅 `0.454`，完整 1 epoch 候选进一步退化到 `0.196`，
+并出现 `CER 0.838`、5/20 条时长护栏触发；两者都没有达到当前零样本的 `0.681` 均值、
+`0.614` 最低值。因此这条 1.7B LoRA/custom-voice 路线本轮不启用，保留 checkpoint
+仅供离线分析，不得写入设置或发布资源。

@@ -1,7 +1,7 @@
 // 实时语音通话控制器（前端）。
 //
 // 与本地 Rust 桥接（realtime.rs）的私有协议：
-//   连上后先发 {type:"start", systemRole, botName}；随后：
+//   连上后先发 {type:"start", systemRole, botName, initialHistory?}；随后：
 //     上行 binary = 麦克风 PCM16 mono 16k（worklet 产出）；
 //     下行 binary = 火山/旧服务为 PCM16 mono 24k；本地/Cosy 可协商 managed-v1 envelope；
 //     下行 text  = 事件 JSON：
@@ -56,6 +56,9 @@ const TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1";
 const PROACTIVE_TURN_CAPABILITY = "local-v1";
 const MAX_TURN_MEMORY_ITEMS = 3;
 const MAX_TURN_MEMORY_CHARS = 700;
+const MAX_INITIAL_HISTORY_MESSAGES = 12;
+const MAX_INITIAL_HISTORY_MESSAGE_CHARS = 1024;
+const MAX_INITIAL_HISTORY_CHARS = 4096;
 const CANDIDATE_ID_MAX = 0xffffffff;
 const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 const VAD_SHADOW_FINAL_WAIT_MS = 50;
@@ -98,7 +101,40 @@ export function deriveRealtimeTopicKey(text) {
 }
 
 function usesManagedCascade(provider) {
-  return provider === "local" || provider === "cosyvoice";
+  return provider === "local" || provider === "voxcpm" || provider === "cosyvoice";
+}
+
+/** Bounded local/Cosy-only bridge from visible text chat into a new voice session. */
+export function sanitizeRealtimeInitialHistory(messages) {
+  if (!Array.isArray(messages)) return [];
+  const selected = [];
+  let totalChars = 0;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    const role = message?.role;
+    if (role !== "user" && role !== "assistant") continue;
+    let content = typeof message?.content === "string" ? message.content.trim() : "";
+    if (!content || content.startsWith("\u2063")) continue;
+    content = Array.from(content).slice(0, MAX_INITIAL_HISTORY_MESSAGE_CHARS).join("");
+    if (!content || totalChars + content.length > MAX_INITIAL_HISTORY_CHARS) continue;
+    selected.push({ role, content });
+    totalChars += content.length;
+    if (selected.length >= MAX_INITIAL_HISTORY_MESSAGES) break;
+  }
+  selected.reverse();
+  while (selected[0]?.role === "assistant") selected.shift();
+  const normalized = [];
+  for (const message of selected) {
+    const previous = normalized.at(-1);
+    if (message.role === "assistant" && previous?.role === "assistant") {
+      previous.content = Array.from(`${previous.content}\n${message.content}`)
+        .slice(0, MAX_INITIAL_HISTORY_MESSAGE_CHARS)
+        .join("");
+    } else {
+      normalized.push(message);
+    }
+  }
+  return normalized;
 }
 
 function sanitizeAsrRuntime(value) {
@@ -369,7 +405,7 @@ export class RealtimeSession {
   }
 
   /** 开始通话：确认播放能力 → 连桥接并协商 → 起麦克风。 */
-  async start({ systemRole, botName }) {
+  async start({ systemRole, botName, initialHistory }) {
     this.trace.startSession();
     // 若 chat.js 已在点击栈调用 prepareAudio，这里是幂等补齐。
     this._initAudioCtx();
@@ -383,7 +419,7 @@ export class RealtimeSession {
     if (this.stopped) return;
     await this._startPlayback();
     if (this.stopped) return;
-    await this._openSocket(base, { systemRole, botName });
+    await this._openSocket(base, { systemRole, botName, initialHistory });
     if (this.stopped) return;
     await this._startMic();
     if (this.stopped) return;
@@ -417,6 +453,9 @@ export class RealtimeSession {
           : [SESSION_MEMORY_CAPABILITY];
         if (usesManagedCascade(this.trace.provider)) {
           cascadeCapabilities.temporalContext = [TEMPORAL_CONTEXT_CAPABILITY];
+          cascadeCapabilities.initialHistory = sanitizeRealtimeInitialHistory(
+            startMsg.initialHistory,
+          );
         }
         if (
           usesManagedCascade(this.trace.provider) &&

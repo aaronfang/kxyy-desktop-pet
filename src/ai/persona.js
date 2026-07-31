@@ -1165,16 +1165,19 @@ export function buildMessages({
         isKxyy: isKxyyPersona(cardId),
         includeLivestream,
       });
-  // follow-up：不把「续说」幕后触发语发给模型——最后一条保留为观众真实发言 + 你上一条回复，
-  // 避免「（还在听）」等字样让模型误以为观众沉默。
-  let apiHistory = trimmed;
-  if (proactiveKind === "followup") {
-    while (
-      apiHistory.length &&
-      apiHistory[apiHistory.length - 1].role === "user" &&
-      isHiddenUserMessage(apiHistory[apiHistory.length - 1].content)
-    ) {
-      apiHistory = apiHistory.slice(0, -1);
+  // 幕后指令只在它是本轮最后一条消息时发送：这样 follow-up 请求以明确的
+  // user 角色收尾，不会让模型把上一条 assistant 回复误当成需要回答的话；
+  // 已完成轮次里的旧幕后指令则不再回灌，避免污染后续正常聊天。
+  const apiHistory = [];
+  for (const [index, message] of trimmed.entries()) {
+    const hiddenUser =
+      message.role === "user" && isHiddenUserMessage(message.content);
+    if (hiddenUser && index !== trimmed.length - 1) continue;
+    const previous = apiHistory.at(-1);
+    if (message.role === "assistant" && previous?.role === "assistant") {
+      previous.content = `${previous.content || ""}\n${message.content || ""}`.trim();
+    } else {
+      apiHistory.push({ ...message });
     }
   }
   return [
