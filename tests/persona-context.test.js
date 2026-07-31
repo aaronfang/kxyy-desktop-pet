@@ -12,6 +12,7 @@ import {
   hasExplicitLivestreamIntent,
   detectDeepIntent,
   detectShortTermConversationMood,
+  getFollowupUserTrigger,
 } from "../src/ai/persona.js";
 
 const LORE = {
@@ -126,6 +127,68 @@ test("proactive daily prompts contain no livestream-room topic seeds", () => {
     const prompt = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
     assert.doesNotMatch(prompt, /直播间|开播|下播|福袋|礼物|人气票|弹幕/, proactiveKind);
   }
+});
+
+test("follow-up request ends with an explicit user-role continuation directive", () => {
+  const trigger = getFollowupUserTrigger();
+  const messages = buildMessages({
+    systemPrompt: "persona",
+    fewShot: [],
+    history: [
+      { role: "user", content: "你不是买了一把按摩椅吗" },
+      { role: "assistant", content: "那玩意那么贵，我就用了一两次。" },
+      { role: "user", content: trigger },
+    ],
+    maxTurns: 4,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+    proactiveKind: "followup",
+  });
+  assert.equal(messages.at(-1)?.role, "user");
+  assert.equal(messages.at(-1)?.content, trigger);
+  assert.match(messages.at(-1)?.content || "", /由你再顺口补一句/);
+});
+
+test("completed follow-up hides its old directive without corrupting role order", () => {
+  const trigger = getFollowupUserTrigger();
+  const messages = buildMessages({
+    systemPrompt: "persona",
+    fewShot: [],
+    history: [
+      { role: "user", content: "按摩椅后来怎么样了" },
+      { role: "assistant", content: "后来我把它挪到角落了。" },
+      { role: "user", content: trigger },
+      { role: "assistant", content: "现在主要拿来放衣服。" },
+      { role: "user", content: "那确实挺真实" },
+    ],
+    maxTurns: 6,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+  });
+  const conversational = messages.filter((message) => message.role !== "system");
+  assert.deepEqual(conversational.map((message) => message.role), [
+    "user",
+    "assistant",
+    "user",
+  ]);
+  assert.match(conversational[1].content, /挪到角落.*放衣服/s);
+  assert.doesNotMatch(JSON.stringify(messages), /由你再顺口补一句/);
+
+  const assistantTrigger = buildMessages({
+    systemPrompt: "persona",
+    fewShot: [],
+    history: [
+      { role: "user", content: "复述一下" },
+      { role: "assistant", content: trigger },
+    ],
+    maxTurns: 2,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+  });
+  assert.equal(assistantTrigger.at(-1)?.content, trigger);
 });
 
 test("motif cooldown is bounded to recent session replies and yields to explicit user topics", () => {

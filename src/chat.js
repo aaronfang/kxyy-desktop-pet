@@ -2048,6 +2048,23 @@ function callBotName() {
   return aiShortName();
 }
 
+function buildRealtimeInitialHistory() {
+  const messages = [];
+  for (const message of history) {
+    if (message?.role !== "user" && message?.role !== "assistant") continue;
+    if (message.role === "user" && isHiddenUserMessage(message.content)) continue;
+    const content = String(message.content || "").trim();
+    if (!content) continue;
+    const previous = messages.at(-1);
+    if (message.role === "assistant" && previous?.role === "assistant") {
+      previous.content = `${previous.content}\n${content}`;
+    } else {
+      messages.push({ role: message.role, content });
+    }
+  }
+  return messages;
+}
+
 function ensureCallWaveBars() {
   if (!callWaveBarsEl || callWaveBars.length) return;
   callWaveBarsEl.innerHTML = "";
@@ -2377,6 +2394,7 @@ async function startCall() {
     await session.start({
       systemRole,
       botName: callBotName(),
+      initialHistory: buildRealtimeInitialHistory(),
     });
   } catch (e) {
     appendPatNotice(`📞 无法开始通话：${e.message || e}`);

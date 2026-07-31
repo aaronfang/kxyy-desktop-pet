@@ -579,24 +579,49 @@ class StableSentenceBufferTests(unittest.TestCase):
         self.assertEqual(buf.flush(), [])
 
     def test_realtime_minimum_coalesces_short_sentences_into_one_clone_request(self):
-        buf = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
-        self.assertEqual(buf.feed("第一句很短。"), [])
-        self.assertEqual(buf.feed("第二句也会和前句一起合成。"), [])
         self.assertEqual(
-            buf.feed("第三句正好补足稳定长度。"),
-            ["第一句很短。第二句也会和前句一起合成。第三句正好补足稳定长度。"],
+            (
+                common.REALTIME_TTS_MIN_CHARS,
+                common.REALTIME_TTS_SOFT_CHARS,
+                common.REALTIME_TTS_HARD_CHARS,
+            ),
+            (30, 40, 60),
         )
+        buf = common.StableSentenceBuffer(
+            min_chars=common.REALTIME_TTS_MIN_CHARS,
+            soft_chars=common.REALTIME_TTS_SOFT_CHARS,
+            hard_chars=common.REALTIME_TTS_HARD_CHARS,
+        )
+        first = "第一句很短。"
+        second = "第二句也会和前句一起合成。"
+        prefix = first + second
+        third = "丙" * (common.REALTIME_TTS_MIN_CHARS - len(prefix) - 1) + "。"
+        self.assertEqual(buf.feed(first), [])
+        self.assertEqual(buf.feed(second), [])
+        self.assertEqual(buf.feed(third), [prefix + third])
 
-        boundary = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        boundary = common.StableSentenceBuffer(
+            min_chars=common.REALTIME_TTS_MIN_CHARS,
+            soft_chars=common.REALTIME_TTS_SOFT_CHARS,
+            hard_chars=common.REALTIME_TTS_HARD_CHARS,
+        )
         sentence = "甲" * (common.REALTIME_TTS_MIN_CHARS - 1) + "。"
         self.assertEqual(boundary.feed(sentence), [sentence])
 
-        short_only = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        short_only = common.StableSentenceBuffer(
+            min_chars=common.REALTIME_TTS_MIN_CHARS,
+            soft_chars=common.REALTIME_TTS_SOFT_CHARS,
+            hard_chars=common.REALTIME_TTS_HARD_CHARS,
+        )
         self.assertEqual(short_only.feed("只有一句。"), [])
         self.assertEqual(short_only.flush(), ["只有一句。"])
 
     def test_realtime_minimum_reduces_medium_sentence_clone_requests(self):
-        buf = common.StableSentenceBuffer(min_chars=common.REALTIME_TTS_MIN_CHARS)
+        buf = common.StableSentenceBuffer(
+            min_chars=common.REALTIME_TTS_MIN_CHARS,
+            soft_chars=common.REALTIME_TTS_SOFT_CHARS,
+            hard_chars=common.REALTIME_TTS_HARD_CHARS,
+        )
         first = "甲" * 19 + "。"
         second = "乙" * 19 + "。"
         third = "丙" * 19 + "。"
@@ -963,6 +988,83 @@ class BoundedOrderedTtsPipelineTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(blocked, timeout=1)
         release_first_play.set()
         await pipeline.finish()
+
+    async def test_coalesces_same_turn_text_waiting_behind_playback(self):
+        first_play = asyncio.Event()
+        release_first_play = asyncio.Event()
+        synthesized = []
+        played = []
+
+        async def synthesize(_sequence, sentence):
+            synthesized.append(sentence)
+            return sentence
+
+        async def play(sequence, sentence, result):
+            played.append((sequence, sentence, result))
+            if sequence == 1:
+                first_play.set()
+                await release_first_play.wait()
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=1,
+            prefetch_while_playing=False,
+            coalesce_pending=True,
+        )
+        await pipeline.submit("第一段。")
+        await first_play.wait()
+        await pipeline.submit("第二段。")
+        await pipeline.submit("第三段。")
+        finish = asyncio.create_task(pipeline.finish())
+        await asyncio.sleep(0)
+        release_first_play.set()
+        await finish
+
+        self.assertEqual(synthesized, ["第一段。", "第二段。第三段。"])
+        self.assertEqual(
+            played,
+            [
+                (1, "第一段。", "第一段。"),
+                (2, "第二段。第三段。", "第二段。第三段。"),
+            ],
+        )
+
+    async def test_pending_coalescing_preserves_text_past_one_tts_request_limit(self):
+        first_play = asyncio.Event()
+        release_first_play = asyncio.Event()
+        synthesized = []
+
+        async def synthesize(_sequence, sentence):
+            synthesized.append(sentence)
+            return sentence
+
+        async def play(sequence, _sentence, _result):
+            if sequence == 1:
+                first_play.set()
+                await release_first_play.wait()
+
+        pipeline = common.BoundedOrderedTtsPipeline(
+            synthesize,
+            play,
+            parallelism=1,
+            prefetch_while_playing=False,
+            coalesce_pending=True,
+            coalesce_max_chars=160,
+        )
+        await pipeline.submit("开场。")
+        await first_play.wait()
+        second = "甲" * 96
+        third = "乙" * 96
+        await pipeline.submit(second)
+        await pipeline.submit(third)
+        finish = asyncio.create_task(pipeline.finish())
+        release_first_play.set()
+        await finish
+
+        self.assertEqual(synthesized, ["开场。", second, third])
+        self.assertEqual("".join(synthesized[1:]), second + third)
+        self.assertTrue(all(len(text) <= 160 for text in synthesized))
 
     async def test_shared_asr_executor_backend_does_not_prefetch_during_playback(self):
         release_first_synth = asyncio.Event()
@@ -2312,6 +2414,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             last_json_of_type(self.ws, "session")["ttsStream"],
             common.TTS_STREAMING_CAPABILITY,
         )
+
         self.assertEqual(
             last_json_of_type(self.ws, "session")["interruptionHint"],
             common.INTERRUPTION_HINT_CAPABILITY,
@@ -2368,6 +2471,48 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(no_adapter.tts_streaming, "none")
+
+    async def test_start_keeps_text_chat_context_outside_audible_voice_history(self):
+        initial_history = [
+            {"role": "user", "content": "文字聊天里提到按摩椅"},
+            {"role": "assistant", "content": "那把椅子买回来没怎么用。"},
+        ]
+        await self.session.on_start({"initialHistory": initial_history})
+
+        self.assertEqual(self.session.history, [])
+        self.assertEqual(self.session._initial_history, initial_history)
+
+        captured = []
+        common._synth_tts = lambda _text: b"\x00\x00"
+
+        def capture_start(_role, history, _text, _scope, out):
+            captured.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture_start
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        await self.session._reply_pipeline("那后来呢", scope)
+        self.assertEqual(captured[0][:2], initial_history)
+        self.assertEqual(self.session.history, [{"role": "user", "content": "那后来呢"}])
+
+    def test_initial_history_drops_hidden_user_directives_and_merges_assistants(self):
+        trigger = "\u2063幕后续说"
+        self.assertEqual(
+            common.sanitize_initial_history(
+                [
+                    {"role": "assistant", "content": "孤立开头"},
+                    {"role": "user", "content": "之前那把椅子"},
+                    {"role": "assistant", "content": "放在角落。"},
+                    {"role": "user", "content": trigger},
+                    {"role": "assistant", "content": "现在拿来放衣服。"},
+                ]
+            ),
+            [
+                {"role": "user", "content": "之前那把椅子"},
+                {"role": "assistant", "content": "放在角落。\n现在拿来放衣服。"},
+            ],
+        )
 
     def test_turn_temporal_context_is_fixed_shape_and_fail_closed(self):
         context = common.format_turn_temporal_context(

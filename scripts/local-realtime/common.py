@@ -538,6 +538,9 @@ BARGE_IN_FRAMES = 6
 BARGE_IN_RMS_PLAY = 0.04
 BARGE_IN_FRAMES_PLAY = 12  # ~360ms
 MAX_HISTORY_MESSAGES = 24
+INITIAL_HISTORY_MAX_MESSAGES = 12
+INITIAL_HISTORY_MAX_MESSAGE_CHARS = 1024
+INITIAL_HISTORY_MAX_CHARS = 4096
 MAX_PENDING_HISTORY_TURNS = 4
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
 MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
@@ -550,6 +553,8 @@ TTS_PARALLELISM_MAX = 2
 # 放大的逐句随机音色漂移。30 字仍低于 40 字 soft boundary；不足此长度的
 # 短回复在 SSE done 时立即 flush，不增加固定等待时间。
 REALTIME_TTS_MIN_CHARS = 30
+REALTIME_TTS_SOFT_CHARS = 40
+REALTIME_TTS_HARD_CHARS = 60
 # 单个稳定句最多保留 60 秒 24kHz mono s16le；数量有界之外也限制 PCM 字节。
 TTS_SENTENCE_MAX_SAMPLES = OUTPUT_RATE * 60
 MANAGED_AUDIO_CAPABILITY = "managed-v1"
@@ -563,8 +568,9 @@ TTS_STREAMING_CAPABILITY = "provider-pcm-v1"
 INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1"
 PROACTIVE_TURN_CAPABILITY = "local-v1"
 PROACTIVE_WELCOME_PROMPT = (
-    "（内部控制：实时通话刚接通，用户还没开口。请按当前人设自然地先打招呼，"
-    "顺手抛一个轻松、很容易回应的小话题。只说一到两句，不要解释任务，不要催促用户。）"
+    "（内部控制：实时通话刚接通，用户还没开口。如果上方已有文字聊天上下文，"
+    "请直接自然承接最后一个话题，不要重新寒暄或换成无关新话题；只有没有上下文时才先打招呼，"
+    "再抛一个轻松、很容易回应的小话题。只说一到两句，不要解释任务，不要催促用户。）"
 )
 PROACTIVE_FOLLOWUP_PROMPT = (
     "（内部控制：用户暂时没有接话。沿着上一段实际播完的话题自然续说一小步，"
@@ -1017,6 +1023,44 @@ class AudibleHistory:
         self._proactive_assistants = [
             item for item in self._proactive_assistants if any(item is msg for msg in self.messages)
         ]
+
+
+def sanitize_initial_history(raw_messages) -> list[dict]:
+    """Bound visible text-chat context without treating it as audible realtime history."""
+    if not isinstance(raw_messages, list):
+        return []
+    selected: list[dict] = []
+    total_chars = 0
+    for raw in reversed(raw_messages):
+        if not isinstance(raw, dict):
+            continue
+        role = raw.get("role")
+        content = raw.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        content = content.strip()
+        if not content or content.startswith("\u2063"):
+            continue
+        content = content[:INITIAL_HISTORY_MAX_MESSAGE_CHARS]
+        if total_chars + len(content) > INITIAL_HISTORY_MAX_CHARS:
+            continue
+        selected.append({"role": role, "content": content})
+        total_chars += len(content)
+        if len(selected) >= INITIAL_HISTORY_MAX_MESSAGES:
+            break
+    selected.reverse()
+    while selected and selected[0]["role"] == "assistant":
+        selected.pop(0)
+    normalized: list[dict] = []
+    for message in selected:
+        previous = normalized[-1] if normalized else None
+        if message["role"] == "assistant" and previous and previous["role"] == "assistant":
+            previous["content"] = (
+                previous["content"] + "\n" + message["content"]
+            )[:INITIAL_HISTORY_MAX_MESSAGE_CHARS]
+        else:
+            normalized.append(message)
+    return normalized
 
 
 class SafeRealtimeError(RuntimeError):
@@ -1962,6 +2006,8 @@ class BoundedOrderedTtsPipeline:
         *,
         parallelism: int = 1,
         prefetch_while_playing: bool = True,
+        coalesce_pending: bool = False,
+        coalesce_max_chars: int = STABLE_SENTENCE_HARD_CHARS,
         queue_max: int = TTS_SENTENCE_QUEUE_MAX,
         max_segments: int = MAX_AUDIO_SEGMENTS_PER_TURN,
     ):
@@ -1969,6 +2015,8 @@ class BoundedOrderedTtsPipeline:
         self.play = play
         self.parallelism = max(1, min(TTS_PARALLELISM_MAX, int(parallelism)))
         self.prefetch_while_playing = bool(prefetch_while_playing)
+        self.coalesce_pending = bool(coalesce_pending)
+        self.coalesce_max_chars = max(1, int(coalesce_max_chars))
         self.queue = asyncio.Queue(maxsize=max(1, int(queue_max)))
         self.max_segments = max(1, int(max_segments))
         self.submitted = 0
@@ -2066,6 +2114,25 @@ class BoundedOrderedTtsPipeline:
                         input_closed = True
                     else:
                         sequence, sentence = item
+                        if self.coalesce_pending:
+                            while True:
+                                try:
+                                    next_item = self.queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                                if next_item is None:
+                                    input_closed = True
+                                    break
+                                next_sequence, next_sentence = next_item
+                                if len(sentence) + len(next_sentence) > self.coalesce_max_chars:
+                                    input_task = asyncio.create_task(
+                                        asyncio.sleep(
+                                            0,
+                                            result=(next_sequence, next_sentence),
+                                        )
+                                    )
+                                    break
+                                sentence = f"{sentence}{next_sentence}"
                         pending.append(
                             (
                                 sequence,
@@ -2309,6 +2376,7 @@ class Session:
         self.system_role = "你是元元，口语化简短回复，一两句即可。"
         self.bot_name = "元元"
         self._audible_history = AudibleHistory()
+        self._initial_history: list[dict] = []
         # 兼容现有诊断/测试读取；其中 assistant 永远只含前端确认播完的句段。
         self.history = self._audible_history.messages
         self.pcm_buf = bytearray()
@@ -2686,6 +2754,7 @@ class Session:
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
         self.bot_name = (msg.get("botName") or "元元").strip() or "元元"
+        self._initial_history = sanitize_initial_history(msg.get("initialHistory"))
         offered = msg.get("downlinkAudio")
         self.downlink_audio = (
             MANAGED_AUDIO_CAPABILITY
@@ -3351,16 +3420,21 @@ class Session:
         proactive_kind: str = "",
         turn_policy: str = "substantive",
     ) -> None:
-        sentences = StableSentenceBuffer(min_chars=REALTIME_TTS_MIN_CHARS)
+        sentences = StableSentenceBuffer(
+            min_chars=REALTIME_TTS_MIN_CHARS,
+            soft_chars=REALTIME_TTS_SOFT_CHARS,
+            hard_chars=REALTIME_TTS_HARD_CHARS,
+        )
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
         try:
             assert _synth_tts is not None
             t1 = time.perf_counter()
-            history_snapshot = (
+            audible_snapshot = (
                 self._audible_history.begin_proactive_turn(scope.generation)
                 if proactive_kind
                 else self._audible_history.begin_turn(scope.generation, text)
             )
+            history_snapshot = [*self._initial_history, *audible_snapshot]
             if memory_context:
                 history_snapshot.append({"role": "system", "content": memory_context})
             if temporal_context:
@@ -3715,6 +3789,8 @@ class Session:
                     if self.tts_streaming == TTS_STREAMING_CAPABILITY
                     else self.tts_prefetch_while_playing
                 ),
+                coalesce_pending=True,
+                coalesce_max_chars=REALTIME_TTS_HARD_CHARS,
             )
 
             stream_done = False
