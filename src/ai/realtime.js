@@ -101,7 +101,7 @@ export function deriveRealtimeTopicKey(text) {
 }
 
 function usesManagedCascade(provider) {
-  return provider === "local" || provider === "cosyvoice";
+  return provider === "local" || provider === "voxcpm" || provider === "cosyvoice";
 }
 
 /** Bounded local/Cosy-only bridge from visible text chat into a new voice session. */

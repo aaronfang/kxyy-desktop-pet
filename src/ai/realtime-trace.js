@@ -126,7 +126,7 @@ function defaultId(prefix) {
 function normalizeProvider(provider) {
   const value = String(provider || "unknown").trim().toLowerCase();
   if (value === "cosy") return "cosyvoice";
-  return ["volc", "local", "cosyvoice"].includes(value) ? value : "unknown";
+  return ["volc", "local", "voxcpm", "cosyvoice"].includes(value) ? value : "unknown";
 }
 
 function normalizeMode(mode, provider) {

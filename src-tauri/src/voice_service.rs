@@ -1,4 +1,4 @@
-//! 按设置自动拉起 / 切换本地语音 Python 服务（Qwen3 / CosyVoice 云桥）。
+//! 按设置自动拉起 / 切换本地语音 Python 服务（Qwen3 / VoxCPM2 / CosyVoice 云桥）。
 //! 火山后端不启 Python；若端口健康检查通过则视为已就绪；若端口被占但检查失败则自动清理残留进程后重拉。
 
 use serde::Serialize;
@@ -294,6 +294,7 @@ fn emit(app: &AppHandle, status: VoiceServiceStatus) {
 pub fn normalize_backend(backend: &str) -> String {
     match backend.trim().to_ascii_lowercase().as_str() {
         "local" => "local".into(),
+        "voxcpm" | "voxcpm2" => "voxcpm".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
         "volc" => "volc".into(),
         _ => String::new(), // 空/其他=关闭
@@ -316,7 +317,7 @@ fn normalize_turn_pause_tolerance(value: &str) -> &'static str {
 }
 
 fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> bool {
-    matches!(backend, "local" | "cosyvoice") && !next.is_empty() && previous != next
+    matches!(backend, "local" | "voxcpm" | "cosyvoice") && !next.is_empty() && previous != next
 }
 
 fn startup_slow_message(backend: &str, elapsed_secs: u64) -> Option<&'static str> {
@@ -325,6 +326,8 @@ fn startup_slow_message(backend: &str, elapsed_secs: u64) -> Option<&'static str
     }
     Some(if backend == "local" {
         "首次使用可能正在下载数 GB 模型；语音服务仍在下载或加载，完成后将自动恢复"
+    } else if backend == "voxcpm" {
+        "VoxCPM2 正在加载本地模型，完成后将自动恢复"
     } else {
         "语音服务仍在加载本地模型，完成后将自动恢复"
     })
@@ -335,16 +338,23 @@ mod fingerprint_tests {
     use super::{
         backend_still_selected, begin_sensevoice_runtime_install, begin_vad_runtime_install,
         finish_sensevoice_runtime_install, finish_vad_runtime_install, normalize_asr_provider,
-        normalize_turn_pause_tolerance, parse_sensevoice_install_progress,
-        record_desired_voice_config, resolve_hf_endpoint, sensevoice_install_matches_target,
-        should_defer_for_vad_install, should_restart_for_fingerprint, startup_slow_message,
-        supports_vad_runtime_install, voice_target_still_selected, VoiceServiceManager,
-        DEFAULT_HF_ENDPOINT,
+        normalize_backend, normalize_turn_pause_tolerance, parse_sensevoice_install_progress,
+        port_for, record_desired_voice_config, resolve_hf_endpoint,
+        sensevoice_install_matches_target, should_defer_for_vad_install,
+        should_restart_for_fingerprint, startup_slow_message, supports_vad_runtime_install,
+        voice_target_still_selected, VoiceServiceManager, DEFAULT_HF_ENDPOINT,
     };
 
     #[test]
+    fn voxcpm_backend_has_a_separate_managed_port_and_alias() {
+        assert_eq!(normalize_backend("VoxCPM2"), "voxcpm");
+        assert_eq!(port_for("voxcpm"), 19878);
+        assert_eq!(crate::local_tts_http_port("voxcpm2"), Some(19978));
+    }
+
+    #[test]
     fn restarts_managed_voice_backends_only_for_nonempty_changes() {
-        for backend in ["local", "cosyvoice"] {
+        for backend in ["local", "voxcpm", "cosyvoice"] {
             assert!(should_restart_for_fingerprint(backend, "old", "new"));
             assert!(!should_restart_for_fingerprint(backend, "same", "same"));
             assert!(!should_restart_for_fingerprint(backend, "old", ""));
@@ -392,6 +402,7 @@ mod fingerprint_tests {
     #[test]
     fn vad_runtime_installer_accepts_only_managed_voice_backends() {
         assert!(supports_vad_runtime_install("local"));
+        assert!(supports_vad_runtime_install("voxcpm"));
         assert!(supports_vad_runtime_install("cosyvoice"));
         for backend in ["volc", "", "unknown"] {
             assert!(!supports_vad_runtime_install(backend));
@@ -509,6 +520,7 @@ mod fingerprint_tests {
 pub fn port_for(backend: &str) -> u16 {
     match backend {
         "local" => 19876,
+        "voxcpm" => 19878,
         "cosyvoice" => 19877,
         _ => 0,
     }
@@ -517,6 +529,7 @@ pub fn port_for(backend: &str) -> u16 {
 fn script_for(backend: &str) -> Option<&'static str> {
     match backend {
         "local" => Some("server.py"),
+        "voxcpm" => Some("server_voxcpm.py"),
         "cosyvoice" => Some("server_cosyvoice.py"),
         _ => None,
     }
@@ -793,6 +806,14 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
         list.push(repo.join("scripts/local-realtime/.venv-qwen3/bin/python"));
         list.push(repo.join("scripts/local-realtime/.venv-qwen3/Scripts/python.exe"));
     }
+
+    if backend == "voxcpm" {
+        if let Some(rt) = macos_voice_runtime() {
+            list.push(rt.join(".venv-voxcpm2/bin/python"));
+        }
+        list.push(repo.join("scripts/voxcpm-ab/.venv/bin/python"));
+        list.push(repo.join("scripts/voxcpm-ab/.venv/Scripts/python.exe"));
+    }
     // GPU 后端优先用各自独立环境
     if backend == "cosyvoice" {
         list.push(repo.join("scripts/local-realtime/.venv-cosy/bin/python"));
@@ -1043,7 +1064,76 @@ fn sensevoice_runtime_root() -> Option<PathBuf> {
 }
 
 fn supports_vad_runtime_install(backend: &str) -> bool {
-    matches!(backend, "local" | "cosyvoice")
+    matches!(backend, "local" | "voxcpm" | "cosyvoice")
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_voxcpm_setup(app: &AppHandle, repo: &Path, runtime: &Path) -> Result<(), String> {
+    let setup = repo.join("scripts/macos/setup-voxcpm2.sh");
+    if !setup.is_file() {
+        return Err(format!(
+            "缺少配置脚本：{}。请确认安装包包含 scripts/macos。",
+            setup.display()
+        ));
+    }
+    let mut child = Command::new("bash")
+        .arg(&setup)
+        .env("KXYY_VOXCPM_RUNTIME", runtime)
+        .env("KXYY_VOXCPM_RESOURCES", repo)
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法启动 VoxCPM2 配置脚本：{e}"))?;
+    let lines = Arc::new(Mutex::new(VecDeque::<String>::new()));
+    let mut handles = vec![];
+    for output in [child.stdout.take(), child.stderr.take()] {
+        if let Some(output) = output {
+            let app2 = app.clone();
+            let lines2 = Arc::clone(&lines);
+            handles.push(std::thread::spawn(move || {
+                for line in BufReader::new(output).lines().flatten() {
+                    if let Some(msg) = format_setup_line(&line) {
+                        emit_setup_progress(&app2, msg, &lines2, "voxcpm", port_for("voxcpm"));
+                    }
+                }
+            }));
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("等待 VoxCPM2 配置失败：{e}"))?;
+    for h in handles {
+        let _ = h.join();
+    }
+    if !status.success() {
+        let detail = lines
+            .lock()
+            .ok()
+            .map(|q| {
+                q.iter()
+                    .rev()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default();
+        return Err(if detail.is_empty() {
+            format!("VoxCPM2 自动配置失败（exit {status}）")
+        } else {
+            detail
+        });
+    }
+    if !(runtime.join(".voxcpm2-ready").is_file()
+        && runtime.join(".venv-voxcpm2/bin/python").is_file())
+    {
+        return Err("配置脚本已结束，但未生成 VoxCPM2 运行时标记".into());
+    }
+    Ok(())
 }
 
 fn begin_vad_runtime_install(inner: &mut Inner, backend: &str) -> bool {
@@ -1870,6 +1960,93 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    if backend == "voxcpm" {
+        if let Some(rt) = macos_voice_runtime() {
+            let marker = rt.join(".voxcpm2-ready");
+            let py = rt.join(".venv-voxcpm2/bin/python");
+            if !(marker.is_file() && py.is_file()) {
+                let already = match app.state::<VoiceServiceManager>().inner.lock() {
+                    Ok(mut inner) => {
+                        let was = inner.qwen_setup_running;
+                        if !was {
+                            inner.qwen_setup_running = true;
+                        }
+                        was
+                    }
+                    Err(_) => false,
+                };
+                if already {
+                    emit(
+                        app,
+                        VoiceServiceStatus {
+                            backend: backend.clone(),
+                            state: "starting".into(),
+                            message: "正在自动配置 VoxCPM2…".into(),
+                            port,
+                        },
+                    );
+                    return;
+                }
+                emit(
+                    app,
+                    VoiceServiceStatus {
+                        backend: backend.clone(),
+                        state: "starting".into(),
+                        message: "首次使用：正在配置 VoxCPM2（仅 Apple Silicon，模型约 4.6 GiB）…"
+                            .into(),
+                        port,
+                    },
+                );
+                let app2 = app.clone();
+                let repo2 = repo.clone();
+                let rt2 = rt.clone();
+                std::thread::spawn(move || {
+                    let result = run_macos_voxcpm_setup(&app2, &repo2, &rt2);
+                    let manager = app2.state::<VoiceServiceManager>();
+                    let Ok(_lifecycle) = manager.lifecycle.lock() else {
+                        return;
+                    };
+                    let (still_selected, current_fp) = match manager.inner.lock() {
+                        Ok(mut inner) => {
+                            inner.qwen_setup_running = false;
+                            (
+                                backend_still_selected(&inner, "voxcpm"),
+                                inner.desired_fingerprint.clone(),
+                            )
+                        }
+                        Err(_) => return,
+                    };
+                    match result {
+                        Ok(()) if still_selected => {
+                            emit(
+                                &app2,
+                                VoiceServiceStatus {
+                                    backend: "voxcpm".into(),
+                                    state: "starting".into(),
+                                    message: "配置完成，正在启动 VoxCPM2…".into(),
+                                    port,
+                                },
+                            );
+                            ensure_impl(&app2, "voxcpm".into(), current_fp);
+                        }
+                        Err(msg) if still_selected => emit(
+                            &app2,
+                            VoiceServiceStatus {
+                                backend: "voxcpm".into(),
+                                state: "failed".into(),
+                                message: msg,
+                                port,
+                            },
+                        ),
+                        _ => {}
+                    }
+                });
+                return;
+            }
+        }
+    }
+
     let work_dir = repo.join("scripts/local-realtime");
     let script = work_dir.join(script_name);
     if !script.is_file() {
@@ -1896,6 +2073,9 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
                         .into()
                 } else if backend == "local" {
                     "找不到本地 Qwen3-TTS 运行环境。请运行 scripts/windows/setup-qwen3-tts.cmd 自动配置（创建 .venv-qwen3 并安装流式运行时）。".into()
+                } else if backend == "voxcpm" {
+                    "找不到 VoxCPM2 运行环境。macOS 请重新选择后自动配置（仅 Apple Silicon）；Windows 请运行 scripts/voxcpm-ab/setup.ps1。"
+                        .into()
                 } else {
                     "找不到 Python。请先创建 scripts/voice-ab/.venv 并安装依赖。".into()
                 },
@@ -1947,6 +2127,10 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);
+        if backend == "voxcpm" {
+            cmd.env("KXYY_VOXCPM_MODEL", rt.join("voxcpm2-model"));
+            cmd.env("KXYY_VOXCPM_DEVICE", "mps");
+        }
     }
     // Final ASR provider 只接受固定枚举；SenseVoice 使用独立 App-data runtime，
     // 不把模型或第三方依赖写入 Qwen/CosyVoice 自身环境。

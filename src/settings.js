@@ -67,6 +67,7 @@ function renderAvatars() {
 function normalizeBackend(v) {
   const x = (v || "").toLowerCase();
   if (x === "local") return "local";
+  if (x === "voxcpm" || x === "voxcpm2") return "voxcpm";
   if (x === "cosyvoice" || x === "cosy") return "cosyvoice";
   if (x === "volc") return "volc";
   return ""; // empty = off
@@ -97,27 +98,28 @@ function syncVoiceFields() {
   const backend = currentBackend();
   el("voiceFieldsVolc").hidden = backend !== "volc";
   el("voiceFieldsLocal").hidden = backend !== "local";
+  if (el("voiceFieldsVoxcpm")) el("voiceFieldsVoxcpm").hidden = backend !== "voxcpm";
   el("voiceFieldsCosyvoice").hidden = backend !== "cosyvoice";
-  // 参考音频仅对本地 Qwen3 可见。
+  // 参考音频对本地 Qwen3 / VoxCPM2 共用。
   const refBox = el("voiceFieldsRef");
   if (refBox) {
-    refBox.hidden = backend !== "local";
+    refBox.hidden = backend !== "local" && backend !== "voxcpm";
   }
   const vadBox = el("vadShadowFields");
   if (vadBox) {
-    vadBox.hidden = backend !== "local" && backend !== "cosyvoice";
+    vadBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const asrBox = el("asrFields");
   if (asrBox) {
-    asrBox.hidden = backend !== "local" && backend !== "cosyvoice";
+    asrBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const pauseBox = el("turnPauseFields");
   if (pauseBox) {
-    pauseBox.hidden = backend !== "local" && backend !== "cosyvoice";
+    pauseBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const conversationModeBox = el("conversationModeFields");
   if (conversationModeBox) {
-    conversationModeBox.hidden = backend !== "local" && backend !== "cosyvoice";
+    conversationModeBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const installSenseVoice = el("installSenseVoiceRuntime");
   if (installSenseVoice) {
@@ -689,9 +691,9 @@ async function save() {
     key: bk === "volc" ? el("volcTtsKey").value.trim() : undefined,
     model: bk === "cosyvoice" ? el("cosyvoiceModel").value.trim() : undefined,
     cosyvoiceVoice: bk === "cosyvoice" ? el("cosyvoiceVoice").value.trim() : undefined,
-    refWav: bk === "local" ? el("localRefWav").value.trim() : undefined,
-    refText: bk === "local" ? el("localRefText").value.trim() : undefined,
-    preset: bk === "local" ? localVoicePresetById(el("localVoicePreset")?.value)?.id : undefined,
+    refWav: bk === "local" || bk === "voxcpm" ? el("localRefWav").value.trim() : undefined,
+    refText: bk === "local" || bk === "voxcpm" ? el("localRefText").value.trim() : undefined,
+    preset: bk === "local" || bk === "voxcpm" ? localVoicePresetById(el("localVoicePreset")?.value)?.id : undefined,
   });
   saveBtn.disabled = true;
   statusEl.textContent = "";
@@ -771,6 +773,7 @@ const voiceSetupLogLines = [];
 
 function backendLabel(backend) {
   if (backend === "local") return "Qwen3-TTS（本地）";
+  if (backend === "voxcpm") return "VoxCPM2（本地零样本）";
   if (backend === "cosyvoice") return "CosyVoice（通义云端）";
   if (backend === "volc") return "火山引擎（云端）";
   return backend || "本地服务";

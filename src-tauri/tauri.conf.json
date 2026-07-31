@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "元元桌宠",
-  "version": "0.2.47",
+  "version": "0.2.48",
   "identifier": "com.aaronfang.kxyydesktoppet",
   "build": {
     "frontendDist": "../src"
@@ -79,6 +79,9 @@
       "../scripts/local-realtime/sensevoice-runtime-lock.json": "scripts/local-realtime/sensevoice-runtime-lock.json",
       "../scripts/local-realtime/SENSEVOICE-NOTICE.md": "scripts/local-realtime/SENSEVOICE-NOTICE.md",
       "../scripts/local-realtime/server.py": "scripts/local-realtime/server.py",
+      "../scripts/local-realtime/server_voxcpm.py": "scripts/local-realtime/server_voxcpm.py",
+      "../scripts/voxcpm-ab/setup.ps1": "scripts/voxcpm-ab/setup.ps1",
+      "../scripts/macos/setup-voxcpm2.sh": "scripts/macos/setup-voxcpm2.sh",
       "../scripts/local-realtime/server_cosyvoice.py": "scripts/local-realtime/server_cosyvoice.py",
       "../scripts/local-realtime/tts_cosyvoice.py": "scripts/local-realtime/tts_cosyvoice.py",
       "../scripts/local-realtime/tts_qwen3_torch.py": "scripts/local-realtime/tts_qwen3_torch.py",

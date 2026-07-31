@@ -22,6 +22,8 @@ const expectedMappings = new Map([
   ["../scripts/local-realtime/install_sensevoice_runtime.py", "scripts/local-realtime/install_sensevoice_runtime.py"],
   ["../scripts/local-realtime/sensevoice-runtime-lock.json", "scripts/local-realtime/sensevoice-runtime-lock.json"],
   ["../scripts/local-realtime/SENSEVOICE-NOTICE.md", "scripts/local-realtime/SENSEVOICE-NOTICE.md"],
+  ["../scripts/local-realtime/server_voxcpm.py", "scripts/local-realtime/server_voxcpm.py"],
+  ["../scripts/macos/setup-voxcpm2.sh", "scripts/macos/setup-voxcpm2.sh"],
 ]);
 
 for (const [source, target] of expectedMappings) {
