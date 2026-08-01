@@ -819,6 +819,19 @@ test("managed audio decoder validates the complete fixed header and payload", as
   for (const frame of invalid) assert.equal(decodeManagedAudioFrame(frame), null);
 });
 
+test("realtime waveform envelope stays finite and bounded for short PCM", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  const pcm = new Int16Array([0x7fff, -0x8000]);
+
+  const envelope = session._pcmEnvelope(pcm.buffer);
+
+  assert.equal(envelope.length, 48);
+  assert.equal(envelope.every((value) => Number.isFinite(value)), true);
+  assert.equal(envelope.every((value) => value >= 0 && value <= 1), true);
+});
+
 test("managed and proactive capabilities are explicitly offered only by eligible cascade clients", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const sockets = [];

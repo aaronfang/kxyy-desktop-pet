@@ -2,6 +2,9 @@
 # macOS Apple Silicon VoxCPM2 runtime. Runtime and model stay in Application Support.
 set -euo pipefail
 export PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8
+# Hugging Face's Xet transport can stall indefinitely on some macOS networks.
+# Prefer the resumable standard HTTP path unless the caller explicitly opts in.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "[setup-voxcpm] 错误：VoxCPM2 macOS 后端要求 Apple Silicon（arm64），Intel 不支持实时运行。"; exit 1
 fi

@@ -253,6 +253,8 @@ export class RealtimeSession {
     this.stopped = false;
     this._micLevel = 0;
     this._playLevel = 0;
+    this._micWave = new Float32Array(48);
+    this._playWave = new Float32Array(48);
     this._levelRaf = 0;
     this._pendingPcm = []; // context 未 running 时暂存下行 PCM，避免排进「过去」
     this._resumingOut = false;
@@ -873,11 +875,32 @@ export class RealtimeSession {
   _noteMicLevel(arrayBuffer) {
     const r = this._rmsI16(arrayBuffer);
     this._micLevel = Math.max(this._micLevel * 0.6, r);
+    this._micWave = this._pcmEnvelope(arrayBuffer);
   }
 
   _notePlayLevel(arrayBuffer) {
     const r = this._rmsI16(arrayBuffer);
     this._playLevel = Math.max(this._playLevel * 0.55, r);
+    this._playWave = this._pcmEnvelope(arrayBuffer);
+  }
+
+  // 只保留固定 48 段包络，不保留或转发原始 PCM；供 UI 做短时实时波形。
+  _pcmEnvelope(arrayBuffer, bins = 48) {
+    const i16 = new Int16Array(arrayBuffer);
+    const result = new Float32Array(bins);
+    if (!i16.length) return result;
+    for (let bin = 0; bin < bins; bin++) {
+      const start = Math.floor((bin * i16.length) / bins);
+      if (start >= i16.length) continue;
+      const end = Math.max(start + 1, Math.floor(((bin + 1) * i16.length) / bins));
+      let sum = 0;
+      for (let i = start; i < end; i++) {
+        const value = i16[i] / 0x8000;
+        sum += value * value;
+      }
+      result[bin] = Math.min(1, Math.sqrt(sum / (end - start)) * 3.6);
+    }
+    return result;
   }
 
   _startLevelLoop() {
@@ -887,7 +910,13 @@ export class RealtimeSession {
       this._micLevel *= 0.88;
       this._playLevel *= 0.9;
       const level = Math.min(1, Math.max(this._micLevel, this._playLevel) * 2.4);
-      this.cb.onLevel?.(level);
+      const waveform = new Float32Array(48);
+      for (let i = 0; i < waveform.length; i++) {
+        this._micWave[i] *= 0.86;
+        this._playWave[i] *= 0.89;
+        waveform[i] = Math.max(this._micWave[i], this._playWave[i]);
+      }
+      this.cb.onLevel?.(level, waveform);
       this._levelRaf = requestAnimationFrame(tick);
     };
     this._levelRaf = requestAnimationFrame(tick);

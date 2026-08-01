@@ -438,6 +438,12 @@ select:focus {
   grid-template-columns: 1fr 1fr 1fr;
   gap: 12px;
 }
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.grid2 label { margin-bottom: 0; }
 .grid3 label {
   margin-bottom: 0;
 }

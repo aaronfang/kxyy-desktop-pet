@@ -10,7 +10,7 @@ mod voice_service;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -214,6 +214,19 @@ struct Settings {
     /// 聊天窗口距工作区底部的逻辑偏移(px)。
     #[serde(default = "default_chat_bottom_offset")]
     chat_bottom_offset: u32,
+    /// 贴边收缩后胶囊入口宽度；0 兼容早期未配置版本。
+    #[serde(default = "default_capsule_collapsed_width")]
+    capsule_collapsed_width: u32,
+    /// 通话胶囊相对目标工作区左上角的逻辑坐标。
+    #[serde(default)]
+    capsule_x: Option<f64>,
+    #[serde(default)]
+    capsule_y: Option<f64>,
+    /// 空字符串表示浮动；`left` / `right` 表示贴边。
+    #[serde(default)]
+    capsule_edge: String,
+    #[serde(default)]
+    capsule_monitor_id: Option<String>,
 }
 
 fn default_temperature() -> f64 {
@@ -292,6 +305,18 @@ fn default_chat_bottom_offset() -> u32 {
     96
 }
 
+fn default_capsule_collapsed_width() -> u32 {
+    96
+}
+
+fn capsule_collapsed_width(value: u32) -> f64 {
+    if value == 0 {
+        default_capsule_collapsed_width() as f64
+    } else {
+        value.clamp(64, 160) as f64
+    }
+}
+
 impl Settings {
     fn defaults() -> Self {
         let r = roster();
@@ -347,6 +372,11 @@ impl Settings {
             chat_width: default_chat_width(),
             chat_height: default_chat_height(),
             chat_bottom_offset: default_chat_bottom_offset(),
+            capsule_collapsed_width: default_capsule_collapsed_width(),
+            capsule_x: None,
+            capsule_y: None,
+            capsule_edge: String::new(),
+            capsule_monitor_id: None,
         }
     }
 }
@@ -359,6 +389,70 @@ struct AppState {
     realtime_port: u16,
     /// 正在走「先刷长期记忆再退出」流程，避免托盘连点重复触发。
     quitting: AtomicBool,
+    /// 聊天窗口当前是否处于实时通话胶囊模式。
+    chat_compact: AtomicBool,
+    /// 去抖胶囊移动事件；只允许最后一次移动落盘和触发吸附。
+    capsule_move_generation: AtomicU64,
+    capsule_move_worker: AtomicBool,
+    capsule_collapsed: AtomicBool,
+    settings_save: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapsuleEdge {
+    Left,
+    Right,
+}
+
+impl CapsuleEdge {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+const CAPSULE_WIDTH: f64 = 252.0;
+const CAPSULE_HEIGHT: f64 = 64.0;
+const CAPSULE_MARGIN: f64 = 24.0;
+const CAPSULE_SNAP_DISTANCE: f64 = 20.0;
+
+fn capsule_drag_result(
+    x: f64,
+    y: f64,
+    work_x: f64,
+    work_y: f64,
+    work_width: f64,
+    work_height: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64, Option<CapsuleEdge>) {
+    let max_x = work_x + (work_width - width).max(0.0);
+    let max_y = work_y + (work_height - height).max(0.0);
+    let clamped_y = y.clamp(work_y, max_y);
+    if x - work_x <= CAPSULE_SNAP_DISTANCE {
+        (work_x, clamped_y, Some(CapsuleEdge::Left))
+    } else if max_x - x <= CAPSULE_SNAP_DISTANCE {
+        (max_x, clamped_y, Some(CapsuleEdge::Right))
+    } else {
+        (x.clamp(work_x, max_x), clamped_y, None)
+    }
+}
+
+fn capsule_resized_x(x: f64, old_width: f64, new_width: f64, edge: CapsuleEdge) -> f64 {
+    match edge {
+        CapsuleEdge::Left => x,
+        CapsuleEdge::Right => x + old_width - new_width,
+    }
 }
 
 /// 持有托盘图标引用，防止 setup 结束后被 drop 移除。
@@ -504,12 +598,15 @@ fn load_settings(app: &AppHandle) -> Settings {
     Settings::defaults()
 }
 
-fn save_settings(app: &AppHandle, s: &Settings) {
+fn save_settings(app: &AppHandle, _snapshot: &Settings) {
+    let state = app.state::<AppState>();
+    let _save_guard = state.settings_save.lock().unwrap();
+    let current = state.settings.lock().unwrap().clone();
     if let Some(p) = settings_path(app) {
         if let Some(dir) = p.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        if let Ok(json) = serde_json::to_string_pretty(s) {
+        if let Ok(json) = serde_json::to_string_pretty(&current) {
             let _ = fs::write(p, json);
         }
     }
@@ -854,12 +951,247 @@ fn position_chat_window(app: &AppHandle) {
     }
 }
 
+/// 将实时通话胶囊停靠在当前聊天窗口所在屏幕的右下角。
+fn position_chat_capsule(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("chat") {
+        let saved = app.state::<AppState>().settings.lock().unwrap().clone();
+        let monitor_id = saved.capsule_monitor_id.clone();
+        if let Some(monitor) = resolve_monitor(&win, &monitor_id) {
+            #[cfg(windows)]
+            {
+                let wa = monitor.work_area();
+                let win_sf = monitor.scale_factor().max(0.1);
+                let width = (CAPSULE_WIDTH * win_sf) as u32;
+                let height = (CAPSULE_HEIGHT * win_sf) as u32;
+                let max_x = (wa.size.width as f64 / win_sf - CAPSULE_WIDTH).max(0.0);
+                let max_y = (wa.size.height as f64 / win_sf - CAPSULE_HEIGHT).max(0.0);
+                let relative_x = CapsuleEdge::parse(&saved.capsule_edge)
+                    .map(|edge| {
+                        if edge == CapsuleEdge::Left {
+                            0.0
+                        } else {
+                            max_x
+                        }
+                    })
+                    .or(saved.capsule_x)
+                    .unwrap_or(max_x - CAPSULE_MARGIN)
+                    .clamp(0.0, max_x);
+                let relative_y = saved
+                    .capsule_y
+                    .unwrap_or(max_y - CAPSULE_MARGIN)
+                    .clamp(0.0, max_y);
+                let x = wa.position.x + (relative_x * win_sf) as i32;
+                let y = wa.position.y + (relative_y * win_sf) as i32;
+                let _ = win.set_size(tauri::PhysicalSize::new(width, height));
+                let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+            }
+            #[cfg(not(windows))]
+            {
+                let (lx, ly, lw, lh) = work_area_logical(&monitor);
+                let max_x = (lw - CAPSULE_WIDTH).max(0.0);
+                let max_y = (lh - CAPSULE_HEIGHT).max(0.0);
+                let relative_x = CapsuleEdge::parse(&saved.capsule_edge)
+                    .map(|edge| {
+                        if edge == CapsuleEdge::Left {
+                            0.0
+                        } else {
+                            max_x
+                        }
+                    })
+                    .or(saved.capsule_x)
+                    .unwrap_or(max_x - CAPSULE_MARGIN)
+                    .clamp(0.0, max_x);
+                let relative_y = saved
+                    .capsule_y
+                    .unwrap_or(max_y - CAPSULE_MARGIN)
+                    .clamp(0.0, max_y);
+                let _ = win.set_size(tauri::LogicalSize::new(CAPSULE_WIDTH, CAPSULE_HEIGHT));
+                let _ = win.set_position(tauri::LogicalPosition::new(
+                    lx + relative_x,
+                    ly + relative_y,
+                ));
+            }
+            app.state::<AppState>()
+                .capsule_collapsed
+                .store(false, Ordering::Release);
+            let edge = CapsuleEdge::parse(&saved.capsule_edge).map(CapsuleEdge::as_str);
+            let _ = app.emit("call-capsule-edge", edge);
+        }
+    }
+}
+
+fn finish_capsule_move(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if !state.chat_compact.load(Ordering::Acquire)
+        || state.capsule_collapsed.load(Ordering::Acquire)
+    {
+        return;
+    }
+    let Some(win) = app.get_webview_window("chat") else {
+        return;
+    };
+    let Some(monitor) = resolve_monitor(&win, &None) else {
+        return;
+    };
+    let Ok(position) = win.outer_position() else {
+        return;
+    };
+
+    #[cfg(windows)]
+    let (work_x, work_y, work_width, work_height, x, y) = {
+        let wa = monitor.work_area();
+        let sf = win.scale_factor().unwrap_or(1.0).max(0.1);
+        (
+            0.0,
+            0.0,
+            wa.size.width as f64 / sf,
+            wa.size.height as f64 / sf,
+            (position.x - wa.position.x) as f64 / sf,
+            (position.y - wa.position.y) as f64 / sf,
+        )
+    };
+    #[cfg(not(windows))]
+    let (work_x, work_y, work_width, work_height, x, y) = {
+        let (wx, wy, ww, wh) = work_area_logical(&monitor);
+        let sf = win.scale_factor().unwrap_or(1.0).max(0.1);
+        (
+            0.0,
+            0.0,
+            ww,
+            wh,
+            position.x as f64 / sf - wx,
+            position.y as f64 / sf - wy,
+        )
+    };
+
+    let (next_x, next_y, edge) = capsule_drag_result(
+        x,
+        y,
+        work_x,
+        work_y,
+        work_width,
+        work_height,
+        CAPSULE_WIDTH,
+        CAPSULE_HEIGHT,
+    );
+    #[cfg(windows)]
+    {
+        let wa = monitor.work_area();
+        let sf = win.scale_factor().unwrap_or(1.0).max(0.1);
+        let _ = win.set_position(tauri::PhysicalPosition::new(
+            wa.position.x + (next_x * sf).round() as i32,
+            wa.position.y + (next_y * sf).round() as i32,
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let (wx, wy, _, _) = work_area_logical(&monitor);
+        let _ = win.set_position(tauri::LogicalPosition::new(wx + next_x, wy + next_y));
+    }
+
+    let snapshot = {
+        let mut settings = state.settings.lock().unwrap();
+        settings.capsule_x = Some(next_x);
+        settings.capsule_y = Some(next_y);
+        settings.capsule_edge = edge.map(CapsuleEdge::as_str).unwrap_or("").into();
+        settings.capsule_monitor_id = monitor.name().cloned();
+        settings.clone()
+    };
+    save_settings(app, &snapshot);
+    let _ = app.emit("call-capsule-edge", edge.map(CapsuleEdge::as_str));
+}
+
+fn resize_chat_capsule(app: &AppHandle, collapsed: bool) {
+    let state = app.state::<AppState>();
+    if !state.chat_compact.load(Ordering::Acquire) {
+        return;
+    }
+    let (edge, collapsed_width) = {
+        let settings = state.settings.lock().unwrap();
+        (
+            CapsuleEdge::parse(&settings.capsule_edge),
+            capsule_collapsed_width(settings.capsule_collapsed_width),
+        )
+    };
+    let Some(edge) = edge else { return };
+    if state.capsule_collapsed.swap(collapsed, Ordering::AcqRel) == collapsed {
+        return;
+    }
+    let Some(win) = app.get_webview_window("chat") else {
+        return;
+    };
+    let Ok(position) = win.outer_position() else {
+        return;
+    };
+    let sf = win.scale_factor().unwrap_or(1.0).max(0.1);
+    let old_width = win
+        .outer_size()
+        .map(|size| size.width as f64 / sf)
+        .unwrap_or(if collapsed {
+            CAPSULE_WIDTH
+        } else {
+            collapsed_width
+        });
+    let new_width = if collapsed {
+        collapsed_width
+    } else {
+        CAPSULE_WIDTH
+    };
+    #[cfg(windows)]
+    {
+        let next_x = capsule_resized_x(position.x as f64 / sf, old_width, new_width, edge);
+        let _ = win.set_size(tauri::PhysicalSize::new(
+            (new_width * sf).round() as u32,
+            (CAPSULE_HEIGHT * sf).round() as u32,
+        ));
+        let _ = win.set_position(tauri::PhysicalPosition::new(
+            (next_x * sf).round() as i32,
+            position.y,
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let next_x = capsule_resized_x(position.x as f64 / sf, old_width, new_width, edge);
+        let _ = win.set_size(tauri::LogicalSize::new(new_width, CAPSULE_HEIGHT));
+        let _ = win.set_position(tauri::LogicalPosition::new(next_x, position.y as f64 / sf));
+    }
+    let _ = app.emit("call-capsule-collapsed", collapsed);
+}
+
+fn set_chat_compact_window(app: &AppHandle, compact: bool) {
+    app.state::<AppState>()
+        .chat_compact
+        .store(compact, Ordering::Release);
+    if let Some(win) = app.get_webview_window("chat") {
+        if compact {
+            position_chat_capsule(app);
+        } else {
+            app.state::<AppState>()
+                .capsule_collapsed
+                .store(false, Ordering::Release);
+            position_chat_window(app);
+        }
+        let _ = win.show();
+        if !compact {
+            let _ = win.set_focus();
+        }
+    }
+    let _ = app.emit("chat-window-mode", compact);
+}
+
 /// 切换聊天窗口显隐（全局快捷键与托盘共用）。
 fn toggle_chat(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("chat") {
         if win.is_visible().unwrap_or(false) {
-            let _ = win.hide();
+            if app.state::<AppState>().chat_compact.load(Ordering::Acquire) {
+                set_chat_compact_window(app, false);
+            } else {
+                let _ = win.hide();
+            }
         } else {
+            app.state::<AppState>()
+                .chat_compact
+                .store(false, Ordering::Release);
             position_chat_window(app);
             let _ = win.show();
             let _ = win.set_focus();
@@ -1318,9 +1650,30 @@ fn toggle_chat_window(app: AppHandle) {
 
 #[tauri::command]
 fn hide_chat(app: AppHandle) {
+    app.state::<AppState>()
+        .chat_compact
+        .store(false, Ordering::Release);
     if let Some(win) = app.get_webview_window("chat") {
         let _ = win.hide();
     }
+}
+
+#[tauri::command]
+fn set_chat_compact(app: AppHandle, compact: bool) {
+    set_chat_compact_window(&app, compact);
+}
+
+#[tauri::command]
+fn start_chat_capsule_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "chat" {
+        return Err("胶囊拖动仅允许聊天窗口调用".into());
+    }
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_chat_capsule_collapsed(app: AppHandle, collapsed: bool) {
+    resize_chat_capsule(&app, collapsed);
 }
 
 #[tauri::command]
@@ -1416,6 +1769,8 @@ struct AiSettingsInput {
     chat_width: u32,
     chat_height: u32,
     chat_bottom_offset: u32,
+    #[serde(default = "default_capsule_collapsed_width")]
+    capsule_collapsed_width: u32,
 }
 
 /// 前端用于按平台显示语音后端选项（macos / windows / linux）。
@@ -1521,10 +1876,19 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.chat_width = settings.chat_width.clamp(240, 900);
         s.chat_height = settings.chat_height.clamp(200, 900);
         s.chat_bottom_offset = settings.chat_bottom_offset.min(1200);
+        s.capsule_collapsed_width = settings.capsule_collapsed_width.clamp(64, 160);
         s.persona_card_id = card_id;
     });
     re_register_hotkey(&app);
-    position_chat_window(&app);
+    let app_state = app.state::<AppState>();
+    if app_state.chat_compact.load(Ordering::Acquire) {
+        if app_state.capsule_collapsed.load(Ordering::Acquire) {
+            app_state.capsule_collapsed.store(false, Ordering::Release);
+            resize_chat_capsule(&app, true);
+        }
+    } else {
+        position_chat_window(&app);
+    }
     // 按所选语音后端自动拉起 / 切换本地 Python 服务。
     let backend;
     let voice_fp;
@@ -1704,6 +2068,11 @@ pub fn run() {
                 api_port,
                 realtime_port,
                 quitting: AtomicBool::new(false),
+                chat_compact: AtomicBool::new(false),
+                capsule_move_generation: AtomicU64::new(0),
+                capsule_move_worker: AtomicBool::new(false),
+                capsule_collapsed: AtomicBool::new(false),
+                settings_save: Mutex::new(()),
             });
             // 尽早创建托盘，避免语音服务等后台任务拖慢菜单栏图标出现。
             install_tray(app)?;
@@ -1763,6 +2132,48 @@ pub fn run() {
                 });
             }
 
+            if let Some(chat_win) = app.get_webview_window("chat") {
+                let moved_handle = handle.clone();
+                chat_win.on_window_event(move |event| {
+                    if let WindowEvent::Moved(_) = event {
+                        let state = moved_handle.state::<AppState>();
+                        if !state.chat_compact.load(Ordering::Acquire)
+                            || state.capsule_collapsed.load(Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        let generation =
+                            state.capsule_move_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                        if state.capsule_move_worker.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
+                        let app = moved_handle.clone();
+                        std::thread::spawn(move || {
+                            let mut observed = generation;
+                            loop {
+                                std::thread::sleep(Duration::from_millis(360));
+                                let state = app.state::<AppState>();
+                                let latest = state.capsule_move_generation.load(Ordering::Acquire);
+                                if latest == observed {
+                                    finish_capsule_move(&app);
+                                    state.capsule_move_worker.store(false, Ordering::Release);
+                                    if state.capsule_move_generation.load(Ordering::Acquire)
+                                        == latest
+                                        || state.capsule_move_worker.swap(true, Ordering::AcqRel)
+                                    {
+                                        break;
+                                    }
+                                    observed =
+                                        state.capsule_move_generation.load(Ordering::Acquire);
+                                } else {
+                                    observed = latest;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1786,6 +2197,9 @@ pub fn run() {
             probe_voice_backend,
             toggle_chat_window,
             hide_chat,
+            set_chat_compact,
+            start_chat_capsule_drag,
+            set_chat_capsule_collapsed,
             open_settings,
             set_ai_settings,
             get_platform,
@@ -1828,9 +2242,81 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_asr_provider, normalize_local_voice_preset, normalize_realtime_conversation_mode,
-        normalize_turn_pause_tolerance, voice_config_fingerprint, Settings,
+        capsule_collapsed_width, capsule_drag_result, capsule_resized_x, normalize_asr_provider,
+        normalize_local_voice_preset, normalize_realtime_conversation_mode,
+        normalize_turn_pause_tolerance, voice_config_fingerprint, CapsuleEdge, Settings,
+        CAPSULE_HEIGHT, CAPSULE_WIDTH,
     };
+
+    #[test]
+    fn capsule_drag_snaps_to_nearby_edges_and_clamps_vertically() {
+        let left = capsule_drag_result(
+            11.0,
+            -20.0,
+            0.0,
+            0.0,
+            1440.0,
+            900.0,
+            CAPSULE_WIDTH,
+            CAPSULE_HEIGHT,
+        );
+        assert_eq!(left, (0.0, 0.0, Some(CapsuleEdge::Left)));
+
+        let right = capsule_drag_result(
+            1176.0,
+            860.0,
+            0.0,
+            0.0,
+            1440.0,
+            900.0,
+            CAPSULE_WIDTH,
+            CAPSULE_HEIGHT,
+        );
+        assert_eq!(right, (1188.0, 836.0, Some(CapsuleEdge::Right)));
+
+        let floating = capsule_drag_result(
+            500.0,
+            300.0,
+            0.0,
+            0.0,
+            1440.0,
+            900.0,
+            CAPSULE_WIDTH,
+            CAPSULE_HEIGHT,
+        );
+        assert_eq!(floating, (500.0, 300.0, None));
+
+        // The initial 24 px margin must remain floating instead of being
+        // mistaken for a user edge snap by the programmatic Moved event.
+        let initial = capsule_drag_result(
+            1164.0,
+            820.0,
+            0.0,
+            0.0,
+            1440.0,
+            900.0,
+            CAPSULE_WIDTH,
+            CAPSULE_HEIGHT,
+        );
+        assert_eq!(initial, (1164.0, 820.0, None));
+    }
+
+    #[test]
+    fn capsule_edge_collapse_keeps_the_attached_edge_fixed() {
+        assert_eq!(capsule_resized_x(0.0, 252.0, 54.0, CapsuleEdge::Left), 0.0);
+        assert_eq!(
+            capsule_resized_x(1188.0, 252.0, 54.0, CapsuleEdge::Right),
+            1386.0
+        );
+    }
+
+    #[test]
+    fn capsule_collapsed_wave_width_uses_a_readable_bounded_setting() {
+        assert_eq!(capsule_collapsed_width(0), 96.0);
+        assert_eq!(capsule_collapsed_width(20), 64.0);
+        assert_eq!(capsule_collapsed_width(120), 120.0);
+        assert_eq!(capsule_collapsed_width(999), 160.0);
+    }
 
     #[test]
     fn vad_shadow_is_opt_in_and_changes_voice_fingerprint() {
