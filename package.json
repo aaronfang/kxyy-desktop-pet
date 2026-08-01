@@ -7,7 +7,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/persona-context.test.js",
+    "test": "node --test tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/persona-context.test.js tests/persona-realtime.test.js",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:resources": "node scripts/verify-vad-resources.mjs",
     "tauri": "tauri",

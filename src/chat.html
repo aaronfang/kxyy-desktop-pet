@@ -7,6 +7,11 @@
 </head>
 <body>
   <div id="chat">
+    <div id="chat-toolbar" hidden>
+      <button id="chat-collapse" type="button" title="收起为通话胶囊" aria-label="收起为通话胶囊" hidden>
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
+      </button>
+    </div>
     <div id="messages" aria-live="polite"></div>
     <div id="attach-preview" hidden>
       <img id="attach-thumb" alt="待发送图片" />
@@ -57,6 +62,19 @@
     <div id="startup-status" aria-live="polite">
       <span class="svc-dot voice pending"></span><span class="svc-label">语音</span>
       <span class="svc-dot api pending"></span><span class="svc-label">AI</span>
+    </div>
+    <div id="call-capsule" hidden>
+      <div id="call-capsule-wave" aria-label="通话波形">
+        <canvas id="capsule-wave-canvas" width="344" height="60"></canvas>
+      </div>
+      <div id="call-capsule-actions">
+        <button id="call-capsule-open" type="button" title="打开通话界面" aria-label="打开通话界面">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4H5a1 1 0 0 0-1 1v4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/></svg>
+        </button>
+        <button id="call-capsule-hangup" type="button" title="挂断通话" aria-label="挂断通话">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M4.28 13.74c4.92-3.63 10.52-3.63 15.44 0 .72.53.92 1.51.46 2.27l-1.19 1.96a1.55 1.55 0 0 1-2.02.58l-2.08-1.08a1.55 1.55 0 0 1-.82-1.61l.18-1.06a9.6 9.6 0 0 0-4.5 0l.18 1.06a1.55 1.55 0 0 1-.82 1.61l-2.08 1.08a1.55 1.55 0 0 1-2.02-.58l-1.19-1.96a1.7 1.7 0 0 1 .46-2.27Z"/></svg>
+        </button>
+      </div>
     </div>
   </div>
   <script type="module" src="./chat.js"></script>

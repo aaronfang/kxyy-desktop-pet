@@ -317,6 +317,20 @@ const thumbEl = document.getElementById("attach-thumb");
 const attachRemoveBtn = document.getElementById("attach-remove");
 const stickersBtn = document.getElementById("stickers-btn");
 const callBtn = document.getElementById("call-btn");
+const chatEl = document.getElementById("chat");
+const chatToolbarEl = document.getElementById("chat-toolbar");
+const chatCollapseBtn = document.getElementById("chat-collapse");
+const callCapsuleEl = document.getElementById("call-capsule");
+const callCapsuleWaveEl = document.getElementById("call-capsule-wave");
+const callCapsuleActionsEl = document.getElementById("call-capsule-actions");
+const capsuleWaveCanvas = document.getElementById("capsule-wave-canvas");
+const capsuleWaveCtx = capsuleWaveCanvas?.getContext("2d");
+const capsuleWaveEnvelope = new Float32Array(48);
+const callCapsuleOpenBtn = document.getElementById("call-capsule-open");
+const callCapsuleHangupBtn = document.getElementById("call-capsule-hangup");
+let callCapsuleEdge = null;
+let callCapsuleCollapseTimer = 0;
+let callCapsuleHovered = false;
 const stickerPanel = document.getElementById("sticker-panel");
 const stickerGrid = document.getElementById("sticker-grid");
 const stickerPreviewEl = document.getElementById("sticker-preview");
@@ -361,13 +375,12 @@ function updateInputPlaceholder() {
     : `和${aiShortName()}说点什么…（Esc 收起）`;
 }
 
-/** 非 kxyy 人设暂不开放实时语音与表情包：隐藏对应按钮并收尾进行中状态。 */
-function updateKxyyOnlyControls() {
+/** 实时语音对所有人设开放；表情包仍只使用 kxyy 自带素材。 */
+function updatePersonaControls() {
   const kxyy = isKxyyPersona(settings.personaCardId);
-  if (callBtn) callBtn.hidden = !kxyy;
+  if (callBtn) callBtn.hidden = false;
   if (stickersBtn) stickersBtn.hidden = !kxyy;
   if (!kxyy) {
-    if (callActive) endCall({ notice: false });
     clearPendingSticker();
     closeStickerPanel();
   }
@@ -990,7 +1003,9 @@ onTtsProgress(applyTtsProgress);
 /** 应用外观设置（字号）到根元素，并把已渲染气泡的头像刷新为最新设置。 */
 function applyAppearance() {
   const fs = Number(settings.chatFontSize) || 14;
+  const collapsedWidth = Math.max(64, Math.min(160, Number(settings.capsuleCollapsedWidth) || 96));
   document.documentElement.style.setProperty("--chat-font-size", `${fs}px`);
+  document.documentElement.style.setProperty("--capsule-collapsed-width", `${collapsedWidth}px`);
   messagesEl.querySelectorAll(".row").forEach((row) => {
     const img = row.querySelector(".avatar img");
     if (!img) return;
@@ -1000,7 +1015,7 @@ function applyAppearance() {
   setVoiceVolumePercent(Number.isFinite(vol) ? vol : 100);
   updateVoiceDebug();
   updateInputPlaceholder();
-  updateKxyyOnlyControls();
+  updatePersonaControls();
 }
 
 function scrollBottom() {
@@ -2099,8 +2114,124 @@ function showCallWave(show) {
   }
 }
 
+function drawCapsuleWave(level = 0, waveform = null) {
+  if (!capsuleWaveCtx || !capsuleWaveCanvas) return;
+  const ctx = capsuleWaveCtx;
+  const width = capsuleWaveCanvas.width;
+  const height = capsuleWaveCanvas.height;
+  const center = height / 2;
+  const count = 56;
+  ctx.clearRect(0, 0, width, height);
+
+  const values = waveform instanceof Float32Array ? waveform : null;
+  const now = performance.now() / 1000;
+  for (let i = 0; i < capsuleWaveEnvelope.length; i++) {
+    const target = values ? Math.min(1, values[i] || 0) : 0;
+    const current = capsuleWaveEnvelope[i];
+    capsuleWaveEnvelope[i] = target > current
+      ? current * .48 + target * .52
+      : current * .84 + target * .16;
+  }
+  const smoothEnvelope = new Float32Array(capsuleWaveEnvelope);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < smoothEnvelope.length; i++) {
+      let sum = 0;
+      let count = 0;
+      for (let j = Math.max(0, i - 2); j <= Math.min(smoothEnvelope.length - 1, i + 2); j++) {
+        sum += smoothEnvelope[j];
+        count++;
+      }
+      capsuleWaveEnvelope[i] = sum / count;
+    }
+    smoothEnvelope.set(capsuleWaveEnvelope);
+  }
+  const sampleAt = (t) => {
+    const p = Math.max(0, Math.min(capsuleWaveEnvelope.length - 1, t * (capsuleWaveEnvelope.length - 1)));
+    const a = Math.floor(p);
+    const b = Math.min(capsuleWaveEnvelope.length - 1, a + 1);
+    return capsuleWaveEnvelope[a] * (1 - (p - a)) + capsuleWaveEnvelope[b] * (p - a);
+  };
+  const gaussian = (x, centerAt, spread) => {
+    const distance = (x - centerAt) / spread;
+    return Math.exp(-distance * distance * 2.2);
+  };
+  const layerSpecs = [
+    { color: "#29eda8", center: .33, width: .105, flowWidth: .19, gain: 19, phase: .2, speed: 1.05, alpha: .56 },
+    { color: "#23dfff", center: .45, width: .13, flowWidth: .21, gain: 25, phase: 1.55, speed: .94, alpha: .54 },
+    { color: "#317dff", center: .54, width: .115, flowWidth: .2, gain: 29, phase: 2.8, speed: 1.12, alpha: .52 },
+    { color: "#ed65e8", center: .62, width: .12, flowWidth: .19, gain: 24, phase: 4.15, speed: 1, alpha: .52 },
+    { color: "#ff9d62", center: .73, width: .105, flowWidth: .17, gain: 18, phase: 5.4, speed: 1.08, alpha: .5 },
+  ];
+
+  const makePath = (spec) => {
+    const top = [];
+    const bottom = [];
+    for (let i = 0; i < count; i++) {
+      const t = i / (count - 1);
+      const local = gaussian(t, spec.center, spec.width);
+      const flowArea = gaussian(t, spec.center, spec.flowWidth);
+      const envelope = Math.min(1, Math.max(sampleAt(t) * 1.3, level * .2, .055));
+      const flow = Math.sin(now * spec.speed + spec.phase + t * (6.2 + spec.center * 2.4));
+      const pulse = .68 + .32 * Math.sin(now * spec.speed * .7 + spec.phase * 1.3 + t * 7.4) ** 2;
+      const centerLine = center + flow * (1.4 + envelope * 8.5) * flowArea;
+      const thickness = .18 + spec.gain * envelope * local * pulse;
+      top.push([t * width, centerLine - thickness]);
+      bottom.push([t * width, centerLine + thickness]);
+    }
+    const path = new Path2D();
+    path.moveTo(0, center);
+    for (let i = 0; i < top.length - 1; i++) {
+      const [x, y] = top[i];
+      const [nx, ny] = top[i + 1];
+      path.quadraticCurveTo(x, y, (x + nx) / 2, (y + ny) / 2);
+    }
+    const [lastX, lastY] = top[top.length - 1];
+    path.quadraticCurveTo(lastX, lastY, width, center);
+    for (let i = bottom.length - 1; i >= 0; i--) {
+      const [x, y] = bottom[i];
+      if (i === bottom.length - 1) path.lineTo(x, y);
+      else {
+        const [px, py] = bottom[i + 1];
+        path.quadraticCurveTo(px, py, (x + px) / 2, (y + py) / 2);
+      }
+    }
+    path.closePath();
+    return path;
+  };
+
+  for (const spec of layerSpecs) {
+    const path = makePath(spec);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = spec.alpha * .55;
+    ctx.filter = "blur(5px)";
+    ctx.fillStyle = spec.color;
+    ctx.fill(path);
+    ctx.restore();
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = spec.alpha;
+    ctx.fillStyle = spec.color;
+    ctx.fill(path);
+    ctx.restore();
+  }
+
+  const baseline = ctx.createLinearGradient(0, 0, width, 0);
+  baseline.addColorStop(0, "rgba(255,255,255,0)");
+  baseline.addColorStop(.12, "rgba(255,255,255,.7)");
+  baseline.addColorStop(.88, "rgba(255,255,255,.7)");
+  baseline.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.strokeStyle = baseline;
+  ctx.lineWidth = .8;
+  ctx.beginPath();
+  ctx.moveTo(0, center);
+  ctx.lineTo(width, center);
+  ctx.stroke();
+}
+
 /** level ∈ [0,1]：麦克风与下行播放的合成电平。 */
-function updateCallWave(level) {
+function updateCallWave(level, waveform) {
+  drawCapsuleWave(level, waveform);
   if (!callWaveBars.length || callWaveEl?.hidden) return;
   const t = performance.now() / 1000;
   const idle = 0.08 + 0.04 * Math.sin(t * 2.2);
@@ -2119,6 +2250,11 @@ function updateCallWave(level) {
 function setCallActive(next) {
   callActive = next;
   callBtn.classList.toggle("in-call", next);
+  callBtn.getAnimations?.().forEach((animation) => {
+    if (!next) animation.cancel();
+  });
+  callBtn.style.animation = next ? "" : "none";
+  callBtn.style.boxShadow = next ? "" : "0 3px 12px rgba(0, 0, 0, 0.2)";
   callBtn.title = next ? "挂断" : "实时语音通话";
   callBtn.setAttribute("aria-label", next ? "挂断" : "实时语音通话");
   // 通话中锁定文字输入 / 发图 / 表情，避免两路音频与消息冲突。
@@ -2128,6 +2264,57 @@ function setCallActive(next) {
   stickersBtn.disabled = next;
   updateInputPlaceholder();
   showCallWave(next);
+  if (chatToolbarEl) chatToolbarEl.hidden = !next;
+  if (chatCollapseBtn) chatCollapseBtn.hidden = !next;
+  if (callCapsuleEl && !next) callCapsuleEl.hidden = true;
+  if (callCapsuleActionsEl) callCapsuleActionsEl.hidden = !next;
+  if (!next) capsuleWaveEnvelope.fill(0);
+}
+
+function clearCallCapsuleCollapseTimer() {
+  if (!callCapsuleCollapseTimer) return;
+  clearTimeout(callCapsuleCollapseTimer);
+  callCapsuleCollapseTimer = 0;
+}
+
+function setCallCapsuleCollapsed(collapsed) {
+  clearCallCapsuleCollapseTimer();
+  if (!chatEl?.classList.contains("compact")) return;
+  chatEl.classList.toggle("capsule-collapsed", collapsed);
+  invoke("set_chat_capsule_collapsed", { collapsed }).catch(() => {
+    chatEl.classList.toggle("capsule-collapsed", !collapsed);
+  });
+}
+
+function scheduleCallCapsuleCollapse() {
+  clearCallCapsuleCollapseTimer();
+  if (callCapsuleHovered || !callCapsuleEdge || !chatEl?.classList.contains("compact")) return;
+  callCapsuleCollapseTimer = window.setTimeout(() => {
+    callCapsuleCollapseTimer = 0;
+    setCallCapsuleCollapsed(true);
+  }, 900);
+}
+
+async function setChatCompact(compact) {
+  if (!callActive && compact) return;
+  chatEl?.classList.toggle("compact", compact);
+  if (!compact) {
+    clearCallCapsuleCollapseTimer();
+    callCapsuleHovered = false;
+    chatEl?.classList.remove("capsule-collapsed");
+  }
+  if (callCapsuleEl) callCapsuleEl.hidden = !compact;
+  try {
+    await invoke("set_chat_compact", { compact });
+  } catch (_) {
+    chatEl?.classList.toggle("compact", !compact);
+    if (callCapsuleEl) callCapsuleEl.hidden = compact;
+  }
+}
+
+function setCallCapsuleStatus(_text, speaking = false, listening = false) {
+  callCapsuleEl?.classList.toggle("speaking", speaking);
+  callCapsuleEl?.classList.toggle("listening", listening);
 }
 
 function finalizeCallUserBubble() {
@@ -2304,7 +2491,6 @@ async function provideTurnMemoryContext(session, generation, reason = "turn") {
 }
 
 async function startCall() {
-  if (!isKxyyPersona(settings.personaCardId)) return;
   if (callActive || callTraceFinalizing || busy) return;
   if (!assets) return;
   unlockAudio();
@@ -2346,19 +2532,27 @@ async function startCall() {
       finalizeCallUserBubble();
       finalizeCallAsstBubble();
       petSignal("user");
+      setCallCapsuleStatus("聆听中", false, true);
     },
     // ASR 全文是覆盖式更新；只在 asr_end 定稿，避免中间态被标成 final 时切成多条。
     onAsr: (text) => upsertCallUserBubble(text, { interim: true }),
-    onAsrEnd: () => finalizeCallUserBubble(),
+    onAsrEnd: () => {
+      finalizeCallUserBubble();
+      setCallCapsuleStatus("通话中");
+    },
     onMemoryContextRequest: ({ generation, reason }) => {
       void provideTurnMemoryContext(session, generation, reason);
     },
     onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
-    onAssistantEnd: () => finalizeCallAsstBubble(),
+    onAssistantEnd: () => {
+      finalizeCallAsstBubble();
+      setCallCapsuleStatus("通话中");
+    },
     onAssistantDiscarded: (meta) => discardCallAsstBubble(meta),
     onAudibleAssistant: (text, meta) => commitCallAudibleSegment(text, meta),
     onSpeechCandidate: () => {
       callWaveEl?.classList.add("candidate");
+      setCallCapsuleStatus("聆听中", false, true);
     },
     onSpeechRejected: () => {
       callWaveEl?.classList.remove("candidate");
@@ -2368,14 +2562,16 @@ async function startCall() {
       callWaveSpeaking = true;
       callWaveEl?.classList.add("speaking");
       petSignal("speaking");
+      setCallCapsuleStatus("元元说话", true);
     },
     onUsage: (msg) => noteCallUsage(msg),
-    onLevel: (level) => updateCallWave(level),
+    onLevel: (level, waveform) => updateCallWave(level, waveform),
     onResponseError: (e) => {
       callWaveSpeaking = false;
       callWaveEl?.classList.remove("candidate", "speaking");
       petSignal("abort");
       appendPatNotice(`📞 本轮回复失败，可继续说话重试：${e.message || e}`);
+      setCallCapsuleStatus("可继续说话");
     },
     onError: (e) => {
       appendPatNotice(`📞 通话出错：${e.message || e}`);
@@ -2411,6 +2607,7 @@ async function endCall({ notice = true } = {}) {
   finalizeCallAsstBubble();
   callAudibleReceiptsActive = false;
   setCallActive(false);
+  await setChatCompact(false);
   petSignal("abort");
   if (notice) appendPatNotice("📞 通话已结束");
   if (s) {
@@ -2439,7 +2636,6 @@ async function endCall({ notice = true } = {}) {
 }
 
 function toggleCall() {
-  if (!isKxyyPersona(settings.personaCardId)) return;
   if (callActive) void endCall({ notice: true });
   else startCall();
 }
@@ -2507,6 +2703,27 @@ attachRemoveBtn.addEventListener("click", clearPendingImage);
 stickerRemoveBtn.addEventListener("click", clearPendingSticker);
 stickersBtn.addEventListener("click", toggleStickerPanel);
 callBtn.addEventListener("click", toggleCall);
+chatCollapseBtn?.addEventListener("click", () => void setChatCompact(true));
+callCapsuleOpenBtn?.addEventListener("click", () => void setChatCompact(false));
+callCapsuleHangupBtn?.addEventListener("click", () => void endCall({ notice: true }));
+callCapsuleEl?.addEventListener("mouseenter", () => {
+  callCapsuleHovered = true;
+  setCallCapsuleCollapsed(false);
+});
+callCapsuleEl?.addEventListener("mouseleave", () => {
+  callCapsuleHovered = false;
+  scheduleCallCapsuleCollapse();
+});
+callCapsuleWaveEl?.addEventListener("mousedown", (event) => {
+  if (event.button !== 0) return;
+  clearCallCapsuleCollapseTimer();
+  if (chatEl?.classList.contains("capsule-collapsed")) {
+    setCallCapsuleCollapsed(false);
+    return;
+  }
+  event.preventDefault();
+  invoke("start_chat_capsule_drag").catch(() => {});
+});
 copyRealtimeDiagnosticBtn?.addEventListener("click", () => void copyRealtimeDiagnostic());
 
 fileEl.addEventListener("change", async () => {
@@ -2538,7 +2755,8 @@ window.addEventListener("paste", async (e) => {
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     hideContextMenu();
-    invoke("hide_chat").catch(() => {});
+    if (callActive) void setChatCompact(true);
+    else invoke("hide_chat").catch(() => {});
   }
 });
 
@@ -2700,6 +2918,32 @@ function setupPatAndDeletion() {
 setupMiddleDragScroll();
 setupContextMenu();
 setupPatAndDeletion();
+
+// Rust 全局快捷键可直接把胶囊展开；同步 DOM 状态，避免只放大窗口而仍显示紧凑布局。
+listen("chat-window-mode", ({ payload }) => {
+  const compact = payload === true;
+  chatEl?.classList.toggle("compact", compact);
+  if (!compact) {
+    callCapsuleHovered = false;
+    chatEl?.classList.remove("capsule-collapsed");
+  }
+  if (callCapsuleEl) callCapsuleEl.hidden = !compact;
+  if (compact) scheduleCallCapsuleCollapse();
+});
+
+listen("call-capsule-edge", ({ payload }) => {
+  callCapsuleEdge = payload === "left" || payload === "right" ? payload : null;
+  if (!callCapsuleEdge) {
+    clearCallCapsuleCollapseTimer();
+    setCallCapsuleCollapsed(false);
+  } else {
+    scheduleCallCapsuleCollapse();
+  }
+});
+
+listen("call-capsule-collapsed", ({ payload }) => {
+  chatEl?.classList.toggle("capsule-collapsed", payload === true);
+});
 
 // 语音服务状态推送（Rust → 前端）：更新启动状态栏。
 // 注意这是 push 事件，窗口打开前的事件会丢失；loadConfig 内有主动探活兜底。

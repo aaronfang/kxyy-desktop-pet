@@ -46,6 +46,7 @@ const FIELDS = [
   "chatWidth",
   "chatHeight",
   "chatBottomOffset",
+  "capsuleCollapsedWidth",
 ];
 
 const el = (id) => document.getElementById(id);
@@ -274,6 +275,7 @@ function fill(s) {
   el("chatWidth").value = s.chatWidth ?? 420;
   el("chatHeight").value = s.chatHeight ?? 340;
   el("chatBottomOffset").value = s.chatBottomOffset ?? 96;
+  el("capsuleCollapsedWidth").value = s.capsuleCollapsedWidth ?? 96;
   renderAvatars();
 }
 
@@ -669,6 +671,7 @@ function collect() {
     chatWidth: parseInt(el("chatWidth").value, 10) || 420,
     chatHeight: parseInt(el("chatHeight").value, 10) || 340,
     chatBottomOffset: parseInt(el("chatBottomOffset").value, 10) || 96,
+    capsuleCollapsedWidth: parseInt(el("capsuleCollapsedWidth").value, 10) || 96,
   };
 }
 
