@@ -14,6 +14,35 @@ export const REALTIME_MEMORY_TIMEOUT_MS = 120;
 export const REALTIME_TURN_MEMORY_TIMEOUT_MS = 80;
 export const REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX = 8;
 
+function overlapUnits(value) {
+  const compact = String(value || "")
+    .toLocaleLowerCase()
+    .replace(/[\p{P}\p{S}\s]+/gu, "");
+  const chars = Array.from(compact);
+  if (chars.length < 2) return new Set(chars);
+  return new Set(chars.slice(0, -1).map((char, index) => char + chars[index + 1]));
+}
+
+/** Remove recalled text that would make the model repeat its recent audible output. */
+export function filterRealtimeMemoryAgainstAssistant(items, assistantTexts) {
+  if (!Array.isArray(items)) return [];
+  const spoken = (Array.isArray(assistantTexts) ? assistantTexts : [])
+    .map(overlapUnits)
+    .filter((units) => units.size >= 4);
+  if (!spoken.length) return items;
+  return items.filter((item) => {
+    const memoryUnits = overlapUnits(item?.text);
+    if (memoryUnits.size < 4) return true;
+    return !spoken.some((spokenUnits) => {
+      let shared = 0;
+      for (const unit of memoryUnits) {
+        if (spokenUnits.has(unit)) shared += 1;
+      }
+      return shared / Math.min(memoryUnits.size, spokenUnits.size) >= 0.68;
+    });
+  });
+}
+
 const LABELS = Object.freeze({
   fact: "事实",
   episode: "经历",

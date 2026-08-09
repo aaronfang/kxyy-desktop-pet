@@ -4,10 +4,22 @@ import assert from "node:assert/strict";
 import {
   REALTIME_MEMORY_TIMEOUT_MS,
   REALTIME_PROACTIVE_MEMORY_COOLDOWN_MAX,
+  filterRealtimeMemoryAgainstAssistant,
   formatRealtimeMemoryHints,
   recallRealtimeMemory,
   takeFreshRealtimeMemoryItems,
 } from "../src/realtime-memory.js";
+
+test("realtime memory omits content already spoken by the assistant", () => {
+  const items = [
+    { id: "web-fact", kind: "fact", text: "最近 Steam 喜加一有《呼吸边缘》免费领" },
+    { id: "preference", kind: "fact", text: "用户喜欢玩剧情向游戏" },
+  ];
+  const filtered = filterRealtimeMemoryAgainstAssistant(items, [
+    "不过前两天看到 Steam 喜加一，有《呼吸边缘》这个外太空生存冒险游戏免费领。",
+  ]);
+  assert.deepEqual(filtered.map((item) => item.id), ["preference"]);
+});
 
 test("realtime memory formatting keeps the bounded internal hint shape", () => {
   const prompt = formatRealtimeMemoryHints([

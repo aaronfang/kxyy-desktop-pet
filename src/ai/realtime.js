@@ -10,6 +10,7 @@
 //       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
+//       {type:"thinking_filler",runtimeGenerated:true,audio:base64} /
 //       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
 //       session/asr_end.vadShadowSummary / {type:"vad_shadow_summary",final:true,summary} /
 //       {type:"speaking"} / {type:"usage",...} / {type:"error",message}。
@@ -19,6 +20,8 @@
 //     只回执句段标识，不回传文本或 PCM。
 //     本地/Cosy 清空播放时可发 {type:"playback_reset"}，清理服务端的有界尾部状态。
 //     memoryContext 可协商 session-start-v1；本地/Cosy 还可协商 turn-final-v1，
+//     fresh-topic-v1 先协商，服务端确认后再以 fresh_topics 消息注入启动缓存；
+//     逐轮缓存仍通过 memory_context 注入；
 //     服务端未明确回显时视为 none，不把 ASR final 误当作支持动态 context。
 //   挂断发 {type:"hangup"}。
 //
@@ -26,6 +29,11 @@
 // 桌宠是外放场景，没有 AEC 会自己听到自己造成啸叫与误打断。
 
 import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
+import {
+  classifyImportantTopicBranch,
+  createConversationDirector,
+  createSessionTopicLedger,
+} from "./conversation-director.js";
 import {
   RealtimeTrace,
   TRACE_EVENT,
@@ -53,9 +61,12 @@ const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
 const TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1";
+const FRESH_TOPIC_CAPABILITY = "fresh-topic-v1";
 const PROACTIVE_TURN_CAPABILITY = "local-v1";
 const MAX_TURN_MEMORY_ITEMS = 3;
 const MAX_TURN_MEMORY_CHARS = 700;
+const MAX_FRESH_TOPIC_ITEMS = 3;
+const MAX_FRESH_TOPIC_CHARS = 1200;
 const MAX_INITIAL_HISTORY_MESSAGES = 12;
 const MAX_INITIAL_HISTORY_MESSAGE_CHARS = 1024;
 const MAX_INITIAL_HISTORY_CHARS = 4096;
@@ -64,9 +75,12 @@ const CANDIDATE_SNAPSHOT_GRACE_MS = 50;
 const VAD_SHADOW_FINAL_WAIT_MS = 50;
 const MAX_TOPIC_KEY_CHARS = 64;
 const MAX_TOPICS_USED = 8;
-const PROACTIVE_KINDS = new Set(["welcome", "followup", "idle", "memory", "commitment"]);
+const PROACTIVE_KINDS = new Set(["welcome", "followup", "idle", "revisit", "memory", "commitment"]);
+const CONVERSATION_MOVES = new Set(["expand", "offer-entry", "deepen"]);
+const CONVERSATION_RESPONSE_CUES = new Set(["none", "low-burden", "question"]);
+const CONVERSATION_STANCES = new Set(["companion", "opinion", "advice", "concrete", "light"]);
 
-const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?)$/;
+const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完)$/;
 const REDIRECT_TURN_RE = /(?:换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个)/;
 const RESUME_TURN_RE = /^(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)$/;
 const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
@@ -74,6 +88,11 @@ const AMUSED_TURN_RE = /^(?:哈{2,}|嘿{2,}|呵{2,}|笑死(?:我了)?|太逗了|
 const CURIOUS_TURN_RE = /^(?:是吗|真的(?:啊|吗)?|然后呢|后来呢|还有呢|怎么说|为什么(?:呀|啊)?)$/;
 const AGREE_TURN_RE = /^(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理)$/;
 const ENGAGEMENT_POLICIES = new Set(["acknowledge", "amused", "curious", "agree"]);
+const INVITE_ADVICE_RE = /你觉得我?(?:该|应该)?怎么办|我(?:该|应该)怎么办|换成你(?:会)?怎么做|你会怎么做|给我.{0,12}(?:建议|主意)/;
+const INVITE_OPINION_RE = /你(?:是)?怎么(?:看|想)(?:的)?|你有(?:什么|啥)看法|想听听你(?:是)?怎么(?:想|看)|换成你(?:会)?怎么(?:想|看待)/;
+const DEEPEN_RE = /深入(?:点|一点)?.{0,6}(?:聊|说|讲)|聊深(?:点|一点)|多(?:说|讲|聊)(?:点|一点|一些)|展开(?:说|讲|聊)|详细(?:说|讲|聊)/;
+const LIGHTEN_RE = /轻松(?:点|一点)|别(?:聊|说)得?这么沉重|聊点轻松的/;
+const CONCRETIZE_RE = /(?:说|讲)具体(?:点|一点)|举个例子|比如呢|说清楚(?:点|一点)?/;
 
 /** Fixed, local-only policy. It never asks a model to decide whether proactive speech is allowed. */
 export function classifyRealtimeConversationTurn(text) {
@@ -88,6 +107,61 @@ export function classifyRealtimeConversationTurn(text) {
   if (CURIOUS_TURN_RE.test(compact)) return "curious";
   if (AGREE_TURN_RE.test(compact)) return "agree";
   return "substantive";
+}
+
+/** Per-turn guidance only. It never mutates pause/redirect/resume state. */
+export function classifyRealtimeSoftIntent(text) {
+  const value = String(text || "").trim();
+  if (!value || classifyRealtimeConversationTurn(value) !== "substantive") return "none";
+  if (INVITE_ADVICE_RE.test(value)) return "invite-advice";
+  if (INVITE_OPINION_RE.test(value)) return "invite-opinion";
+  if (DEEPEN_RE.test(value)) return "deepen";
+  if (LIGHTEN_RE.test(value)) return "lighten";
+  if (CONCRETIZE_RE.test(value)) return "concretize";
+  return "none";
+}
+
+function sanitizeConversationPlan(value) {
+  if (!value || typeof value !== "object") return null;
+  const move = CONVERSATION_MOVES.has(value.move) ? value.move : null;
+  const responseCue = CONVERSATION_RESPONSE_CUES.has(value.responseCue)
+    ? value.responseCue
+    : null;
+  const stance = CONVERSATION_STANCES.has(value.stance) ? value.stance : null;
+  const depth = Number.isSafeInteger(value.depth) ? Math.max(0, Math.min(5, value.depth)) : null;
+  return move && responseCue && stance && depth !== null
+    ? { move, responseCue, stance, depth }
+    : null;
+}
+
+function sanitizeFreshTopics(items) {
+  const safe = [];
+  let chars = 0;
+  for (const item of Array.isArray(items) ? items : []) {
+    if (safe.length >= MAX_FRESH_TOPIC_ITEMS) break;
+    const title = typeof item?.title === "string" ? item.title.trim().slice(0, 120) : "";
+    const shortText = typeof item?.shortText === "string" ? item.shortText.trim().slice(0, 300) : "";
+    const sourceName = typeof item?.sourceName === "string" ? item.sourceName.trim().slice(0, 64) : "";
+    const canonicalUrl = typeof item?.canonicalUrl === "string" && /^https:\/\//i.test(item.canonicalUrl)
+      ? item.canonicalUrl.slice(0, 512)
+      : "";
+    const fetchedAt = typeof item?.fetchedAt === "string" ? item.fetchedAt.slice(0, 40) : "";
+    const publishedAt = typeof item?.publishedAt === "string" ? item.publishedAt.slice(0, 40) : "";
+    const category = typeof item?.category === "string" ? item.category.slice(0, 32) : "";
+    if (!title || !shortText || !sourceName || !canonicalUrl || !fetchedAt || !category) continue;
+    if (chars + shortText.length > MAX_FRESH_TOPIC_CHARS) continue;
+    safe.push({
+      sourceName,
+      canonicalUrl,
+      title,
+      publishedAt: publishedAt || null,
+      fetchedAt,
+      shortText,
+      category,
+    });
+    chars += shortText.length;
+  }
+  return safe;
 }
 
 /** Session-only topic identity. It is never sent over the wire or exposed in diagnostics. */
@@ -154,6 +228,19 @@ function sanitizeAsrRuntime(value) {
   };
 }
 
+function decodeThinkingFiller(value) {
+  if (typeof value !== "string" || value.length > 160000 || typeof atob !== "function") return null;
+  try {
+    const decoded = atob(value);
+    if (!decoded || decoded.length < 2 || decoded.length % 2) return null;
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
+    return bytes.buffer;
+  } catch {
+    return null;
+  }
+}
+
 function recoverablePlaybackEnabled() {
   try {
     return globalThis.localStorage?.getItem("kxyy.realtime.playback") !== "legacy";
@@ -208,12 +295,14 @@ export class RealtimeSession {
     onAssistantEnd,
     onAssistantDiscarded,
     onAudibleAssistant,
+    onThinking,
     onSpeaking,
     onUsage,
     onLevel,
     onSpeechCandidate,
     onSpeechRejected,
     onMemoryContextRequest,
+    onThinkingFillerOffer,
     onPlaybackStats,
     onResponseError,
     onError,
@@ -222,6 +311,7 @@ export class RealtimeSession {
     proactiveGreetingDelayMs,
     proactiveFollowupDelayMs,
     proactiveIdleDelayMs,
+    thinkingFeedbackDelayMs,
     maxTraceEvents = 256,
     onTrace,
   } = {}) {
@@ -234,12 +324,14 @@ export class RealtimeSession {
       onAssistantEnd,
       onAssistantDiscarded,
       onAudibleAssistant,
+      onThinking,
       onSpeaking,
       onUsage,
       onLevel,
       onSpeechCandidate,
       onSpeechRejected,
       onMemoryContextRequest,
+      onThinkingFillerOffer,
       onPlaybackStats,
       onResponseError,
       onError,
@@ -285,6 +377,8 @@ export class RealtimeSession {
     this._interruptionHintMode = "none";
     this._memoryContextMode = "none";
     this._temporalContextMode = "none";
+    this._freshTopicMode = "none";
+    this._startupFreshTopics = [];
     this._memoryContextRequestedAt = 0;
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
@@ -323,6 +417,11 @@ export class RealtimeSession {
       topicsUsed: [],
       repeatedTopic: false,
     };
+    this._sessionTopicLedger = this._conversationMode === "ai-leads"
+      ? createSessionTopicLedger()
+      : null;
+    this._activeImportantTopicKey = "";
+    this._proactiveTopicProposals = new Map();
     this._proactiveRhythm = {
       delayMultiplier: 1,
       negativeSignals: 0,
@@ -379,6 +478,34 @@ export class RealtimeSession {
       : this._conversationMode === "ai-leads"
         ? 14000
         : 32000;
+    this._conversationDirector = this._conversationMode === "ai-leads"
+      ? createConversationDirector({
+          mode: "ai-leads",
+          delays: {
+            statement: Number.isFinite(proactiveFollowupDelayMs)
+              ? this._proactiveFollowupDelayMs
+              : 4000,
+            lowBurden: Number.isFinite(proactiveFollowupDelayMs)
+              ? this._proactiveFollowupDelayMs
+              : 6000,
+            question: Number.isFinite(proactiveFollowupDelayMs)
+              ? this._proactiveFollowupDelayMs
+              : 8000,
+            topicSwitch: this._proactiveIdleDelayMs,
+          },
+        })
+      : null;
+    this._conversationDirector?.dispatch({ type: "session-started" });
+    this._pendingConversationPlan = null;
+    this._pendingConversationPlanGeneration = null;
+    this._conversationPlans = new Map();
+    this._proactiveConversationPlans = new Map();
+    this._thinkingFeedbackDelayMs = Number.isFinite(thinkingFeedbackDelayMs)
+      ? Math.max(0, thinkingFeedbackDelayMs)
+      : 1500;
+    this._thinkingFeedbackTimer = 0;
+    this._thinkingFillerOffered = false;
+    this._thinkingPhase = "idle";
   }
 
   /**
@@ -407,7 +534,7 @@ export class RealtimeSession {
   }
 
   /** 开始通话：确认播放能力 → 连桥接并协商 → 起麦克风。 */
-  async start({ systemRole, botName, initialHistory }) {
+  async start({ systemRole, botName, initialHistory, freshTopics }) {
     this.trace.startSession();
     // 若 chat.js 已在点击栈调用 prepareAudio，这里是幂等补齐。
     this._initAudioCtx();
@@ -421,7 +548,7 @@ export class RealtimeSession {
     if (this.stopped) return;
     await this._startPlayback();
     if (this.stopped) return;
-    await this._openSocket(base, { systemRole, botName, initialHistory });
+    await this._openSocket(base, { systemRole, botName, initialHistory, freshTopics });
     if (this.stopped) return;
     await this._startMic();
     if (this.stopped) return;
@@ -441,6 +568,9 @@ export class RealtimeSession {
       }
       ws.binaryType = "arraybuffer";
       this.ws = ws;
+      this._startupFreshTopics = usesManagedCascade(this.trace.provider)
+        ? sanitizeFreshTopics(startMsg.freshTopics)
+        : [];
       let opened = false;
 
       ws.onopen = () => {
@@ -458,6 +588,7 @@ export class RealtimeSession {
           cascadeCapabilities.initialHistory = sanitizeRealtimeInitialHistory(
             startMsg.initialHistory,
           );
+          cascadeCapabilities.freshTopic = [FRESH_TOPIC_CAPABILITY];
         }
         if (
           usesManagedCascade(this.trace.provider) &&
@@ -473,14 +604,13 @@ export class RealtimeSession {
           cascadeCapabilities.interruptionHint = [INTERRUPTION_HINT_CAPABILITY];
           cascadeCapabilities.ttsStream = [TTS_STREAMING_CAPABILITY];
         }
-        ws.send(
-          JSON.stringify({
-            type: "start",
-            systemRole: startMsg.systemRole || "",
-            botName: startMsg.botName || "元元",
-            ...cascadeCapabilities,
-          }),
-        );
+        const startPayload = {
+          type: "start",
+          systemRole: startMsg.systemRole || "",
+          botName: startMsg.botName || "元元",
+          ...cascadeCapabilities,
+        };
+        ws.send(JSON.stringify(startPayload));
         resolve();
       };
       ws.onmessage = (ev) => this._onMessage(ev);
@@ -553,6 +683,21 @@ export class RealtimeSession {
             msg.temporalContext === TEMPORAL_CONTEXT_CAPABILITY
               ? TEMPORAL_CONTEXT_CAPABILITY
               : "none";
+          this._freshTopicMode =
+            usesManagedCascade(this.trace.provider) && msg.freshTopic === FRESH_TOPIC_CAPABILITY
+              ? FRESH_TOPIC_CAPABILITY
+              : "none";
+          if (
+            this._freshTopicMode === FRESH_TOPIC_CAPABILITY &&
+            this._startupFreshTopics.length &&
+            this.ws?.readyState === WebSocket.OPEN
+          ) {
+            this.ws.send(JSON.stringify({
+              type: "fresh_topics",
+              items: this._startupFreshTopics,
+            }));
+          }
+          this._startupFreshTopics = [];
         }
         if (msg.state === "started" && usesManagedCascade(this.trace.provider)) {
           this._downlinkAudioMode =
@@ -637,7 +782,11 @@ export class RealtimeSession {
         // 否则会当成新一轮用户说话，把刚开始的助手语音整段 flush 掉 → 首句静音。
         if (!this._userTurnOpen) {
           if (this._speechCandidate) {
-            if (this._confirmSpeech()) this.cb.onAsrStart?.();
+            // Interim ASR is only a preview. Confirming it here would flush
+            // an active response before the provider has validated the turn.
+            if (msg.interim === false && this._confirmSpeech()) {
+              this.cb.onAsrStart?.();
+            }
           } else {
             if (this._assistantActive || this._hasPlayback()) return;
             if (this._confirmSpeech()) this.cb.onAsrStart?.();
@@ -650,7 +799,19 @@ export class RealtimeSession {
         if (msg.interim === false) {
           this._traceAsrFinalSeen = true;
           this._latestFinalAsr = msg.text || "";
-          this._applyUserTurnPolicy(classifyRealtimeConversationTurn(this._latestFinalAsr));
+          const policy = classifyRealtimeConversationTurn(this._latestFinalAsr);
+          this._applyUserTurnPolicy(policy);
+          if (this._conversationDirector) {
+            const actions = this._conversationDirector.dispatch({
+              type: "user-turn-final",
+              policy,
+              softIntent: classifyRealtimeSoftIntent(this._latestFinalAsr),
+            });
+            const request = actions.find((action) => action.type === "request-reply");
+            this._pendingConversationPlan = sanitizeConversationPlan(request?.plan);
+            this._pendingConversationPlanGeneration = this._backendGeneration;
+          }
+          if (policy === "substantive") this._observeImportantTopic(this._latestFinalAsr);
         }
         this.cb.onAsr?.(msg.text || "", { interim: msg.interim !== false });
         break;
@@ -667,6 +828,7 @@ export class RealtimeSession {
         this._userTurnOpen = false;
         if (hadUserTurn) {
           this.cb.onAsrEnd?.();
+          this._beginThinkingFeedback("reasoning");
           this.trace.startResponse();
           this.trace.recordOnce("llm_request", TRACE_EVENT.LLM_REQUEST);
         }
@@ -704,10 +866,25 @@ export class RealtimeSession {
       case "assistant":
         this._cancelProactiveWelcome();
         this._assistantActive = true;
+        this._beginThinkingFeedback("synthesizing", { allowFiller: false });
         this.trace.startResponse();
         this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
         this.cb.onAssistant?.(msg.text || "", { generation: msg.generation });
         break;
+      case "thinking_filler": {
+        if (
+          !usesManagedCascade(this.trace.provider) ||
+          msg.runtimeGenerated !== true ||
+          msg.format !== "pcm16le" ||
+          msg.sampleRate !== OUTPUT_RATE ||
+          (Number.isSafeInteger(msg.generation) && msg.generation !== this._backendGeneration)
+        ) break;
+        const filler = decodeThinkingFiller(msg.audio);
+        if (!filler || filler.byteLength > OUTPUT_RATE * 2 * 2) break;
+        this.cb.onThinkingFillerOffer?.();
+        this._enqueuePcm(filler, null);
+        break;
+      }
       case "assistant_end":
         this._assistantActive = false;
         this.trace.recordOnce("llm_response", TRACE_EVENT.LLM_RESPONSE);
@@ -753,6 +930,7 @@ export class RealtimeSession {
         this._endAudioSegment(msg);
         break;
       case "speaking":
+        this._endThinkingFeedback();
         this._assistantActive = true;
         this._audioGate = false;
         this.trace.startResponse();
@@ -763,6 +941,7 @@ export class RealtimeSession {
         this.cb.onUsage?.(msg);
         break;
       case "error":
+        this._endThinkingFeedback();
         this._backendAudioPending = false;
         if (this.trace.responseId && this.trace.state.response === "active") {
           this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "error" });
@@ -783,7 +962,7 @@ export class RealtimeSession {
   }
 
   /** 回传当前 final turn 的有界记忆卡片；旧 generation、旧服务或火山路径拒绝发送。 */
-  sendMemoryContext({ generation, items, temporalContext } = {}) {
+  sendMemoryContext({ generation, items, temporalContext, freshTopics } = {}) {
     if (
       this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
       Number.isSafeInteger(generation) &&
@@ -829,11 +1008,26 @@ export class RealtimeSession {
             timeZone: String(temporalContext.timeZone || "").slice(0, 64),
           }
         : undefined;
+      const conversationPlan = this._conversationDirector &&
+        generation === this._pendingConversationPlanGeneration
+        ? sanitizeConversationPlan(this._pendingConversationPlan)
+        : null;
+      if (conversationPlan) {
+        this._conversationPlans.set(generation, conversationPlan);
+        while (this._conversationPlans.size > 8) {
+          this._conversationPlans.delete(this._conversationPlans.keys().next().value);
+        }
+      }
+      const safeFreshTopics = this._freshTopicMode === FRESH_TOPIC_CAPABILITY
+        ? sanitizeFreshTopics(freshTopics)
+        : [];
       this.ws.send(JSON.stringify({
         type: "memory_context",
         generation,
         items: safe,
         ...(temporal ? { temporalContext: temporal } : {}),
+        ...(conversationPlan ? { conversationPlan } : {}),
+        ...(safeFreshTopics.length ? { freshTopics: safeFreshTopics } : {}),
       }));
     } catch {
       this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
@@ -995,7 +1189,36 @@ export class RealtimeSession {
     await this._resumeAudioCtx();
   }
 
+  _beginThinkingFeedback(phase = "reasoning", { allowFiller = true } = {}) {
+    if (this.stopped) return;
+    if (this._thinkingFeedbackTimer) clearTimeout(this._thinkingFeedbackTimer);
+    this._thinkingFeedbackTimer = 0;
+    if (phase === "reasoning") this._thinkingFillerOffered = false;
+    this._thinkingPhase = phase === "synthesizing" ? "synthesizing" : "reasoning";
+    this.cb.onThinking?.(this._thinkingPhase);
+    if (!allowFiller || this._thinkingPhase !== "reasoning") return;
+    this._thinkingFeedbackTimer = setTimeout(() => {
+      this._thinkingFeedbackTimer = 0;
+      if (
+        this.stopped ||
+        this._thinkingPhase !== "reasoning" ||
+        this._thinkingFillerOffered
+      ) return;
+      this._thinkingFillerOffered = true;
+      this.cb.onThinkingFillerOffer?.();
+    }, this._thinkingFeedbackDelayMs);
+  }
+
+  _endThinkingFeedback() {
+    if (this._thinkingFeedbackTimer) clearTimeout(this._thinkingFeedbackTimer);
+    this._thinkingFeedbackTimer = 0;
+    if (this._thinkingPhase === "idle") return;
+    this._thinkingPhase = "idle";
+    this.cb.onThinking?.("idle");
+  }
+
   _beginSpeechCandidate(msg = {}) {
+    this._endThinkingFeedback();
     if (this._speechCandidate || this._userTurnOpen) return false;
     this._resetInterruptionCandidate();
     if (this._proactiveGreetingTimer || this._proactiveLeadTimer) {
@@ -1079,7 +1302,7 @@ export class RealtimeSession {
     this._proactiveLeadTimer = 0;
   }
 
-  _sendProactiveTurn(kind) {
+  _sendProactiveTurn(kind, conversationPlan = null, topicRevisit = null, topicProposal = null) {
     if (
       !PROACTIVE_KINDS.has(kind) ||
       this.stopped ||
@@ -1090,13 +1313,36 @@ export class RealtimeSession {
     this._proactiveTriggerId += 1;
     const triggerId = this._proactiveTriggerId;
     this._proactivePending.set(triggerId, kind);
+    const safePlan = sanitizeConversationPlan(conversationPlan);
+    if (safePlan) this._proactiveConversationPlans.set(triggerId, safePlan);
+    if (topicProposal) this._proactiveTopicProposals.set(triggerId, topicProposal);
     while (this._proactivePending.size > 8) {
-      this._proactivePending.delete(this._proactivePending.keys().next().value);
+      const oldest = this._proactivePending.keys().next().value;
+      this._proactivePending.delete(oldest);
+      this._proactiveConversationPlans.delete(oldest);
+      this._proactiveTopicProposals.delete(oldest);
     }
     this._proactiveSummary.candidates += 1;
-    this._proactiveSummary.triggerKinds[kind] += 1;
-    this.ws.send(JSON.stringify({ type: "proactive_turn", triggerId, kind }));
+    const summaryKind = kind === "revisit" ? "idle" : kind;
+    this._proactiveSummary.triggerKinds[summaryKind] += 1;
+    const message = {
+      type: "proactive_turn",
+      triggerId,
+      kind,
+      ...(safePlan ? { conversationPlan: safePlan } : {}),
+      ...(topicRevisit ? { topicRevisit } : {}),
+    };
+    this.ws.send(JSON.stringify(message));
     return true;
+  }
+
+  _sendTopicTransition(conversationPlan = null) {
+    const proposal = this._sessionTopicLedger?.proposeTransition();
+    const kind = proposal?.kind === "revisit" ? "revisit" : "idle";
+    const topicRevisit = proposal?.kind === "revisit"
+      ? { category: proposal.category, context: proposal.context }
+      : null;
+    return this._sendProactiveTurn(kind, conversationPlan, topicRevisit, proposal);
   }
 
   _noteProactiveVeto(reason) {
@@ -1146,22 +1392,40 @@ export class RealtimeSession {
     if (!kind) return;
     if (msg.state === "vetoed") {
       this._proactivePending.delete(msg.triggerId);
+      this._proactiveConversationPlans.delete(msg.triggerId);
+      this._proactiveTopicProposals.delete(msg.triggerId);
       this._noteProactiveVeto(msg.reason);
     }
     this._proactiveSummary[msg.state] += 1;
     if (msg.state === "accepted") {
+      const conversationPlan = this._proactiveConversationPlans.get(msg.triggerId) || null;
+      const topicProposal = this._proactiveTopicProposals.get(msg.triggerId) || null;
       this._proactivePending.delete(msg.triggerId);
+      this._proactiveConversationPlans.delete(msg.triggerId);
+      this._proactiveTopicProposals.delete(msg.triggerId);
       this._activeProactiveTriggerId = msg.triggerId;
       if (Number.isSafeInteger(msg.generation)) {
         this._activeProactiveGeneration = msg.generation;
         this._activeProactiveFirstAudioAt = 0;
+        if (conversationPlan) {
+          this._conversationPlans.set(msg.generation, conversationPlan);
+          while (this._conversationPlans.size > 8) {
+            this._conversationPlans.delete(this._conversationPlans.keys().next().value);
+          }
+        }
       }
+      this._sessionTopicLedger?.commitTransition(topicProposal);
+      this._conversationDirector?.dispatch({
+        type: "proactive-accepted",
+        kind: kind === "revisit" ? "idle" : kind,
+      });
+      this._beginThinkingFeedback("reasoning");
       this._topicLead.proactiveTurns += 1;
       this._topicLead.aiTurnsOnTopic += 1;
       this._topicLead.lastProactiveKind = kind;
-      this._topicLead.phase = kind === "idle" ? "opening" : "expanding";
+      this._topicLead.phase = kind === "idle" || kind === "revisit" ? "opening" : "expanding";
       this._proactiveSummary.proactiveTurns += 1;
-      if (kind === "idle") {
+      if (kind === "idle" || kind === "revisit") {
         this._rememberTopicKey(this._topicLead.topicKey);
         this._topicLead.topicKey = "";
         this._topicLead.repeatedTopic = false;
@@ -1171,6 +1435,8 @@ export class RealtimeSession {
     }
     if (msg.state === "cancelled") {
       this._proactivePending.delete(msg.triggerId);
+      this._proactiveConversationPlans.delete(msg.triggerId);
+      this._proactiveTopicProposals.delete(msg.triggerId);
       this._activeProactiveTriggerId = null;
       this._activeProactiveGeneration = null;
       this._activeProactiveFirstAudioAt = 0;
@@ -1192,6 +1458,8 @@ export class RealtimeSession {
       return;
     }
     if (policy === "redirect") {
+      this._sessionTopicLedger?.seal(this._activeImportantTopicKey);
+      this._activeImportantTopicKey = "";
       this._rememberTopicKey(this._topicLead.topicKey);
       this._topicLead.topicKey = deriveRealtimeTopicKey(this._latestFinalAsr);
       this._topicLead.repeatedTopic = false;
@@ -1249,6 +1517,17 @@ export class RealtimeSession {
     }
   }
 
+  _observeImportantTopic(text) {
+    if (!this._sessionTopicLedger) return;
+    const category = classifyImportantTopicBranch(text);
+    if (category === "none") return;
+    const topicKey = deriveRealtimeTopicKey(text);
+    if (!topicKey) return;
+    if (this._sessionTopicLedger.observe({ topicKey, category, context: text })) {
+      this._activeImportantTopicKey = topicKey;
+    }
+  }
+
   _noteAudibleTopic(text) {
     const topicKey = deriveRealtimeTopicKey(text);
     if (!topicKey) return;
@@ -1274,6 +1553,37 @@ export class RealtimeSession {
       return;
     }
     if (this._proactiveLeadTimer) clearTimeout(this._proactiveLeadTimer);
+    if (this._conversationDirector) {
+      const scheduled = this._conversationDirector.dispatch({
+        type: "playback-completed",
+        plan: this._conversationPlans.get(generation) || null,
+      }).find((action) => action.type === "schedule-proactive");
+      if (!scheduled) {
+        this._noteProactiveVeto("limit");
+        return;
+      }
+      const delay = scheduled.delayMs * this._proactiveRhythm.delayMultiplier;
+      this._proactiveLeadTimer = setTimeout(() => {
+        this._proactiveLeadTimer = 0;
+        if (
+          this.stopped ||
+          this._topicLead.paused ||
+          this._proactiveRhythm.stopped
+        ) return this._noteProactiveVeto("cooldown");
+        if (this._speechCandidate) return this._noteProactiveVeto("speech");
+        if (this._userTurnOpen) return this._noteProactiveVeto("asr");
+        if (this._assistantActive) return this._noteProactiveVeto("reply");
+        if (this._hasPlayback()) return this._noteProactiveVeto("playback");
+        const request = this._conversationDirector.dispatch({
+          type: "silence-deadline",
+          kind: scheduled.kind,
+        }).find((action) => action.type === "request-reply");
+        if (!request) return this._noteProactiveVeto("limit");
+        if (request.kind === "idle") this._sendTopicTransition(request.plan);
+        else this._sendProactiveTurn(request.kind, request.plan);
+      }, delay);
+      return;
+    }
     const maxTurns = this._conversationMode === "ai-leads" ? 3 : 1;
     if (this._topicLead.proactiveTurns >= maxTurns) {
       this._noteProactiveVeto("limit");
@@ -1506,6 +1816,13 @@ export class RealtimeSession {
       receivedSamples: 0,
       nextChunkSequence: 0,
     };
+    // A valid current-generation segment is authoritative response audio. If a
+    // prior candidate/turn left the defensive audio gate closed, reopen it here;
+    // otherwise the browser silently discards every PCM frame while the backend
+    // continues streaming the completed sentence.
+    if (!this._userTurnOpen && generation === this._backendGeneration) {
+      this._audioGate = false;
+    }
     this._audioSegments.set(key, segment);
     this._currentAudioSegment = segment;
     this.playbackNode?.port.postMessage({ type: "segment_start", generation, segmentId });
@@ -1694,6 +2011,11 @@ export class RealtimeSession {
     this._candidateInterruptsResponse = false;
     this._resetInterruptionCandidate();
     this.trace.record(TRACE_EVENT.SPEECH_REJECTED, { reason });
+    // Rejection means the candidate was not a real user turn. Resume both the
+    // Worklet and the transport gate so audio already admitted by the backend,
+    // including segments created while ASR was validating the candidate, can
+    // continue to playback.
+    this._audioGate = false;
     this._resumePlayback();
     this._commitDeferredAudioSegments();
     if (this._lastAudibleGeneration !== null) {
@@ -2023,8 +2345,13 @@ export class RealtimeSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this._conversationDirector?.dispatch({ type: "hangup" });
+    this._endThinkingFeedback();
     this._cancelProactiveTimers();
     this._pendingProactiveRhythmSignal = null;
+    this._sessionTopicLedger?.stop();
+    this._activeImportantTopicKey = "";
+    this._proactiveTopicProposals.clear();
     this._backendAudioPending = false;
     if (this._levelRaf) cancelAnimationFrame(this._levelRaf);
     this._levelRaf = 0;

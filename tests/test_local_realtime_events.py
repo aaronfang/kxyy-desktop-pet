@@ -393,6 +393,8 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertFalse("thinking" in payload)
         self.assertFalse("temperature" in payload)
         self.assertTrue(payload["stream"])
+        self.assertGreaterEqual(payload["max_tokens"], 512)
+        self.assertNotIn("一两句即可", payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][-1]["content"], "这一轮")
 
     def test_llm_stream_uses_loopback_proxy_and_parses_deltas_and_usage(self):
@@ -468,6 +470,57 @@ class TextProviderAdapterTests(unittest.TestCase):
             [event.get("text") for event in events if event["type"] == "delta"],
             ["answer"],
         )
+
+    def test_deepseek_sse_replay_keeps_the_director_hint_on_the_shared_proxy_path(self):
+        captured = {}
+
+        class FakeResponse:
+            headers = {"X-Kxyy-Text-Provider": "DeepSeek", "X-Kxyy-Thinking": "1"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"reasoning_content":"private"}}]}\n',
+                        'data: {"choices":[{"delta":{"content":"先给一个具体角度。"}}]}\n'.encode("utf-8"),
+                        b"data: [DONE]\n",
+                    ]
+                )
+
+        def fake_urlopen(request, *, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        common.urllib.request.urlopen = fake_urlopen
+        plan = {
+            "move": "expand",
+            "responseCue": "none",
+            "stance": "companion",
+            "depth": 1,
+        }
+        hint = common.format_conversation_plan_hint(plan)
+        events = list(
+            common.iter_llm_stream(
+                "角色设定",
+                [{"role": "system", "content": hint}],
+                "用户内容",
+            )
+        )
+
+        self.assertEqual(events[0], {"type": "meta", "provider": "DeepSeek", "thinking": True})
+        self.assertEqual(
+            [event["text"] for event in events if event["type"] == "delta"],
+            ["先给一个具体角度。"],
+        )
+        self.assertEqual(captured["timeout"], 120)
+        self.assertIn(hint, [message["content"] for message in captured["payload"]["messages"]])
+        self.assertNotIn("private", str(events))
 
     def test_reasoning_fallback_waits_for_end_and_only_when_content_is_empty(self):
         class FakeResponse:
@@ -546,6 +599,25 @@ class TextProviderAdapterTests(unittest.TestCase):
 
 
 class StableSentenceBufferTests(unittest.TestCase):
+    def test_reply_novelty_rejects_the_repeated_sims_recommendation(self):
+        previous = (
+            "那你是真有福了啊！这种游戏就挺适合咱这种手残星人，躺着也能玩得开心。"
+            "不过你要是感兴趣的话，我这儿还有一款游戏叫《模拟人生》，特别轻松，还能自己造房子、养宠物。"
+        )
+        self.assertTrue(common.is_near_duplicate_reply(previous, [previous]))
+        self.assertTrue(
+            common.is_near_duplicate_reply(
+                "这种游戏挺适合手残星人。我这儿还有《模拟人生》，能造房子、养宠物。",
+                [previous],
+            )
+        )
+        self.assertFalse(
+            common.is_near_duplicate_reply(
+                "手机上可以先试试单机合成类，不过得先看你能不能接受广告。",
+                [previous],
+            )
+        )
+
     def test_cross_delta_and_chinese_english_boundaries(self):
         buf = common.StableSentenceBuffer()
         self.assertEqual(buf.feed("这是跨越"), [])
@@ -2298,6 +2370,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         cases = [
             ("安静一会儿", "pause"), ("先别说话", "pause"), ("暂停一下", "pause"),
             ("让我想想", "pause"), ("我想静静", "pause"), ("稍等一下", "pause"),
+            ("你先听我说", "pause"), ("让我先讲完", "pause"),
             ("换个话题吧", "redirect"), ("聊点别的", "redirect"), ("别聊这个", "redirect"),
             ("跳过这个吧", "redirect"), ("不说这个了", "redirect"),
             ("你继续", "resume"), ("继续说吧", "resume"), ("接着讲", "resume"),
@@ -2315,6 +2388,24 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         for text, expected in cases:
             with self.subTest(text=text):
                 self.assertEqual(common.classify_realtime_conversation_turn(text), expected)
+
+        soft_cases = [
+            ("我想听听你是怎么想的", "invite-opinion"),
+            ("你怎么看？", "invite-opinion"),
+            ("我也不知道，你觉得我该怎么办", "invite-advice"),
+            ("换成你会怎么做", "invite-advice"),
+            ("这个可以再深入聊聊", "deepen"),
+            ("你多讲一点", "deepen"),
+            ("我们聊点轻松的吧", "lighten"),
+            ("别说得这么沉重", "lighten"),
+            ("你能不能说具体点", "concretize"),
+            ("举个例子呢", "concretize"),
+            ("你今天怎么看起来很累", "none"),
+            ("换个话题", "none"),
+        ]
+        for text, expected in soft_cases:
+            with self.subTest(text=text):
+                self.assertEqual(common.classify_realtime_soft_intent(text), expected)
 
     async def test_engagement_policy_hints_are_ephemeral_and_category_specific(self):
         common._synth_tts = lambda _text: b"unused"
@@ -2341,6 +2432,285 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             await session._reply_pipeline("简短回应", scope, turn_policy=policy)
             self.assertEqual(captured, [[{"role": "system", "content": expected_hint}]])
             self.assertFalse(any(message.get("content") == expected_hint for message in session.history))
+
+    async def test_conversation_plan_hint_is_fixed_and_ephemeral(self):
+        captured = []
+        common._synth_tts = lambda _text: b"unused"
+
+        def capture(_role, history, _text, _scope, out):
+            captured.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        session = common.Session(FakeWebSocket())
+        scope = session._new_scope("response")
+        session.response_scope = scope
+        plan = {
+            "move": "offer-entry",
+            "responseCue": "low-burden",
+            "stance": "companion",
+            "depth": 2,
+        }
+        await session._reply_pipeline("简短回应", scope, conversation_plan=plan)
+
+        rendered = captured[0][-1]["content"]
+        self.assertEqual(rendered, common.format_conversation_plan_hint(plan))
+        self.assertIn("先贡献具体内容", rendered)
+        self.assertIn("低负担", rendered)
+        self.assertNotIn("简短回应", rendered)
+        self.assertFalse(any(message.get("content") == rendered for message in session.history))
+
+    async def test_runtime_thinking_filler_is_bounded_ephemeral_and_skips_when_content_starts(self):
+        original_delay = common.THINKING_FILLER_DELAY_SECONDS
+        original_synth = common._synth_tts
+        try:
+            common.THINKING_FILLER_DELAY_SECONDS = 0
+            common._synth_tts = lambda text: b"\x01\x00" * 120
+            ws = FakeWebSocket()
+            session = common.Session(ws)
+            await session.on_start({"downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY]})
+            scope = session._new_scope("response")
+            session.response_scope = scope
+            await session._maybe_send_thinking_filler(scope, lambda: False)
+            filler = last_json_of_type(ws, "thinking_filler")
+            self.assertTrue(filler["runtimeGenerated"])
+            self.assertEqual(filler["format"], "pcm16le")
+            self.assertLessEqual(len(filler["audio"]), 160000)
+            self.assertFalse(any(message.get("content") == common.THINKING_FILLER_TEXT for message in session.history))
+        finally:
+            common.THINKING_FILLER_DELAY_SECONDS = original_delay
+            common._synth_tts = original_synth
+
+    async def test_proactive_welcome_never_emits_runtime_thinking_filler(self):
+        original_delay = common.THINKING_FILLER_DELAY_SECONDS
+        original_synth = common._synth_tts
+        captured = {}
+
+        def capture_queue(_role, _history, _text, _scope, out):
+            captured["events"] = out
+
+        try:
+            common.THINKING_FILLER_DELAY_SECONDS = 0
+            common._synth_tts = lambda _text: b"\x01\x00" * 120
+            common.start_llm_stream_producer = capture_queue
+            await self.session.on_start(
+                {
+                    "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                    "proactiveTurn": [common.PROACTIVE_TURN_CAPABILITY],
+                }
+            )
+            await self.session.on_proactive_turn(
+                {"triggerId": 1, "kind": "welcome"}
+            )
+            for _ in range(100):
+                if "events" in captured:
+                    break
+                await asyncio.sleep(0)
+            self.assertIn("events", captured)
+            await asyncio.sleep(0.02)
+            message_types = [message["type"] for message in self.ws.json_messages()]
+            captured["events"].put_nowait({"type": "done"})
+            await self.session.reply_task
+            self.assertNotIn("thinking_filler", message_types)
+        finally:
+            common.THINKING_FILLER_DELAY_SECONDS = original_delay
+            common._synth_tts = original_synth
+
+    async def test_runtime_thinking_filler_serializes_before_qwen_body_tts(self):
+        original_delay = common.THINKING_FILLER_DELAY_SECONDS
+        filler_started = threading.Event()
+        release_filler = threading.Event()
+        model_busy = threading.Event()
+        body_attempted = asyncio.Event()
+        captured = {}
+
+        def blocking_filler_synth(_text):
+            model_busy.set()
+            filler_started.set()
+            release_filler.wait(timeout=1)
+            model_busy.clear()
+            return b"\x01\x00" * 120
+
+        async def guarded_body_stream(_text):
+            body_attempted.set()
+            if model_busy.is_set():
+                raise RuntimeError("Qwen3-TTS 正忙，请稍后再试")
+            yield {"type": "audio", "pcm": b"\x02\x00" * 4}
+            yield {"type": "done", "characters": 9, "provider": "Qwen3-TTS"}
+
+        def capture_queue(_role, _history, _text, _scope, out):
+            captured["events"] = out
+
+        try:
+            common.THINKING_FILLER_DELAY_SECONDS = 0
+            common._synth_tts = blocking_filler_synth
+            common._synth_tts_stream = guarded_body_stream
+            common.start_llm_stream_producer = capture_queue
+            await self.session.on_start(
+                {
+                    "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                    "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+                }
+            )
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            task = asyncio.create_task(
+                self.session._reply_pipeline("用户输入", scope)
+            )
+
+            for _ in range(100):
+                if filler_started.is_set() and "events" in captured:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(filler_started.is_set())
+            captured["events"].put_nowait(
+                {"type": "delta", "text": "正文已经准备好了。"}
+            )
+            captured["events"].put_nowait({"type": "done"})
+
+            await asyncio.sleep(0.05)
+            self.assertFalse(body_attempted.is_set())
+            release_filler.set()
+            await task
+
+            messages = self.ws.json_messages()
+            types = [message["type"] for message in messages]
+            self.assertNotIn("error", types)
+            self.assertIn("thinking_filler", types)
+            self.assertLess(types.index("thinking_filler"), types.index("tts_start"))
+            self.assertTrue(any(isinstance(message, bytes) for message in self.ws.messages))
+            self.assertEqual(
+                self.session.history,
+                [{"role": "user", "content": "用户输入"}],
+            )
+        finally:
+            release_filler.set()
+            common.THINKING_FILLER_DELAY_SECONDS = original_delay
+
+    async def test_runtime_thinking_filler_skips_after_llm_output_begins(self):
+        original_delay = common.THINKING_FILLER_DELAY_SECONDS
+        captured = {}
+        synth_calls = []
+
+        def synth(text):
+            synth_calls.append(text)
+            return b"\x01\x00" * 40
+
+        def capture_queue(_role, _history, _text, _scope, out):
+            captured["events"] = out
+
+        try:
+            common.THINKING_FILLER_DELAY_SECONDS = 0.05
+            common._synth_tts = synth
+            common.start_llm_stream_producer = capture_queue
+            await self.session.on_start(
+                {"downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY]}
+            )
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            task = asyncio.create_task(
+                self.session._reply_pipeline("用户输入", scope)
+            )
+            for _ in range(100):
+                if "events" in captured:
+                    break
+                await asyncio.sleep(0)
+
+            captured["events"].put_nowait(
+                {"type": "delta", "text": "正文已经开始生成但还没有形成稳定句子"}
+            )
+            await asyncio.sleep(0.08)
+
+            self.assertNotIn(
+                "thinking_filler",
+                [message["type"] for message in self.ws.json_messages()],
+            )
+            self.assertNotIn(common.THINKING_FILLER_TEXT, synth_calls)
+
+            captured["events"].put_nowait({"type": "done"})
+            await task
+        finally:
+            common.THINKING_FILLER_DELAY_SECONDS = original_delay
+
+    async def test_proactive_conversation_plan_crosses_only_as_fixed_enums(self):
+        captured = []
+        common._synth_tts = lambda _text: b"unused"
+
+        def capture(_role, history, _text, _scope, out):
+            captured.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "proactiveTurn": [common.PROACTIVE_TURN_CAPABILITY],
+        })
+        await self.session.on_proactive_turn({
+            "triggerId": 1,
+            "kind": "followup",
+            "conversationPlan": {
+                "move": "expand",
+                "responseCue": "none",
+                "stance": "companion",
+                "depth": 1,
+                "injected": "forbidden",
+            },
+        })
+        await self.session.reply_task
+
+        rendered = captured[0][-1]["content"]
+        self.assertEqual(rendered, common.format_conversation_plan_hint({
+            "move": "expand",
+            "responseCue": "none",
+            "stance": "companion",
+            "depth": 1,
+        }))
+        self.assertNotIn("forbidden", rendered)
+
+    async def test_proactive_topic_revisit_is_bounded_ephemeral_context(self):
+        captured = []
+        common._synth_tts = lambda _text: b"unused"
+
+        def capture(_role, history, text, _scope, out):
+            captured.append(([dict(message) for message in history], text))
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "proactiveTurn": [common.PROACTIVE_TURN_CAPABILITY],
+        })
+        await self.session.on_proactive_turn({
+            "triggerId": 1,
+            "kind": "revisit",
+            "topicRevisit": {
+                "category": "decision",
+                "context": "我还没决定要不要换工作，这件事让我很纠结",
+                "injected": "forbidden",
+            },
+        })
+        await self.session.reply_task
+
+        history, request_text = captured[0]
+        rendered = history[-1]["content"]
+        self.assertEqual(request_text, common.PROACTIVE_REVISIT_PROMPT)
+        self.assertEqual(
+            rendered,
+            common.format_topic_revisit_hint({
+                "category": "decision",
+                "context": "我还没决定要不要换工作，这件事让我很纠结",
+            }),
+        )
+        self.assertNotIn("forbidden", rendered)
+        self.assertNotIn("换工作", str(self.session.history))
+
+        await self.session.on_proactive_turn({
+            "triggerId": 2,
+            "kind": "revisit",
+            "topicRevisit": {"category": "weather", "context": "坏分类"},
+        })
+        status = last_json_of_type(self.ws, "proactive_turn_status")
+        self.assertEqual(status["state"], "vetoed")
 
     async def test_proactive_veto_reason_is_a_fixed_enum(self):
         await self.session.on_start({
@@ -2471,6 +2841,96 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(no_adapter.tts_streaming, "none")
+
+    async def test_fresh_topics_require_negotiation_and_stay_out_of_audible_history(self):
+        topics = [
+            {
+                "sourceName": "Hacker News",
+                "title": "一条新鲜科技话题",
+                "shortText": "来自统一缓存的短资料",
+                "canonicalUrl": "https://example.com/fresh-topic",
+                "fetchedAt": "2026-08-08T05:00:00Z",
+                "publishedAt": "2026-08-08T04:00:00Z",
+                "category": "technology",
+            }
+        ]
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "memoryContext": [common.TURN_MEMORY_CAPABILITY],
+                "freshTopic": [common.FRESH_TOPIC_CAPABILITY],
+                "freshTopics": topics,
+            }
+        )
+        self.assertEqual(self.session.fresh_topic, common.FRESH_TOPIC_CAPABILITY)
+        self.assertEqual(self.session._fresh_topics, [])
+        self.session.on_fresh_topics({"items": topics})
+        self.assertEqual(self.session._fresh_topics, topics)
+
+        captured = []
+        common._synth_tts = lambda _text: b"\x00\x00"
+
+        def capture(_role, history, _text, _scope, out):
+            captured.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        await self.session._reply_pipeline(
+            "用户问最近有什么科技消息",
+            scope,
+            fresh_topics=self.session._fresh_topics,
+        )
+        self.assertIn("新鲜话题线索", captured[0][-1]["content"])
+        self.assertIn("不能声称自己玩过", captured[0][-1]["content"])
+        self.assertIn("不要照读标题", captured[0][-1]["content"])
+        self.assertNotIn("新鲜话题线索", str(self.session.history))
+        self.assertNotIn("Hacker News", str(self.session.history))
+
+        old = common.Session(FakeWebSocket())
+        await old.on_start({"downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY], "freshTopics": topics})
+        self.assertEqual(old.fresh_topic, "none")
+        self.assertEqual(old._fresh_topics, [])
+        old.on_fresh_topics({"items": topics})
+        self.assertEqual(old._fresh_topics, [])
+
+    async def test_ollama_duplicate_reply_retries_before_streaming_any_text(self):
+        repeated = (
+            "那你是真有福了啊！这种游戏就挺适合咱这种手残星人，躺着也能玩得开心。"
+            "不过我这儿还有一款游戏叫《模拟人生》，特别轻松，还能自己造房子、养宠物。"
+        )
+        novel = "手机上可以先试试单机合成类，不过我得先问一句，你介不介意游戏里有广告？"
+        calls = []
+        original_once = common._iter_llm_stream_once
+
+        def retrying_stream(_role, history, user_text):
+            calls.append(([dict(message) for message in history], user_text))
+            return iter([
+                {"type": "meta", "provider": "Ollama", "thinking": False},
+                {"type": "delta", "text": repeated if len(calls) == 1 else novel},
+            ])
+
+        common._iter_llm_stream_once = retrying_stream
+        try:
+            events = list(common.iter_llm_stream(
+                "角色设定",
+                [
+                {"role": "user", "content": "我想玩轻松一点的游戏"},
+                {"role": "assistant", "content": repeated},
+                ],
+                "有没有手机上能玩的？",
+            ))
+        finally:
+            common._iter_llm_stream_once = original_once
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn(common.LOCAL_REPLY_RETRY_HINT, calls[1][0][-1]["content"])
+        assistant_text = "".join(
+            event.get("text", "") for event in events if event.get("type") == "delta"
+        )
+        self.assertEqual(assistant_text, novel)
+        self.assertNotIn(repeated, assistant_text)
 
     async def test_start_keeps_text_chat_context_outside_audible_voice_history(self):
         initial_history = [
@@ -2675,6 +3135,17 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
         await self.session._emit_speech_rejected()
         await self.session._resume_play_if_paused()
+        self.assertTrue(self.session.play_enabled)
+
+    async def test_rejected_candidate_before_first_audio_reopens_active_response(self):
+        self.session.response_scope = self.session._new_scope("response")
+        self.session.playing = False
+        self.session.play_enabled = False
+
+        await self.session._emit_speech_candidate()
+        await self.session._emit_speech_rejected()
+        await self.session._resume_play_if_paused()
+
         self.assertTrue(self.session.play_enabled)
 
     async def test_turn_memory_wait_is_bounded_and_rejects_stale_generation(self):
@@ -3096,6 +3567,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "error",
                 "message": common.ASR_FAILURE_MESSAGE,
+                "recoverable": True,
                 "generation": scope.generation,
             },
             messages,
@@ -3211,8 +3683,19 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
         self.session.reply_task = task
 
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        for _ in range(100):
+            if any(
+                message.get("type") == "tts_start"
+                for message in self.ws.json_messages()
+            ):
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(
+            any(
+                message.get("type") == "tts_start"
+                for message in self.ws.json_messages()
+            )
+        )
         scope.cancel("turn_detected")
         tts_future.set_result(b"\x01\x00" * common.OUTPUT_RATE)
         await task

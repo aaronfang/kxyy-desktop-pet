@@ -852,9 +852,19 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   const local = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
   local._playbackMode = "worklet";
   local.playbackNode = { port: { postMessage: () => {} } };
+  const freshTopic = {
+    sourceName: "Hacker News",
+    canonicalUrl: "https://example.com/fresh-topic",
+    title: "一条新鲜科技话题",
+    publishedAt: "2026-08-08T04:00:00Z",
+    fetchedAt: "2026-08-08T05:00:00Z",
+    shortText: "来自统一缓存的短资料",
+    category: "technology",
+  };
   const localOpen = local._openSocket("ws://local", {
     systemRole: "role",
     botName: "元元",
+    freshTopics: [freshTopic],
     initialHistory: [
       { role: "user", content: "文字聊天里提到按摩椅" },
       { role: "assistant", content: "那把椅子买回来没怎么用。" },
@@ -867,6 +877,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
   assert.deepEqual(sockets[0].sent[0].proactiveTurn, ["local-v1"]);
+  assert.equal("freshTopics" in sockets[0].sent[0], false);
   assert.deepEqual(sockets[0].sent[0].initialHistory, [
     { role: "user", content: "文字聊天里提到按摩椅" },
     { role: "assistant", content: "那把椅子买回来没怎么用。" },
@@ -892,7 +903,12 @@ test("managed and proactive capabilities are explicitly offered only by eligible
       interruptionHint: "candidate-snapshot-v1",
       ttsStream: "provider-pcm-v1",
       proactiveTurn: "local-v1",
+      freshTopic: "fresh-topic-v1",
     }),
+  });
+  assert.deepEqual(sockets[0].sent[1], {
+    type: "fresh_topics",
+    items: [freshTopic],
   });
   assert.deepEqual(local.getTraceSnapshot().runtime, {
     provider: "local",
@@ -922,6 +938,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     local.sendMemoryContext({
       generation: 7,
       items: [{ kind: "fact", text: "记忆线索", confidence: 1 }],
+      freshTopics: [freshTopic],
     }),
     true,
   );
@@ -929,6 +946,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     type: "memory_context",
     generation: 7,
     items: [{ kind: "fact", text: "记忆线索", uncertain: false, pinned: false }],
+    freshTopics: [freshTopic],
   });
 
   const cosy = new RealtimeSession({ provider: "cosyvoice", conversationMode: "balanced" });
@@ -948,6 +966,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   const legacyOpen = legacy._openSocket("ws://legacy", {
     systemRole: "role",
     botName: "元元",
+    freshTopics: [freshTopic],
   });
   sockets[2].onopen();
   await legacyOpen;
@@ -956,11 +975,29 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
   assert.equal("proactiveTurn" in sockets[2].sent[0], false);
+  assert.equal("freshTopics" in sockets[2].sent[0], false);
+  legacy.trace.startSession();
+  legacy._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "raw",
+      memoryContext: "turn-final-v1",
+      freshTopic: "none",
+    }),
+  });
+  legacy._backendGeneration = 7;
+  assert.equal(
+    legacy.sendMemoryContext({ generation: 7, items: [], freshTopics: [freshTopic] }),
+    true,
+  );
+  assert.equal("freshTopics" in sockets[2].sent.at(-1), false);
 
   const volcano = new RealtimeSession({ provider: "volcano" });
   const volcanoOpen = volcano._openSocket("ws://volcano", {
     systemRole: "role",
     botName: "元元",
+    freshTopics: [freshTopic],
   });
   sockets[3].onopen();
   await volcanoOpen;
@@ -969,6 +1006,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.equal("ttsStream" in sockets[3].sent[0], false);
   assert.equal("proactiveTurn" in sockets[3].sent[0], false);
   assert.equal("initialHistory" in sockets[3].sent[0], false);
+  assert.equal("freshTopics" in sockets[3].sent[0], false);
   assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
 });
 
@@ -1101,10 +1139,14 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
 
 test("realtime proactive policy classifies explicit controls without model inference", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
-  const { classifyRealtimeConversationTurn } = await import("../src/ai/realtime.js");
+  const {
+    classifyRealtimeConversationTurn,
+    classifyRealtimeSoftIntent,
+  } = await import("../src/ai/realtime.js");
   const cases = [
     ["安静一会儿", "pause"], ["先别说话", "pause"], ["暂停一下", "pause"],
     ["让我想想", "pause"], ["我想静静", "pause"], ["稍等一下", "pause"],
+    ["你先听我说", "pause"], ["让我先讲完", "pause"],
     ["换个话题吧", "redirect"], ["聊点别的", "redirect"], ["别聊这个", "redirect"],
     ["跳过这个吧", "redirect"], ["不说这个了", "redirect"],
     ["你继续", "resume"], ["继续说吧", "resume"], ["接着讲", "resume"],
@@ -1122,9 +1164,27 @@ test("realtime proactive policy classifies explicit controls without model infer
   for (const [text, expected] of cases) {
     assert.equal(classifyRealtimeConversationTurn(text), expected, text);
   }
+
+  const softCases = [
+    ["我想听听你是怎么想的", "invite-opinion"],
+    ["你怎么看？", "invite-opinion"],
+    ["我也不知道，你觉得我该怎么办", "invite-advice"],
+    ["换成你会怎么做", "invite-advice"],
+    ["这个可以再深入聊聊", "deepen"],
+    ["你多讲一点", "deepen"],
+    ["我们聊点轻松的吧", "lighten"],
+    ["别说得这么沉重", "lighten"],
+    ["你能不能说具体点", "concretize"],
+    ["举个例子呢", "concretize"],
+    ["你今天怎么看起来很累", "none"],
+    ["换个话题", "none"],
+  ];
+  for (const [text, expected] of softCases) {
+    assert.equal(classifyRealtimeSoftIntent(text), expected, text);
+  }
 });
 
-test("ai-leads schedules bounded followup and topic switch from audible playback", async () => {
+test("ai-leads schedules bounded plan-aware followups from audible playback", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -1145,6 +1205,12 @@ test("ai-leads schedules bounded followup and topic switch from audible playback
   session._scheduleTopicLeadAfterPlayback(1);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.at(-1).kind, "followup");
+  assert.deepEqual(sent.at(-1).conversationPlan, {
+    move: "expand",
+    responseCue: "none",
+    stance: "companion",
+    depth: 0,
+  });
 
   session._noteProactiveStatus({
     triggerId: sent.at(-1).triggerId,
@@ -1154,7 +1220,13 @@ test("ai-leads schedules bounded followup and topic switch from audible playback
   session._assistantActive = false;
   session._scheduleTopicLeadAfterPlayback(2);
   await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(sent.at(-1).kind, "idle");
+  assert.equal(sent.at(-1).kind, "followup");
+  assert.deepEqual(sent.at(-1).conversationPlan, {
+    move: "offer-entry",
+    responseCue: "low-burden",
+    stance: "companion",
+    depth: 0,
+  });
 
   session._noteProactiveStatus({
     triggerId: sent.at(-1).triggerId,
@@ -1165,7 +1237,7 @@ test("ai-leads schedules bounded followup and topic switch from audible playback
   session._scheduleTopicLeadAfterPlayback(3);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 2);
-  assert.equal(session.getTraceSnapshot().proactiveSummary.topicSwitches, 1);
+  assert.equal(session.getTraceSnapshot().proactiveSummary.topicSwitches, 0);
 
   session._applyUserTurnPolicy("pause");
   session._scheduleTopicLeadAfterPlayback(4);
@@ -1199,6 +1271,68 @@ test("balanced allows one proactive turn after user engagement", async () => {
   assert.equal(sent[0].kind, "followup");
 });
 
+test("ai-leads sends a fixed conversation plan with negotiated turn context", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._memoryContextMode = "turn-final-v1";
+  session._backendGeneration = 7;
+  session._userTurnOpen = true;
+  session._onMessage({
+    data: JSON.stringify({
+      type: "asr",
+      text: "我想听听你是怎么想的",
+      interim: false,
+      generation: 7,
+    }),
+  });
+
+  assert.equal(session.sendMemoryContext({ generation: 7, items: [] }), true);
+  assert.deepEqual(sent.at(-1).conversationPlan, {
+    move: "expand",
+    responseCue: "none",
+    stance: "opinion",
+    depth: 0,
+  });
+  assert.equal(JSON.stringify(sent.at(-1)).includes("我想听听"), false);
+});
+
+test("thinking feedback is immediate and offers at most one delayed filler signal per turn", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const phases = [];
+  let fillerOffers = 0;
+  const session = new RealtimeSession({
+    provider: "local",
+    thinkingFeedbackDelayMs: 0,
+    onThinking: (phase) => phases.push(phase),
+    onThinkingFillerOffer: () => { fillerOffers += 1; },
+  });
+  session.trace.startSession();
+  session._userTurnOpen = true;
+  session._onMessage({ data: JSON.stringify({ type: "asr_end" }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(phases, ["reasoning"]);
+  assert.equal(fillerOffers, 1);
+
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant", text: "第一段", generation: 1 }),
+  });
+  assert.equal(phases.at(-1), "synthesizing");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(fillerOffers, 1);
+
+  session._onMessage({ data: JSON.stringify({ type: "speaking", generation: 1 }) });
+  assert.equal(phases.at(-1), "idle");
+  session._userTurnOpen = true;
+  session._onMessage({ data: JSON.stringify({ type: "asr_end" }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(fillerOffers, 2);
+});
+
 test("topic keys are stable bounded session-only identifiers", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { deriveRealtimeTopicKey } = await import("../src/ai/realtime.js");
@@ -1230,6 +1364,65 @@ test("topic history stays bounded and suppresses a repeated audible topic", asyn
   session._scheduleTopicLeadAfterPlayback(1);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.length, 0);
+});
+
+test("important topic revisit is a bounded accepted transition and stays out of diagnostics", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+  session._userTurnOpen = true;
+  session._onMessage({
+    data: JSON.stringify({
+      type: "asr",
+      text: "我还没决定要不要换工作，这件事让我很纠结",
+      interim: false,
+      generation: 1,
+    }),
+  });
+
+  for (let index = 0; index < 4; index += 1) {
+    session._sendTopicTransition({
+      move: "expand",
+      responseCue: "none",
+      stance: "companion",
+      depth: 1,
+    });
+    const message = sent.at(-1);
+    assert.equal(message.kind, "idle");
+    assert.equal("topicRevisit" in message, false);
+    session._noteProactiveStatus({
+      triggerId: message.triggerId,
+      state: "accepted",
+      generation: index + 2,
+    });
+  }
+
+  session._sendTopicTransition({
+    move: "deepen",
+    responseCue: "low-burden",
+    stance: "companion",
+    depth: 2,
+  });
+  const revisit = sent.at(-1);
+  assert.deepEqual(revisit.topicRevisit, {
+    category: "decision",
+    context: "我还没决定要不要换工作，这件事让我很纠结",
+  });
+  assert.equal(revisit.kind, "revisit");
+  session._noteProactiveStatus({
+    triggerId: revisit.triggerId,
+    state: "accepted",
+    generation: 8,
+  });
+
+  const diagnostic = JSON.stringify(session.getTraceSnapshot());
+  assert.equal(diagnostic.includes("换工作"), false);
+  assert.equal(diagnostic.includes("topicRevisit"), false);
+  assert.equal(session._sessionTopicLedger.snapshot().revisited, 1);
 });
 
 test("proactive rhythm backs off once, stops after two negative signals, and resumes explicitly", async () => {
@@ -1921,6 +2114,11 @@ test("desktop session ducks candidates, resumes rejection and gates stale audio"
   session._onMessage({
     data: JSON.stringify({ type: "asr", text: "确认插话", interim: true }),
   });
+  assert.equal(session._audioGate, false);
+  assert.equal(playbackCommands.at(-1).type, "duck");
+  session._onMessage({
+    data: JSON.stringify({ type: "asr", text: "确认插话", interim: false }),
+  });
   assert.equal(session._audioGate, true);
   assert.equal(playbackCommands.at(-1).type, "clear");
   const commandsBeforeStaleAudio = playbackCommands.length;
@@ -1932,6 +2130,47 @@ test("desktop session ducks candidates, resumes rejection and gates stale audio"
   assert.equal(eventTypes.includes(TRACE_EVENT.SPEECH_REJECTED), true);
   assert.equal(eventTypes.includes(TRACE_EVENT.SPEECH_CONFIRMED), true);
   assert.equal(eventTypes.includes(TRACE_EVENT.RESPONSE_CANCELLED), true);
+});
+
+test("candidate rejection reopens the audio gate for the segment already admitted by the backend", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const queued = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.playbackNode = { port: { postMessage: (message) => queued.push(message) } };
+  session.audioCtx = { state: "running" };
+  session.trace.startSession();
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      ttsStream: "provider-pcm-v1",
+    }),
+  });
+  session._assistantActive = true;
+  session._audioGate = true;
+  session._onMessage({ data: JSON.stringify({ type: "speech_candidate" }) });
+  session._onMessage({ data: JSON.stringify({ type: "speech_rejected" }) });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 1,
+      segmentId: 1,
+      text: "候选被拒绝后继续播报。",
+      streaming: true,
+    }),
+  });
+  session._onMessage({ data: managedAudioFrame({
+    generation: 1,
+    segmentId: 1,
+    chunkSequence: 0,
+    payloadSamples: 3,
+    pcm: new Int16Array([1, 2, 3]),
+  }) });
+  assert.equal(session._audioGate, false);
+  assert.equal(queued.some((message) => message.type === "audio"), true);
 });
 
 test("barge-in attributes cleared playback to the interrupted generation", async () => {

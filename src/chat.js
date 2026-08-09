@@ -54,13 +54,26 @@ import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } fro
 import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
 import { fetchWebObservations, renderWebObservationBlock } from "./ai/web-observations.js";
+import {
+  fetchFreshTopics,
+  inferFreshTopicLocations,
+  inferFreshTopicWorkRoles,
+  renderFreshTopicBlock,
+  takeFreshTopicsForSession,
+} from "./ai/fresh-topics.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 import { localVoicePresetById } from "./ai/voice-presets.js";
 import {
+  buildTopicPreferencePrompt,
+  inferTopicPreferenceCandidates,
+  normalizeTopicPreferences,
+} from "./ai/topic-preferences.js";
+import {
   recallRealtimeMemory,
+  filterRealtimeMemoryAgainstAssistant,
   formatRealtimeMemoryHints,
   selectRealtimeMemoryItems,
   takeFreshRealtimeMemoryItems,
@@ -277,6 +290,8 @@ globalThis.fetch = (input, init) => {
 
 // Memory v3：SQLite 长期记忆按人设卡与昵称隔离；旧 localStorage 只用于一次性迁移。
 let activeProfile = null;   // 本轮生效的观众画像（本人 ππ / 自填 / 默认元宝）
+let freshTopicLocationKey = "";
+let freshTopicWorkRoleKey = "";
 let activeName = null;      // 当前生效昵称（记忆分档键；无有效昵称时为 null，不落盘）
 const memoryEnqueuedIds = new Set(); // 已可靠写入 Rust 待巩固队列的消息 id
 let memoryBatchSeq = 0;
@@ -1317,7 +1332,37 @@ function refreshIdentity() {
   const stored = buildStoredProfileFromSettings(settings);
   activeProfile = resolveUserProfile(assets.userProfile, name, stored, settings.personaCardId);
   activeName = getEffectiveName(name, activeProfile);
+  void syncFreshTopicLocations();
   void migrateAllLegacyMemory();
+}
+
+async function syncFreshTopicLocations() {
+  if (!assets) return;
+  const locations = inferFreshTopicLocations({
+    profile: activeProfile,
+    personaText: assets.systemPrompt || "",
+    recentMessages: history,
+  });
+  const locationKey = locations.join("|");
+  const changed = locationKey !== freshTopicLocationKey;
+  freshTopicLocationKey = locationKey;
+  try {
+    await invoke("set_fresh_topic_locations", { locations });
+    const workRoles = inferFreshTopicWorkRoles({ profile: activeProfile, personaText: assets.systemPrompt || "", recentMessages: history });
+    const workRoleKey = workRoles.join("|");
+    const workChanged = workRoleKey !== freshTopicWorkRoleKey;
+    freshTopicWorkRoleKey = workRoleKey;
+    await invoke("set_fresh_topic_work_roles", { roles: workRoles });
+    if ((changed || workChanged) && settings.webGroundingEnabled === true) {
+      void invoke("prefetch_fresh_topics", {
+        reason: "location-context",
+        force: true,
+        topicPreferences: settings.topicPreferences || [],
+      }).catch(() => {});
+    }
+  } catch (_) {
+    // Fresh topics are optional; conversation remains available without location context.
+  }
 }
 
 async function migrateLegacyMemory(cardId) {
@@ -1462,6 +1507,20 @@ async function buildRequestMessages(opts = {}) {
     }
   }
   let webPrompt = "";
+  if (settings.webGroundingEnabled === true) {
+    await syncFreshTopicLocations();
+    const query = lastRealUserMessage()?.content || "";
+    const freshTopics = await fetchFreshTopics({
+      enabled: true,
+      query,
+      proactive: Boolean(opts.proactiveKind),
+      invokeImpl: invoke,
+    });
+    webPrompt = renderFreshTopicBlock(freshTopics);
+    if (chatDebugEnabled() && freshTopics.length) {
+      console.log("[fresh-topics]", { count: freshTopics.length });
+    }
+  }
   if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
     const query = lastRealUserMessage()?.content || "";
     const observations = await fetchWebObservations({
@@ -1470,7 +1529,7 @@ async function buildRequestMessages(opts = {}) {
       query,
       apiBase,
     });
-    webPrompt = renderWebObservationBlock(observations);
+    webPrompt += renderWebObservationBlock(observations);
     if (chatDebugEnabled()) console.log("[web-observations]", { count: observations.length });
   }
   const maxTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
@@ -1814,6 +1873,7 @@ async function send(text, opts = {}) {
       ...(image ? { images: [image.dataUrl] } : {}),
       ...(sticker ? { sticker } : {}),
     });
+    if (text && !currentTurnDoNotRemember) void inferAndPersistTopicPreferences(text);
 
     const mainResult = await streamAssistantReply(streamBubble, streamRow, { replyId });
 
@@ -1924,6 +1984,7 @@ let callAsstGeneration = null;
 let callLastUserMessageId = "";
 let callAudibleTurns = new Map();
 let callProactiveMemoryIds = new Set();
+let callFreshTopicIds = new Set();
 let callWaveSpeaking = false;
 const MAX_CALL_AUDIBLE_TURNS = 4;
 const CALL_CLEANUP_WAIT_MS = 1500;
@@ -2001,8 +2062,25 @@ function callUsesAudibleReceipts() {
 
 const callWaveEl = document.getElementById("call-wave");
 const callWaveBarsEl = callWaveEl?.querySelector(".call-wave-bars");
+const callStatusEl = document.getElementById("call-status");
 const CALL_WAVE_BAR_COUNT = 28;
 let callWaveBars = [];
+let topicPreferenceInferenceBusy = false;
+
+async function inferAndPersistTopicPreferences(text) {
+  if (topicPreferenceInferenceBusy) return;
+  const candidates = inferTopicPreferenceCandidates(text);
+  if (!candidates.length) return;
+  topicPreferenceInferenceBusy = true;
+  try {
+    const merged = await invoke("merge_topic_preferences", { entries: candidates });
+    if (Array.isArray(merged)) settings.topicPreferences = normalizeTopicPreferences(merged);
+  } catch (_) {
+    // 偏好推断是非阻塞弱提示，失败不影响当前语音轮次。
+  } finally {
+    topicPreferenceInferenceBusy = false;
+  }
+}
 
 /** 组装实时通话用的人设 system_role：复用文字聊天的 buildSystemPrompt + 实时状态，
  *  再叠加「语音口语化」提示（说人话、简短、不要括号/表情/贴纸标记）。 */
@@ -2022,9 +2100,13 @@ function buildRealtimeSystemRoleBase() {
     const live = computeLiveContext(new Date(), assets.lore, settings.personaCardId);
     if (live) sys += "\n\n" + live;
   } catch (_) {}
+  if (settings.realtimeConversationMode === "ai-leads") {
+    const topicPreferencePrompt = buildTopicPreferencePrompt(settings.topicPreferences);
+    if (topicPreferencePrompt) sys += `\n\n${topicPreferencePrompt}`;
+  }
   sys +=
     "\n\n# 语音通话模式\n\n" +
-    "- 现在是**实时语音通话**，你的话会被念出来给对方听。说得像打电话一样自然口语、简短，一次别说太长。\n" +
+    "- 现在是**实时语音通话**，你的话会被念出来给对方听。说得像打电话一样自然口语；普通一轮可以说 2~5 句，先贡献具体内容再留回应入口。用户明确想深入时可以更完整，但不要为了凑长度重复或总结收口。\n" +
     "- **不要**输出任何括号里的动作/神态描写、方括号、星号、表情符号或「[表情:xx]」这类标记——这些会被原样念出来，很怪。\n" +
     "- 想表达情绪就用语气词和说话方式本身，别靠文字符号。\n";
   const bot = aiShortName();
@@ -2056,7 +2138,13 @@ async function buildRealtimeSystemRole() {
     imageCaption,
     maxItems: 3,
   });
-  return base + formatRealtimeMemoryHints(items);
+  const recentAssistant = history
+    .filter((message) => message?.role === "assistant" && (message.content || "").trim())
+    .slice(-4)
+    .map((message) => message.content);
+  return base + formatRealtimeMemoryHints(
+    filterRealtimeMemoryAgainstAssistant(items, recentAssistant),
+  );
 }
 
 /** 通话 bot_name：短称便于 ASR 热词与人设对齐。 */
@@ -2105,7 +2193,8 @@ function showCallWave(show) {
   } else {
     callWaveEl.hidden = true;
     callWaveEl.setAttribute("aria-hidden", "true");
-    callWaveEl.classList.remove("speaking", "candidate");
+    callWaveEl.classList.remove("speaking", "candidate", "thinking");
+    if (callStatusEl) callStatusEl.textContent = "通话中";
     callWaveSpeaking = false;
     for (const bar of callWaveBars) {
       const base = Number(bar.dataset.base) || 0.2;
@@ -2312,9 +2401,15 @@ async function setChatCompact(compact) {
   }
 }
 
-function setCallCapsuleStatus(_text, speaking = false, listening = false) {
+function setCallCapsuleStatus(text, speaking = false, listening = false) {
+  const label = String(text || "通话中");
+  const thinking = /思考|组织语音/.test(label);
+  if (callStatusEl) callStatusEl.textContent = label;
+  callWaveEl?.classList.toggle("thinking", thinking);
   callCapsuleEl?.classList.toggle("speaking", speaking);
   callCapsuleEl?.classList.toggle("listening", listening);
+  callCapsuleEl?.classList.toggle("thinking", thinking);
+  callCapsuleEl?.setAttribute("aria-label", label);
 }
 
 function finalizeCallUserBubble() {
@@ -2483,10 +2578,26 @@ async function provideTurnMemoryContext(session, generation, reason = "turn") {
   const freshItems = proactiveTopic
     ? takeFreshRealtimeMemoryItems(items, callProactiveMemoryIds)
     : items;
+  const recalledItems = filterRealtimeMemoryAgainstAssistant(
+    freshItems,
+    history
+      .filter((message) => message?.role === "assistant" && message.audible === true)
+      .slice(-4)
+      .map((message) => message.content),
+  );
+  const fetchedTopics = await fetchFreshTopics({
+    enabled: settings.webGroundingEnabled === true,
+    query: proactiveTopic ? "" : (last?.content || ""),
+    proactive: proactiveTopic,
+    excludedSourceIds: [...callFreshTopicIds],
+    invokeImpl: invoke,
+  });
+  const freshTopics = takeFreshTopicsForSession(fetchedTopics, callFreshTopicIds);
   session.sendMemoryContext({
     generation,
-    items: selectRealtimeMemoryItems(freshItems),
+    items: selectRealtimeMemoryItems(recalledItems),
     temporalContext,
+    freshTopics,
   });
 }
 
@@ -2507,6 +2618,7 @@ async function startCall() {
   callLastUserMessageId = "";
   callAudibleTurns = new Map();
   callProactiveMemoryIds = new Set();
+  callFreshTopicIds = new Set();
   lastCallTraceSnapshot = null;
   if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "";
 
@@ -2535,7 +2647,10 @@ async function startCall() {
       setCallCapsuleStatus("聆听中", false, true);
     },
     // ASR 全文是覆盖式更新；只在 asr_end 定稿，避免中间态被标成 final 时切成多条。
-    onAsr: (text) => upsertCallUserBubble(text, { interim: true }),
+    onAsr: (text, meta) => {
+      upsertCallUserBubble(text, { interim: meta?.interim !== false });
+      if (meta?.interim === false) void inferAndPersistTopicPreferences(text);
+    },
     onAsrEnd: () => {
       finalizeCallUserBubble();
       setCallCapsuleStatus("通话中");
@@ -2543,6 +2658,18 @@ async function startCall() {
     onMemoryContextRequest: ({ generation, reason }) => {
       void provideTurnMemoryContext(session, generation, reason);
     },
+    onThinking: (phase) => {
+      if (phase === "reasoning") {
+        petSignal("thinking");
+        setCallCapsuleStatus("思考中…");
+      } else if (phase === "synthesizing") {
+        setCallCapsuleStatus("组织语音…");
+      } else {
+        callWaveEl?.classList.remove("thinking");
+        callCapsuleEl?.classList.remove("thinking");
+      }
+    },
+    onThinkingFillerOffer: () => setCallCapsuleStatus("还在思考…"),
     onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
     onAssistantEnd: () => {
       finalizeCallAsstBubble();
@@ -2586,12 +2713,22 @@ async function startCall() {
 
   try {
     const systemRole = await buildRealtimeSystemRole();
+    const fetchedTopics = await fetchFreshTopics({
+      enabled: settings.webGroundingEnabled === true,
+      proactive: true,
+      excludedSourceIds: [...callFreshTopicIds],
+      invokeImpl: invoke,
+    });
+    // 启动话题只服务主动欢迎；是否真的被模型采用不可观测，不能提前消耗
+    // 后续用户显式查询的通话内冷却名额。
+    const freshTopics = fetchedTopics;
     // 记忆召回期间用户可能已经点了挂断；不要让迟到的 start 重新打开已关闭的会话。
     if (!callActive || callSession !== session) return;
     await session.start({
       systemRole,
       botName: callBotName(),
       initialHistory: buildRealtimeInitialHistory(),
+      freshTopics,
     });
   } catch (e) {
     appendPatNotice(`📞 无法开始通话：${e.message || e}`);
