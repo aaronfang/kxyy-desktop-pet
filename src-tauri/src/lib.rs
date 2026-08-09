@@ -1,4 +1,5 @@
 mod api;
+mod fresh_topics;
 mod local_text;
 mod memory;
 mod memory_core;
@@ -23,6 +24,7 @@ use tauri::{
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 
 // 角色清单在编译期嵌入，主进程托盘与前端共用同一份数据。
 const ROSTER_JSON: &str = include_str!("../../shared/roster.json");
@@ -49,6 +51,86 @@ struct Roster {
 
 fn roster() -> Roster {
     serde_json::from_str(ROSTER_JSON).expect("invalid roster.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TopicPreference {
+    topic: String,
+    status: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
+}
+
+fn normalize_topic_preferences(values: &[TopicPreference]) -> Vec<TopicPreference> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let topic: String = value
+            .topic
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(32)
+            .collect();
+        let status = match value.status.trim() {
+            "interested" | "not-interested" | "neutral" => value.status.trim().to_string(),
+            _ => continue,
+        };
+        if topic.is_empty() {
+            continue;
+        }
+        let source = if value.source.trim() == "inferred" {
+            "inferred".to_string()
+        } else {
+            "manual".to_string()
+        };
+        let key = topic.to_lowercase();
+        if let Some(index) = normalized
+            .iter()
+            .position(|entry: &TopicPreference| entry.topic.to_lowercase() == key)
+        {
+            if normalized[index].source == "manual" && source == "inferred" {
+                continue;
+            }
+            normalized[index] = TopicPreference {
+                topic,
+                status,
+                source,
+                confidence: value
+                    .confidence
+                    .as_deref()
+                    .map(|v| v.chars().take(16).collect()),
+                evidence: value
+                    .evidence
+                    .as_deref()
+                    .map(|v| v.chars().take(32).collect()),
+            };
+        } else {
+            normalized.push(TopicPreference {
+                topic,
+                status,
+                source,
+                confidence: value
+                    .confidence
+                    .as_deref()
+                    .map(|v| v.chars().take(16).collect()),
+                evidence: value
+                    .evidence
+                    .as_deref()
+                    .map(|v| v.chars().take(32).collect()),
+            });
+        }
+    }
+    normalized.truncate(32);
+    normalized
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +207,9 @@ struct Settings {
     /// 实时通话主动性：`follow-user` / `balanced` / `ai-leads`。
     #[serde(default = "default_realtime_conversation_mode")]
     realtime_conversation_mode: String,
+    /// 用户可编辑的话题偏好；仅保存结构化标签，不保存网络正文或聊天原文。
+    #[serde(default)]
+    topic_preferences: Vec<TopicPreference>,
     /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
     #[serde(default)]
     text_model: String,
@@ -345,6 +430,7 @@ impl Settings {
             asr_provider: default_asr_provider(),
             turn_pause_tolerance: default_turn_pause_tolerance(),
             realtime_conversation_mode: default_realtime_conversation_mode(),
+            topic_preferences: Vec::new(),
             text_model: String::new(),
             text_provider: default_text_provider(),
             web_grounding_enabled: false,
@@ -1723,6 +1809,8 @@ struct AiSettingsInput {
     turn_pause_tolerance: String,
     #[serde(default = "default_realtime_conversation_mode")]
     realtime_conversation_mode: String,
+    #[serde(default)]
+    topic_preferences: Vec<TopicPreference>,
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
@@ -1771,6 +1859,115 @@ struct AiSettingsInput {
     chat_bottom_offset: u32,
     #[serde(default = "default_capsule_collapsed_width")]
     capsule_collapsed_width: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FreshTopicQueryInput {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default = "default_fresh_topic_query_max_items")]
+    max_items: usize,
+    #[serde(default)]
+    excluded_source_ids: Vec<String>,
+}
+
+fn default_fresh_topic_query_max_items() -> usize {
+    3
+}
+
+#[tauri::command]
+fn set_fresh_topic_locations(locations: Vec<String>) -> Vec<String> {
+    fresh_topics::set_location_hints(locations)
+}
+
+#[tauri::command]
+fn set_fresh_topic_work_roles(roles: Vec<String>) -> Vec<String> {
+    fresh_topics::set_work_role_hints(roles)
+}
+
+#[tauri::command]
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "链接无效".to_string())?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.as_str().chars().count() > 512
+    {
+        return Err("只允许打开安全的 HTTPS 链接".into());
+    }
+    app.opener()
+        .open_url(parsed.as_str(), None::<&str>)
+        .map_err(|_| "无法打开网页".to_string())
+}
+
+#[tauri::command]
+fn prefetch_fresh_topics(
+    app: AppHandle,
+    reason: String,
+    force: Option<bool>,
+    topic_preferences: Option<Vec<TopicPreference>>,
+) -> fresh_topics::FreshTopicPrefetchResponse {
+    let normalized = topic_preferences.map(|values| normalize_topic_preferences(&values));
+    fresh_topics::prefetch_for_app(
+        &app,
+        reason.trim(),
+        force.unwrap_or(false),
+        normalized.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn get_fresh_topic_status(
+    app: AppHandle,
+    topic_preferences: Option<Vec<TopicPreference>>,
+) -> fresh_topics::FreshTopicStatusResponse {
+    let normalized = topic_preferences.map(|values| normalize_topic_preferences(&values));
+    fresh_topics::status_for_app(&app, normalized.as_deref())
+}
+
+#[tauri::command]
+fn get_fresh_topics(
+    app: AppHandle,
+    request: FreshTopicQueryInput,
+) -> fresh_topics::FreshTopicResponse {
+    fresh_topics::query_for_app(
+        &app,
+        fresh_topics::FreshTopicQuery {
+            query: request.query.chars().take(300).collect(),
+            categories: request
+                .categories
+                .into_iter()
+                .map(|category| category.chars().take(32).collect())
+                .take(8)
+                .collect(),
+            max_items: request.max_items,
+            excluded_source_ids: request
+                .excluded_source_ids
+                .into_iter()
+                .map(|source_id| source_id.chars().take(96).collect())
+                .take(16)
+                .collect(),
+        },
+    )
+}
+
+#[tauri::command]
+fn merge_topic_preferences(app: AppHandle, entries: Vec<TopicPreference>) -> Vec<TopicPreference> {
+    let mut merged = {
+        let state = app.state::<AppState>();
+        let current = state.settings.lock().unwrap().topic_preferences.clone();
+        current
+    };
+    merged.extend(entries.into_iter().take(8));
+    let normalized = normalize_topic_preferences(&merged);
+    commit_settings(&app, |settings| {
+        settings.topic_preferences = normalized.clone();
+    });
+    let _ = app.emit("topic-preferences-updated", &normalized);
+    normalized
 }
 
 /// 前端用于按平台显示语音后端选项（macos / windows / linux）。
@@ -1828,6 +2025,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).into();
         s.realtime_conversation_mode =
             normalize_realtime_conversation_mode(&settings.realtime_conversation_mode).into();
+        s.topic_preferences = normalize_topic_preferences(&settings.topic_preferences);
         s.text_model = settings.text_model.trim().to_string();
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
@@ -1909,6 +2107,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         local_text_model = guard.local_text_model.clone();
     }
     local_text::ensure(&app, &text_provider, &local_text_model);
+    fresh_topics::schedule_prefetch(app.clone(), "settings", 1);
     // Key、服务商或本地模型恢复可用后，立即唤醒之前退避中的记忆任务。
     memory::retry_pending_now(&app);
 }
@@ -1962,6 +2161,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -2063,6 +2263,12 @@ pub fn run() {
             app.manage(voice_service::VoiceServiceManager::new());
             let memory_state = memory::MemoryState::open(&handle);
             app.manage(memory_state);
+            let fresh_topics_path = handle
+                .path()
+                .app_config_dir()
+                .unwrap_or_default()
+                .join("fresh-topics-v1.json");
+            app.manage(fresh_topics::FreshTopicService::open(fresh_topics_path));
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
@@ -2097,6 +2303,8 @@ pub fn run() {
             voice_service::ensure(&handle, &settings.realtime_backend, &voice_fp);
             // 启动时按已保存的文字服务商自动探测 / 拉起本地 Ollama（非 local 时内部直接返回）。
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
+            // 网页观察开启时，后台预取不阻塞窗口、语音服务或本地模型预热。
+            fresh_topics::schedule_startup_prefetch(handle.clone());
             memory::trigger_worker(&handle);
 
             if let Some(win) = app.get_webview_window("main") {
@@ -2193,6 +2401,13 @@ pub fn run() {
             show_menu,
             get_api_base,
             get_realtime_base,
+            prefetch_fresh_topics,
+            get_fresh_topic_status,
+            get_fresh_topics,
+            set_fresh_topic_locations,
+            set_fresh_topic_work_roles,
+            open_external_url,
+            merge_topic_preferences,
             check_voice_service,
             probe_voice_backend,
             toggle_chat_window,
@@ -2244,8 +2459,8 @@ mod tests {
     use super::{
         capsule_collapsed_width, capsule_drag_result, capsule_resized_x, normalize_asr_provider,
         normalize_local_voice_preset, normalize_realtime_conversation_mode,
-        normalize_turn_pause_tolerance, voice_config_fingerprint, CapsuleEdge, Settings,
-        CAPSULE_HEIGHT, CAPSULE_WIDTH,
+        normalize_topic_preferences, normalize_turn_pause_tolerance, voice_config_fingerprint,
+        CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT, CAPSULE_WIDTH,
     };
 
     #[test]
@@ -2378,6 +2593,45 @@ mod tests {
         let follow_user = voice_config_fingerprint(&settings);
         settings.realtime_conversation_mode = "ai-leads".into();
         assert_eq!(follow_user, voice_config_fingerprint(&settings));
+    }
+
+    #[test]
+    fn topic_preferences_are_bounded_and_manual_entries_override_inferred() {
+        let mut values = vec![
+            TopicPreference {
+                topic: "电影影视".into(),
+                status: "interested".into(),
+                source: "inferred".into(),
+                confidence: None,
+                evidence: None,
+            },
+            TopicPreference {
+                topic: " 电影影视 ".into(),
+                status: "not-interested".into(),
+                source: "manual".into(),
+                confidence: None,
+                evidence: None,
+            },
+            TopicPreference {
+                topic: "电影影视".into(),
+                status: "interested".into(),
+                source: "inferred".into(),
+                confidence: None,
+                evidence: None,
+            },
+        ];
+        values.extend((0..40).map(|index| TopicPreference {
+            topic: format!("自定义{index}"),
+            status: "neutral".into(),
+            source: "manual".into(),
+            confidence: None,
+            evidence: None,
+        }));
+        let normalized = normalize_topic_preferences(&values);
+        assert_eq!(normalized[0].topic, "电影影视");
+        assert_eq!(normalized[0].status, "not-interested");
+        assert_eq!(normalized[0].source, "manual");
+        assert_eq!(normalized.len(), 32);
     }
 
     #[test]

@@ -4349,6 +4349,7 @@ fn import_legacy(
                         confidence: 0.7,
                         importance: 0.5,
                         valid_from: None,
+                        source_message_ids: Vec::new(),
                     },
                     now,
                 )
@@ -4501,6 +4502,7 @@ struct ExtractedFact {
     confidence: f64,
     importance: f64,
     valid_from: Option<i64>,
+    source_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4715,12 +4717,13 @@ fn process_job(app: &AppHandle, job: &PendingJob) -> Result<Extraction, String> 
         .collect::<Vec<_>>()
         .join("\n");
     let system = r#"你是桌宠的长期记忆整理器。只提取关于当前用户、双方共同经历和角色明确承诺的内容。
-不要提取角色人设规则、普通寒暄、API Key、密码、token、支付信息、证件号或精确住址。
+事实只能来自用户消息中明确说出的内容，不能从角色消息、网络资料或角色推测中推导用户事实。
+不要保存新闻、热搜、天气、价格、版本发布、限免等时效信息，也不要提取角色人设规则、普通寒暄、API Key、密码、token、支付信息、证件号或精确住址。
 短期状态用 temporary；长期偏好用 stable；用户明确要求长期记住的稳定身份事实才用 permanent。
 correction/preferenceChange 只在用户明确纠正或说明发生变化时使用。
 sourceMessageIds 必须逐字使用输入中真实存在的 id。所有字段允许为空，不要硬凑。
 严格只输出 JSON：
-{"episode":{"summary":"","emotion":"","importance":0.5,"topics":[],"entities":[],"sourceMessageIds":[]},"facts":[{"text":"","predicate":"","value":"","durability":"temporary|stable|permanent","evidence":"assertion|confirmation|correction|preferenceChange","confidence":0.7,"importance":0.5,"validFrom":null}],"commitments":[{"text":"","dueAt":null,"importance":0.7}]}"#;
+{"episode":{"summary":"","emotion":"","importance":0.5,"topics":[],"entities":[],"sourceMessageIds":[]},"facts":[{"text":"","predicate":"","value":"","durability":"temporary|stable|permanent","evidence":"assertion|confirmation|correction|preferenceChange","confidence":0.7,"importance":0.5,"validFrom":null,"sourceMessageIds":[]}],"commitments":[{"text":"","dueAt":null,"importance":0.7}]}"#;
     let provider = crate::api::ApiMemoryCompletionProvider::new(app.clone());
     let raw = crate::memory_core::MemoryCompletionProvider::complete_memory_batch(
         &provider,
@@ -4883,6 +4886,22 @@ fn apply_extraction(
         if fact.text.trim().is_empty() || is_sensitive(&fact.text) {
             continue;
         }
+        let source_message_ids: Vec<String> = fact
+            .source_message_ids
+            .iter()
+            .filter(|source_id| {
+                messages.iter().any(|message| {
+                    message.id == source_id.as_str()
+                        && message.role == "user"
+                        && !is_sensitive(&message.content)
+                })
+            })
+            .cloned()
+            .take(8)
+            .collect();
+        if source_message_ids.is_empty() {
+            continue;
+        }
         let text = truncate_chars(&fact.text, 600);
         let (predicate, value) = fact_keys(fact, &text);
         let same_before: Option<String> = tx
@@ -4937,6 +4956,7 @@ fn apply_extraction(
             "confidence": clamp01(fact.confidence),
             "importance": clamp01(fact.importance),
             "sourceEpisodeId": episode_id.clone(),
+            "sourceMessageIds": source_message_ids.clone(),
         })
         .to_string();
         let event_id = append_event(
@@ -4964,7 +4984,16 @@ fn apply_extraction(
         } else {
             "supports"
         };
-        append_evidence(&tx, &event_id, "fact", &fact_id, relation, &[], None, now)?;
+        append_evidence(
+            &tx,
+            &event_id,
+            "fact",
+            &fact_id,
+            relation,
+            &source_message_ids,
+            None,
+            now,
+        )?;
         link_source_episode(
             &tx,
             &job.user_id,
@@ -5477,7 +5506,65 @@ mod tests {
             confidence: 0.8,
             importance: 0.6,
             valid_from: None,
+            source_message_ids: vec!["user-1".into()],
         }
+    }
+
+    #[test]
+    fn consolidation_rejects_fact_supported_only_by_assistant_messages() {
+        let mut conn = test_db();
+        let user_id = get_or_create_user(&conn, "card", "小明").unwrap();
+        let job = PendingJob {
+            id: "job-assistant-only".into(),
+            user_id: user_id.clone(),
+            card_id: "card".into(),
+            session_id: "session".into(),
+            payload: serde_json::to_string(&vec![
+                MemoryMessage {
+                    id: "user-1".into(),
+                    role: "user".into(),
+                    content: "最近有什么游戏消息？".into(),
+                    image_caption: String::new(),
+                    do_not_remember: false,
+                },
+                MemoryMessage {
+                    id: "assistant-1".into(),
+                    role: "assistant".into(),
+                    content: "Steam 喜加一有《呼吸边缘》免费领。".into(),
+                    image_caption: String::new(),
+                    do_not_remember: false,
+                },
+            ])
+            .unwrap(),
+            attempts: 0,
+            created_at: now_ts(),
+        };
+        let mut extracted = fact(
+            "《呼吸边缘》正在免费领取",
+            "新闻",
+            "呼吸边缘免费",
+            "assertion",
+        );
+        extracted.source_message_ids = vec!["assistant-1".into()];
+
+        apply_extraction(
+            &mut conn,
+            &job,
+            Extraction {
+                facts: vec![extracted],
+                ..Extraction::default()
+            },
+        )
+        .unwrap();
+
+        let fact_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_facts WHERE user_id=?1",
+                [&user_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fact_count, 0);
     }
 
     #[test]

@@ -25,6 +25,10 @@
         <span class="tab-icon">🗂</span>
         <span class="tab-label">记忆</span>
       </button>
+      <button class="tab-btn" data-tab="fresh-topics">
+        <span class="tab-icon">🌐</span>
+        <span class="tab-label">时下信息</span>
+      </button>
       <button class="tab-btn" data-tab="appearance">
         <span class="tab-icon">🎨</span>
         <span class="tab-label">外观</span>
@@ -99,28 +103,6 @@
             <span>采样温度<small>0~2，越高越发散；思考模式下由模型管理</small></span>
             <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
           </label>
-
-          <label class="row-inline">
-            <input id="webGroundingEnabled" type="checkbox" />
-            <span>允许时下信息观察<small>默认关闭；只在问题明确需要最新信息或要求搜索时联网</small></span>
-          </label>
-          <label>
-            <span>网页观察服务</span>
-            <select id="webGroundingProvider">
-              <option value="none">未配置</option>
-              <option value="tavily">Tavily Search</option>
-            </select>
-          </label>
-          <div id="webGroundingFieldsTavily" hidden>
-            <label>
-              <span>Tavily API Key<small>搜索内容会发送给 Tavily；Key 仅保存在本机，<a href="https://app.tavily.com/home" target="_blank" rel="noreferrer">获取 Key</a></small></span>
-              <div class="pw-field">
-                <input id="tavilyApiKey" type="password" placeholder="tvly-..." autocomplete="off" />
-                <button type="button" class="pw-toggle" data-target="tavilyApiKey" aria-label="显示 / 隐藏">👁</button>
-              </div>
-            </label>
-          </div>
-          <p class="hint">每次最多取 4 条基础搜索摘要，并限制来源、抓取时间和注入长度；网页内容只作为不可信资料，不会写入长期记忆或改变人设。搜索失败时继续普通对话。</p>
 
           <div class="memory-actions">
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
@@ -293,7 +275,7 @@
               <select id="realtimeConversationMode">
                 <option value="follow-user" selected>跟随用户（保持当前方式）</option>
                 <option value="balanced">自然轮流（元元会先打招呼）</option>
-                <option value="ai-leads">元元带聊（更快主动开场）</option>
+                <option value="ai-leads">元元带聊（实验）</option>
               </select>
             </label>
             <p class="hint">第一版会在接通后由元元主动打招呼并抛出轻松话题；你一开口，主动生成会立即让路。火山实时通话暂时保持跟随用户。</p>
@@ -397,6 +379,22 @@
             <span>对话时加载观众画像</span>
           </label>
           <p id="personaHint" class="hint">这些资料只在本机保存，会随对话注入，让元元更懂你。留空就当普通粉丝「元宝」。</p>
+        </section>
+
+        <section>
+          <h2>话题偏好</h2>
+          <p class="hint">只影响“元元带聊（实验）”主动选题。手动设置优先；“不主动聊”不会阻止你主动提起该话题。</p>
+          <div id="topicPreferenceRows" class="topic-preference-rows"></div>
+          <div class="topic-preference-add">
+            <input id="topicPreferenceCustom" type="text" maxlength="32" placeholder="添加自定义标签，例如：独立电影" />
+            <select id="topicPreferenceCustomStatus" aria-label="自定义话题偏好">
+              <option value="interested">感兴趣</option>
+              <option value="neutral">中立</option>
+              <option value="not-interested">不主动聊</option>
+            </select>
+            <button id="topicPreferenceAdd" type="button" class="ghost">添加</button>
+          </div>
+          <p class="hint">聊天中出现的网络正文不会写进这里；自动推测也不能覆盖你的手动选择。</p>
         </section>
       </div>
 
@@ -511,7 +509,52 @@
         </section>
       </div>
 
-      <!-- ========== 页签 5：外观 ========== -->
+      <!-- ========== 页签 5：时下信息 ========== -->
+      <div class="tab-panel" id="tab-fresh-topics">
+        <section>
+          <h2>时下信息</h2>
+          <label class="row-inline">
+            <input id="webGroundingEnabled" type="checkbox" />
+            <span>允许时下信息观察<small>默认关闭；专业榜单优先、分类搜索兜底；明确搜索时可额外使用 Tavily</small></span>
+          </label>
+          <label>
+            <span>网页观察服务</span>
+            <select id="webGroundingProvider">
+              <option value="none">内置中文来源（无需 Key）</option>
+              <option value="tavily">Tavily Search</option>
+            </select>
+          </label>
+          <div id="webGroundingFieldsTavily" hidden>
+            <label>
+              <span>Tavily API Key<small>搜索内容会发送给 Tavily；Key 仅保存在本机，<a href="https://app.tavily.com/home" target="_blank" rel="noreferrer">获取 Key</a></small></span>
+              <div class="pw-field">
+                <input id="tavilyApiKey" type="password" placeholder="tvly-..." autocomplete="off" />
+                <button type="button" class="pw-toggle" data-target="tavilyApiKey" aria-label="显示 / 隐藏">👁</button>
+              </div>
+            </label>
+          </div>
+          <p class="hint">预采集按“人设 → 话题偏好”分配：中立 6 条、感兴趣 10 条、不主动聊 0 条。对话时仍只挑最多 3 条相关线索，不会把整份缓存写入长期记忆。</p>
+          <div class="fresh-topic-toolbar">
+            <button id="refreshFreshTopicStatus" type="button" class="ghost">刷新状态</button>
+            <button id="refreshFreshTopics" type="button">重新采集</button>
+            <span id="freshTopicRefreshStatus" class="hint" role="status"></span>
+          </div>
+          <div id="freshTopicCategorySummary" class="fresh-topic-category-summary" aria-label="话题采集数量"></div>
+          <div id="freshTopicSources" class="fresh-topic-sources" aria-label="网络信息来源状态">
+            <p class="hint">正在读取来源状态…</p>
+          </div>
+          <div class="fresh-topic-items-header">
+            <h3>已入选信息</h3>
+            <span class="hint">按分类展示最终缓存；点击标题可打开原文</span>
+          </div>
+          <div id="freshTopicItems" class="fresh-topic-items" aria-label="已入选网络信息">
+            <p class="hint">正在读取已入选信息…</p>
+          </div>
+          <p class="hint fresh-topic-actions-hint">当前可刷新状态、重新采集、调整话题偏好，或打开来源原文。条目不会自动写入长期记忆；单条隐藏和“不感兴趣”反馈暂不改变来源缓存。</p>
+        </section>
+      </div>
+
+      <!-- ========== 页签 6：外观 ========== -->
       <div class="tab-panel" id="tab-appearance">
 
         <!-- 头像与外观 -->

@@ -596,6 +596,12 @@ body {
   overflow: hidden;
   transition: filter .2s ease, background .2s ease;
 }
+#call-capsule.thinking {
+  background: rgba(23, 41, 48, 0.82);
+}
+#call-capsule.thinking #call-capsule-wave {
+  filter: drop-shadow(0 0 7px rgba(94, 213, 179, .42));
+}
 #call-capsule-wave {
   display: block;
   flex: 1 1 auto;
@@ -734,7 +740,28 @@ body {
 #call-wave[hidden] {
   display: none;
 }
+#call-status {
+  flex: 0 0 72px;
+  color: rgba(244, 242, 251, .72);
+  font-size: 12px;
+  line-height: 1;
+  text-align: center;
+  white-space: nowrap;
+}
+#call-wave.thinking #call-status {
+  color: rgba(118, 226, 194, .95);
+}
+#call-wave.thinking .call-wave-bars span {
+  background: linear-gradient(
+    180deg,
+    rgba(118, 226, 194, .96) 0%,
+    rgba(54, 155, 132, .74) 100%
+  );
+  box-shadow: 0 0 7px rgba(94, 213, 179, .35);
+}
 .call-wave-bars {
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;

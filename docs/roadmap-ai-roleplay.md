@@ -1,6 +1,6 @@
 # 元元桌宠 · AI 角色扮演体验分析报告与改进路线图
 
-> 状态基准：2026-07-30，当前正式版为 `v0.2.47`。下面的完成度按“已发布 / 测试版或部分实现 / 待实现”描述，不使用主观百分比；Memory 与实时语音的实现边界分别以各自专项路线图为准。
+> 状态基准：2026-08-09，当前正式版为 `v0.2.49`，其后的工作区改动尚未发布。下面的完成度按“已发布 / 测试版或部分实现 / 待实现”描述，不使用主观百分比；Memory 与实时语音的实现边界分别以各自专项路线图为准。
 
 > 本轮本地 Qwen3-TTS 交付 6 个受 allow-list 和 SHA-256 校验的音色 preset（5 个自动评分最高参考音 + 最早旧 `ref.wav/ref.txt`），设置保存后下一句热加载，聊天 Debug 显示当前音色。75 条试听样例及其余候选只作本地评测，不进入资源包；语气表现力微调延期。
 
@@ -10,7 +10,7 @@
 | Memory Brain | **核心与管理闭环已发布** | Memory v3/v3.1、事件/证据/scope、关系图、会话开始记忆和本地/CosyVoice `turn-final-v1` | 记录 M2 真实设备延迟，再推进 M5 外部接入；M6 embedding 仍为可选实验 |
 | 实时语音 | **基础管线已发布，体验仍属测试阶段** | Worklet 播放、有界句级管线、可听历史、打断候选、诊断、可选 Silero shadow/SenseVoice、CosyVoice、macOS MLX 与 Windows faster Qwen 流式 adapter | 许可声学回放和真实设备指标；Silero 暂不接管；Windows faster adapter 待实机验收，Linux Qwen 仍为整句 |
 | 主动陪聊 | **本地实现完成，设备体验待测** | 本地/CosyVoice A-D：最终播放回执计时、四类短回应、暂停/恢复、有限 Memory 选题、确认态退让与 schema v8 无文本诊断 | 真实设备抢话率/等待感/连续倾听舒适度与火山能力门（E） |
-| 人设与关系玩法 | **元元日常模式已实现，真实效果待体验验证** | 日常私聊卡片、条件直播 lore、会话 motif cooldown、逐轮时间、安全 Tavily 网页观察、深聊与关系/心情表现层边界 | 做真实搜索与模型对话审计、长期关系投影实验 |
+| 人设与关系玩法 | **元元日常模式已实现，真实效果待体验验证** | 日常私聊卡片、条件直播 lore、会话 motif cooldown、逐轮时间、有界近期话题缓存与安全 Tavily 按需观察、深聊与关系/心情表现层边界 | 做真实来源可用率、模型对话审计和长期关系投影实验 |
 | Windows 本地 TTS | **1.7B/24-step 流式已发布** | 旧 `.venv-qwen3` 自动校验与修复、RTX 50/Blackwell `cu128`/`sm_120` 检查、真实 CUDA smoke | 首次正式回复音色一致性、弱起音阈值和冷启动盲听 |
 
 > 本文档最初基于仓库通读式评审产出，实施状态会随代码与验证结果同步更新。历史诊断保留背景价值；2.1.1 是默认元元日常人设的当前权威答案。
@@ -94,7 +94,7 @@ graph TD
 | 文字对话 | DeepSeek (`deepseek-v4-flash`/`deepseek-v4-pro` + `thinking.type`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换；0.2.29 本地迁移旧模型名并拒绝透传未知值 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
-| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式，Windows CUDA Qwen 在固定 faster runtime 可用时也可协商生成期 PCM；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR，当前诊断 schema 为 v6；0.2.44 补充 IPv4 优先下载、阶段进度、1× PCM pacing 和隐藏窗口音频恢复，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Linux/官方 Qwen fallback、legacy 与火山保持原路径；朗读与通话**共用同一个语音后端选择** |
+| 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式，Windows CUDA Qwen 在固定 faster runtime 可用时也可协商生成期 PCM；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR，后续主动带聊观测把当前诊断 schema 升至 v8；0.2.44 补充 IPv4 优先下载、阶段进度、1× PCM pacing 和隐藏窗口音频恢复，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Linux/官方 Qwen fallback、legacy 与火山保持原路径；朗读与通话**共用同一个语音后端选择** |
 | 长期记忆 | 复用文字模型巩固 | Rust + bundled SQLite Memory v3/v3.1 | `memory.rs` + Tauri IPC | 事实/经历/约定、事件时间线、关系图、异步巩固、选择性召回和管理页；`v0.2.44` 增加单昵称清除和数据库备份恢复，后续路线以 `roadmap-memory-brain.md` 为准 |
 | 会话摘要 | 复用文字模型 | 同上 | `chat.js` + Memory v3 | 最近对话与滚动摘要保留为工作记忆，跨会话不再全量注入 |
 | 人设语料 | — | 编译期默认 + 本地人格卡动态覆盖 | `persona_assets.rs` + settings IPC | 设置页可导入、切换、导出和删除本地人格卡；元元默认卡仍走加密内置资源，见 2.1 |
@@ -120,7 +120,7 @@ graph TD
 
 | 现状 | 具体缺口（代码证据） | 影响 |
 |---|---|---|
-| AI 主动带聊已接通本地/CosyVoice | `balanced` 与 `ai-leads` 已通过显式能力协商启用 welcome、同话题续说、一次换题、短回应分类、暂停/恢复和退让节奏；计时以最终可听播放回执为准，状态与 Memory id 均有界且只在当前通话存在。 | 代码与确定性测试完成；真实设备上的抢话率、等待舒适度和火山 provider 能力仍待验证。 |
+| AI 主动带聊已接通本地/CosyVoice | `balanced` 与 `ai-leads` 已通过显式能力协商启用 welcome、同话题续说、一次换题、短回应分类、暂停/恢复和退让节奏；新增动作轮换、渐进深度、思考 UI、有界重要话题账本与低频回溯；计时以最终可听播放回执为准，状态、回溯正文与 Memory id 均只在当前通话存在。 | 代码与 JS/Python/Rust 确定性测试完成；真实设备上的抢话率、等待舒适度、回溯自然度和火山 provider 能力仍待验证。 |
 | 直播场景曾把对话框在工作现场 | `computeLiveContext()` 现只在普通轮次注入设备本地日期、星期、时间、时区和日常私聊提示；只有用户明确谈主播工作时才附加有界 lore，并明确“日程不能证明当前正在直播”。日常 few-shot 也会过滤直播语境。 | 代码层已从“直播状态机”迁移为“主播身份下的朋友式日常私聊”；真实模型是否仍偶发职业套话，需要持续体验回归。 |
 | 人格卡基础设施已完成，默认元元卡内容治理仍薄弱 | `persona_assets.rs` 支持编译期默认与运行时动态覆盖；设置页已接通 `list_all_cards`、`import_persona_card`、`set_persona_card`、导出和删除命令，并在保存后通知聊天窗口热更新。默认元元卡的权威源仍是 `persona-cards/kxyy-yuanyuan/persona-card.json`，而 `src/ai/persona.js` / `persona-assets.js` 又受上游同步约束。 | 多人设已可用；当前风险从“不能切换”转为“默认卡内容、生成资源和上游副本可能漂移”，所有元元卡改动必须校验卡片、重建加密资源并处理上游镜像。 |
 | Memory v3.1 已形成事件、证据、关系边、实时召回和管理闭环 | App `v0.2.43` 已发布 append-only event、evidence、scope、规范化实体/关系边、可重建派生索引、实时 session/turn recall、列表与关系图；Workspace 仍默认关闭。当前缺口是 M2 设备延迟记录、M5 外部接入和 M6 可选 embedding，而不是继续在 prompt 内堆记忆。 | 后续从发布后的 `main` 建立独立分支，严格按 [Memory Brain M0–M6](./roadmap-memory-brain.md#4-分阶段路线与硬门槛) 推进。 |
@@ -133,7 +133,7 @@ graph TD
 
 **实施前基线（留作对照）**：默认卡 system prompt 为 7,606 个 Unicode code point，25 组/50 条 few-shot 中 5 组含直播语境；prompt 中“直播”17 次、“直播间”9 次，并按日程推测直播阶段。没有网页观察管线，实时语音只在通话开始取一次时间。
 
-**当前实测（2026-07-30）**：默认卡 v1.1.0 的 system prompt 为 7,638 个 Unicode code point，仍为 25 组/50 条 few-shot；卡片保留 5 组按需职业示例，但日常请求会过滤它们。prompt 中“直播”2 次、“直播间”0 次、“开播”1 次、“下播”2 次、“礼物”1 次、“火锅鸡”3 次（其中包含去重复与“不是当前饭菜”的约束，不代表默认回答）。文字每请求刷新时间；受管本地/CosyVoice 协商 `turn-local-v1` 后每轮刷新，旧服务和火山降级不变。网页观察默认关闭；用户显式选择 `tavily`、填写本地 API Key 并启用后，只有明确时效问题或搜索意图才调用固定 Tavily HTTPS 端点。请求使用 basic 搜索、最多 4 条结果、不请求生成答案或原始正文；Rust 与前端分别限制响应、URL、来源时间、正文和最终注入长度，任何异常都降级为空观察且不阻塞普通对话。
+**当前实测（2026-07-30；网络缓存实现复核于 2026-08-09）**：默认卡 v1.1.0 的 system prompt 为 7,638 个 Unicode code point，仍为 25 组/50 条 few-shot；卡片保留 5 组按需职业示例，但日常请求会过滤它们。prompt 中“直播”2 次、“直播间”0 次、“开播”1 次、“下播”2 次、“礼物”1 次、“火锅鸡”3 次（其中包含去重复与“不是当前饭菜”的约束，不代表默认回答）。文字每请求刷新时间；受管本地/CosyVoice 协商 `turn-local-v1` 后每轮刷新，旧服务和火山降级不变。近期话题缓存默认关闭，用户开启后由 Rust 预取固定中文来源并保存有界短期缓存；文字和本地/CosyVoice 只在明确分类/推荐意图时按需取用。Tavily 仍需用户显式选择并填写本地 API Key，仅作为明确搜索意图的按需增强。请求与缓存都不保存整页正文；Rust 与前端分别限制响应、URL、来源时间、正文和最终注入长度，任何异常都降级为空观察且不阻塞普通对话。
 
 **目标分层**：
 
@@ -304,7 +304,7 @@ P1-D 的 connector 权限、认证、scope、审计与撤销原则复用 [Memory
 | 特性 | 来源 | 依赖关系 | 兼容 | 状态 |
 |---|---|---|---|---|---|
 | 人设关系状态（好感度/心情） | 3.1 | 依赖 Memory Brain M1 的 event/evidence 与 `persona-relationship` scope | **高** | `- [ ]` |
-| **语音陪聊主导方式（本地/CosyVoice）** | 3.1 / 实时语音 4.7 | A-D 已实现：三档设置、`local-v1` 协商、主动开场、播放完成后续说、固定控制口令、有限换题与无文本诊断；火山不做伪触发，真实设备体验待测 | 中 | `- [x]` ✅ 本地实现完成 |
+| **语音陪聊主导方式（本地/CosyVoice）** | 3.1 / 实时语音 4.7 | A-D 已实现：三档设置、`local-v1` 协商、主动开场、播放完成后续说、固定控制口令、渐进深聊、思考反馈、重要话题低频回溯、可编辑话题偏好与无文本诊断；火山不做伪触发，真实设备体验待测 | 中 | `- [~]` 🔧 “元元带聊（实验）”代码完成，待真实设备体验 |
 | Memory v3.1 事件/证据/scope/关系内核 | Memory Brain M1 | Memory Graph、实时通话和外部接入的共同前置，不在角色 prompt 中实现 | 高 | `- [x]` ✅ 基础完成（0.2.33+） |
 | 好感度系统（轻量版） | 3.2 | 依赖上一条 | 中 | `- [ ]` |
 | 统一情绪→动作/语音映射表 | 3.3 | 无前置依赖，建议尽早做以避免情绪词表继续分裂 | 低 | `- [ ]` |

@@ -2,6 +2,11 @@
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { clearAllMemory, clearMemory, loadAllMemory, loadCardProfile, saveCardProfile, saveCardVoice, loadCardVoice, saveCardAvatar, loadCardAvatar, isKxyyPersona } from "./ai/persona.js";
 import { LOCAL_VOICE_PRESETS, localVoicePresetById } from "./ai/voice-presets.js";
+import {
+  BASE_TOPIC_CATEGORIES,
+  normalizeTopicPreferences,
+  TOPIC_PREFERENCE_STATUSES,
+} from "./ai/topic-preferences.js";
 import { memoryHealthState } from "./memory-ui.js";
 
 const invoke = window.__TAURI__.core.invoke;
@@ -25,6 +30,7 @@ const FIELDS = [
   "asrProvider",
   "turnPauseTolerance",
   "realtimeConversationMode",
+  "topicPreferences",
   "voiceVolume",
   "textProvider",
   "webGroundingProvider",
@@ -56,6 +62,7 @@ const saveBtn = el("save");
 // 头像 data URL 缓存（空串表示用默认；保存时也存空串，前端渲染时兜底默认）。
 let aiAvatar = "";
 let userAvatar = "";
+let topicPreferences = [];
 /** @type {"macos"|"windows"|"linux"|string} */
 let platform = "";
 
@@ -92,6 +99,94 @@ function currentTurnPauseTolerance() {
 function currentRealtimeConversationMode() {
   const value = (el("realtimeConversationMode")?.value || "follow-user").toLowerCase();
   return value === "balanced" || value === "ai-leads" ? value : "follow-user";
+}
+
+function topicPreferenceStatusSelect(status) {
+  const select = document.createElement("select");
+  select.className = "topic-preference-status";
+  for (const option of TOPIC_PREFERENCE_STATUSES) {
+    const item = document.createElement("option");
+    item.value = option.value;
+    item.textContent = option.label;
+    select.appendChild(item);
+  }
+  select.value = status || "neutral";
+  select.addEventListener("change", () => {
+    select.closest("[data-topic-preference-row]")?.setAttribute("data-source", "manual");
+  });
+  return select;
+}
+
+function renderTopicPreferences(entries) {
+  const container = el("topicPreferenceRows");
+  if (!container) return;
+  topicPreferences = normalizeTopicPreferences(entries);
+  const byTopic = new Map(topicPreferences.map((entry) => [entry.topic.toLocaleLowerCase(), entry]));
+  container.replaceChildren();
+  for (const category of BASE_TOPIC_CATEGORIES) {
+    const entry = byTopic.get(category.label.toLocaleLowerCase());
+    const row = document.createElement("div");
+    row.className = "topic-preference-row";
+    row.dataset.topicPreferenceRow = "true";
+    row.dataset.source = entry?.source || "manual";
+    const label = document.createElement("span");
+    label.className = "topic-preference-label";
+    label.textContent = category.label;
+    row.append(label, topicPreferenceStatusSelect(entry?.status || "neutral"));
+    container.appendChild(row);
+  }
+  for (const entry of topicPreferences) {
+    if (BASE_TOPIC_CATEGORIES.some((category) => category.label.toLocaleLowerCase() === entry.topic.toLocaleLowerCase())) continue;
+    const row = document.createElement("div");
+    row.className = "topic-preference-row custom";
+    row.dataset.topicPreferenceRow = "true";
+    row.dataset.source = entry.source;
+    const input = document.createElement("input");
+    input.className = "topic-preference-topic";
+    input.type = "text";
+    input.value = entry.topic;
+    input.maxLength = 32;
+    input.setAttribute("aria-label", "自定义话题标签");
+    input.addEventListener("input", () => { row.dataset.source = "manual"; });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "topic-preference-remove ghost";
+    remove.textContent = "×";
+    remove.title = "删除自定义话题";
+    remove.addEventListener("click", () => row.remove());
+    row.append(input, topicPreferenceStatusSelect(entry.status), remove);
+    container.appendChild(row);
+  }
+}
+
+function collectTopicPreferences() {
+  const container = el("topicPreferenceRows");
+  if (!container) return normalizeTopicPreferences(topicPreferences);
+  const values = [...container.querySelectorAll("[data-topic-preference-row]")].map((row) => {
+    const topic = row.querySelector(".topic-preference-topic")?.value
+      || row.querySelector(".topic-preference-label")?.textContent
+      || "";
+    return {
+      topic,
+      status: row.querySelector(".topic-preference-status")?.value || "neutral",
+      source: row.dataset.source === "inferred" ? "inferred" : "manual",
+    };
+  });
+  topicPreferences = normalizeTopicPreferences(values);
+  return topicPreferences;
+}
+
+function addCustomTopicPreference() {
+  const input = el("topicPreferenceCustom");
+  const value = input?.value.trim();
+  if (!value) return;
+  const next = normalizeTopicPreferences([
+    ...collectTopicPreferences(),
+    { topic: value, status: el("topicPreferenceCustomStatus")?.value || "interested", source: "manual" },
+  ]);
+  renderTopicPreferences(next);
+  input.value = "";
+  input.focus();
 }
 
 /** 按所选语音后端只展示对应设置项。 */
@@ -191,6 +286,187 @@ function syncWebGroundingFields() {
   if (fields) fields.hidden = currentWebGroundingProvider() !== "tavily";
 }
 
+const FRESH_TOPIC_CATEGORY_LABELS = new Map([
+  ...BASE_TOPIC_CATEGORIES.map((item) => [item.id, item.label]),
+  ["science", "科学科普"],
+]);
+const FRESH_TOPIC_STATUS_LABELS = Object.freeze({
+  ok: "可用",
+  partial: "部分可用",
+  empty: "本次无内容",
+  cached: "使用缓存",
+  disabled: "未启用",
+  not_requested: "偏好未启用",
+  not_checked: "尚未检查",
+  rate_limited: "被限流",
+  timeout: "超时",
+  unavailable: "无法连接",
+  provider_error: "来源失败",
+  parse_error: "格式解析失败",
+  schema_changed: "接口格式变化",
+  auth_or_request_error: "请求被拒绝",
+});
+
+function freshTopicCategoryLabel(value) {
+  return FRESH_TOPIC_CATEGORY_LABELS.get(value) || value;
+}
+
+function renderFreshTopicItems(items) {
+  const container = el("freshTopicItems");
+  if (!container) return;
+  container.replaceChildren();
+  const groups = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const category = typeof item?.category === "string" ? item.category : "general";
+    if (!groups.has(category)) groups.set(category, []);
+    groups.get(category).push(item);
+  }
+  if (!groups.size) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "暂无已入选信息；可点击“重新采集”。";
+    container.append(empty);
+    return;
+  }
+  for (const [category, categoryItems] of groups) {
+    const section = document.createElement("section");
+    section.className = "fresh-topic-item-group";
+    const heading = document.createElement("h4");
+    heading.textContent = `${freshTopicCategoryLabel(category)}（${categoryItems.length}）`;
+    section.append(heading);
+    for (const item of categoryItems) {
+      const article = document.createElement("article");
+      article.className = "fresh-topic-item";
+      const title = document.createElement("a");
+      title.className = "fresh-topic-item-title";
+      title.textContent = item.title || "无标题";
+      title.href = item.canonicalUrl || "#";
+      title.target = "_blank";
+      title.rel = "noreferrer";
+      title.addEventListener("click", (event) => {
+        event.preventDefault();
+        let url;
+        try {
+          url = new URL(item.canonicalUrl || "");
+        } catch {
+          return;
+        }
+        if (url.protocol !== "https:" || url.username || url.password) return;
+        void invoke("open_external_url", { url: url.href }).catch((error) => {
+          const status = el("freshTopicRefreshStatus");
+          if (status) status.textContent = `网页打开失败：${error.message || error}`;
+        });
+      });
+      const summary = document.createElement("p");
+      const normalizedTitle = String(item.title || "").replace(/\s+/g, "").toLocaleLowerCase();
+      const normalizedSummary = String(item.shortText || "").replace(/\s+/g, "").toLocaleLowerCase();
+      const hasSummary = normalizedSummary && normalizedSummary !== normalizedTitle;
+      summary.textContent = hasSummary ? item.shortText : "来源未提供可用简介";
+      if (!hasSummary) summary.className = "fresh-topic-item-summary-missing";
+      const meta = document.createElement("div");
+      meta.className = "fresh-topic-item-meta";
+      const published = shortLocalTime(item.publishedAt);
+      const fetched = shortLocalTime(item.fetchedAt);
+      meta.textContent = `${item.sourceName || "未知来源"}${published ? ` · 发布 ${published}` : ""}${fetched ? ` · 抓取 ${fetched}` : ""}`;
+      article.append(title, summary, meta);
+      section.append(article);
+    }
+    container.append(section);
+  }
+}
+
+function shortLocalTime(value) {
+  const time = Date.parse(value || "");
+  if (!Number.isFinite(time)) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(time));
+}
+
+function renderFreshTopicStatus(payload) {
+  const sourceContainer = el("freshTopicSources");
+  const categoryContainer = el("freshTopicCategorySummary");
+  if (!sourceContainer || !categoryContainer) return;
+  sourceContainer.replaceChildren();
+  categoryContainer.replaceChildren();
+  renderFreshTopicItems(payload?.items);
+  for (const category of Array.isArray(payload?.categories) ? payload.categories : []) {
+    const chip = document.createElement("span");
+    chip.textContent = `${freshTopicCategoryLabel(category.category)} ${category.collected || 0}/${category.requested || 0}`;
+    categoryContainer.append(chip);
+  }
+  for (const source of Array.isArray(payload?.sources) ? payload.sources : []) {
+    const row = document.createElement("div");
+    row.className = "fresh-topic-source-row";
+    const identity = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "fresh-topic-source-name";
+    name.textContent = source.name || source.provider || "未知来源";
+    const status = document.createElement("div");
+    status.className = "fresh-topic-source-status";
+    status.dataset.state = source.status || "not_checked";
+    status.textContent = FRESH_TOPIC_STATUS_LABELS[source.status] || source.status || "未知";
+    identity.append(name, status);
+    const categories = document.createElement("div");
+    categories.className = "fresh-topic-source-categories";
+    categories.textContent = (source.categories || []).map(freshTopicCategoryLabel).join("、");
+    const meta = document.createElement("div");
+    meta.className = "fresh-topic-source-meta";
+    const success = shortLocalTime(source.lastSuccessAt);
+    const latest = shortLocalTime(source.latestPublishedAt);
+    meta.textContent = `候选池 ${source.candidateCount || 0} 条 · 入选 ${source.itemCount || 0} 条${success ? ` · 成功 ${success}` : ""}${latest ? ` · 最新 ${latest}` : ""}`;
+    row.append(identity, categories, meta);
+    sourceContainer.append(row);
+  }
+  if (!sourceContainer.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "暂无来源状态";
+    sourceContainer.append(empty);
+  }
+}
+
+async function probeFreshTopicStatus() {
+  const status = el("freshTopicRefreshStatus");
+  try {
+    renderFreshTopicStatus(await invoke("get_fresh_topic_status", {
+      topicPreferences: collectTopicPreferences(),
+    }));
+    if (status?.textContent === "正在读取状态…") status.textContent = "";
+  } catch (error) {
+    if (status) status.textContent = `状态读取失败：${error.message || error}`;
+  }
+}
+
+async function refreshFreshTopics() {
+  const button = el("refreshFreshTopics");
+  const status = el("freshTopicRefreshStatus");
+  if (!el("webGroundingEnabled")?.checked) {
+    status.textContent = "请先启用并保存“允许时下信息观察”";
+    return;
+  }
+  button.disabled = true;
+  status.textContent = "正在重新采集…";
+  try {
+    const result = await invoke("prefetch_fresh_topics", {
+      reason: "manual",
+      force: true,
+      topicPreferences: collectTopicPreferences(),
+    });
+    status.textContent = result.status === "disabled"
+      ? "请先保存启用设置"
+      : `采集完成，缓存 ${result.itemCount || 0} 条`;
+    await probeFreshTopicStatus();
+  } catch (error) {
+    status.textContent = `采集失败：${error.message || error}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /** 视觉模型服务商：qwen（在线）/ local（本地 Ollama VL）。 */
 function currentVlProvider() {
   const v = (el("vlProvider").value || "qwen").toLowerCase();
@@ -234,6 +510,7 @@ function fill(s) {
     s.realtimeConversationMode === "balanced" || s.realtimeConversationMode === "ai-leads"
       ? s.realtimeConversationMode
       : "follow-user";
+  renderTopicPreferences(s.topicPreferences);
   el("realtimeBackend").value = normalizeBackend(s.realtimeBackend);
   const vol = Number(s.voiceVolume);
   el("voiceVolume").value = Number.isFinite(vol)
@@ -637,6 +914,7 @@ function collect() {
     asrProvider: currentAsrProvider(),
     turnPauseTolerance: currentTurnPauseTolerance(),
     realtimeConversationMode: currentRealtimeConversationMode(),
+    topicPreferences: collectTopicPreferences(),
     voiceVolume: Math.max(
       0,
       Math.min(200, parseInt(el("voiceVolume").value, 10) || 100),
@@ -702,13 +980,17 @@ async function save() {
   statusEl.textContent = "";
   try {
     const payload = collect();
-    if (payload.webGroundingEnabled && payload.webGroundingProvider === "none") {
-      throw new Error("请先选择网页观察服务");
-    }
     if (payload.webGroundingEnabled && payload.webGroundingProvider === "tavily" && !payload.tavilyApiKey) {
       throw new Error("请填写 Tavily API Key");
     }
     await invoke("set_ai_settings", { settings: payload });
+    if (payload.webGroundingEnabled) {
+      await invoke("prefetch_fresh_topics", {
+        reason: "settings",
+        force: true,
+        topicPreferences: payload.topicPreferences,
+      });
+    }
     // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
     emit("apply-settings", payload);
     statusEl.style.color = "#16a34a";
@@ -969,8 +1251,21 @@ el("textProvider").addEventListener("change", () => {
   probeLocalTextStatus();
 });
 el("webGroundingProvider")?.addEventListener("change", syncWebGroundingFields);
+el("refreshFreshTopicStatus")?.addEventListener("click", () => {
+  const status = el("freshTopicRefreshStatus");
+  if (status) status.textContent = "正在读取状态…";
+  void probeFreshTopicStatus();
+});
+el("refreshFreshTopics")?.addEventListener("click", refreshFreshTopics);
 el("vlProvider").addEventListener("change", syncVlFields);
 el("voiceVolume").addEventListener("input", syncVoiceVolumeLabel);
+el("topicPreferenceAdd")?.addEventListener("click", addCustomTopicPreference);
+el("topicPreferenceCustom")?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addCustomTopicPreference();
+  }
+});
 el("localVoicePreset")?.addEventListener("change", () => {
   if (localVoicePresetById(el("localVoicePreset").value)) {
     el("localRefWav").value = "";
@@ -1044,6 +1339,13 @@ FIELDS.forEach((id) => {
 
 listen("voice-service-status", ({ payload }) => applyVoiceServiceStatus(payload));
 listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));
+listen("topic-preferences-updated", ({ payload }) => {
+  if (!Array.isArray(payload)) return;
+  renderTopicPreferences(payload);
+});
+listen("fresh-topic-status", () => {
+  void probeFreshTopicStatus();
+});
 listen("vad-shadow-install-status", ({ payload }) => {
   const btn = el("installVadShadow");
   const status = el("vadShadowInstallStatus");
@@ -2183,6 +2485,7 @@ async function init() {
   updateCardLabels();
   probeBackendStatus();
   probeLocalTextStatus();
+  probeFreshTopicStatus();
 }
 
 init();
