@@ -84,4 +84,3 @@ HTTP 200
 - [小黑盒公开 API host](https://api.xiaoheihe.cn/)
 - [游戏搜索接口](https://api.xiaoheihe.cn/game/search/?q=steam)
 - 官网当前前端 bundle：`https://imgheybox.max-c.com/heybox_website/1.7.188/app.adaebfbe17a193253655.js`
-
