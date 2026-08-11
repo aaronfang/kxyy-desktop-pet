@@ -69,6 +69,10 @@ dist/
 /scripts/voxcpm-ab/work/
 /scripts/voxcpm-ab/reports/
 /scripts/voxcpm-ab/__pycache__/
+/scripts/higgs-ab/.venv*/
+/scripts/higgs-ab/reports/
+/scripts/higgs-ab/__pycache__/
+/scripts/higgs-ab/*.wav
 
 # 临时调试输出（根目录）
 /check-err.txt
@@ -87,4 +91,3 @@ dist/
 /temp_original_settings.css
 /temp_original_settings.html
 /temp_original_settings.js
-

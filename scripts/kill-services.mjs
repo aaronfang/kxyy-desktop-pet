@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const PORTS = [19876, 19976, 19877, 19977, 19878, 19978]; // Qwen3-TTS + CosyVoice + VoxCPM2 WS/HTTP
+const PORTS = [19876, 19976, 19877, 19977, 19878, 19978, 19879, 19979]; // Qwen3-TTS + CosyVoice + VoxCPM2 + Higgs WS/HTTP
 const LOCAL_REALTIME_DIR = join(__dirname, "local-realtime");
 const PROJECT_ROOT = resolve(__dirname, "..");
 const DEBUG_EXE = join(
@@ -139,7 +139,7 @@ try {
       );
       const lines = wmic.trim().split(/\r?\n/);
       for (const line of lines) {
-        if (line.includes("server.py") || line.includes("server_cosyvoice.py") || line.includes("server_voxcpm.py")) {
+        if (line.includes("server.py") || line.includes("server_higgs.py") || line.includes("server_cosyvoice.py") || line.includes("server_voxcpm.py")) {
           const parts = line.split(",");
           const pid = parts[parts.length - 1]?.trim();
           if (/^\d+$/.test(pid)) {
@@ -152,7 +152,7 @@ try {
     } catch {}
   } else {
     try {
-      execSync("pkill -f 'server.py|server_cosyvoice.py|server_voxcpm.py' 2>/dev/null || true", { timeout: 3000 });
+      execSync("pkill -f 'server.py|server_higgs.py|server_cosyvoice.py|server_voxcpm.py' 2>/dev/null || true", { timeout: 3000 });
     } catch {}
   }
 } catch {}

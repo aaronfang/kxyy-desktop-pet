@@ -114,7 +114,7 @@ function canAutoSpeak() {
   if (!settings.autoSpeak) return false;
   const backend = (settings.realtimeBackend || "").toLowerCase();
   if (!backend) return false; // 语音关闭
-  if (backend === "local" || backend === "voxcpm") return true;
+  if (backend === "local" || backend === "voxcpm" || backend === "higgs") return true;
   if (backend === "cosyvoice" || backend === "cosy") {
     return !!(settings.cosyvoiceVoice || "").trim();
   }
@@ -531,6 +531,7 @@ function voiceBackendLabel() {
   if (!backend) return "已关闭";
   if (backend === "local") return "本地 Qwen3-TTS（:19876 / :19976）";
   if (backend === "voxcpm") return "本地 VoxCPM2（:19878 / :19978）";
+  if (backend === "higgs") return "本地 Higgs Audio v3（:19879 / :19979，实验流式）";
   if (backend === "cosyvoice" || backend === "cosy") {
     return "CosyVoice 通义（:19877 / :19977）";
   }
@@ -924,7 +925,7 @@ function updateVoiceDebug() {
   const voiceOff = !settings.realtimeBackend || !String(settings.realtimeBackend).trim();
   const lines = [`语音 · ${voiceBackendLabel()} · 音量 ${volPct}%`];
   const backend = String(settings.realtimeBackend || "").trim().toLowerCase();
-  if (backend === "local" || backend === "voxcpm") {
+  if (backend === "local" || backend === "voxcpm" || backend === "higgs") {
     const preset = localVoicePresetById(settings.localVoicePreset);
     const voiceLabel = preset
       ? `${preset.label}（${preset.id}）`
@@ -2609,7 +2610,7 @@ async function startCall() {
   stopSpeak();
   resetTtsQueue();
   const callBackend = (settings.realtimeBackend || "").toLowerCase();
-  callAudibleReceiptsActive = callBackend === "local" || callBackend === "voxcpm" || callBackend === "cosyvoice";
+  callAudibleReceiptsActive = callBackend === "local" || callBackend === "voxcpm" || callBackend === "higgs" || callBackend === "cosyvoice";
   callUserBubble = null;
   callUserText = "";
   callAsstBubble = null;
@@ -3102,7 +3103,7 @@ listen("voice-service-status", ({ payload }) => {
     // 短暂 stop→restart，保持「启动中」以便底部状态栏重新亮起。
     const backend = (settings.realtimeBackend || "").toLowerCase();
     svcState.voice =
-      backend === "local" || backend === "voxcpm" || backend === "cosyvoice" || backend === "cosy"
+      backend === "local" || backend === "voxcpm" || backend === "higgs" || backend === "cosyvoice" || backend === "cosy"
         ? "loading"
         : "stopped";
   }

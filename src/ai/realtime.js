@@ -57,6 +57,7 @@ const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const STREAMING_PLAYBACK_STARTUP_MS = 240;
+const HIGGS_STREAMING_PLAYBACK_STARTUP_MS = 800;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
@@ -80,7 +81,7 @@ const CONVERSATION_MOVES = new Set(["expand", "offer-entry", "deepen"]);
 const CONVERSATION_RESPONSE_CUES = new Set(["none", "low-burden", "question"]);
 const CONVERSATION_STANCES = new Set(["companion", "opinion", "advice", "concrete", "light"]);
 
-const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完)$/;
+const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完|先不跟你聊(?:了|啦)?(?:[，,、\s]+我先吃了?(?:啊|呀)?)?|不跟你聊(?:了|啦)?|先吃饭(?:了|啦)?|我先(?:去)?吃饭(?:了|啦)?|我先忙(?:一会儿|一下)?|回头再聊)$/;
 const REDIRECT_TURN_RE = /(?:换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个)/;
 const RESUME_TURN_RE = /^(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)$/;
 const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
@@ -175,7 +176,7 @@ export function deriveRealtimeTopicKey(text) {
 }
 
 function usesManagedCascade(provider) {
-  return provider === "local" || provider === "voxcpm" || provider === "cosyvoice";
+  return provider === "local" || provider === "voxcpm" || provider === "higgs" || provider === "cosyvoice";
 }
 
 /** Bounded local/Cosy-only bridge from visible text chat into a new voice session. */
@@ -713,7 +714,9 @@ export class RealtimeSession {
             type: "startup_buffer",
             milliseconds:
               this._ttsStreamingMode === TTS_STREAMING_CAPABILITY
-                ? STREAMING_PLAYBACK_STARTUP_MS
+                ? this.trace.provider === "higgs"
+                  ? HIGGS_STREAMING_PLAYBACK_STARTUP_MS
+                  : STREAMING_PLAYBACK_STARTUP_MS
                 : 0,
           });
           this._interruptionHintMode =

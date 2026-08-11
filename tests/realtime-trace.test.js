@@ -1147,6 +1147,8 @@ test("realtime proactive policy classifies explicit controls without model infer
     ["安静一会儿", "pause"], ["先别说话", "pause"], ["暂停一下", "pause"],
     ["让我想想", "pause"], ["我想静静", "pause"], ["稍等一下", "pause"],
     ["你先听我说", "pause"], ["让我先讲完", "pause"],
+    ["先不跟你聊了，我先吃了啊", "pause"], ["先吃饭了", "pause"],
+    ["我边吃边聊", "substantive"],
     ["换个话题吧", "redirect"], ["聊点别的", "redirect"], ["别聊这个", "redirect"],
     ["跳过这个吧", "redirect"], ["不说这个了", "redirect"],
     ["你继续", "resume"], ["继续说吧", "resume"], ["接着讲", "resume"],
@@ -1507,9 +1509,9 @@ test("streamed managed segments require explicit negotiation and exact final tot
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
 
-  const createSession = (ttsStream = "provider-pcm-v1") => {
+  const createSession = (provider = "cosyvoice", ttsStream = "provider-pcm-v1") => {
     const commands = [];
-    const session = new RealtimeSession({ provider: "cosyvoice" });
+    const session = new RealtimeSession({ provider });
     session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
     session.trace.startSession();
     session._onMessage({
@@ -1523,7 +1525,7 @@ test("streamed managed segments require explicit negotiation and exact final tot
     return { session, commands };
   };
 
-  const unnegotiatedState = createSession(null);
+  const unnegotiatedState = createSession("cosyvoice", null);
   assert.deepEqual(unnegotiatedState.commands[0], {
     type: "startup_buffer",
     milliseconds: 0,
@@ -1544,6 +1546,12 @@ test("streamed managed segments require explicit negotiation and exact final tot
   assert.deepEqual(commands[0], {
     type: "startup_buffer",
     milliseconds: 240,
+  });
+
+  const higgsState = createSession("higgs");
+  assert.deepEqual(higgsState.commands[0], {
+    type: "startup_buffer",
+    milliseconds: 800,
   });
   session._onMessage({
     data: JSON.stringify({

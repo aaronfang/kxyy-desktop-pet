@@ -543,6 +543,9 @@ INITIAL_HISTORY_MAX_MESSAGES = 12
 INITIAL_HISTORY_MAX_MESSAGE_CHARS = 1024
 INITIAL_HISTORY_MAX_CHARS = 4096
 MAX_PENDING_HISTORY_TURNS = 4
+LLM_HISTORY_MAX_MESSAGES = 20
+LLM_HISTORY_MAX_CHARS = 12000
+LLM_CONTEXT_SYSTEM_MAX_CHARS = 4000
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
 MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
 LLM_STREAM_QUEUE_MAX = 32
@@ -798,7 +801,7 @@ def classify_realtime_conversation_turn(text: str) -> str:
     if not value:
         return "silence"
     compact = re.sub(r"[。！!？?，,\s]+$", "", value)
-    if re.fullmatch(r"(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完)", compact):
+    if re.fullmatch(r"(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完|先不跟你聊(?:了|啦)?(?:[，,、\s]+我先吃了?(?:啊|呀)?)?|不跟你聊(?:了|啦)?|先吃饭(?:了|啦)?|我先(?:去)?吃饭(?:了|啦)?|我先忙(?:一会儿|一下)?|回头再聊)", compact):
         return "pause"
     if re.search(r"换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个", compact):
         return "redirect"
@@ -930,6 +933,39 @@ def format_turn_memory_context(items) -> str:
     if not lines:
         return ""
     return TURN_MEMORY_HEADER + "\n" + "\n".join(lines)
+
+
+def update_short_term_facts(facts: dict[str, str], text: str) -> dict[str, str]:
+    """Extract a tiny, session-only state for volatile user-stated facts."""
+    updated = dict(facts)
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    food = re.search(
+        r"(?:点的(?:外卖)?|吃的(?:是)?|吃了|正在吃)"
+        r"(?:一个|一份|一碗|一盒)?\s*"
+        r"([\u4e00-\u9fffA-Za-z0-9]{2,20}(?:饭|面|粉|粥|饺子|盖饭|汉堡|套餐))",
+        value,
+    )
+    if food:
+        updated["当前食物"] = food.group(1)
+    if re.search(r"还差.{0,8}(?:米|分钟)|还没(?:来|到|送到)|没送到", value):
+        updated["外卖状态"] = "尚未送达"
+    elif re.search(r"终于来了|送到了|已经到了|到手了", value):
+        updated["外卖状态"] = "已经送达"
+    if re.search(r"边吃边聊|正吃着|正在吃|吃了一半|吃一半", value):
+        updated["用户正在做"] = "边吃边聊"
+    return {key: updated[key] for key in ("当前食物", "外卖状态", "用户正在做") if key in updated}
+
+
+def format_short_term_facts(facts: dict[str, str]) -> str:
+    if not isinstance(facts, dict) or not facts:
+        return ""
+    lines = [f"- {key}：{value}" for key, value in facts.items() if isinstance(value, str)]
+    if not lines:
+        return ""
+    return (
+        "本次通话的临时状态（只根据用户明确说过的内容；不要推测、不要写入长期记忆）：\n"
+        + "\n".join(lines[:3])
+    )
 STABLE_SENTENCE_SOFT_CHARS = 40
 STABLE_SENTENCE_HARD_CHARS = 60
 MIN_SPEECH_MS_PLAY = 800
@@ -1528,7 +1564,46 @@ def build_llm_proxy_payload(
     if _system_suffix:
         role = role + _system_suffix
     messages = [{"role": "system", "content": role}]
-    messages.extend(history[-12:])
+    context_systems: list[dict] = []
+    conversation: list[dict] = []
+    system_chars = 0
+    for raw in history:
+        if not isinstance(raw, dict):
+            continue
+        message_role = raw.get("role")
+        content = raw.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if message_role == "system":
+            remaining = LLM_CONTEXT_SYSTEM_MAX_CHARS - system_chars
+            if remaining <= 0:
+                continue
+            content = content.strip()[:remaining]
+            context_systems.append({"role": "system", "content": content})
+            system_chars += len(content)
+        elif message_role in ("user", "assistant"):
+            conversation.append({"role": message_role, "content": content.strip()})
+
+    # Keep complete recent turns and never start the provider history with an
+    # orphan assistant message. Dynamic system hints have their own budget.
+    selected: list[dict] = []
+    selected_chars = 0
+    for message in reversed(conversation):
+        content = message["content"]
+        if selected and selected_chars + len(content) > LLM_HISTORY_MAX_CHARS:
+            break
+        if not selected and len(content) > LLM_HISTORY_MAX_CHARS:
+            content = content[-LLM_HISTORY_MAX_CHARS:]
+            message = {"role": message["role"], "content": content}
+        selected.append(message)
+        selected_chars += len(content)
+        if len(selected) >= LLM_HISTORY_MAX_MESSAGES:
+            break
+    selected.reverse()
+    while selected and selected[0]["role"] == "assistant":
+        selected.pop(0)
+    messages.extend(context_systems)
+    messages.extend(selected)
     messages.append({"role": "user", "content": user_text})
     return {
         "provider": "text",
@@ -2629,6 +2704,7 @@ class Session:
         self.bot_name = "元元"
         self._audible_history = AudibleHistory()
         self._initial_history: list[dict] = []
+        self._short_term_facts: dict[str, str] = {}
         # 兼容现有诊断/测试读取；其中 assistant 永远只含前端确认播完的句段。
         self.history = self._audible_history.messages
         self.pcm_buf = bytearray()
@@ -3185,6 +3261,7 @@ class Session:
             proactive_kind=kind,
             memory_context=memory_context,
             temporal_context=self._turn_temporal_context,
+            short_term_context=format_short_term_facts(self._short_term_facts),
             fresh_topics=self._fresh_topics or self._turn_fresh_topics,
             conversation_plan=conversation_plan,
             topic_revisit=topic_revisit,
@@ -3630,6 +3707,10 @@ class Session:
                 scope.complete()
                 return
 
+            self._short_term_facts = update_short_term_facts(
+                self._short_term_facts, cleaned
+            )
+
             # 此时才真正打断：先停播并通知前端 flush
             if from_play_barge or self.playing:
                 log("确认打断播报")
@@ -3677,6 +3758,9 @@ class Session:
                 reply_kwargs["memory_context"] = turn_memory_context
             if turn_temporal_context:
                 reply_kwargs["temporal_context"] = turn_temporal_context
+            short_term_context = format_short_term_facts(self._short_term_facts)
+            if short_term_context:
+                reply_kwargs["short_term_context"] = short_term_context
             if turn_conversation_plan:
                 reply_kwargs["conversation_plan"] = turn_conversation_plan
             if turn_fresh_topics:
@@ -3800,6 +3884,7 @@ class Session:
         continuation_hint: bool = False,
         memory_context: str = "",
         temporal_context: str = "",
+        short_term_context: str = "",
         proactive_kind: str = "",
         turn_policy: str = "substantive",
         conversation_plan: dict | None = None,
@@ -3825,6 +3910,8 @@ class Session:
                 history_snapshot.append({"role": "system", "content": memory_context})
             if temporal_context:
                 history_snapshot.append({"role": "system", "content": temporal_context})
+            if short_term_context:
+                history_snapshot.append({"role": "system", "content": short_term_context})
             if interruption_hint:
                 history_snapshot.append(
                     {"role": "system", "content": INTERRUPTION_HINT_TEXT}

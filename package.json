@@ -10,6 +10,8 @@
     "test": "node --test tests/conversation-director.test.js tests/conversation-replay.test.js tests/topic-preferences.test.js tests/topic-preferences-ui.test.js tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/persona-context.test.js tests/persona-realtime.test.js",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:resources": "node scripts/verify-vad-resources.mjs",
+    "prototype:higgs": "node scripts/higgs-ab/run.mjs",
+    "prototype:higgs:setup": "bash scripts/higgs-ab/setup-macos.sh",
     "tauri": "tauri",
     "dev": "tauri dev",
     "predev": "node scripts/kill-services.mjs && npm run encrypt-assets",

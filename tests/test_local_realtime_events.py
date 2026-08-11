@@ -397,6 +397,25 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertNotIn("一两句即可", payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][-1]["content"], "这一轮")
 
+    def test_proxy_request_preserves_recent_facts_and_message_boundaries(self):
+        history = []
+        for index in range(1, 9):
+            history.extend(
+                [
+                    {
+                        "role": "user",
+                        "content": f"用户{index}" + ("，我点的是牛肉饭" if index == 1 else ""),
+                    },
+                    {"role": "assistant", "content": f"回复{index}"},
+                ]
+            )
+        history.append({"role": "system", "content": "本轮时间上下文"})
+        payload = common.build_llm_proxy_payload("角色设定", history, "当前用户输入")
+        self.assertEqual(payload["messages"][1]["role"], "system")
+        self.assertEqual(payload["messages"][2]["role"], "user")
+        self.assertIn("牛肉饭", str(payload["messages"]))
+        self.assertNotEqual(payload["messages"][2]["role"], "assistant")
+
     def test_llm_stream_uses_loopback_proxy_and_parses_deltas_and_usage(self):
         captured = {}
 
@@ -821,6 +840,18 @@ class AudibleHistoryTests(unittest.TestCase):
         self.assertTrue(snapshot)
         self.assertEqual(snapshot[0]["role"], "user")
         self.assertLessEqual(len(snapshot), 4)
+
+
+class ShortTermFactTests(unittest.TestCase):
+    def test_short_term_facts_track_food_and_delivery_without_memory(self):
+        facts = common.update_short_term_facts({}, "我今天点的一个牛肉饭，外卖还差我39米")
+        self.assertEqual(facts, {"当前食物": "牛肉饭", "外卖状态": "尚未送达"})
+        facts = common.update_short_term_facts(facts, "终于来了，我边吃边聊")
+        self.assertEqual(
+            facts,
+            {"当前食物": "牛肉饭", "外卖状态": "已经送达", "用户正在做": "边吃边聊"},
+        )
+        self.assertNotIn("牛肉饭", common.format_turn_memory_context([]))
 
 
 class BoundedLlmProducerTests(unittest.TestCase):
@@ -2371,6 +2402,8 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             ("安静一会儿", "pause"), ("先别说话", "pause"), ("暂停一下", "pause"),
             ("让我想想", "pause"), ("我想静静", "pause"), ("稍等一下", "pause"),
             ("你先听我说", "pause"), ("让我先讲完", "pause"),
+            ("先不跟你聊了，我先吃了啊", "pause"), ("先吃饭了", "pause"),
+            ("我边吃边聊", "substantive"),
             ("换个话题吧", "redirect"), ("聊点别的", "redirect"), ("别聊这个", "redirect"),
             ("跳过这个吧", "redirect"), ("不说这个了", "redirect"),
             ("你继续", "resume"), ("继续说吧", "resume"), ("接着讲", "resume"),
