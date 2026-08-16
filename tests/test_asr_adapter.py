@@ -45,7 +45,7 @@ class WhisperAdapterTests(unittest.TestCase):
         self.assertEqual(result.language, "zh")
         self.assertEqual(captured["audio"], ("audio", b"pcm"))
         self.assertEqual(captured["kwargs"]["path_or_hf_repo"], asr.WHISPER_MODEL)
-        self.assertEqual(captured["kwargs"]["initial_prompt"], asr.WHISPER_PROMPT)
+        self.assertNotIn("initial_prompt", captured["kwargs"])
         self.assertFalse(captured["kwargs"]["condition_on_previous_text"])
         self.assertFalse(captured["kwargs"]["verbose"])
 
@@ -72,7 +72,7 @@ class WhisperAdapterTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.no_speech_prob, 0.3)
         self.assertEqual(captured["kwargs"]["language"], "zh")
-        self.assertEqual(captured["kwargs"]["initial_prompt"], asr.WHISPER_PROMPT)
+        self.assertNotIn("initial_prompt", captured["kwargs"])
         self.assertFalse(captured["kwargs"]["condition_on_previous_text"])
 
     def test_provider_exception_is_replaced_by_fixed_reason(self):

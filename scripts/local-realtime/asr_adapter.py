@@ -23,7 +23,6 @@ from typing import Callable, Mapping, Protocol
 
 INPUT_RATE = 16000
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-WHISPER_PROMPT = "以下是一段中文对话，角色名叫元元。"
 SENSEVOICE_RUNTIME_VERSION = "1.13.4"
 SENSEVOICE_RUNTIME_MARKER = ".kxyy-sensevoice-ready"
 SENSEVOICE_MODEL_DIRNAME = "sensevoice-small-int8-2024-07-17"
@@ -213,7 +212,6 @@ class WhisperAdapter:
                     audio,
                     path_or_hf_repo=WHISPER_MODEL,
                     language="zh",
-                    initial_prompt=WHISPER_PROMPT,
                     condition_on_previous_text=False,
                     verbose=False,
                 )
@@ -229,7 +227,6 @@ class WhisperAdapter:
                 result = self._openai_model.transcribe(
                     audio,
                     language="zh",
-                    initial_prompt=WHISPER_PROMPT,
                     condition_on_previous_text=False,
                     verbose=False,
                 )
