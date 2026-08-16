@@ -57,7 +57,6 @@ const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const STREAMING_PLAYBACK_STARTUP_MS = 240;
-const HIGGS_STREAMING_PLAYBACK_STARTUP_MS = 800;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
@@ -176,7 +175,7 @@ export function deriveRealtimeTopicKey(text) {
 }
 
 function usesManagedCascade(provider) {
-  return provider === "local" || provider === "voxcpm" || provider === "higgs" || provider === "cosyvoice";
+  return provider === "local" || provider === "voxcpm" || provider === "cosyvoice";
 }
 
 /** Bounded local/Cosy-only bridge from visible text chat into a new voice session. */
@@ -714,9 +713,7 @@ export class RealtimeSession {
             type: "startup_buffer",
             milliseconds:
               this._ttsStreamingMode === TTS_STREAMING_CAPABILITY
-                ? this.trace.provider === "higgs"
-                  ? HIGGS_STREAMING_PLAYBACK_STARTUP_MS
-                  : STREAMING_PLAYBACK_STARTUP_MS
+                ? STREAMING_PLAYBACK_STARTUP_MS
                 : 0,
           });
           this._interruptionHintMode =

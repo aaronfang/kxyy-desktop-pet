@@ -1509,9 +1509,9 @@ test("streamed managed segments require explicit negotiation and exact final tot
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
 
-  const createSession = (provider = "cosyvoice", ttsStream = "provider-pcm-v1") => {
+  const createSession = (ttsStream = "provider-pcm-v1") => {
     const commands = [];
-    const session = new RealtimeSession({ provider });
+    const session = new RealtimeSession({ provider: "cosyvoice" });
     session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
     session.trace.startSession();
     session._onMessage({
@@ -1525,7 +1525,7 @@ test("streamed managed segments require explicit negotiation and exact final tot
     return { session, commands };
   };
 
-  const unnegotiatedState = createSession("cosyvoice", null);
+  const unnegotiatedState = createSession(null);
   assert.deepEqual(unnegotiatedState.commands[0], {
     type: "startup_buffer",
     milliseconds: 0,
@@ -1546,12 +1546,6 @@ test("streamed managed segments require explicit negotiation and exact final tot
   assert.deepEqual(commands[0], {
     type: "startup_buffer",
     milliseconds: 240,
-  });
-
-  const higgsState = createSession("higgs");
-  assert.deepEqual(higgsState.commands[0], {
-    type: "startup_buffer",
-    milliseconds: 800,
   });
   session._onMessage({
     data: JSON.stringify({

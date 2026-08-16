@@ -76,7 +76,6 @@ function normalizeBackend(v) {
   const x = (v || "").toLowerCase();
   if (x === "local") return "local";
   if (x === "voxcpm" || x === "voxcpm2") return "voxcpm";
-  if (x === "higgs" || x === "higgs-mlx") return "higgs";
   if (x === "cosyvoice" || x === "cosy") return "cosyvoice";
   if (x === "volc") return "volc";
   return ""; // empty = off
@@ -196,31 +195,27 @@ function syncVoiceFields() {
   el("voiceFieldsVolc").hidden = backend !== "volc";
   el("voiceFieldsLocal").hidden = backend !== "local";
   if (el("voiceFieldsVoxcpm")) el("voiceFieldsVoxcpm").hidden = backend !== "voxcpm";
-  if (el("voiceFieldsHiggs")) el("voiceFieldsHiggs").hidden = backend !== "higgs";
-  const presetSelect = el("localVoicePreset");
-  if (presetSelect?.closest("label")) presetSelect.closest("label").hidden = backend === "higgs";
-  if (el("localVoicePresetMeta")) el("localVoicePresetMeta").hidden = backend === "higgs";
   el("voiceFieldsCosyvoice").hidden = backend !== "cosyvoice";
   // 参考音频对本地 Qwen3 / VoxCPM2 共用。
   const refBox = el("voiceFieldsRef");
   if (refBox) {
-    refBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "higgs";
+    refBox.hidden = backend !== "local" && backend !== "voxcpm";
   }
   const vadBox = el("vadShadowFields");
   if (vadBox) {
-    vadBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "higgs" && backend !== "cosyvoice";
+    vadBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const asrBox = el("asrFields");
   if (asrBox) {
-    asrBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "higgs" && backend !== "cosyvoice";
+    asrBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const pauseBox = el("turnPauseFields");
   if (pauseBox) {
-    pauseBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "higgs" && backend !== "cosyvoice";
+    pauseBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const conversationModeBox = el("conversationModeFields");
   if (conversationModeBox) {
-    conversationModeBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "higgs" && backend !== "cosyvoice";
+    conversationModeBox.hidden = backend !== "local" && backend !== "voxcpm" && backend !== "cosyvoice";
   }
   const installSenseVoice = el("installSenseVoiceRuntime");
   if (installSenseVoice) {
@@ -977,8 +972,8 @@ async function save() {
     key: bk === "volc" ? el("volcTtsKey").value.trim() : undefined,
     model: bk === "cosyvoice" ? el("cosyvoiceModel").value.trim() : undefined,
     cosyvoiceVoice: bk === "cosyvoice" ? el("cosyvoiceVoice").value.trim() : undefined,
-    refWav: bk === "local" || bk === "voxcpm" || bk === "higgs" ? el("localRefWav").value.trim() : undefined,
-    refText: bk === "local" || bk === "voxcpm" || bk === "higgs" ? el("localRefText").value.trim() : undefined,
+    refWav: bk === "local" || bk === "voxcpm" ? el("localRefWav").value.trim() : undefined,
+    refText: bk === "local" || bk === "voxcpm" ? el("localRefText").value.trim() : undefined,
     preset: bk === "local" || bk === "voxcpm" ? localVoicePresetById(el("localVoicePreset")?.value)?.id : undefined,
   });
   saveBtn.disabled = true;
@@ -989,13 +984,6 @@ async function save() {
       throw new Error("请填写 Tavily API Key");
     }
     await invoke("set_ai_settings", { settings: payload });
-    if (payload.webGroundingEnabled) {
-      await invoke("prefetch_fresh_topics", {
-        reason: "settings",
-        force: true,
-        topicPreferences: payload.topicPreferences,
-      });
-    }
     // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
     emit("apply-settings", payload);
     statusEl.style.color = "#16a34a";
@@ -1064,7 +1052,6 @@ const voiceSetupLogLines = [];
 function backendLabel(backend) {
   if (backend === "local") return "Qwen3-TTS（本地）";
   if (backend === "voxcpm") return "VoxCPM2（本地零样本）";
-  if (backend === "higgs") return "Higgs Audio v3（macOS 实验）";
   if (backend === "cosyvoice") return "CosyVoice（通义云端）";
   if (backend === "volc") return "火山引擎（云端）";
   return backend || "本地服务";
@@ -2472,11 +2459,6 @@ async function init() {
     platform = await invoke("get_platform");
   } catch (_) {
     platform = "";
-  }
-  const higgsOption = el("realtimeBackend")?.querySelector('option[value="higgs"]');
-  if (higgsOption) {
-    higgsOption.disabled = platform !== "macos";
-    if (platform !== "macos") higgsOption.textContent = "Higgs Audio v3（仅 Apple Silicon macOS）";
   }
   // 必须先加载下拉列表选项，再 fill 表单，否则 fill 设置 personaCardId 时
   // 目标 option 尚未插入 select，value 赋值会被浏览器静默清空，导致重启后

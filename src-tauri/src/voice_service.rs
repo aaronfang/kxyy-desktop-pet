@@ -295,7 +295,6 @@ pub fn normalize_backend(backend: &str) -> String {
     match backend.trim().to_ascii_lowercase().as_str() {
         "local" => "local".into(),
         "voxcpm" | "voxcpm2" => "voxcpm".into(),
-        "higgs" | "higgs-mlx" => "higgs".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
         "volc" => "volc".into(),
         _ => String::new(), // 空/其他=关闭
@@ -318,9 +317,7 @@ fn normalize_turn_pause_tolerance(value: &str) -> &'static str {
 }
 
 fn should_restart_for_fingerprint(backend: &str, previous: &str, next: &str) -> bool {
-    matches!(backend, "local" | "voxcpm" | "higgs" | "cosyvoice")
-        && !next.is_empty()
-        && previous != next
+    matches!(backend, "local" | "voxcpm" | "cosyvoice") && !next.is_empty() && previous != next
 }
 
 fn startup_slow_message(backend: &str, elapsed_secs: u64) -> Option<&'static str> {
@@ -331,8 +328,6 @@ fn startup_slow_message(backend: &str, elapsed_secs: u64) -> Option<&'static str
         "首次使用可能正在下载数 GB 模型；语音服务仍在下载或加载，完成后将自动恢复"
     } else if backend == "voxcpm" {
         "VoxCPM2 正在加载本地模型，完成后将自动恢复"
-    } else if backend == "higgs" {
-        "Higgs Audio v3 正在加载本地模型，完成后将自动恢复"
     } else {
         "语音服务仍在加载本地模型，完成后将自动恢复"
     })
@@ -358,15 +353,16 @@ mod fingerprint_tests {
     }
 
     #[test]
-    fn higgs_backend_has_a_separate_experimental_port_and_alias() {
-        assert_eq!(normalize_backend("higgs-mlx"), "higgs");
-        assert_eq!(port_for("higgs"), 19879);
-        assert_eq!(crate::local_tts_http_port("higgs"), Some(19979));
+    fn retired_higgs_backend_values_migrate_to_voice_disabled() {
+        assert_eq!(normalize_backend("higgs"), "");
+        assert_eq!(normalize_backend("higgs-mlx"), "");
+        assert_eq!(port_for("higgs"), 0);
+        assert_eq!(crate::local_tts_http_port("higgs"), None);
     }
 
     #[test]
     fn restarts_managed_voice_backends_only_for_nonempty_changes() {
-        for backend in ["local", "voxcpm", "higgs", "cosyvoice"] {
+        for backend in ["local", "voxcpm", "cosyvoice"] {
             assert!(should_restart_for_fingerprint(backend, "old", "new"));
             assert!(!should_restart_for_fingerprint(backend, "same", "same"));
             assert!(!should_restart_for_fingerprint(backend, "old", ""));
@@ -415,7 +411,6 @@ mod fingerprint_tests {
     fn vad_runtime_installer_accepts_only_managed_voice_backends() {
         assert!(supports_vad_runtime_install("local"));
         assert!(supports_vad_runtime_install("voxcpm"));
-        assert!(supports_vad_runtime_install("higgs"));
         assert!(supports_vad_runtime_install("cosyvoice"));
         for backend in ["volc", "", "unknown"] {
             assert!(!supports_vad_runtime_install(backend));
@@ -534,7 +529,6 @@ pub fn port_for(backend: &str) -> u16 {
     match backend {
         "local" => 19876,
         "voxcpm" => 19878,
-        "higgs" => 19879,
         "cosyvoice" => 19877,
         _ => 0,
     }
@@ -544,7 +538,6 @@ fn script_for(backend: &str) -> Option<&'static str> {
     match backend {
         "local" => Some("server.py"),
         "voxcpm" => Some("server_voxcpm.py"),
-        "higgs" => Some("server_higgs.py"),
         "cosyvoice" => Some("server_cosyvoice.py"),
         _ => None,
     }
@@ -829,9 +822,6 @@ fn python_candidates(repo: &Path, backend: &str) -> Vec<PathBuf> {
         list.push(repo.join("scripts/voxcpm-ab/.venv/bin/python"));
         list.push(repo.join("scripts/voxcpm-ab/.venv/Scripts/python.exe"));
     }
-    if backend == "higgs" {
-        list.push(repo.join("scripts/higgs-ab/.venv-macos/bin/python"));
-    }
     // GPU 后端优先用各自独立环境
     if backend == "cosyvoice" {
         list.push(repo.join("scripts/local-realtime/.venv-cosy/bin/python"));
@@ -1082,7 +1072,7 @@ fn sensevoice_runtime_root() -> Option<PathBuf> {
 }
 
 fn supports_vad_runtime_install(backend: &str) -> bool {
-    matches!(backend, "local" | "voxcpm" | "higgs" | "cosyvoice")
+    matches!(backend, "local" | "voxcpm" | "cosyvoice")
 }
 
 #[cfg(target_os = "macos")]
@@ -2095,10 +2085,7 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
             VoiceServiceStatus {
                 backend: backend.clone(),
                 state: "failed".into(),
-                message: if backend == "higgs" {
-                    "找不到 Higgs MLX 运行环境。请先运行 bash scripts/higgs-ab/setup-macos.sh（仅 Apple Silicon macOS）。"
-                        .into()
-                } else if cfg!(target_os = "macos") {
+                message: if cfg!(target_os = "macos") {
                     "找不到 Python。请安装 Python 3.10+（Apple Silicon），将自动创建语音运行时。"
                         .into()
                 } else if backend == "local" {

@@ -25,6 +25,15 @@ test("settings exposes editable base and custom topic preferences", () => {
   assert.match(settingsJs, /topicPreferences: collectTopicPreferences\(\)/);
 });
 
+test("saving settings does not wait for a forced fresh-topic refresh", () => {
+  const saveStart = settingsJs.indexOf("async function save() {");
+  const saveEnd = settingsJs.indexOf("// ---- 头像上传", saveStart);
+  assert.ok(saveStart >= 0 && saveEnd > saveStart, "save function should be present");
+  const saveFunction = settingsJs.slice(saveStart, saveEnd);
+  assert.doesNotMatch(saveFunction, /prefetch_fresh_topics/);
+  assert.match(settingsJs, /reason: "manual",\s*force: true/);
+});
+
 test("realtime experimental role consumes structured preferences without adding chat text", () => {
   assert.match(chatJs, /buildTopicPreferencePrompt/);
   assert.match(chatJs, /settings\.realtimeConversationMode === "ai-leads"/);

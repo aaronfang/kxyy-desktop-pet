@@ -171,7 +171,7 @@ struct Settings {
     #[serde(default)]
     realtime_voice: String,
     /// 语音后端（朗读 + 实时通话共用）：
-    /// `volc` / `local`（Qwen3）/ `voxcpm`（VoxCPM2）/ `higgs`（Higgs MLX）/ `cosyvoice`（通义）。
+    /// `volc` / `local`（Qwen3）/ `voxcpm`（VoxCPM2）/ `cosyvoice`（通义）。
     #[serde(default = "default_realtime_backend")]
     realtime_backend: String,
     /// CosyVoice 复刻音色 id（`cosyvoice-…`），仅 `realtimeBackend=cosyvoice` 时用。
@@ -368,11 +368,9 @@ fn normalize_local_voice_preset(value: &str) -> String {
 const LOCAL_REALTIME_PORT: u16 = 19876; // Qwen3-TTS
 const COSYVOICE_REALTIME_PORT: u16 = 19877; // CosyVoice 通义 API
 const VOXCPM_REALTIME_PORT: u16 = 19878; // VoxCPM2
-const HIGGS_REALTIME_PORT: u16 = 19879; // Higgs Audio v3 MLX experiment
 const LOCAL_TTS_HTTP_PORT: u16 = LOCAL_REALTIME_PORT + 100;
 const COSYVOICE_TTS_HTTP_PORT: u16 = COSYVOICE_REALTIME_PORT + 100;
 const VOXCPM_TTS_HTTP_PORT: u16 = VOXCPM_REALTIME_PORT + 100;
-const HIGGS_TTS_HTTP_PORT: u16 = HIGGS_REALTIME_PORT + 100;
 fn default_true() -> bool {
     true
 }
@@ -565,7 +563,7 @@ pub(crate) struct AiConfig {
     pub vl_provider: String,
     pub thinking_default: bool,
     pub temperature_default: f64,
-    /// 语音后端：`volc` / `local` / `voxcpm` / `higgs` / `cosyvoice`。
+    /// 语音后端：`volc` / `local` / `voxcpm` / `cosyvoice`。
     pub voice_backend: String,
     /// 火山 TTS Key（仅 volc）。
     pub volc_tts_key: String,
@@ -579,7 +577,6 @@ pub(crate) fn ai_config(app: &AppHandle) -> AiConfig {
     let voice_backend = match backend.as_str() {
         "local" => "local".into(),
         "voxcpm" | "voxcpm2" => "voxcpm".into(),
-        "higgs" | "higgs-mlx" => "higgs".into(),
         "cosyvoice" | "cosy" => "cosyvoice".into(),
         "volc" => "volc".into(),
         _ => String::new(),
@@ -615,7 +612,7 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
     normalize_asr_provider(&settings.asr_provider).hash(&mut hasher);
     normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).hash(&mut hasher);
     match backend.as_str() {
-        "local" | "voxcpm" | "higgs" => {
+        "local" | "voxcpm" => {
             settings.persona_card_id.trim().hash(&mut hasher);
             settings.local_ref_wav.trim().hash(&mut hasher);
             settings.local_ref_text.trim().hash(&mut hasher);
@@ -659,7 +656,6 @@ pub(crate) fn local_tts_http_port(backend: &str) -> Option<u16> {
     match backend.trim().to_ascii_lowercase().as_str() {
         "local" => Some(LOCAL_TTS_HTTP_PORT),
         "voxcpm" | "voxcpm2" => Some(VOXCPM_TTS_HTTP_PORT),
-        "higgs" | "higgs-mlx" => Some(HIGGS_TTS_HTTP_PORT),
         "cosyvoice" | "cosy" => Some(COSYVOICE_TTS_HTTP_PORT),
         _ => None,
     }
@@ -1727,7 +1723,6 @@ fn get_realtime_base(state: tauri::State<AppState>) -> String {
     match backend.as_str() {
         "local" => format!("ws://127.0.0.1:{LOCAL_REALTIME_PORT}"),
         "voxcpm" => format!("ws://127.0.0.1:{VOXCPM_REALTIME_PORT}"),
-        "higgs" => format!("ws://127.0.0.1:{HIGGS_REALTIME_PORT}"),
         "cosyvoice" | "cosy" => format!("ws://127.0.0.1:{COSYVOICE_REALTIME_PORT}"),
         "volc" if state.realtime_port != 0 => format!("ws://127.0.0.1:{}", state.realtime_port),
         _ => String::new(), // 关或未初始化
@@ -2013,7 +2008,6 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.realtime_backend = match backend.as_str() {
             "local" => "local".into(),
             "voxcpm" | "voxcpm2" => "voxcpm".into(),
-            "higgs" | "higgs-mlx" => "higgs".into(),
             "cosyvoice" | "cosy" => "cosyvoice".into(),
             "volc" => "volc".into(),
             _ => String::new(), // 空=关闭语音

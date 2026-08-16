@@ -51,22 +51,22 @@ Legacy 15.9s 参考音在整体试听中优于 Qwen-MLX，但情绪矩阵中的�
 
 ## 与 kxyy 架构的实验合入方案
 
-### 当前仓库实验状态（2026-08-11）
+### 最终实验结论与撤下记录（2026-08-16）
 
-本仓库已在不改变默认 Qwen3 后端的前提下接入一个仅 macOS Apple Silicon 可选的 Higgs 实验后端：Rust voice-service 管理 `server_higgs.py`，实时通话通过现有 `managed-v1` / `provider-pcm-v1` 契约下发 24 kHz PCM。MLX v3 的内部生成钩子被包装为有界滚动解码；文本按自然子句拆分，首段和后续子句使用不同的有限预缓冲，短文本有最大生成预算以防止持续音退化。
+Higgs Audio v3 MLX 实验后端已经从产品代码中撤下。真实实时通话确认它虽然能保持相对稳定的参考音色，但没有达到可使用标准：首音频通常需要数秒；同一回复的独立生成片段之间出现约 2--3 秒停顿；部分采样会把开头感叹词或其他音节异常拖长；4B 自回归模型在目标 Apple Silicon 设备上的生成速度不能稳定支撑连续 1x 播放。
 
-实测结论：Higgs 音色稳定性明显优于此前的流式实验，但在当前 Mac MLX 路径上仍慢于 Qwen3。A/B 离线报告的生成 RTF 中位数约为 Higgs `1.29`、Qwen3 `0.49`；这主要来自 4B 自回归模型相对 0.6B Qwen3 的推理成本。该实验后端不改变默认语音设置，也不把模型权重、缓存或试听报告打包进应用。
+离线 A/B 的生成 RTF 中位数约为 Higgs `1.29`、Qwen3 `0.49`。后续曾尝试滚动 codec 解码、有界预缓冲、减少片段重启、收紧字符到生成帧预算，以及固定参考编码；这些措施解决了 API 兼容、线程上下文和部分音色漂移问题，但没有消除实时对话中的延迟、停顿和异常时长。
 
-后续模型尝试应以当前 Higgs 实现作为隔离实验基线，优先比较：首音频时间、RTF、长句连续性、ASR 抢占、音色漂移和取消后的旧 generation 音频。当前代码仍是本地个人测试路径，不代表已完成商业授权或发行准备。
+撤下范围包括设置项、Rust service/backend/端口映射、Tauri resources、前端协议特例、`server_higgs.py`、`scripts/higgs-ab` 原型和对应测试。旧配置中的 `higgs` / `higgs-mlx` 会归一化为关闭语音，不自动切换到其他供应方。研究文档作为负面结果保留；除非新的上游公开流式实现和目标硬件重新通过首音、RTF、连续性、异常时长、取消、许可证与分发验收，否则不要恢复产品接入。
 
-### P0：独立 macOS 实验，不改现有默认后端（已完成）
+### P0：独立 macOS 实验，不改现有默认后端（历史实验，已撤下）
 
 1. 在 `scripts/local-realtime` 增加隔离的 MLX-Higgs v3 Python 环境/服务，不复用 Qwen venv，不把模型或 Hugging Face cache 加入 Tauri resources。
 2. 服务启动前做 Apple Silicon/MPS/统一内存预检，下载模型到用户 App-data；记录固定版本、权重 SHA-256、MLX-Audio commit 和内存上限。没有 MPS 或内存不足时保持 `unsupported`，RMS/现有 Qwen 路径继续工作。
 3. 复用现有 `ref.wav/ref.txt`，在 Rust voice-service 的 backend/fingerprint/epoch 状态中增加 `higgs-mlx`；服务健康检查仍只返回固定 `kxyy-voice`，日志和诊断禁止模型路径、文本、PCM、原始异常。
 4. HTTP 朗读保留整段 WAV；实时通话另走受能力协商保护的滚动解码路径。两者均复用现有 admission、取消和 generation 隔离边界。
 
-### P1：接入实时本地/CosyVoice 契约（已完成实验版）
+### P1：接入实时本地/CosyVoice 契约（历史实验，已撤下）
 
 实验服务使用 MLX v3 内部生成钩子做滚动 codec 解码，并且只在客户端与服务端共同协商 `provider-pcm-v1` 后启用。输出统一为 24 kHz、16-bit PCM，严格套用现有 Rust/JS `KXAU` envelope、generation/segment/sequence 和 60 秒/64 项上限；取消、序列不匹配或缺失完成边界的流不会产生可听完成回执。公开 API 或内部钩子不可用时，服务自动降级到整段缓冲路径，不伪造流式能力。
 

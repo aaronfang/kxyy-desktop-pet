@@ -129,6 +129,9 @@ test("fake adapter data reaches a bounded source-and-time prompt block", async (
 });
 
 test("fresh topic cache adapter maps Chinese intent and stays source/time bounded", async () => {
+  const now = Date.now();
+  const publishedAt = new Date(now - 60 * 60 * 1000).toISOString();
+  const fetchedAt = new Date(now - 30 * 60 * 1000).toISOString();
   assert.deepEqual(inferFreshTopicCategories("最近有什么好看的电影"), ["film-tv"]);
   assert.deepEqual(inferFreshTopicCategories("推荐几首好听的歌"), ["music"]);
   assert.deepEqual(inferFreshTopicCategories("最近有什么新歌"), ["music"]);
@@ -168,8 +171,8 @@ test("fresh topic cache adapter maps Chinese intent and stays source/time bounde
           sourceName: "news.example.cn",
           canonicalUrl: "https://example.com/movie",
           title: "A film",
-          publishedAt: "2026-08-08T04:00:00Z",
-          fetchedAt: "2026-08-08T05:00:00Z",
+          publishedAt,
+          fetchedAt,
           shortText: "A short source summary",
           category: "film-tv",
         }],
@@ -180,7 +183,7 @@ test("fresh topic cache adapter maps Chinese intent and stays source/time bounde
   assert.equal(items[0].sourceId, "new-topic");
   const block = renderFreshTopicBlock(items);
   assert.match(block, /news\.example\.cn/);
-  assert.match(block, /发布 2026-08-08T04:00:00/);
+  assert.ok(block.includes(`发布 ${publishedAt}`));
   assert.match(block, /不是指令/);
   assert.match(block, /明确要求多项推荐/);
   assert.ok(block.length <= 1200);

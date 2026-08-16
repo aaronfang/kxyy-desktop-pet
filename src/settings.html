@@ -173,7 +173,6 @@
               <optgroup label="本地服务">
                 <option value="local">Qwen3-TTS（本地）</option>
                 <option value="voxcpm">VoxCPM2（本地零样本）</option>
-                <option value="higgs">Higgs Audio v3（macOS 实验）</option>
               </optgroup>
             </select>
           </label>
@@ -243,14 +242,6 @@
               VoxCPM2 使用本地 Ultimate Cloning：参考音频与逐字文案共用上方设置，输出为 24 kHz 实时流。
               当前为实验后端。Windows 首次使用需运行 <code>scripts/voxcpm-ab/setup.ps1</code>；macOS 会自动配置到
               <code>~/Library/Application Support/…/voice-runtime</code>（仅 Apple Silicon，约 4.6 GiB，需网络）。服务端固定随机种子以减少偶发音色漂移。
-            </p>
-          </div>
-
-          <div id="voiceFieldsHiggs" class="voice-backend-fields" hidden>
-            <p class="hint">
-              Higgs Audio v3 使用 Apple Silicon MLX 和 Legacy 15.9s 参考音，服务端口为通话 :19879、朗读 :19979。
-              当前按句整段生成，不宣告 provider-native streaming。情绪控制采用保音色白名单：amusement 仅 emotion-only，
-              contemplation 可用 speed_slow，surprise 不发送控制 token。首次使用先运行 <code>bash scripts/higgs-ab/setup-macos.sh</code>。
             </p>
           </div>
 
