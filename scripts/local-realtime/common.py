@@ -976,14 +976,13 @@ ASR_REPETITION_MIN_SPAN = 16
 ASR_REPETITION_MIN_COPIES = 6
 ASR_REPETITION_MAX_UNIT = 8
 
-WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-WHISPER_PROMPT = "以下是一段中文对话，角色名叫元元。"
-
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _FILLER_RE = re.compile(
     r"^(嗯+|啊+|呃+|哦+|噢+|唔+|恩+|嘿+|欸+|唉+|那个|这|啊哈|哈哈+|嘿嘿+)+$"
 )
 _HALLUCINATION_RE = re.compile(r"字幕|订阅|点赞|鸣谢|翻译|thanks for watching", re.I)
+_WHISPER_PROMPT_CONTEXT_RE = re.compile(r"(?:一段)?中文对话")
+_WHISPER_PROMPT_ROLE_RE = re.compile(r"角色名(?:字)?叫元元")
 
 
 class SoftEndpoint:
@@ -2059,6 +2058,9 @@ def is_valid_asr(text: str, no_speech_prob: float | None, pcm: bytes) -> str | N
         return None
     if _HALLUCINATION_RE.search(text):
         log(f"过滤: 幻觉文本 ({len(text)} chars)")
+        return None
+    if _WHISPER_PROMPT_CONTEXT_RE.search(text) and _WHISPER_PROMPT_ROLE_RE.search(text):
+        log(f"过滤: Whisper 提示词泄露 ({len(text)} chars)")
         return None
     cjk = _CJK_RE.findall(text)
     if len(cjk) < MIN_CJK_CHARS:

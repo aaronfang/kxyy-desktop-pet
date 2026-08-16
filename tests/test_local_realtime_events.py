@@ -1431,7 +1431,7 @@ class InMemoryAsrTests(unittest.TestCase):
         self.assertEqual(result.text, "本地数组")
         self.assertAlmostEqual(result.no_speech_prob, 0.2)
         self.assertFalse(isinstance(captured["audio"], (str, Path)))
-        self.assertEqual(captured["kwargs"]["initial_prompt"], common.WHISPER_PROMPT)
+        self.assertNotIn("initial_prompt", captured["kwargs"])
         self.assertIs(captured["kwargs"]["condition_on_previous_text"], False)
 
     def test_asr_runtime_summary_is_fixed_shape_and_fixed_enums(self):
@@ -1483,6 +1483,26 @@ class InMemoryAsrTests(unittest.TestCase):
             "好好好，我马上就来。",
             "我真的真的真的很喜欢这个设计。",
             "今天我们一起出去散步吧。",
+        )
+        for text in accepted:
+            with self.subTest(text=text):
+                self.assertEqual(common.is_valid_asr(text, 0.1, voiced), text)
+
+    def test_whisper_prompt_leaks_are_rejected_without_blocking_normal_dialogue(self):
+        voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        rejected = (
+            "以下是一段中文对话，角色名叫元元。",
+            "这一段是一段中文对话，角色名叫元元。",
+            "这是一段中文对话，角色名字叫元元",
+        )
+        for text in rejected:
+            with self.subTest(text=text):
+                self.assertIsNone(common.is_valid_asr(text, 0.1, voiced))
+
+        accepted = (
+            "我正在写一段中文对话。",
+            "这个角色名字叫小明。",
+            "你为什么叫元元？",
         )
         for text in accepted:
             with self.subTest(text=text):
