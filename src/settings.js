@@ -984,13 +984,6 @@ async function save() {
       throw new Error("请填写 Tavily API Key");
     }
     await invoke("set_ai_settings", { settings: payload });
-    if (payload.webGroundingEnabled) {
-      await invoke("prefetch_fresh_topics", {
-        reason: "settings",
-        force: true,
-        topicPreferences: payload.topicPreferences,
-      });
-    }
     // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
     emit("apply-settings", payload);
     statusEl.style.color = "#16a34a";

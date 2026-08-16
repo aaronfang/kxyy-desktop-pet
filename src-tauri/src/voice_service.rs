@@ -353,6 +353,14 @@ mod fingerprint_tests {
     }
 
     #[test]
+    fn retired_higgs_backend_values_migrate_to_voice_disabled() {
+        assert_eq!(normalize_backend("higgs"), "");
+        assert_eq!(normalize_backend("higgs-mlx"), "");
+        assert_eq!(port_for("higgs"), 0);
+        assert_eq!(crate::local_tts_http_port("higgs"), None);
+    }
+
+    #[test]
     fn restarts_managed_voice_backends_only_for_nonempty_changes() {
         for backend in ["local", "voxcpm", "cosyvoice"] {
             assert!(should_restart_for_fingerprint(backend, "old", "new"));
