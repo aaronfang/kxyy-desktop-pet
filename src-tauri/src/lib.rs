@@ -219,6 +219,8 @@ struct Settings {
     /// 时下信息网页观察；默认关闭，仅在用户明确选择 provider 后生效。
     #[serde(default)]
     web_grounding_enabled: bool,
+    #[serde(default = "default_fresh_topic_participation")]
+    fresh_topic_participation: String,
     /// 网页观察 provider：`none` / `tavily`。
     #[serde(default)]
     web_grounding_provider: String,
@@ -342,6 +344,10 @@ fn default_text_provider() -> String {
     "deepseek".into()
 }
 
+fn default_fresh_topic_participation() -> String {
+    "relevant".into()
+}
+
 fn default_vl_provider() -> String {
     "qwen".into()
 }
@@ -434,6 +440,7 @@ impl Settings {
             text_model: String::new(),
             text_provider: default_text_provider(),
             web_grounding_enabled: false,
+            fresh_topic_participation: default_fresh_topic_participation(),
             web_grounding_provider: String::new(),
             tavily_api_key: String::new(),
             local_text_model: String::new(),
@@ -648,6 +655,14 @@ fn normalize_realtime_conversation_mode(value: &str) -> &'static str {
         "balanced" => "balanced",
         "ai-leads" => "ai-leads",
         _ => "follow-user",
+    }
+}
+
+fn normalize_fresh_topic_participation(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "occasional" => "occasional",
+        "active" => "active",
+        _ => "relevant",
     }
 }
 
@@ -1816,6 +1831,8 @@ struct AiSettingsInput {
     text_provider: String,
     #[serde(default)]
     web_grounding_enabled: bool,
+    #[serde(default = "default_fresh_topic_participation")]
+    fresh_topic_participation: String,
     #[serde(default)]
     web_grounding_provider: String,
     #[serde(default)]
@@ -2032,6 +2049,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             _ => "deepseek".into(),
         };
         s.web_grounding_enabled = settings.web_grounding_enabled;
+        s.fresh_topic_participation =
+            normalize_fresh_topic_participation(&settings.fresh_topic_participation).into();
         s.web_grounding_provider = match settings
             .web_grounding_provider
             .trim()
