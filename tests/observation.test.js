@@ -86,6 +86,13 @@ test("current-information detection is narrow and deterministic", () => {
   assert.equal(needsCurrentWebInformation("你喜欢吃什么"), false);
 });
 
+test("fresh topic participation modes allow bounded ambient sampling", () => {
+  assert.equal(needsFreshTopics("我今天有点闲", { participation: "occasional", ambient: true }), true);
+  assert.equal(needsFreshTopics("我最近在看书", { participation: "active", ambient: true }), false);
+  assert.equal(needsFreshTopics("嗯", { participation: "active", ambient: true }), false);
+  assert.equal(needsFreshTopics("聊聊科技", { participation: "relevant" }), true);
+});
+
 test("web adapter is disabled by default and failures fail closed", async () => {
   let calls = 0;
   const fetchImpl = async () => {

@@ -39,3 +39,10 @@ test("realtime experimental role consumes structured preferences without adding 
   assert.match(chatJs, /settings\.realtimeConversationMode === "ai-leads"/);
   assert.match(chatJs, /settings\.topicPreferences/);
 });
+
+test("text chat keeps a session cooldown for fresh topic sources", () => {
+  assert.match(chatJs, /const textFreshTopicIds = new Set\(\)/);
+  assert.match(chatJs, /excludedSourceIds: \[\.\.\.textFreshTopicIds\]/);
+  assert.match(chatJs, /takeFreshTopicsForSession\(freshTopics, textFreshTopicIds\)/);
+  assert.match(chatJs, /textFreshTopicIds\.clear\(\)/);
+});

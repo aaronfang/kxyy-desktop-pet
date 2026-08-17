@@ -518,6 +518,14 @@
             <span>允许时下信息观察<small>默认关闭；专业榜单优先、分类搜索兜底；明确搜索时可额外使用 Tavily</small></span>
           </label>
           <label>
+            <span>参与方式<small>只使用本机缓存的候选，不会每句话都联网</small></span>
+            <select id="freshTopicParticipation">
+              <option value="relevant">相关时带一句</option>
+              <option value="occasional">偶尔找个话头</option>
+              <option value="active">更主动一点</option>
+            </select>
+          </label>
+          <label>
             <span>网页观察服务</span>
             <select id="webGroundingProvider">
               <option value="none">内置中文来源（无需 Key）</option>

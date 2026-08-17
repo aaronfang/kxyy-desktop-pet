@@ -292,6 +292,9 @@ globalThis.fetch = (input, init) => {
 let activeProfile = null;   // 本轮生效的观众画像（本人 ππ / 自填 / 默认元宝）
 let freshTopicLocationKey = "";
 let freshTopicWorkRoleKey = "";
+let freshTopicAmbientTurn = 0;
+// 文字聊天的时下信息只在本会话首次实际注入；避免下一轮把同一条线索重新播报。
+const textFreshTopicIds = new Set();
 let activeName = null;      // 当前生效昵称（记忆分档键；无有效昵称时为 null，不落盘）
 const memoryEnqueuedIds = new Set(); // 已可靠写入 Rust 待巩固队列的消息 id
 let memoryBatchSeq = 0;
@@ -305,6 +308,17 @@ function newMemorySessionId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 let sessionId = newMemorySessionId();
+
+function shouldSampleAmbientFreshTopics(query, proactiveKind = "") {
+  if (proactiveKind) return false;
+  const mode = settings.freshTopicParticipation || "relevant";
+  if (mode === "relevant") return false;
+  const text = String(query || "").trim();
+  if (text.length < 4) return false;
+  freshTopicAmbientTurn += 1;
+  const interval = mode === "active" ? 3 : 6;
+  return freshTopicAmbientTurn % interval === 0;
+}
 
 function renderRecalledMemory(items) {
   const labels = { fact: "事实", episode: "经历", commitment: "待兑现约定" };
@@ -1510,15 +1524,20 @@ async function buildRequestMessages(opts = {}) {
   if (settings.webGroundingEnabled === true) {
     await syncFreshTopicLocations();
     const query = lastRealUserMessage()?.content || "";
+    const ambient = shouldSampleAmbientFreshTopics(query, opts.proactiveKind);
     const freshTopics = await fetchFreshTopics({
       enabled: true,
       query,
       proactive: Boolean(opts.proactiveKind),
+      participation: settings.freshTopicParticipation || "relevant",
+      ambient,
+      excludedSourceIds: [...textFreshTopicIds],
       invokeImpl: invoke,
     });
-    webPrompt = renderFreshTopicBlock(freshTopics);
-    if (chatDebugEnabled() && freshTopics.length) {
-      console.log("[fresh-topics]", { count: freshTopics.length });
+    const unusedFreshTopics = takeFreshTopicsForSession(freshTopics, textFreshTopicIds);
+    webPrompt = renderFreshTopicBlock(unusedFreshTopics);
+    if (chatDebugEnabled() && unusedFreshTopics.length) {
+      console.log("[fresh-topics]", { count: unusedFreshTopics.length });
     }
   }
   if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
@@ -2995,6 +3014,8 @@ function resetConversation() {
   messagesEl.innerHTML = "";
   memoryEnqueuedIds.clear();
   memoryBatchSeq = 0;
+  textFreshTopicIds.clear();
+  freshTopicAmbientTurn = 0;
   sessionId = newMemorySessionId();
   resetRecap();
   clearPendingSticker();

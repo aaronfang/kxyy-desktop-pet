@@ -33,6 +33,7 @@ const FIELDS = [
   "topicPreferences",
   "voiceVolume",
   "textProvider",
+  "freshTopicParticipation",
   "webGroundingProvider",
   "tavilyApiKey",
   "textModel",
@@ -525,6 +526,9 @@ function fill(s) {
   if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
   el("webGroundingEnabled").checked = s.webGroundingEnabled === true;
+  el("freshTopicParticipation").value = ["relevant", "occasional", "active"].includes(s.freshTopicParticipation)
+    ? s.freshTopicParticipation
+    : "relevant";
   el("webGroundingProvider").value = s.webGroundingProvider === "tavily" ? "tavily" : "none";
   el("tavilyApiKey").value = s.tavilyApiKey || "";
   syncWebGroundingFields();
@@ -924,6 +928,7 @@ function collect() {
     vadShadowEnabled: el("vadShadowEnabled").checked,
     textProvider: currentTextProvider(),
     webGroundingEnabled: el("webGroundingEnabled").checked,
+    freshTopicParticipation: el("freshTopicParticipation").value || "relevant",
     webGroundingProvider: currentWebGroundingProvider(),
     tavilyApiKey: el("tavilyApiKey").value.trim(),
     textModel: el("textModel").value,
