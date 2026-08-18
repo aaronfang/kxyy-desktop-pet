@@ -916,6 +916,28 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   const recovered = sanitizeRealtimeInitialHistory(longRecoveryHistory);
   assert.equal(recovered.length, 12);
   assert.equal(recovered[0].content, "今天你不直播，感觉有点寂寞呀");
+  const restOnlyRecovery = sanitizeRealtimeInitialHistory([
+    { role: "user", content: "元元今天好好休息，别太累" },
+    ...Array.from({ length: 20 }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user",
+      content: `普通后续${index}`,
+    })),
+  ]);
+  assert.equal(
+    restOnlyRecovery.some((message) => message.content.includes("好好休息")),
+    false,
+  );
+  const clipOnlyRecovery = sanitizeRealtimeInitialHistory([
+    { role: "user", content: "元元今天的直播切片很好看" },
+    ...Array.from({ length: 20 }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user",
+      content: `切片后续${index}`,
+    })),
+  ]);
+  assert.equal(
+    clipOnlyRecovery.some((message) => message.content.includes("直播切片")),
+    false,
+  );
   local.trace.startSession();
   assert.deepEqual(sockets[0].sent[1], {
     type: "fresh_topics",
@@ -2407,24 +2429,6 @@ test("local session exposes text-free unplayed assistant discard only to the UI"
     data: JSON.stringify({ type: "assistant_discarded", generation: 7 }),
   });
   assert.deepEqual(volcanoDiscarded, []);
-});
-
-test("local session replaces a filtered assistant draft without adding trace text", async () => {
-  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
-  const { RealtimeSession } = await import("../src/ai/realtime.js");
-  const replacements = [];
-  const session = new RealtimeSession({
-    provider: "local",
-    onAssistantReplace: (text, meta) => replacements.push({ text, ...meta }),
-  });
-  session.trace.startSession();
-  session._backendGeneration = 3;
-  session._onMessage({
-    data: JSON.stringify({ type: "assistant_replace", generation: 3, text: "继续聊。" }),
-  });
-
-  assert.deepEqual(replacements, [{ text: "继续聊。", generation: 3 }]);
-  assert.equal(JSON.stringify(session.getTraceSnapshot()).includes("继续聊"), false);
 });
 
 test("desktop session ducks candidates, resumes rejection and gates stale audio", async () => {

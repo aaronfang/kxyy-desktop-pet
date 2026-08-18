@@ -2534,19 +2534,6 @@ function appendCallAsstBubble(delta, { generation } = {}) {
   }
 }
 
-function replaceCallAsstBubble(text, { generation } = {}) {
-  if (
-    !callAsstBubble ||
-    !Number.isSafeInteger(generation) ||
-    generation !== callAsstGeneration
-  )
-    return;
-  callAsstText = (text || "").trim();
-  if (!callAsstText) return;
-  callAsstBubble.textContent = callAsstText;
-  scrollBottom();
-}
-
 function discardCallAsstBubble({ generation, preserveAudible = false } = {}) {
   if (!Number.isSafeInteger(generation)) return;
   const turn = callAudibleTurns.get(generation);
@@ -2743,7 +2730,6 @@ async function startCall() {
     },
     onThinkingFillerOffer: () => setCallCapsuleStatus("还在思考…"),
     onAssistant: (text, meta) => appendCallAsstBubble(text, meta),
-    onAssistantReplace: (text, meta) => replaceCallAsstBubble(text, meta),
     onAssistantEnd: () => {
       finalizeCallAsstBubble();
       setCallCapsuleStatus("通话中");

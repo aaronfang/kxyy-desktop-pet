@@ -749,7 +749,6 @@ CONTINUATION_HINT_TEXT = (
 )
 CONTINUATION_MAX_PARTS = 4
 CONTINUATION_MAX_CHARS = 512
-CONTINUE_LISTENING_FALLBACK = "嗯，你接着说，我听着呢。"
 ACKNOWLEDGE_HINT_TEXT = (
     "用户只是简短表示听到了。沿当前话题自然补一个具体细节，不要把这句当成新事实，"
     "也不要立刻连发问题。"
@@ -946,8 +945,8 @@ def update_short_term_facts(facts: dict[str, str], text: str) -> dict[str, str]:
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     role_subject = r"(?:你|元元|圆圆|原原|源源|园园)"
     today = r"(?:今天|今晚|今儿)"
-    not_live = rf"(?:不(?:直播|播)|没(?:直播|播)|休息)"
-    live = r"(?:又?开播(?:了)?|会直播|要直播|还得直播|准备直播|打算直播|直播)"
+    not_live = rf"(?:不(?:直播|播)|没(?:直播|播))"
+    live = r"(?:又?开播(?:了)?|会直播|要直播|还得直播|准备直播|打算直播)"
     asks_question = bool(re.search(r"(?:吗|嘛|么)[？?]?$|[？?]$", value))
     if not asks_question and (
         re.search(rf"{today}.{{0,8}}{role_subject}.{{0,8}}{not_live}", value)
@@ -997,55 +996,6 @@ def format_short_term_facts(facts: dict[str, str]) -> str:
     )
 
 
-def is_explicit_farewell(text: str) -> bool:
-    """Accept only direct user intent to sleep, leave, hang up, or say goodbye."""
-    value = re.sub(r"\s+", "", str(text or "")).strip("，,。！？!?；;")
-    if not value:
-        return False
-    if len(value) <= 16 and re.search(r"晚安|拜拜+|再见|先这样|不聊了", value):
-        return True
-    return bool(
-        re.search(
-            r"我(?:先|要|得|准备|去|该)?(?:睡|走|撤|挂)|"
-            r"我就先不聊|先挂了|挂电话|结束通话|你也?早点(?:睡|歇|休息)",
-            value,
-        )
-    )
-
-
-_UNSOLICITED_CLOSING_PATTERNS = tuple(
-    re.compile(pattern)
-    for pattern in (
-        r"行[啊吧]?[，,\s]*那就先这么着",
-        r"(?:那啥[，,\s]*)?今(?:儿|天)[^。！？!?]{0,12}(?:咱|咱们)[^。！？!?]{0,12}"
-        r"(?:聊|唠)[^。！？!?]{0,8}(?:这么多|差不多)",
-        r"(?:咱|咱们|我们)?[，,\s]*就先这样(?:吧)?",
-        r"回头(?:咱|咱们|我们)?再(?:聊|唠)",
-        r"(?:改天|下回)再(?:聊|唠)",
-        r"咱们?明天见",
-        r"今天先(?:聊|唠)到这",
-    )
-)
-
-
-def filter_unsolicited_closing(user_text: str, reply_text: str) -> str:
-    """Remove model-authored call-closing tails unless the user actually left."""
-    reply = str(reply_text or "").strip()
-    if not reply or is_explicit_farewell(user_text):
-        return reply
-    starts = [
-        match.start()
-        for pattern in _UNSOLICITED_CLOSING_PATTERNS
-        if (match := pattern.search(reply)) is not None
-    ]
-    if not starts:
-        return reply
-    prefix = reply[: min(starts)].rstrip(" ，,。！？!?；;")
-    if not prefix:
-        return CONTINUE_LISTENING_FALLBACK
-    if prefix[-1] not in "。！？!?；;":
-        prefix += "。"
-    return prefix
 STABLE_SENTENCE_SOFT_CHARS = 40
 STABLE_SENTENCE_HARD_CHARS = 60
 MIN_SPEECH_MS_PLAY = 800
@@ -4171,7 +4121,6 @@ class Session:
                 events,
             )
             reply_parts: list[str] = []
-            spoken_reply_parts: list[str] = []
             reply_chars = 0
             llm_usage = {"prompt": 0, "completion": 0, "total": 0}
             llm_provider = "文字模型"
@@ -4520,15 +4469,6 @@ class Session:
                 coalesce_max_chars=REALTIME_TTS_HARD_CHARS,
             )
 
-            async def enqueue_filtered_sentence(sentence: str) -> None:
-                filtered = filter_unsolicited_closing(text, sentence)
-                if not filtered or not scope.active:
-                    return
-                if filtered == CONTINUE_LISTENING_FALLBACK and spoken_reply_parts:
-                    return
-                spoken_reply_parts.append(filtered)
-                await enqueue_sentence(filtered)
-
             stream_done = False
             while scope.active and not stream_done:
                 try:
@@ -4561,7 +4501,7 @@ class Session:
                         return
                     self._response_generated = True
                     for sentence in sentences.feed(delta):
-                        await enqueue_filtered_sentence(sentence)
+                        await enqueue_sentence(sentence)
                 elif event_type == "error":
                     raise SafeRealtimeError(
                         str(event.get("message") or "文字模型请求失败")
@@ -4579,22 +4519,11 @@ class Session:
             if not raw_reply:
                 return
 
-            filtered_reply = filter_unsolicited_closing(text, raw_reply)
-            if filtered_reply != raw_reply and not await self.send_json(
-                {"type": "assistant_replace", "text": filtered_reply},
-                scope=scope,
-            ):
-                return
             if not await self.send_json({"type": "assistant_end"}, scope=scope):
                 return
 
             for sentence in sentences.flush():
-                await enqueue_filtered_sentence(sentence)
-
-            if not spoken_reply_parts:
-                await enqueue_filtered_sentence(filtered_reply)
-            if not spoken_reply_parts:
-                return
+                await enqueue_sentence(sentence)
 
             await tts_pipeline.finish()
 

@@ -9,8 +9,7 @@
 //       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
 //       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
-//       {type:"assistant|assistant_replace",text} / {type:"assistant_end"} /
-//       {type:"tts_start|tts_end"} /
+//       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
 //       {type:"thinking_filler",runtimeGenerated:true,audio:base64} /
 //       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
 //       session/asr_end.vadShadowSummary / {type:"vad_shadow_summary",final:true,summary} /
@@ -195,7 +194,7 @@ export function sanitizeRealtimeInitialHistory(messages) {
     if (!content || /[？?]$/.test(content)) return false;
     const hasToday = /今天|今晚|今儿/.test(content);
     const hasRole = /你|元元|圆圆|原原|源源|园园/.test(content);
-    const hasLiveState = /不直播|不播|没直播|没播|休息|开播|会直播|要直播|还得直播|准备直播|打算直播/.test(
+    const hasLiveState = /不直播|不播|没直播|没播|开播|会直播|要直播|还得直播|准备直播|打算直播/.test(
       content,
     );
     return hasToday && hasRole && hasLiveState;
@@ -327,7 +326,6 @@ export class RealtimeSession {
     onAsr,
     onAsrEnd,
     onAssistant,
-    onAssistantReplace,
     onAssistantEnd,
     onAssistantDiscarded,
     onAudibleAssistant,
@@ -360,7 +358,6 @@ export class RealtimeSession {
       onAsr,
       onAsrEnd,
       onAssistant,
-      onAssistantReplace,
       onAssistantEnd,
       onAssistantDiscarded,
       onAudibleAssistant,
@@ -720,6 +717,27 @@ export class RealtimeSession {
     return SESSION_HANDSHAKE_TIMEOUT_MS;
   }
 
+  async _retryRecoveredSocket(startAttempt, endAttempt) {
+    for (
+      this._recoveryAttempt = startAttempt;
+      this._recoveryAttempt < endAttempt;
+      this._recoveryAttempt += 1
+    ) {
+      const delay = this._transportRecoveryDelayMs(this._recoveryAttempt);
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      if (this.stopped) return false;
+      try {
+        await this._reopenRecoveredSocket();
+        this._recoveryAttempt = 0;
+        this._transportRecovering = false;
+        return true;
+      } catch {
+        // The bounded caller decides whether to restart or end the call.
+      }
+    }
+    return false;
+  }
+
   async _recoverTransport({ restartImmediately = false } = {}) {
     if (this._recoveryInFlight || this.stopped) return;
     this._recoveryInFlight = true;
@@ -728,48 +746,26 @@ export class RealtimeSession {
     this._prepareTransportRecovery();
     try {
       try {
-        if (!restartImmediately) {
-          for (
-            this._recoveryAttempt = 0;
-            this._recoveryAttempt < TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART;
-            this._recoveryAttempt += 1
-          ) {
-            const attempt = this._recoveryAttempt;
-            const delay = this._transportRecoveryDelayMs(attempt);
-            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-            if (this.stopped) return;
-            try {
-              await this._reopenRecoveredSocket();
-              this._recoveryAttempt = 0;
-              this._transportRecovering = false;
-              return;
-            } catch {
-              // The first three failures are same-process reconnects. Restart is below.
-            }
-          }
-        }
+        if (
+          !restartImmediately &&
+          (await this._retryRecoveredSocket(
+            0,
+            TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART,
+          ))
+        )
+          return;
+        if (this.stopped) return;
         if (this.trace.provider === "voxcpm") {
           await this._requestVoiceServiceRecovery();
           await this._waitForVoiceServiceReady();
         }
-        for (
-          this._recoveryAttempt = TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART;
-          this._recoveryAttempt < TRANSPORT_RECOVERY_MAX_ATTEMPTS;
-          this._recoveryAttempt += 1
-        ) {
-          const attempt = this._recoveryAttempt;
-          const delay = this._transportRecoveryDelayMs(attempt);
-          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-          if (this.stopped) return;
-          try {
-            await this._reopenRecoveredSocket();
-            this._recoveryAttempt = 0;
-            this._transportRecovering = false;
-            return;
-          } catch {
-            // The restarted service is healthy, but the session handshake still failed.
-          }
-        }
+        if (
+          await this._retryRecoveredSocket(
+            TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART,
+            TRANSPORT_RECOVERY_MAX_ATTEMPTS,
+          )
+        )
+          return;
       } catch {
         // Terminal service failures use the same bounded end-of-call path below.
       }
@@ -1150,10 +1146,6 @@ export class RealtimeSession {
           ? msg.generation
           : this._backendGeneration;
         this.cb.onAssistant?.(msg.text || "", { generation: msg.generation });
-        break;
-      case "assistant_replace":
-        if (!usesManagedCascade(this.trace.provider)) break;
-        this.cb.onAssistantReplace?.(msg.text || "", { generation: msg.generation });
         break;
       case "thinking_filler": {
         if (

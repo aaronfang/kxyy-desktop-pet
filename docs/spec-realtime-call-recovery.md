@@ -51,9 +51,9 @@ reconnect attempts fail.
   enters long-term Memory.
 - Unless the user explicitly says they are leaving, sleeping, hanging up or
   saying goodbye, every local realtime backend receives a fixed continuation
-  constraint. Known model-authored closing tails are removed before TTS; if a
-  streamed draft changes, the frontend replaces the current-generation bubble
-  with the exact text submitted to TTS. Explicit farewells remain untouched.
+  constraint at the end of its system prompt. Generated text is never rewritten
+  with closing-phrase regexes because quoted, translated and example language
+  must remain intact. Explicit farewells remain available to the model.
 
 ## Implemented slices
 
@@ -77,14 +77,12 @@ reconnect attempts fail.
   replace the oldest ordinary slot with the latest same-day livestream-state
   statement, and the new service reconstructs the fixed session state from
   user messages without writing a new chat or Memory record.
-- Assistant deltas retain their existing streaming granularity. A bounded
-  `assistant_replace` event is accepted only by managed local cascades and only
-  for the current generation; diagnostics continue to retain no transcript
-  text. Playback receipts, not generated drafts, remain the source of assistant
-  history and Memory.
+- Assistant deltas retain their existing streaming granularity. Diagnostics
+  continue to retain no transcript text. Playback receipts, not generated
+  drafts, remain the source of assistant history and Memory.
 - VoxCPM, Qwen and CosyVoice share the no-unsolicited-closing constraint. The
-  service also filters the reviewed closing forms before sentence admission so
-  chat display, spoken audio and audible history converge on the same reply.
+  constraint is prompt-level rather than a text post-processor, so chat display,
+  spoken audio and audible history preserve the same unmodified reply.
 
 ## Verification
 
@@ -92,7 +90,7 @@ reconnect attempts fail.
   provider cleanup timeout, service-restart negotiation, volatile-state
   reconstruction, explicit farewell preservation and filtered UI/TTS output.
 - JavaScript tests cover bounded recovery-history preservation, stale transport
-  rejection, managed draft replacement and transcript-free diagnostics.
+  rejection and transcript-free diagnostics.
 - Rust tests cover desired-target epochs, lifecycle-lock recovery and child
   startup/exit state reporting.
 - A real call confirmed that ordinary post-interruption replies remain audible.

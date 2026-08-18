@@ -866,25 +866,17 @@ class ShortTermFactTests(unittest.TestCase):
             "用户后来表示角色今天会直播",
             common.format_short_term_facts(corrected),
         )
+        rest_only = common.update_short_term_facts({}, "元元今天好好休息，别太累")
+        self.assertNotIn("角色今日直播状态", rest_only)
+        clip_only = common.update_short_term_facts({}, "元元今天的直播切片很好看")
+        self.assertNotIn("角色今日直播状态", clip_only)
+        outfit_only = common.update_short_term_facts({}, "今天元元直播穿的衣服很好看")
+        self.assertNotIn("角色今日直播状态", outfit_only)
 
-    def test_unsolicited_closing_is_trimmed_but_explicit_goodbye_is_preserved(self):
-        first = common.filter_unsolicited_closing(
-            "那确实",
-            "行，那就先这么着。你这通电话聊得我都有点饿了，回头咱再唠。",
-        )
-        self.assertEqual(first, common.CONTINUE_LISTENING_FALLBACK)
-
-        second = common.filter_unsolicited_closing(
-            "哎呀，你开心就好，你开心我们就开心。",
-            "谢谢哥，这话听着心里头暖和。那啥，今儿咱唠这么多了，你也早点歇着，咱明天见？",
-        )
-        self.assertEqual(second, "谢谢哥，这话听着心里头暖和。")
-
-        goodbye = "好的好的，晚安，明天见。"
-        self.assertEqual(
-            common.filter_unsolicited_closing("我先睡了，晚安。", goodbye),
-            goodbye,
-        )
+    def test_all_local_backends_share_the_no_unsolicited_closing_constraint(self):
+        self.assertIn("用户没有明确说要睡、道别或挂断时", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("不要主动", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("明天见", common.CONTINUE_CONVERSATION_SUFFIX)
 
 
 class BoundedLlmProducerTests(unittest.TestCase):
@@ -2449,43 +2441,6 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(common.realtime_stream_pacing_delay(one_second, 0.25), 0.75)
         self.assertEqual(common.realtime_stream_pacing_delay(one_second, 1.0), 0.0)
         self.assertEqual(common.realtime_stream_pacing_delay(one_second, 1.5), 0.0)
-
-    async def test_reply_pipeline_filters_unsolicited_closing_before_ui_and_tts(self):
-        common._synth_tts = lambda text: text.encode("utf-16le")
-        self.stream_events = [
-            {
-                "type": "delta",
-                "text": (
-                    "谢谢哥，这话听着心里头暖和。"
-                    "那啥，今儿咱唠这么多了，你也早点歇着，咱明天见？"
-                ),
-            },
-            {"type": "done"},
-        ]
-        scope = self.session._new_scope("response")
-        self.session.response_scope = scope
-
-        await self.session._reply_pipeline("你开心就好", scope)
-
-        messages = self.ws.json_messages()
-        assistant = "".join(
-            message.get("text", "")
-            for message in messages
-            if message.get("type") == "assistant"
-        )
-        replacements = [
-            message["text"]
-            for message in messages
-            if message.get("type") == "assistant_replace"
-        ]
-        segments = [
-            message["text"]
-            for message in messages
-            if message.get("type") == "audio_segment_start"
-        ]
-        self.assertIn("早点歇", assistant)
-        self.assertEqual(replacements, ["谢谢哥，这话听着心里头暖和。"])
-        self.assertEqual(segments, replacements)
 
     def test_realtime_conversation_turn_policy_is_fixed_and_bounded(self):
         cases = [
