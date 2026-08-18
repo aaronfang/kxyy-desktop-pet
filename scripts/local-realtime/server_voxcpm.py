@@ -25,6 +25,7 @@ _ref_text = ""
 _gate = threading.BoundedSemaphore(1)
 _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxcpm")
 _DONE = object()
+PROVIDER_CLEANUP_WAIT_SECONDS = 5.0
 
 
 def _model_path() -> str:
@@ -87,10 +88,19 @@ def _pull(generator):
         return _DONE
 
 
+def _close_stream(generator) -> None:
+    generator.close()
+
+
 async def _synth_stream(text: str):
-    if not _gate.acquire(blocking=False):
-        raise RuntimeError("VoxCPM2 正忙，请稍后再试")
     loop = asyncio.get_running_loop()
+    deadline = loop.time() + PROVIDER_CLEANUP_WAIT_SECONDS
+    while not _gate.acquire(blocking=False):
+        if loop.time() >= deadline:
+            raise common.VoiceServiceRestartRequired(
+                "VoxCPM2 上一轮清理超时，正在恢复语音服务"
+            )
+        await asyncio.sleep(0.02)
     generator = None
     try:
         generator = _model.generate_streaming(**_kwargs(text))
@@ -102,9 +112,36 @@ async def _synth_stream(text: str):
             for part in common.chunk_pcm(pcm, 80):
                 yield {"type": "audio", "pcm": part}
     finally:
-        if generator is not None:
-            generator.close()
-        _gate.release()
+        if generator is None:
+            _gate.release()
+        else:
+            # A cancelled run_in_executor await does not stop its in-flight next().
+            # Close on the same single worker and keep the model gate held until the
+            # provider iterator is no longer executing.
+            try:
+                cleanup = loop.run_in_executor(_pool, _close_stream, generator)
+            except Exception:
+                _gate.release()
+                raise
+            gate_released = False
+
+            def release_gate(future) -> None:
+                nonlocal gate_released
+                if gate_released:
+                    return
+                gate_released = True
+                try:
+                    if not future.cancelled():
+                        future.exception()
+                finally:
+                    _gate.release()
+
+            cleanup.add_done_callback(release_gate)
+            # Do not await the cleanup from generator cancellation.  The provider
+            # iterator may still be inside next() on the single worker; the queued
+            # close will run there and the callback keeps the gate held until it is
+            # actually finished.  This lets the caller's bounded gate wait decide
+            # whether a last-resort service recovery is needed.
 
 
 def _prepare() -> None:
@@ -129,6 +166,7 @@ if __name__ == "__main__":
         port=PORT, name="local-voxcpm", synth_tts=_synth,
         synth_tts_stream=_synth_stream, prepare=_prepare, tts_pool=_pool,
         tts_parallelism=1, tts_prefetch_while_playing=False,
+        system_suffix=common.CONTINUE_CONVERSATION_SUFFIX,
         vad_shadow_pipeline_factory=cap.pipeline_factory(),
         vad_shadow_start_status=cap.status, vad_shadow_mode=cap.mode,
         vad_shadow_config_revision=getattr(cap, "config_revision", "none"),

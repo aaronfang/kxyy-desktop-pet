@@ -853,6 +853,31 @@ class ShortTermFactTests(unittest.TestCase):
         )
         self.assertNotIn("牛肉饭", common.format_turn_memory_context([]))
 
+    def test_short_term_facts_keep_and_correct_todays_role_live_state(self):
+        facts = common.update_short_term_facts({}, "今天你不直播，感觉有点寂寞呀")
+        for text in ("我吃了肥牛饭", "我在地铁上", "刚才看了会儿视频"):
+            facts = common.update_short_term_facts(facts, text)
+        rendered = common.format_short_term_facts(facts)
+        self.assertIn("用户明确表示角色今天不直播", rendered)
+        self.assertIn("不要假设角色正在直播或刚下播", rendered)
+
+        corrected = common.update_short_term_facts(facts, "你今晚又开播了呀")
+        self.assertIn(
+            "用户后来表示角色今天会直播",
+            common.format_short_term_facts(corrected),
+        )
+        rest_only = common.update_short_term_facts({}, "元元今天好好休息，别太累")
+        self.assertNotIn("角色今日直播状态", rest_only)
+        clip_only = common.update_short_term_facts({}, "元元今天的直播切片很好看")
+        self.assertNotIn("角色今日直播状态", clip_only)
+        outfit_only = common.update_short_term_facts({}, "今天元元直播穿的衣服很好看")
+        self.assertNotIn("角色今日直播状态", outfit_only)
+
+    def test_all_local_backends_share_the_no_unsolicited_closing_constraint(self):
+        self.assertIn("用户没有明确说要睡、道别或挂断时", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("不要主动", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("明天见", common.CONTINUE_CONVERSATION_SUFFIX)
+
 
 class BoundedLlmProducerTests(unittest.TestCase):
     def test_cancel_unblocks_full_event_queue(self):
@@ -2821,6 +2846,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 "proactiveTurn": [common.PROACTIVE_TURN_CAPABILITY],
                 "temporalContext": [common.TEMPORAL_CONTEXT_CAPABILITY],
+                "pendingTurnResume": [common.PENDING_TURN_RESUME_CAPABILITY],
             }
         )
         self.assertEqual(self.session.downlink_audio, common.MANAGED_AUDIO_CAPABILITY)
@@ -2857,6 +2883,10 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             last_json_of_type(self.ws, "session")["temporalContext"],
             common.TEMPORAL_CONTEXT_CAPABILITY,
         )
+        self.assertEqual(
+            last_json_of_type(self.ws, "session")["pendingTurnResume"],
+            common.PENDING_TURN_RESUME_CAPABILITY,
+        )
 
         old_ws = FakeWebSocket()
         old_session = common.Session(old_ws)
@@ -2867,6 +2897,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_session.memory_context, "none")
         self.assertEqual(old_session.proactive_turn, "none")
         self.assertEqual(old_session.temporal_context, "none")
+        self.assertEqual(old_session.pending_turn_resume, "none")
         old_started = last_json_of_type(old_ws, "session")
         self.assertEqual(old_started["downlinkAudio"], "raw")
         self.assertEqual(old_started["ttsStream"], "none")
@@ -2874,6 +2905,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_started["memoryContext"], "none")
         self.assertEqual(old_started["proactiveTurn"], "none")
         self.assertEqual(old_started["temporalContext"], "none")
+        self.assertEqual(old_started["pendingTurnResume"], "none")
         old_scope = old_session._new_scope("response")
         self.assertTrue(
             await old_session.send_downlink_pcm(
@@ -3008,6 +3040,71 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         await self.session._reply_pipeline("那后来呢", scope)
         self.assertEqual(captured[0][:2], initial_history)
         self.assertEqual(self.session.history, [{"role": "user", "content": "那后来呢"}])
+
+    async def test_recovered_session_resumes_one_trailing_user_turn_without_text_control(self):
+        initial_history = [
+            {"role": "user", "content": "前一个问题"},
+            {"role": "assistant", "content": "前一个回答"},
+            {"role": "user", "content": "被打断的前半句"},
+            {"role": "user", "content": "被打断的后半句"},
+        ]
+        await self.session.on_start(
+            {
+                "initialHistory": initial_history,
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "pendingTurnResume": [common.PENDING_TURN_RESUME_CAPABILITY],
+            }
+        )
+        captured = []
+
+        async def request_memory(scope, *, reason="turn"):
+            self.assertTrue(scope.active)
+            self.assertEqual(reason, "turn")
+            self.session._turn_temporal_context = "当前时间上下文"
+            self.session._turn_conversation_plan = {"mode": "follow-up"}
+            self.session._turn_fresh_topics = [{"title": "本轮话题"}]
+            return "本轮记忆上下文"
+
+        async def capture_reply(text, scope, **kwargs):
+            captured.append((text, scope, kwargs))
+
+        self.session._request_turn_memory = request_memory
+        self.session._reply_pipeline = capture_reply
+        self.assertTrue(await self.session.on_resume_pending_turn())
+        task = self.session.reply_task
+        if task is not None:
+            await task
+
+        self.assertEqual(captured[0][0], "被打断的前半句\n被打断的后半句")
+        self.assertTrue(captured[0][1].active)
+        self.assertEqual(
+            captured[0][2],
+            {
+                "short_term_context": "",
+                "memory_context": "本轮记忆上下文",
+                "temporal_context": "当前时间上下文",
+                "conversation_plan": {"mode": "follow-up"},
+                "fresh_topics": [{"title": "本轮话题"}],
+            },
+        )
+        self.assertEqual(self.session._initial_history, initial_history[:2])
+        self.assertFalse(await self.session.on_resume_pending_turn())
+
+    async def test_recovered_session_rebuilds_volatile_role_state_from_initial_history(self):
+        await self.session.on_start(
+            {
+                "initialHistory": [
+                    {"role": "user", "content": "今天你不直播，感觉有点寂寞呀"},
+                    {"role": "assistant", "content": "我就在家待着呢。"},
+                    {"role": "user", "content": "后来咱们又聊了很多别的。"},
+                ]
+            }
+        )
+
+        self.assertIn(
+            "不要假设角色正在直播或刚下播",
+            common.format_short_term_facts(self.session._short_term_facts),
+        )
 
     def test_initial_history_drops_hidden_user_directives_and_merges_assistants(self):
         trigger = "\u2063幕后续说"
@@ -3657,7 +3754,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ws.messages, [])
         self.assertIsNone(self.session.response_scope)
 
-    async def test_unplayed_response_is_discarded_only_before_tts_admission(self):
+    async def test_unplayed_response_is_discarded_until_audio_starts(self):
         scope = self.session._new_scope("response")
         self.session.response_scope = scope
         self.session._response_generated = True
@@ -3677,6 +3774,20 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.session.response_scope = admitted
         self.session._response_generated = True
         self.session._response_tts_admitted = True
+        self.session._response_audio_started = False
+        self.session._response_started_at = common.time.perf_counter()
+        before = len(self.ws.json_messages())
+        self.assertTrue(await self.session.cancel_reply("turn_detected"))
+        self.assertEqual(
+            self.ws.json_messages()[before:],
+            [{"type": "assistant_discarded", "generation": admitted.generation}],
+        )
+
+        audible = self.session._new_scope("response")
+        self.session.response_scope = audible
+        self.session._response_generated = True
+        self.session._response_tts_admitted = True
+        self.session._response_audio_started = True
         self.session._response_started_at = common.time.perf_counter()
         before = len(self.ws.json_messages())
         self.assertFalse(await self.session.cancel_reply("turn_detected"))
@@ -3686,6 +3797,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.session.response_scope = expired
         self.session._response_generated = True
         self.session._response_tts_admitted = False
+        self.session._response_audio_started = False
         self.session._response_started_at = (
             common.time.perf_counter() - common.CONTINUATION_WINDOW_SECONDS - 0.1
         )
@@ -3695,23 +3807,45 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_continuation_hint_is_one_request_only_and_not_history(self):
         captured = []
 
-        def capture(_role, history, _text, _scope, out):
-            captured.append([dict(message) for message in history])
+        def capture(_role, history, request_text, _scope, out):
+            captured.append(
+                {
+                    "history": [dict(message) for message in history],
+                    "requestText": request_text,
+                }
+            )
             out.put_nowait({"type": "done"})
 
         common.start_llm_stream_producer = capture
         common._synth_tts = lambda _text: b"unused"
+        for generation, text in enumerate(
+            ["第一段", "第二段", "第三段", "第四段"],
+            start=1,
+        ):
+            self.session._audible_history.begin_turn(generation, text)
+            self.session._audible_history.cancel_turn(generation)
         scope = self.session._new_scope("response")
         self.session.response_scope = scope
         await self.session._reply_pipeline(
-            "继续补充",
+            "第五段",
             scope,
             continuation_hint=True,
         )
 
         self.assertEqual(
             captured,
-            [[{"role": "system", "content": common.CONTINUATION_HINT_TEXT}]],
+            [
+                {
+                    "history": [
+                        {"role": "system", "content": common.CONTINUATION_HINT_TEXT}
+                    ],
+                    "requestText": "第二段\n第三段\n第四段\n第五段",
+                }
+            ],
+        )
+        self.assertEqual(
+            [message["content"] for message in self.session.history],
+            ["第一段", "第二段", "第三段", "第四段", "第五段"],
         )
         self.assertFalse(
             any(
@@ -4122,6 +4256,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("provider detail", messages[-1].get("message", ""))
         self.assertEqual(messages[-1]["type"], "error")
         self.assertTrue(messages[-1]["recoverable"])
+        self.assertFalse(messages[-1]["restartRequired"])
         self.session.on_playback_segment(
             {"generation": scope.generation, "segmentId": 1, "state": "completed"}
         )
@@ -4129,6 +4264,34 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.session.history,
             [{"role": "user", "content": "用户输入"}],
         )
+
+    async def test_provider_cleanup_timeout_emits_fixed_restart_signal(self):
+        async def stuck_stream(_text):
+            if False:
+                yield {"type": "audio", "pcm": b""}
+            raise common.VoiceServiceRestartRequired("固定恢复提示")
+
+        common._synth_tts = lambda _text: b"unused"
+        common._synth_tts_stream = stuck_stream
+        await self.session.on_start(
+            {
+                "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+            }
+        )
+        self.stream_events = [
+            {"type": "delta", "text": "需要恢复的句子。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+
+        await self.session._reply_pipeline("用户输入", scope)
+
+        error = self.ws.json_messages()[-1]
+        self.assertEqual(error["type"], "error")
+        self.assertTrue(error["recoverable"])
+        self.assertTrue(error["restartRequired"])
 
         async def successful_stream(_text):
             yield {"type": "audio", "pcm": b"\x02\x00" * 4}
@@ -4244,6 +4407,61 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         common._tts_stream_slots.release()
         self.assertEqual(self.ws.json_messages()[-1]["type"], "error")
         self.assertNotIn("cleanup failed", self.ws.json_messages()[-1]["message"])
+
+    async def test_provider_pcm_cancel_does_not_wait_forever_for_stream_close(self):
+        close_release = asyncio.Event()
+
+        class StuckCloseStream:
+            def __init__(self):
+                self.count = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.count += 1
+                if self.count == 1:
+                    return {"type": "audio", "pcm": b"\x01\x00" * 4}
+                await close_release.wait()
+
+            async def aclose(self):
+                while not close_release.is_set():
+                    try:
+                        await close_release.wait()
+                    except asyncio.CancelledError:
+                        continue
+
+        common._synth_tts = lambda _text: b"unused"
+        common._synth_tts_stream = lambda _text: StuckCloseStream()
+        original_grace = common.TTS_STREAM_CLOSE_GRACE_SECONDS
+        common.TTS_STREAM_CLOSE_GRACE_SECONDS = 0.01
+        try:
+            await self.session.on_start(
+                {
+                    "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+                    "ttsStream": [common.TTS_STREAMING_CAPABILITY],
+                }
+            )
+            self.stream_events = [
+                {"type": "delta", "text": "关闭会永久阻塞的流。"},
+                {"type": "done"},
+            ]
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            task = asyncio.create_task(self.session._reply_pipeline("用户输入", scope))
+            for _ in range(100):
+                if any(isinstance(message, bytes) for message in self.ws.messages):
+                    break
+                await asyncio.sleep(0)
+
+            cancel_task = asyncio.create_task(self.session.cancel_reply("turn_detected"))
+            try:
+                await asyncio.wait_for(asyncio.shield(cancel_task), timeout=0.1)
+            finally:
+                close_release.set()
+                await asyncio.gather(cancel_task, task, return_exceptions=True)
+        finally:
+            common.TTS_STREAM_CLOSE_GRACE_SECONDS = original_grace
 
     async def test_managed_audio_chunks_are_identified_between_segment_markers(self):
         common._synth_tts = lambda _text: b"\x01\x00" * 4000

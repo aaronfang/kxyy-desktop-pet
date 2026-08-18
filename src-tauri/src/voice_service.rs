@@ -339,7 +339,7 @@ mod fingerprint_tests {
         backend_still_selected, begin_sensevoice_runtime_install, begin_vad_runtime_install,
         finish_sensevoice_runtime_install, finish_vad_runtime_install, normalize_asr_provider,
         normalize_backend, normalize_turn_pause_tolerance, parse_sensevoice_install_progress,
-        port_for, record_desired_voice_config, resolve_hf_endpoint,
+        port_for, record_desired_voice_config, recovery_target_matches, resolve_hf_endpoint,
         sensevoice_install_matches_target, should_defer_for_vad_install,
         should_restart_for_fingerprint, startup_slow_message, supports_vad_runtime_install,
         voice_target_still_selected, VoiceServiceManager, DEFAULT_HF_ENDPOINT,
@@ -454,6 +454,38 @@ mod fingerprint_tests {
         assert_eq!(inner.desired_asr_provider, "sensevoice");
         assert_eq!(inner.desired_fingerprint, "fp-2");
         assert!(inner.desired_epoch > first_epoch);
+    }
+
+    #[test]
+    fn recovery_target_is_invalidated_by_any_new_desired_configuration() {
+        let manager = VoiceServiceManager::new();
+        let mut inner = manager.inner.lock().unwrap();
+        record_desired_voice_config(&mut inner, "voxcpm", "whisper", "fp-1");
+        let epoch = inner.desired_epoch;
+        assert!(recovery_target_matches(
+            &inner, "voxcpm", "whisper", "fp-1", epoch
+        ));
+        record_desired_voice_config(&mut inner, "local", "whisper", "fp-local");
+        let local_epoch = inner.desired_epoch;
+        assert!(!recovery_target_matches(
+            &inner,
+            "local",
+            "whisper",
+            "fp-local",
+            local_epoch
+        ));
+
+        record_desired_voice_config(&mut inner, "voxcpm", "sensevoice", "fp-1");
+        assert!(!recovery_target_matches(
+            &inner, "voxcpm", "whisper", "fp-1", epoch
+        ));
+        assert!(!recovery_target_matches(
+            &inner,
+            "voxcpm",
+            "sensevoice",
+            "fp-1",
+            epoch
+        ));
     }
 
     #[test]
@@ -1234,6 +1266,18 @@ fn voice_target_still_selected(
         && inner.desired_fingerprint == fingerprint
 }
 
+fn recovery_target_matches(
+    inner: &Inner,
+    backend: &str,
+    asr_provider: &str,
+    fingerprint: &str,
+    epoch: u64,
+) -> bool {
+    backend == "voxcpm"
+        && inner.desired_epoch == epoch
+        && voice_target_still_selected(inner, backend, asr_provider, fingerprint)
+}
+
 fn backend_still_selected(inner: &Inner, completed_backend: &str) -> bool {
     inner.desired_backend == completed_backend
 }
@@ -1671,6 +1715,133 @@ pub fn stop(app: &AppHandle) {
             port: 0,
         },
     );
+}
+
+/// Return the current managed-service lifecycle state without starting it.
+/// A live child remains `starting` for as long as model loading takes.
+pub fn status(app: &AppHandle, backend_raw: &str) -> VoiceServiceStatus {
+    let backend = normalize_backend(backend_raw);
+    let port = port_for(&backend);
+    if backend.is_empty() {
+        return VoiceServiceStatus {
+            backend,
+            state: "stopped".into(),
+            message: "语音已关闭".into(),
+            port: 0,
+        };
+    }
+    if backend == "volc" {
+        return VoiceServiceStatus {
+            backend,
+            state: "running".into(),
+            message: "火山云端，无需本地服务".into(),
+            port: 0,
+        };
+    }
+    if service_running(port) {
+        return VoiceServiceStatus {
+            backend,
+            state: "running".into(),
+            message: format!("已在运行（:{port}）"),
+            port,
+        };
+    }
+
+    let manager = app.state::<VoiceServiceManager>();
+    let Ok(mut inner) = manager.inner.lock() else {
+        return VoiceServiceStatus {
+            backend,
+            state: "unknown".into(),
+            message: "语音服务状态不可用".into(),
+            port,
+        };
+    };
+    if inner.backend == backend {
+        if let Some(child) = inner.child.as_mut() {
+            return match child.try_wait() {
+                Ok(None) => VoiceServiceStatus {
+                    backend,
+                    state: "starting".into(),
+                    message: "正在启动（加载模型中）…".into(),
+                    port,
+                },
+                _ => VoiceServiceStatus {
+                    backend,
+                    state: "failed".into(),
+                    message: "语音服务进程已退出".into(),
+                    port,
+                },
+            };
+        }
+    }
+    if inner.desired_backend == backend {
+        let installing = inner.qwen_setup_running
+            || inner.vad_install_backend == backend
+            || inner.sensevoice_install_backend == backend;
+        return VoiceServiceStatus {
+            backend,
+            state: if installing { "starting" } else { "failed" }.into(),
+            message: if installing {
+                "正在准备本地语音运行时".into()
+            } else {
+                "未检测到运行中的语音服务".into()
+            },
+            port,
+        };
+    }
+    VoiceServiceStatus {
+        backend,
+        state: "unknown".into(),
+        message: "未检测到运行中的语音服务".into(),
+        port,
+    }
+}
+
+/// Last-resort recovery for the currently selected App-managed backend.
+/// The desired target is checked under the same lifecycle lock that covers
+/// child termination and the replacement ensure, so a newer settings change wins.
+pub fn recover(
+    app: &AppHandle,
+    backend_raw: &str,
+    asr_provider_raw: &str,
+    voice_fingerprint: &str,
+) -> Result<(), String> {
+    let backend = normalize_backend(backend_raw);
+    let asr_provider = normalize_asr_provider(asr_provider_raw);
+    let fingerprint = voice_fingerprint.trim().to_string();
+    if backend != "voxcpm" {
+        return Err("当前语音后端不支持自动进程恢复".into());
+    }
+
+    let manager = app.state::<VoiceServiceManager>();
+    let _lifecycle = manager.lifecycle.lock().map_err(|_| "语音服务状态不可用")?;
+    let epoch = {
+        let mut inner = manager.inner.lock().map_err(|_| "语音服务状态不可用")?;
+        let epoch = inner.desired_epoch;
+        if !recovery_target_matches(&inner, &backend, &asr_provider, &fingerprint, epoch) {
+            return Err("语音设置已变化，已取消旧的恢复请求".into());
+        }
+        if inner.child.is_none() && service_running(port_for(&backend)) {
+            return Err("当前语音服务不由本应用进程托管，无法自动重启".into());
+        }
+        if inner.child.is_some() {
+            if inner.backend != backend
+                || (!fingerprint.is_empty() && inner.voice_fingerprint != fingerprint)
+            {
+                return Err("当前托管语音进程与恢复目标不一致".into());
+            }
+            stop_inner(&mut inner);
+        }
+        epoch
+    };
+    {
+        let inner = manager.inner.lock().map_err(|_| "语音服务状态不可用")?;
+        if !recovery_target_matches(&inner, &backend, &asr_provider, &fingerprint, epoch) {
+            return Err("语音设置已变化，已取消旧的恢复请求".into());
+        }
+    }
+    ensure_impl(app, backend, fingerprint);
+    Ok(())
 }
 
 /// 按当前语音后端确保服务在跑（volc 则停掉托管进程；空=关闭则不启动）。

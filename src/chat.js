@@ -1404,48 +1404,58 @@ async function migrateAllLegacyMemory() {
   }
 }
 
-/** 会话结束（窗口收起 / 退出应用）时：只把新增消息可靠写入 Rust 待巩固队列。
- *  无有效昵称或没有新增消息时跳过；LLM 巩固在后台执行，不阻塞隐藏和退出。
+/** 把已定稿的新增消息可靠写入 Rust 待巩固队列。
+ *  实时通话逐轮触发，窗口收起 / 退出应用时再兜底；LLM 巩固不阻塞界面。
  *  并发调用共用同一个 Promise，避免收起与退出同时触发时重复入队。 */
 let enqueueMemoryPromise = null;
+let enqueueMemoryAgain = false;
 async function enqueueMemory() {
-  if (enqueueMemoryPromise) return enqueueMemoryPromise;
+  if (enqueueMemoryPromise) {
+    enqueueMemoryAgain = true;
+    return enqueueMemoryPromise;
+  }
   enqueueMemoryPromise = (async () => {
     if (!activeName) return;
-    const pendingRecords = history.filter((m) => m?.id && !memoryEnqueuedIds.has(m.id));
-    if (!pendingRecords.length) return;
-    try {
-      const messages = pendingRecords
-        .filter((m) => !isHiddenUserMessage(m.content))
-        .map((m) => ({
-          id: m.id || genMsgId(),
-          role: m.role,
-          content: m.content || "",
-          imageCaption: m.imageCaption || "",
-          doNotRemember: !!m.doNotRemember,
-        }));
-      if (!messages.length) {
+    do {
+      enqueueMemoryAgain = false;
+      const pendingRecords = history.filter(
+        (m) => m?.id && !memoryEnqueuedIds.has(m.id),
+      );
+      if (!pendingRecords.length) continue;
+      try {
+        const messages = pendingRecords
+          .filter((m) => !isHiddenUserMessage(m.content))
+          .map((m) => ({
+            id: m.id || genMsgId(),
+            role: m.role,
+            content: m.content || "",
+            imageCaption: m.imageCaption || "",
+            doNotRemember: !!m.doNotRemember,
+          }));
+        if (!messages.length) {
+          pendingRecords.forEach((m) => memoryEnqueuedIds.add(m.id));
+          memoryBatchSeq += pendingRecords.length;
+          continue;
+        }
+        const batchStart = memoryBatchSeq;
+        const batchEnd = batchStart + pendingRecords.length;
+        await invoke("memory_enqueue_session", {
+          request: {
+            cardId: settings.personaCardId || "",
+            nickname: activeName,
+            sessionId,
+            batchStart,
+            batchEnd,
+            messages,
+          },
+        });
         pendingRecords.forEach((m) => memoryEnqueuedIds.add(m.id));
-        memoryBatchSeq += pendingRecords.length;
-        return;
+        memoryBatchSeq = batchEnd;
+      } catch (e) {
+        console.warn("[memory] 会话入队失败，下次收起时重试", e);
+        break;
       }
-      const batchStart = memoryBatchSeq;
-      const batchEnd = batchStart + pendingRecords.length;
-      await invoke("memory_enqueue_session", {
-        request: {
-          cardId: settings.personaCardId || "",
-          nickname: activeName,
-          sessionId,
-          batchStart,
-          batchEnd,
-          messages,
-        },
-      });
-      pendingRecords.forEach((m) => memoryEnqueuedIds.add(m.id));
-      memoryBatchSeq = batchEnd;
-    } catch (e) {
-      console.warn("[memory] 会话入队失败，下次收起时重试", e);
-    }
+    } while (enqueueMemoryAgain);
   })().finally(() => {
     enqueueMemoryPromise = null;
   });
@@ -2444,6 +2454,7 @@ function finalizeCallUserBubble() {
     const message = { role: "user", content: text, id: mid, call: true };
     history.push(message);
     callLastUserMessageId = mid;
+    void enqueueMemory();
     return message;
   }
   return null;
@@ -2523,16 +2534,37 @@ function appendCallAsstBubble(delta, { generation } = {}) {
   }
 }
 
-function discardCallAsstBubble({ generation } = {}) {
-  if (
-    !callAsstBubble ||
-    !Number.isSafeInteger(generation) ||
-    generation !== callAsstGeneration
-  ) return;
-  callAsstBubble.closest(".row")?.remove();
-  callAsstBubble = null;
-  callAsstText = "";
-  callAsstGeneration = null;
+function discardCallAsstBubble({ generation, preserveAudible = false } = {}) {
+  if (!Number.isSafeInteger(generation)) return;
+  const turn = callAudibleTurns.get(generation);
+  const isCurrent = callAsstBubble && generation === callAsstGeneration;
+  const bubble = isCurrent
+    ? callAsstBubble
+    : Array.from(messagesEl.querySelectorAll("[data-mid]")).find(
+        (node) => node.dataset.mid === turn?.assistantId,
+      );
+  if (!bubble) {
+    callAudibleTurns.delete(generation);
+    return;
+  }
+  if (preserveAudible && turn?.entry && turn.audibleText) {
+    bubble.textContent = turn.audibleText;
+    bubble.closest(".row")?.classList.remove("streaming");
+    if (isCurrent) {
+      callAsstBubble = null;
+      callAsstText = "";
+      callAsstGeneration = null;
+    }
+    callAudibleTurns.delete(generation);
+    void enqueueMemory();
+    return;
+  }
+  bubble.closest(".row")?.remove();
+  if (isCurrent) {
+    callAsstBubble = null;
+    callAsstText = "";
+    callAsstGeneration = null;
+  }
   callAudibleTurns.delete(generation);
   scrollBottom();
 }
@@ -2646,17 +2678,25 @@ async function startCall() {
   petSignal("thinking");
 
   let session;
+  let callSessionStarted = false;
   session = new RealtimeSession({
     provider: settings.realtimeBackend,
     conversationMode: settings.realtimeConversationMode,
     onState: (state) => {
       if (state === "started") {
-        appendPatNotice("📞 通话已接通");
+        if (!callSessionStarted) appendPatNotice("📞 通话已接通");
+        callSessionStarted = true;
+        setCallCapsuleStatus("通话中");
         petSignal("reply");
+      } else if (state === "recovering") {
+        setCallCapsuleStatus("语音恢复中…");
+        petSignal("thinking");
       } else if (state === "ended") {
         endCall({ notice: true });
       }
     },
+    getRecoveryHistory: () => buildRealtimeInitialHistory(),
+    onTransportReset: () => callAudibleTurns.clear(),
     onAsrStart: () => {
       // 新一轮用户说话：定稿上一轮用户气泡（若有），并打断助手。
       callWaveEl?.classList.remove("candidate", "speaking");
@@ -2696,6 +2736,7 @@ async function startCall() {
     },
     onAssistantDiscarded: (meta) => discardCallAsstBubble(meta),
     onAudibleAssistant: (text, meta) => commitCallAudibleSegment(text, meta),
+    onAudibleResponseComplete: () => void enqueueMemory(),
     onSpeechCandidate: () => {
       callWaveEl?.classList.add("candidate");
       setCallCapsuleStatus("聆听中", false, true);

@@ -1635,8 +1635,9 @@ pub(crate) fn local_api_base(app: &AppHandle) -> Option<String> {
 /// 查询当前语音后端服务就绪状态，供前端在聊天窗口打开时主动探测
 /// （`voice-service-status` 事件是 push 式，窗口打开前的事件会被丢失）。
 #[tauri::command]
-fn check_voice_service(state: tauri::State<AppState>) -> serde_json::Value {
-    let backend = state
+fn check_voice_service(app: AppHandle) -> serde_json::Value {
+    let backend = app
+        .state::<AppState>()
         .settings
         .lock()
         .unwrap()
@@ -1644,28 +1645,31 @@ fn check_voice_service(state: tauri::State<AppState>) -> serde_json::Value {
         .trim()
         .to_ascii_lowercase();
     let normalized = voice_service::normalize_backend(&backend);
-    if normalized.is_empty() {
-        return serde_json::json!({
-            "backend": "",
-            "state": "stopped",
-            "message": "语音已关闭"
-        });
-    }
-    if normalized == "volc" {
-        return serde_json::json!({
-            "backend": "volc",
-            "state": "running",
-            "message": "火山云端，无需本地服务"
-        });
-    }
-    let port = voice_service::port_for(&normalized);
-    let running = voice_service::service_running(port);
-    serde_json::json!({
-        "backend": normalized,
-        "state": if running { "running" } else { "unknown" },
-        "message": if running { format!("已在运行（:{}）", port) } else { "未检测到运行中服务".into() },
-        "port": port,
+    serde_json::to_value(voice_service::status(&app, &normalized)).unwrap_or_else(|_| {
+        serde_json::json!({
+            "backend": normalized,
+            "state": "unknown",
+            "message": "语音服务状态不可用"
+        })
     })
+}
+
+/// Recover a managed local voice backend after the realtime transport has
+/// exhausted its non-destructive reconnect attempts. This is deliberately
+/// narrower than settings-driven restart: it never applies to Volcano and
+/// reuses the current opaque fingerprint/configuration.
+#[tauri::command]
+fn recover_voice_service(app: AppHandle) -> Result<(), String> {
+    let (backend, asr_provider, fingerprint) = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().map_err(|_| "设置锁不可用")?;
+        (
+            voice_service::normalize_backend(&settings.realtime_backend),
+            settings.asr_provider.clone(),
+            voice_config_fingerprint(&settings),
+        )
+    };
+    voice_service::recover(&app, &backend, &asr_provider, &fingerprint)
 }
 
 /// 探测任意语音后端状态（不启动服务），供设置页切换下拉时立即反馈。
@@ -2428,6 +2432,7 @@ pub fn run() {
             open_external_url,
             merge_topic_preferences,
             check_voice_service,
+            recover_voice_service,
             probe_voice_backend,
             toggle_chat_window,
             hide_chat,
