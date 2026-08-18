@@ -871,6 +871,18 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     ],
   });
   sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      memoryContext: "turn-final-v1",
+      interruptionHint: "candidate-snapshot-v1",
+      ttsStream: "provider-pcm-v1",
+      proactiveTurn: "local-v1",
+      freshTopic: "fresh-topic-v1",
+    }),
+  });
   await localOpen;
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
@@ -893,19 +905,18 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     ]).length,
     12,
   );
+  const longRecoveryHistory = [
+    { role: "user", content: "今天你不直播，感觉有点寂寞呀" },
+    { role: "assistant", content: "我就在家待着呢。" },
+    ...Array.from({ length: 20 }, (_, index) => ({
+      role: index % 2 ? "assistant" : "user",
+      content: `后续消息${index}`,
+    })),
+  ];
+  const recovered = sanitizeRealtimeInitialHistory(longRecoveryHistory);
+  assert.equal(recovered.length, 12);
+  assert.equal(recovered[0].content, "今天你不直播，感觉有点寂寞呀");
   local.trace.startSession();
-  local._onMessage({
-    data: JSON.stringify({
-      type: "session",
-      state: "started",
-      downlinkAudio: "managed-v1",
-      memoryContext: "turn-final-v1",
-      interruptionHint: "candidate-snapshot-v1",
-      ttsStream: "provider-pcm-v1",
-      proactiveTurn: "local-v1",
-      freshTopic: "fresh-topic-v1",
-    }),
-  });
   assert.deepEqual(sockets[0].sent[1], {
     type: "fresh_topics",
     items: [freshTopic],
@@ -954,6 +965,9 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   cosy.playbackNode = { port: { postMessage: () => {} } };
   const cosyOpen = cosy._openSocket("ws://cosy", { systemRole: "role", botName: "元元" });
   sockets[1].onopen();
+  sockets[1].onmessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
   await cosyOpen;
   assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
@@ -969,15 +983,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     freshTopics: [freshTopic],
   });
   sockets[2].onopen();
-  await legacyOpen;
-  assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
-  assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
-  assert.equal("interruptionHint" in sockets[2].sent[0], false);
-  assert.equal("ttsStream" in sockets[2].sent[0], false);
-  assert.equal("proactiveTurn" in sockets[2].sent[0], false);
-  assert.equal("freshTopics" in sockets[2].sent[0], false);
-  legacy.trace.startSession();
-  legacy._onMessage({
+  sockets[2].onmessage({
     data: JSON.stringify({
       type: "session",
       state: "started",
@@ -986,6 +992,14 @@ test("managed and proactive capabilities are explicitly offered only by eligible
       freshTopic: "none",
     }),
   });
+  await legacyOpen;
+  assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
+  assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
+  assert.equal("interruptionHint" in sockets[2].sent[0], false);
+  assert.equal("ttsStream" in sockets[2].sent[0], false);
+  assert.equal("proactiveTurn" in sockets[2].sent[0], false);
+  assert.equal("freshTopics" in sockets[2].sent[0], false);
+  legacy.trace.startSession();
   legacy._backendGeneration = 7;
   assert.equal(
     legacy.sendMemoryContext({ generation: 7, items: [], freshTopics: [freshTopic] }),
@@ -1000,6 +1014,9 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     freshTopics: [freshTopic],
   });
   sockets[3].onopen();
+  sockets[3].onmessage({
+    data: JSON.stringify({ type: "session", state: "started" }),
+  });
   await volcanoOpen;
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
@@ -1008,6 +1025,304 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.equal("initialHistory" in sockets[3].sent[0], false);
   assert.equal("freshTopics" in sockets[3].sent[0], false);
   assert.deepEqual(sockets[3].sent[0].memoryContext, ["session-start-v1"]);
+});
+
+test("managed transport reconnects with current history before requesting service recovery", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "ws://local" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 1;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    getRecoveryHistory: () => [{ role: "user", content: "重连前的历史" }],
+  });
+  session._pendingUserTurn = true;
+  const opening = session._openSocket("ws://local", {
+    systemRole: "role",
+    botName: "元元",
+    initialHistory: [],
+  });
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      pendingTurnResume: "pending-turn-resume-v1",
+    }),
+  });
+  await opening;
+  sockets[0].onclose();
+  for (let i = 0; i < 50 && sockets.length < 2; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(sockets.length, 2);
+  sockets[1].onopen();
+  sockets[1].onmessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      pendingTurnResume: "pending-turn-resume-v1",
+    }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(sockets[1].sent[0].initialHistory, [
+    { role: "user", content: "重连前的历史" },
+  ]);
+  assert.deepEqual(sockets[1].sent[1], { type: "resume_pending_turn" });
+  session.stopped = true;
+});
+
+test("transport recovery does not resume an old trailing user message", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    getRecoveryHistory: () => [{ role: "user", content: "旧文字消息" }],
+  });
+  session._getRealtimeBase = async () => "ws://local";
+  session._openSocket = async () => {
+    session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
+    session._sessionStarted = true;
+    session._pendingTurnResumeMode = "pending-turn-resume-v1";
+  };
+
+  await session._reopenRecoveredSocket();
+
+  assert.deepEqual(sent, []);
+});
+
+test("transport reset clears old generation completion identity after preserving the draft", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const events = [];
+  let socketClosed = 0;
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    onAssistantDiscarded: (meta) => events.push(["discard", meta]),
+    onTransportReset: () => events.push(["reset"]),
+  });
+  session._assistantDraftGeneration = 1;
+  session._lastAudibleGeneration = 1;
+  session._lastDurableAudibleGeneration = 1;
+  session.ws = { close: () => { socketClosed += 1; } };
+
+  session._prepareTransportRecovery();
+
+  assert.deepEqual(events, [
+    ["discard", { generation: 1, preserveAudible: true }],
+    ["reset"],
+  ]);
+  assert.equal(session._lastAudibleGeneration, null);
+  assert.equal(session._lastDurableAudibleGeneration, null);
+  assert.equal(session.ws, null);
+  assert.equal(socketClosed, 1);
+});
+
+test("managed socket opens only after a validated session handshake", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 1;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+    close() {}
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session._sessionHandshakeTimeoutMs = () => 5;
+  const opening = session._openSocket("ws://local", { systemRole: "role", botName: "元元" });
+  sockets[0].onopen();
+
+  await assert.rejects(opening, /会话握手超时/);
+  assert.equal(session._sessionStarted, false);
+});
+
+test("replaced socket cannot inject stale control messages", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 1;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const assistant = [];
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    onAssistant: (text) => assistant.push(text),
+  });
+  const firstOpen = session._openSocket("ws://first", { systemRole: "role", botName: "元元" });
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
+  await firstOpen;
+  const secondOpen = session._openSocket("ws://second", { systemRole: "role", botName: "元元" });
+  sockets[1].onopen();
+  sockets[1].onmessage({
+    data: JSON.stringify({ type: "session", state: "started", downlinkAudio: "managed-v1" }),
+  });
+  await secondOpen;
+
+  sockets[0].onmessage({
+    data: JSON.stringify({ type: "assistant", text: "旧连接迟到内容", generation: 0 }),
+  });
+
+  assert.deepEqual(assistant, []);
+});
+
+test("transport recovery discards an unplayed assistant draft before reconnecting", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const discarded = [];
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    onAssistantDiscarded: (meta) => discarded.push(meta),
+  });
+  session._backendGeneration = 4;
+  session._assistantActive = true;
+  session._assistantDraftGeneration = 4;
+
+  session._prepareTransportRecovery();
+
+  assert.deepEqual(discarded, [{ generation: 4, preserveAudible: false }]);
+
+  const partiallyAudible = new RealtimeSession({
+    provider: "voxcpm",
+    onAssistantDiscarded: (meta) => discarded.push(meta),
+  });
+  partiallyAudible._backendGeneration = 5;
+  partiallyAudible._assistantActive = true;
+  partiallyAudible._assistantDraftGeneration = 5;
+  partiallyAudible._lastAudibleGeneration = 5;
+  partiallyAudible._prepareTransportRecovery();
+  assert.deepEqual(discarded.at(-1), { generation: 5, preserveAudible: true });
+});
+
+test("only VoxCPM provider cleanup timeout can request immediate managed restart", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const requests = [];
+  const responseErrors = [];
+  const voxcpm = new RealtimeSession({
+    provider: "voxcpm",
+    onResponseError: (error) => responseErrors.push(error.message),
+  });
+  voxcpm._recoverTransport = async (options) => requests.push(options);
+  voxcpm._onMessage({
+    data: JSON.stringify({
+      type: "error",
+      message: "cleanup timeout",
+      recoverable: true,
+      restartRequired: true,
+    }),
+  });
+  const local = new RealtimeSession({
+    provider: "local",
+    onResponseError: (error) => responseErrors.push(error.message),
+  });
+  local._recoverTransport = async (options) => requests.push(options);
+  local._onMessage({
+    data: JSON.stringify({
+      type: "error",
+      message: "ordinary error",
+      recoverable: true,
+      restartRequired: true,
+    }),
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(requests, [{ restartImmediately: true }]);
+  assert.deepEqual(responseErrors, ["ordinary error"]);
+});
+
+test("managed transport waits through slow service startup after three reconnect failures", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const states = [];
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    onState: (state) => states.push(state),
+  });
+  session._startMessage = { systemRole: "role", botName: "元元", initialHistory: [] };
+  session._transportRecoveryDelayMs = () => 0;
+  session._voiceServiceRecoveryPollDelayMs = () => 0;
+  session._getRealtimeBase = async () => "ws://local";
+  let reconnects = 0;
+  session._openSocket = async () => {
+    reconnects += 1;
+    if (reconnects <= 3) throw new Error("not ready");
+  };
+  let restarts = 0;
+  session._requestVoiceServiceRecovery = async () => {
+    restarts += 1;
+  };
+  const serviceStates = ["starting", "starting", "starting", "running"];
+  let statusChecks = 0;
+  session._checkVoiceService = async () => {
+    const state = serviceStates[Math.min(statusChecks, serviceStates.length - 1)];
+    statusChecks += 1;
+    return { backend: "voxcpm", state };
+  };
+
+  await session._recoverTransport();
+
+  assert.equal(reconnects, 4);
+  assert.equal(restarts, 1);
+  assert.equal(statusChecks, 4);
+  assert.deepEqual(states, ["recovering"]);
+  assert.equal(session.stopped, false);
+});
+
+test("non-Vox managed transport never requests an automatic process restart", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const states = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onState: (state) => states.push(state),
+  });
+  session._startMessage = { systemRole: "role", botName: "元元", initialHistory: [] };
+  session._transportRecoveryDelayMs = () => 0;
+  session._getRealtimeBase = async () => "ws://local";
+  session._openSocket = async () => {
+    throw new Error("not ready");
+  };
+  let restarts = 0;
+  session._requestVoiceServiceRecovery = async () => {
+    restarts += 1;
+  };
+
+  await session._recoverTransport();
+
+  assert.equal(restarts, 0);
+  assert.deepEqual(states, ["recovering", "ended"]);
 });
 
 test("visible chat can resume an interrupted audio context without rebuilding the session", async () => {
@@ -1060,8 +1375,7 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
     const pending = session._openSocket("ws://test", { systemRole: "role", botName: "元元" });
     const socket = sockets.at(-1);
     socket.onopen();
-    await pending;
-    session._onMessage({
+    socket.onmessage({
       data: JSON.stringify({
         type: "session",
         state: "started",
@@ -1069,6 +1383,7 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
         ...started,
       }),
     });
+    await pending;
     return { session, socket };
   };
 
@@ -2094,6 +2409,24 @@ test("local session exposes text-free unplayed assistant discard only to the UI"
   assert.deepEqual(volcanoDiscarded, []);
 });
 
+test("local session replaces a filtered assistant draft without adding trace text", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const replacements = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAssistantReplace: (text, meta) => replacements.push({ text, ...meta }),
+  });
+  session.trace.startSession();
+  session._backendGeneration = 3;
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant_replace", generation: 3, text: "继续聊。" }),
+  });
+
+  assert.deepEqual(replacements, [{ text: "继续聊。", generation: 3 }]);
+  assert.equal(JSON.stringify(session.getTraceSnapshot()).includes("继续聊"), false);
+});
+
 test("desktop session ducks candidates, resumes rejection and gates stale audio", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -2368,6 +2701,42 @@ test("suspended audio keeps PCM before its segment end marker", async () => {
   ]);
 });
 
+test("desktop session reports one durable boundary after audible playback drains", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const completed = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAudibleResponseComplete: (meta) => completed.push(meta),
+  });
+  session.ws = { readyState: 1, send: () => {} };
+  session.playbackNode = { port: { postMessage: () => {} } };
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 3,
+      segmentId: 1,
+      text: "已经完整播完。",
+      samples: 2400,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "audio_segment_end", generation: 3, segmentId: 1 }),
+  });
+  session._onPlaybackMessage({ type: "segment_completed", generation: 3, segmentId: 1 });
+  session._onMessage({ data: JSON.stringify({ type: "tts_end", generation: 3 }) });
+  session._onPlaybackMessage({ type: "drained" });
+
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.deepEqual(completed, [{ generation: 3 }]);
+
+  session._schedulePlaybackCompletion();
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.deepEqual(completed, [{ generation: 3 }]);
+});
+
 test("legacy playback receipts require natural source completion and remain bounded", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
@@ -2491,11 +2860,13 @@ test("a recoverable local response error clears only that response and keeps the
   const { RealtimeSession } = await import("../src/ai/realtime.js");
   const responseErrors = [];
   const fatalErrors = [];
+  const discarded = [];
   const playbackCommands = [];
   const sent = [];
   const session = new RealtimeSession({
     provider: "local",
     onResponseError: (error) => responseErrors.push(error.message),
+    onAssistantDiscarded: (meta) => discarded.push(meta),
     onError: (error) => fatalErrors.push(error.message),
   });
   session.ws = {
@@ -2509,6 +2880,7 @@ test("a recoverable local response error clears only that response and keeps the
   session.trace.startResponse();
   session._backendAudioPending = true;
   session._assistantActive = true;
+  session._assistantDraftGeneration = 0;
   session._playbackQueuedMs = 80;
 
   session._onMessage({
@@ -2521,6 +2893,7 @@ test("a recoverable local response error clears only that response and keeps the
 
   assert.deepEqual(responseErrors, ["本地实时语音处理失败，请稍后重试"]);
   assert.deepEqual(fatalErrors, []);
+  assert.deepEqual(discarded, [{ generation: 0, preserveAudible: false }]);
   assert.equal(session.stopped, false);
   assert.equal(session._assistantActive, false);
   assert.equal(session._backendAudioPending, false);

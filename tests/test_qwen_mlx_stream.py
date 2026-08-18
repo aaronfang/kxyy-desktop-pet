@@ -37,6 +37,7 @@ evaluator = _load_evaluator()
 def _load_server():
     fake_common = types.ModuleType("common")
     fake_common.OUTPUT_RATE = 24000
+    fake_common.CONTINUE_CONVERSATION_SUFFIX = "fixed-continue-suffix"
     fake_common._mlx_pool = None
     fake_common._synth_tts_stream = None
     fake_common.ensure_ref_wav = lambda: (Path("/fake/ref.wav"), "reference")
@@ -472,6 +473,7 @@ class QwenMlxStreamTests(unittest.IsolatedAsyncioTestCase):
         try:
             server._run_torch()
             self.assertIsNone(captured["synth_tts_stream"])
+            self.assertEqual(captured["system_suffix"], "fixed-continue-suffix")
             common._synth_tts_stream = None
             captured["prepare"]()
             self.assertIs(common._synth_tts_stream, fake_qwen.synth_tts_stream)

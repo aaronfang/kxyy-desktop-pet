@@ -9,7 +9,8 @@
 //       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
 //       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
-//       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
+//       {type:"assistant|assistant_replace",text} / {type:"assistant_end"} /
+//       {type:"tts_start|tts_end"} /
 //       {type:"thinking_filler",runtimeGenerated:true,audio:base64} /
 //       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
 //       session/asr_end.vadShadowSummary / {type:"vad_shadow_summary",final:true,summary} /
@@ -47,6 +48,12 @@ const TARGET_RATE = 16000; // 上行目标采样率
 const MAX_PENDING_PCM_CHUNKS = 64;
 const PLAYBACK_MAX_QUEUE_MS = 3000;
 const PLAYBACK_DRAIN_GRACE_MS = 300;
+const TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART = 3;
+const TRANSPORT_RECOVERY_MAX_ATTEMPTS = 6;
+const TRANSPORT_RECOVERY_DELAYS_MS = [0, 250, 750, 1500, 2500, 4000];
+const VOICE_SERVICE_RECOVERY_POLL_MS = 1000;
+const VOICE_SERVICE_UNKNOWN_MAX_POLLS = 10;
+const SESSION_HANDSHAKE_TIMEOUT_MS = 5000;
 const MAX_AUDIO_SEGMENTS = 64;
 const MANAGED_AUDIO_CAPABILITY = "managed-v1";
 const MANAGED_AUDIO_MAGIC = 0x4b584155; // ASCII KXAU; not a Volcano protocol constant.
@@ -62,6 +69,7 @@ const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
 const TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1";
 const FRESH_TOPIC_CAPABILITY = "fresh-topic-v1";
+const PENDING_TURN_RESUME_CAPABILITY = "pending-turn-resume-v1";
 const PROACTIVE_TURN_CAPABILITY = "local-v1";
 const MAX_TURN_MEMORY_ITEMS = 3;
 const MAX_TURN_MEMORY_CHARS = 700;
@@ -181,6 +189,17 @@ function usesManagedCascade(provider) {
 /** Bounded local/Cosy-only bridge from visible text chat into a new voice session. */
 export function sanitizeRealtimeInitialHistory(messages) {
   if (!Array.isArray(messages)) return [];
+  const volatileFact = [...messages].reverse().find((message) => {
+    if (message?.role !== "user") return false;
+    const content = String(message.content || "").replace(/\s+/g, "");
+    if (!content || /[？?]$/.test(content)) return false;
+    const hasToday = /今天|今晚|今儿/.test(content);
+    const hasRole = /你|元元|圆圆|原原|源源|园园/.test(content);
+    const hasLiveState = /不直播|不播|没直播|没播|休息|开播|会直播|要直播|还得直播|准备直播|打算直播/.test(
+      content,
+    );
+    return hasToday && hasRole && hasLiveState;
+  });
   const selected = [];
   let totalChars = 0;
   for (let index = messages.length - 1; index >= 0; index--) {
@@ -191,11 +210,27 @@ export function sanitizeRealtimeInitialHistory(messages) {
     if (!content || content.startsWith("\u2063")) continue;
     content = Array.from(content).slice(0, MAX_INITIAL_HISTORY_MESSAGE_CHARS).join("");
     if (!content || totalChars + content.length > MAX_INITIAL_HISTORY_CHARS) continue;
-    selected.push({ role, content });
+    selected.push({ role, content, index });
     totalChars += content.length;
     if (selected.length >= MAX_INITIAL_HISTORY_MESSAGES) break;
   }
-  selected.reverse();
+  const volatileIndex = volatileFact ? messages.indexOf(volatileFact) : -1;
+  if (volatileIndex >= 0 && !selected.some((message) => message.index === volatileIndex)) {
+    const content = Array.from(String(volatileFact.content || "").trim())
+      .slice(0, MAX_INITIAL_HISTORY_MESSAGE_CHARS)
+      .join("");
+    while (
+      selected.length &&
+      (selected.length >= MAX_INITIAL_HISTORY_MESSAGES ||
+        totalChars + content.length > MAX_INITIAL_HISTORY_CHARS)
+    ) {
+      totalChars -= selected.pop().content.length;
+    }
+    if (content && totalChars + content.length <= MAX_INITIAL_HISTORY_CHARS) {
+      selected.push({ role: "user", content, index: volatileIndex });
+    }
+  }
+  selected.sort((left, right) => left.index - right.index);
   while (selected[0]?.role === "assistant") selected.shift();
   const normalized = [];
   for (const message of selected) {
@@ -205,7 +240,7 @@ export function sanitizeRealtimeInitialHistory(messages) {
         .slice(0, MAX_INITIAL_HISTORY_MESSAGE_CHARS)
         .join("");
     } else {
-      normalized.push(message);
+      normalized.push({ role: message.role, content: message.content });
     }
   }
   return normalized;
@@ -292,9 +327,11 @@ export class RealtimeSession {
     onAsr,
     onAsrEnd,
     onAssistant,
+    onAssistantReplace,
     onAssistantEnd,
     onAssistantDiscarded,
     onAudibleAssistant,
+    onAudibleResponseComplete,
     onThinking,
     onSpeaking,
     onUsage,
@@ -305,6 +342,8 @@ export class RealtimeSession {
     onThinkingFillerOffer,
     onPlaybackStats,
     onResponseError,
+    getRecoveryHistory,
+    onTransportReset,
     onError,
     provider = "unknown",
     conversationMode = "follow-user",
@@ -321,9 +360,11 @@ export class RealtimeSession {
       onAsr,
       onAsrEnd,
       onAssistant,
+      onAssistantReplace,
       onAssistantEnd,
       onAssistantDiscarded,
       onAudibleAssistant,
+      onAudibleResponseComplete,
       onThinking,
       onSpeaking,
       onUsage,
@@ -334,6 +375,8 @@ export class RealtimeSession {
       onThinkingFillerOffer,
       onPlaybackStats,
       onResponseError,
+      getRecoveryHistory,
+      onTransportReset,
       onError,
     };
     this.ws = null;
@@ -353,6 +396,7 @@ export class RealtimeSession {
     this._bargeInTurn = false; // 本轮用户说话是否已打断过播报
     this._userTurnOpen = false; // asr_start…asr_end 之间为 true
     this._assistantActive = false; // 助手正在出字/出声
+    this._assistantDraftGeneration = null;
     this._backendAudioPending = false; // 本地逐句 TTS 尚可能继续产出 PCM
     this._keepAliveOsc = null;
     this._keepAliveGain = null;
@@ -368,6 +412,7 @@ export class RealtimeSession {
     this._playbackDrainTimer = 0;
     this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
     this._backendGeneration = 0;
+    this._lastDurableAudibleGeneration = null;
     this._traceAsrFinalSeen = false;
     this._currentAudioSegment = null;
     this._audioSegments = new Map();
@@ -462,6 +507,12 @@ export class RealtimeSession {
       rhythmStops: 0,
     };
     this._sessionStarted = false;
+    this._startMessage = null;
+    this._recoveryInFlight = false;
+    this._recoveryAttempt = 0;
+    this._transportRecovering = false;
+    this._pendingUserTurn = false;
+    this._pendingTurnResumeMode = "none";
     this._micReady = false;
     this._proactiveGreetingDelayMs = Number.isFinite(proactiveGreetingDelayMs)
       ? Math.max(0, proactiveGreetingDelayMs)
@@ -535,12 +586,13 @@ export class RealtimeSession {
 
   /** 开始通话：确认播放能力 → 连桥接并协商 → 起麦克风。 */
   async start({ systemRole, botName, initialHistory, freshTopics }) {
+    this._startMessage = { systemRole, botName, initialHistory, freshTopics };
     this.trace.startSession();
     // 若 chat.js 已在点击栈调用 prepareAudio，这里是幂等补齐。
     this._initAudioCtx();
     if (!this._micPrepare) this._micPrepare = this._acquireMicStream();
 
-    const base = await invoke("get_realtime_base");
+    const base = await this._getRealtimeBase();
     if (this.stopped) return;
     if (!base) throw new Error("实时语音服务未启动");
 
@@ -568,10 +620,22 @@ export class RealtimeSession {
       }
       ws.binaryType = "arraybuffer";
       this.ws = ws;
+      this._sessionStarted = false;
       this._startupFreshTopics = usesManagedCascade(this.trace.provider)
         ? sanitizeFreshTopics(startMsg.freshTopics)
         : [];
       let opened = false;
+      let settled = false;
+      let handshakeTimer = 0;
+
+      const settle = (error) => {
+        if (settled) return;
+        settled = true;
+        if (handshakeTimer) clearTimeout(handshakeTimer);
+        handshakeTimer = 0;
+        if (error) reject(error);
+        else resolve();
+      };
 
       ws.onopen = () => {
         opened = true;
@@ -589,6 +653,7 @@ export class RealtimeSession {
             startMsg.initialHistory,
           );
           cascadeCapabilities.freshTopic = [FRESH_TOPIC_CAPABILITY];
+          cascadeCapabilities.pendingTurnResume = [PENDING_TURN_RESUME_CAPABILITY];
         }
         if (
           usesManagedCascade(this.trace.provider) &&
@@ -611,19 +676,222 @@ export class RealtimeSession {
           ...cascadeCapabilities,
         };
         ws.send(JSON.stringify(startPayload));
-        resolve();
+        handshakeTimer = setTimeout(() => {
+          if (this.ws === ws) this.ws = null;
+          settle(new Error("实时语音会话握手超时"));
+          try {
+            ws.close();
+          } catch {
+            /* ignore */
+          }
+        }, this._sessionHandshakeTimeoutMs());
       };
-      ws.onmessage = (ev) => this._onMessage(ev);
+      ws.onmessage = (ev) => {
+        if (this.ws !== ws) return;
+        this._onMessage(ev);
+        if (this._sessionStarted) settle();
+      };
       ws.onerror = () => {
-        if (!opened) reject(new Error("连接实时语音服务失败"));
+        if (!settled) {
+          if (this.ws === ws) this.ws = null;
+          settle(new Error("连接实时语音服务失败"));
+        }
       };
       ws.onclose = () => {
+        if (this.ws !== ws || this.stopped) return;
+        if (!settled) {
+          this.ws = null;
+          settle(new Error(opened ? "实时语音会话未就绪" : "连接实时语音服务失败"));
+          return;
+        }
+        if (usesManagedCascade(this.trace.provider)) {
+          void this._recoverTransport();
+          return;
+        }
         this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
-          reason: this.stopped ? "hangup" : "session_ended",
+          reason: "session_ended",
         });
-        if (!this.stopped) this.cb.onState?.("ended");
+        this.cb.onState?.("ended");
       };
     });
+  }
+
+  _sessionHandshakeTimeoutMs() {
+    return SESSION_HANDSHAKE_TIMEOUT_MS;
+  }
+
+  async _recoverTransport({ restartImmediately = false } = {}) {
+    if (this._recoveryInFlight || this.stopped) return;
+    this._recoveryInFlight = true;
+    this._transportRecovering = true;
+    this.cb.onState?.("recovering");
+    this._prepareTransportRecovery();
+    try {
+      try {
+        if (!restartImmediately) {
+          for (
+            this._recoveryAttempt = 0;
+            this._recoveryAttempt < TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART;
+            this._recoveryAttempt += 1
+          ) {
+            const attempt = this._recoveryAttempt;
+            const delay = this._transportRecoveryDelayMs(attempt);
+            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+            if (this.stopped) return;
+            try {
+              await this._reopenRecoveredSocket();
+              this._recoveryAttempt = 0;
+              this._transportRecovering = false;
+              return;
+            } catch {
+              // The first three failures are same-process reconnects. Restart is below.
+            }
+          }
+        }
+        if (this.trace.provider === "voxcpm") {
+          await this._requestVoiceServiceRecovery();
+          await this._waitForVoiceServiceReady();
+        }
+        for (
+          this._recoveryAttempt = TRANSPORT_RECOVERY_ATTEMPTS_BEFORE_RESTART;
+          this._recoveryAttempt < TRANSPORT_RECOVERY_MAX_ATTEMPTS;
+          this._recoveryAttempt += 1
+        ) {
+          const attempt = this._recoveryAttempt;
+          const delay = this._transportRecoveryDelayMs(attempt);
+          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+          if (this.stopped) return;
+          try {
+            await this._reopenRecoveredSocket();
+            this._recoveryAttempt = 0;
+            this._transportRecovering = false;
+            return;
+          } catch {
+            // The restarted service is healthy, but the session handshake still failed.
+          }
+        }
+      } catch {
+        // Terminal service failures use the same bounded end-of-call path below.
+      }
+      if (!this.stopped) {
+        this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
+          reason: "recovery_failed",
+        });
+        this.cb.onState?.("ended");
+      }
+    } finally {
+      this._recoveryInFlight = false;
+      if (this.stopped) this._transportRecovering = false;
+    }
+  }
+
+  async _reopenRecoveredSocket() {
+    const base = await this._getRealtimeBase();
+    const recoveryHistory =
+      this.cb.getRecoveryHistory?.() || this._startMessage?.initialHistory || [];
+    const startMsg = {
+      ...(this._startMessage || {}),
+      initialHistory: recoveryHistory,
+    };
+    const sanitizedHistory = sanitizeRealtimeInitialHistory(recoveryHistory);
+    const shouldResumePendingTurn =
+      this._pendingUserTurn && sanitizedHistory.at(-1)?.role === "user";
+    await this._openSocket(base, startMsg);
+    if (
+      shouldResumePendingTurn &&
+      this._pendingTurnResumeMode === PENDING_TURN_RESUME_CAPABILITY &&
+      this.ws?.readyState === WebSocket.OPEN &&
+      this._sessionStarted
+    ) {
+      this.ws.send(JSON.stringify({ type: "resume_pending_turn" }));
+    }
+  }
+
+  async _waitForVoiceServiceReady() {
+    let unknownPolls = 0;
+    while (!this.stopped) {
+      const status = await this._checkVoiceService();
+      const state = String(status?.state || "unknown");
+      if (state === "running") return;
+      if (state === "failed" || state === "stopped") {
+        throw new Error("本地语音服务恢复失败");
+      }
+      if (state === "unknown") {
+        unknownPolls += 1;
+        if (unknownPolls >= VOICE_SERVICE_UNKNOWN_MAX_POLLS) {
+          throw new Error("无法确认本地语音服务恢复状态");
+        }
+      } else {
+        unknownPolls = 0;
+      }
+      const delay = this._voiceServiceRecoveryPollDelayMs();
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    throw new Error("通话已结束");
+  }
+
+  _transportRecoveryDelayMs(attempt) {
+    return TRANSPORT_RECOVERY_DELAYS_MS[attempt] ?? TRANSPORT_RECOVERY_DELAYS_MS.at(-1);
+  }
+
+  _getRealtimeBase() {
+    return invoke("get_realtime_base");
+  }
+
+  _requestVoiceServiceRecovery() {
+    return invoke("recover_voice_service");
+  }
+
+  _checkVoiceService() {
+    return invoke("check_voice_service");
+  }
+
+  _voiceServiceRecoveryPollDelayMs() {
+    return VOICE_SERVICE_RECOVERY_POLL_MS;
+  }
+
+  _prepareTransportRecovery() {
+    const staleSocket = this.ws;
+    this.ws = null;
+    try {
+      staleSocket?.close();
+    } catch {
+      /* ignore */
+    }
+    if (Number.isSafeInteger(this._assistantDraftGeneration)) {
+      this.cb.onAssistantDiscarded?.({
+        generation: this._assistantDraftGeneration,
+        preserveAudible: this._lastAudibleGeneration === this._assistantDraftGeneration,
+      });
+      this._assistantDraftGeneration = null;
+    }
+    this._sessionStarted = false;
+    this._backendGeneration = 0;
+    this._backendAudioPending = false;
+    this._assistantActive = false;
+    this._lastAudibleGeneration = null;
+    this._lastDurableAudibleGeneration = null;
+    this._activeProactiveGeneration = null;
+    this._conversationPlans.clear();
+    this._proactiveConversationPlans.clear();
+    this._pendingConversationPlanGeneration = null;
+    this._resetInterruptionCandidate();
+    this._speechCandidate = false;
+    this._candidateInterruptsResponse = false;
+    this._userTurnOpen = false;
+    this._bargeInTurn = false;
+    if (this._playbackDrainTimer) clearTimeout(this._playbackDrainTimer);
+    this._playbackDrainTimer = 0;
+    this._audioSegments.clear();
+    this._legacySegments.clear();
+    this._currentAudioSegment = null;
+    this._pendingPcm = [];
+    this._audioGate = false;
+    this._micLevel = 0;
+    this._micWave.fill(0);
+    this.cb.onLevel?.(0, this._micWave);
+    this.cb.onTransportReset?.();
+    this.playbackNode?.port.postMessage({ type: "clear" });
   }
 
   _onMessage(ev) {
@@ -686,6 +954,11 @@ export class RealtimeSession {
           this._freshTopicMode =
             usesManagedCascade(this.trace.provider) && msg.freshTopic === FRESH_TOPIC_CAPABILITY
               ? FRESH_TOPIC_CAPABILITY
+              : "none";
+          this._pendingTurnResumeMode =
+            usesManagedCascade(this.trace.provider) &&
+            msg.pendingTurnResume === PENDING_TURN_RESUME_CAPABILITY
+              ? PENDING_TURN_RESUME_CAPABILITY
               : "none";
           if (
             this._freshTopicMode === FRESH_TOPIC_CAPABILITY &&
@@ -797,6 +1070,7 @@ export class RealtimeSession {
           { metrics: { interim: msg.interim !== false } },
         );
         if (msg.interim === false) {
+          this._pendingUserTurn = true;
           this._traceAsrFinalSeen = true;
           this._latestFinalAsr = msg.text || "";
           const policy = classifyRealtimeConversationTurn(this._latestFinalAsr);
@@ -840,6 +1114,9 @@ export class RealtimeSession {
           Number.isSafeInteger(msg.generation) &&
           msg.generation === this._backendGeneration
         ) {
+          if (this._pendingUserTurn && this._pendingConversationPlan) {
+            this._pendingConversationPlanGeneration = msg.generation;
+          }
           this._memoryContextRequestedAt = performance.now();
           this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
           this.cb.onMemoryContextRequest?.({
@@ -869,7 +1146,14 @@ export class RealtimeSession {
         this._beginThinkingFeedback("synthesizing", { allowFiller: false });
         this.trace.startResponse();
         this.trace.recordOnce("llm_first_token", TRACE_EVENT.LLM_FIRST_TOKEN);
+        this._assistantDraftGeneration = Number.isSafeInteger(msg.generation)
+          ? msg.generation
+          : this._backendGeneration;
         this.cb.onAssistant?.(msg.text || "", { generation: msg.generation });
+        break;
+      case "assistant_replace":
+        if (!usesManagedCascade(this.trace.provider)) break;
+        this.cb.onAssistantReplace?.(msg.text || "", { generation: msg.generation });
         break;
       case "thinking_filler": {
         if (
@@ -897,6 +1181,9 @@ export class RealtimeSession {
         if (!usesManagedCascade(this.trace.provider)) break;
         this._assistantActive = false;
         this.cb.onAssistantDiscarded?.({ generation: msg.generation });
+        if (msg.generation === this._assistantDraftGeneration) {
+          this._assistantDraftGeneration = null;
+        }
         break;
       case "proactive_turn_status":
         if (
@@ -947,10 +1234,24 @@ export class RealtimeSession {
           this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "error" });
         }
         if (msg.recoverable === true && usesManagedCascade(this.trace.provider)) {
+          if (Number.isSafeInteger(this._assistantDraftGeneration)) {
+            this.cb.onAssistantDiscarded?.({
+              generation: this._assistantDraftGeneration,
+              preserveAudible: this._lastAudibleGeneration === this._assistantDraftGeneration,
+            });
+            this._assistantDraftGeneration = null;
+          }
           this._assistantActive = false;
           this._flushPlayback("response_error");
-          const callback = this.cb.onResponseError || this.cb.onError;
-          callback?.(new Error(msg.message || "本轮语音处理失败，请继续说话重试"));
+          const restartRequired =
+            msg.restartRequired === true && this.trace.provider === "voxcpm";
+          if (restartRequired) {
+            void this._recoverTransport({ restartImmediately: true });
+          } else {
+            this._pendingUserTurn = false;
+            const callback = this.cb.onResponseError || this.cb.onError;
+            callback?.(new Error(msg.message || "本轮语音处理失败，请继续说话重试"));
+          }
         } else {
           if (!this._hasPlayback()) this._schedulePlaybackCompletion();
           this.cb.onError?.(new Error(msg.message || "实时语音出错"));
@@ -1925,6 +2226,7 @@ export class RealtimeSession {
       );
     }
     this.cb.onAudibleAssistant?.(segment.text, { generation, segmentId });
+    this._pendingUserTurn = false;
     this._noteAudibleTopic(segment.text);
     this._lastAudibleGeneration = generation;
     this._maybeScheduleTopicLeadAfterPlayback(generation);
@@ -2147,6 +2449,18 @@ export class RealtimeSession {
           reason: "completed",
         });
       }
+      if (
+        Number.isSafeInteger(this._lastAudibleGeneration) &&
+        this._lastAudibleGeneration !== this._lastDurableAudibleGeneration
+      ) {
+        this._lastDurableAudibleGeneration = this._lastAudibleGeneration;
+        if (this._assistantDraftGeneration === this._lastAudibleGeneration) {
+          this._assistantDraftGeneration = null;
+        }
+        this.cb.onAudibleResponseComplete?.({
+          generation: this._lastAudibleGeneration,
+        });
+      }
     }, PLAYBACK_DRAIN_GRACE_MS);
   }
 
@@ -2327,11 +2641,21 @@ export class RealtimeSession {
     });
     this.workletNode.port.onmessage = (e) => {
       // e.data 是 Int16 PCM 的 ArrayBuffer，直接上行。
+      if (this._transportRecovering) {
+        this._micLevel = 0;
+        return;
+      }
       this.trace.recordOnce("mic_audio_input", TRACE_EVENT.MIC_AUDIO_INPUT, {
         metrics: { audioBytes: e.data?.byteLength || 0 },
       });
       this._noteMicLevel(e.data);
-      if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.stopped) {
+      if (
+        this.ws &&
+        this.ws.readyState === WebSocket.OPEN &&
+        this._sessionStarted &&
+        !this._transportRecovering &&
+        !this.stopped
+      ) {
         this.ws.send(e.data);
       }
     };

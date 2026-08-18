@@ -553,6 +553,7 @@ LLM_STREAM_MAX_PRODUCERS = 2
 TTS_STREAM_MAX_TASKS = 2
 TTS_SENTENCE_QUEUE_MAX = 4
 TTS_PARALLELISM_MAX = 2
+TTS_STREAM_CLOSE_GRACE_SECONDS = 0.25
 # 实时回复把相邻中短句合并到同一次 voice-clone，减少文字模型分句风格
 # 放大的逐句随机音色漂移。30 字仍低于 40 字 soft boundary；不足此长度的
 # 短回复在 SSE done 时立即 flush，不增加固定等待时间。
@@ -602,6 +603,7 @@ MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
 TURN_MEMORY_CAPABILITY = "turn-final-v1"
 TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1"
 FRESH_TOPIC_CAPABILITY = "fresh-topic-v1"
+PENDING_TURN_RESUME_CAPABILITY = "pending-turn-resume-v1"
 
 
 def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> float:
@@ -742,9 +744,12 @@ TURN_MEMORY_HEADER = (
     "不要展示档案或逐条复述；标为不确定的内容只能试探确认。"
 )
 CONTINUATION_HINT_TEXT = (
-    "用户刚才是在停顿后继续补充同一轮内容。结合上一条用户消息理解完整意图，"
+    "用户刚才是在停顿后继续补充同一轮内容。结合最近几条连续用户消息理解完整意图，"
     "只回答一次，不要分别回答或提及系统取消了上一版回复。"
 )
+CONTINUATION_MAX_PARTS = 4
+CONTINUATION_MAX_CHARS = 512
+CONTINUE_LISTENING_FALLBACK = "嗯，你接着说，我听着呢。"
 ACKNOWLEDGE_HINT_TEXT = (
     "用户只是简短表示听到了。沿当前话题自然补一个具体细节，不要把这句当成新事实，"
     "也不要立刻连发问题。"
@@ -939,6 +944,26 @@ def update_short_term_facts(facts: dict[str, str], text: str) -> dict[str, str]:
     """Extract a tiny, session-only state for volatile user-stated facts."""
     updated = dict(facts)
     value = re.sub(r"\s+", " ", str(text or "")).strip()
+    role_subject = r"(?:你|元元|圆圆|原原|源源|园园)"
+    today = r"(?:今天|今晚|今儿)"
+    not_live = rf"(?:不(?:直播|播)|没(?:直播|播)|休息)"
+    live = r"(?:又?开播(?:了)?|会直播|要直播|还得直播|准备直播|打算直播|直播)"
+    asks_question = bool(re.search(r"(?:吗|嘛|么)[？?]?$|[？?]$", value))
+    if not asks_question and (
+        re.search(rf"{today}.{{0,8}}{role_subject}.{{0,8}}{not_live}", value)
+        or re.search(rf"{role_subject}.{{0,8}}{today}.{{0,8}}{not_live}", value)
+    ):
+        updated["角色今日直播状态"] = (
+            "用户明确表示角色今天不直播；除非用户后来纠正，"
+            "不要假设角色正在直播或刚下播"
+        )
+    elif not asks_question and (
+        re.search(rf"{today}.{{0,8}}{role_subject}.{{0,8}}{live}", value)
+        or re.search(rf"{role_subject}.{{0,8}}{today}.{{0,8}}{live}", value)
+    ):
+        updated["角色今日直播状态"] = (
+            "用户后来表示角色今天会直播；仍不要编造具体开播、下播或当前进度"
+        )
     food = re.search(
         r"(?:点的(?:外卖)?|吃的(?:是)?|吃了|正在吃)"
         r"(?:一个|一份|一碗|一盒)?\s*"
@@ -953,7 +978,11 @@ def update_short_term_facts(facts: dict[str, str], text: str) -> dict[str, str]:
         updated["外卖状态"] = "已经送达"
     if re.search(r"边吃边聊|正吃着|正在吃|吃了一半|吃一半", value):
         updated["用户正在做"] = "边吃边聊"
-    return {key: updated[key] for key in ("当前食物", "外卖状态", "用户正在做") if key in updated}
+    return {
+        key: updated[key]
+        for key in ("角色今日直播状态", "当前食物", "外卖状态", "用户正在做")
+        if key in updated
+    }
 
 
 def format_short_term_facts(facts: dict[str, str]) -> str:
@@ -964,8 +993,59 @@ def format_short_term_facts(facts: dict[str, str]) -> str:
         return ""
     return (
         "本次通话的临时状态（只根据用户明确说过的内容；不要推测、不要写入长期记忆）：\n"
-        + "\n".join(lines[:3])
+        + "\n".join(lines[:4])
     )
+
+
+def is_explicit_farewell(text: str) -> bool:
+    """Accept only direct user intent to sleep, leave, hang up, or say goodbye."""
+    value = re.sub(r"\s+", "", str(text or "")).strip("，,。！？!?；;")
+    if not value:
+        return False
+    if len(value) <= 16 and re.search(r"晚安|拜拜+|再见|先这样|不聊了", value):
+        return True
+    return bool(
+        re.search(
+            r"我(?:先|要|得|准备|去|该)?(?:睡|走|撤|挂)|"
+            r"我就先不聊|先挂了|挂电话|结束通话|你也?早点(?:睡|歇|休息)",
+            value,
+        )
+    )
+
+
+_UNSOLICITED_CLOSING_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"行[啊吧]?[，,\s]*那就先这么着",
+        r"(?:那啥[，,\s]*)?今(?:儿|天)[^。！？!?]{0,12}(?:咱|咱们)[^。！？!?]{0,12}"
+        r"(?:聊|唠)[^。！？!?]{0,8}(?:这么多|差不多)",
+        r"(?:咱|咱们|我们)?[，,\s]*就先这样(?:吧)?",
+        r"回头(?:咱|咱们|我们)?再(?:聊|唠)",
+        r"(?:改天|下回)再(?:聊|唠)",
+        r"咱们?明天见",
+        r"今天先(?:聊|唠)到这",
+    )
+)
+
+
+def filter_unsolicited_closing(user_text: str, reply_text: str) -> str:
+    """Remove model-authored call-closing tails unless the user actually left."""
+    reply = str(reply_text or "").strip()
+    if not reply or is_explicit_farewell(user_text):
+        return reply
+    starts = [
+        match.start()
+        for pattern in _UNSOLICITED_CLOSING_PATTERNS
+        if (match := pattern.search(reply)) is not None
+    ]
+    if not starts:
+        return reply
+    prefix = reply[: min(starts)].rstrip(" ，,。！？!?；;")
+    if not prefix:
+        return CONTINUE_LISTENING_FALLBACK
+    if prefix[-1] not in "。！？!?；;":
+        prefix += "。"
+    return prefix
 STABLE_SENTENCE_SOFT_CHARS = 40
 STABLE_SENTENCE_HARD_CHARS = 60
 MIN_SPEECH_MS_PLAY = 800
@@ -1311,17 +1391,56 @@ def sanitize_initial_history(raw_messages) -> list[dict]:
     return normalized
 
 
+def merge_continuation_request(
+    history: list[dict],
+    current_text: str,
+) -> tuple[list[dict], str]:
+    """Collapse trailing user-only continuation turns for one bounded LLM request."""
+    tail_start = len(history)
+    while tail_start > 0 and history[tail_start - 1].get("role") == "user":
+        tail_start -= 1
+    parts = [
+        str(message.get("content") or "").strip()
+        for message in history[tail_start:]
+    ]
+    parts.append(str(current_text or "").strip())
+    parts = [part for part in parts if part][-CONTINUATION_MAX_PARTS:]
+
+    selected_reversed: list[str] = []
+    chars = 0
+    for part in reversed(parts):
+        separator = 1 if selected_reversed else 0
+        remaining = CONTINUATION_MAX_CHARS - chars - separator
+        if remaining <= 0:
+            break
+        selected_reversed.append(part[:remaining])
+        chars += min(len(part), remaining) + separator
+    merged = "\n".join(reversed(selected_reversed)).strip()
+    return [dict(message) for message in history[:tail_start]], merged
+
+
 class SafeRealtimeError(RuntimeError):
     """可安全回给前端/日志的固定文案；原始上游异常只保留为 exception cause。"""
 
 
-# 各 TTS 后端共用的 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
+class VoiceServiceRestartRequired(SafeRealtimeError):
+    """The provider is stuck past local cleanup and needs App-managed recovery."""
+
+
+# 各本地后端都必须遵守的对话持续性约束；其余风格后缀目前仅 CosyVoice 使用。
+CONTINUE_CONVERSATION_SUFFIX = (
+    "\n用户没有明确说要睡、道别或挂断时，不要主动用先这样、回头再聊、早点休息、"
+    "明天见等话术结束对话。"
+)
+
+
+# CosyVoice 共用的完整 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
 SYSTEM_SUFFIX = (
     "\n口语化、像真人闲聊；普通一轮通常说 2~5 句，先贡献具体内容再留回应入口；"
     "用户明确想深入时可以自然说得更完整，但不要为了凑长度重复或总结收口；"
     "需要停顿时用逗号或……；"
     "可带神态括号如（开心）（小声）（生气）（难过），括号不会被念出。"
-)
+) + CONTINUE_CONVERSATION_SUFFIX
 
 _CUE_RE = re.compile(r"（[^（）]*）|\([^()]*\)|【[^【】]*】|\*[^*]+\*")
 
@@ -2285,6 +2404,22 @@ def _drain_background_future(done) -> None:
         pass
 
 
+async def _close_async_stream_bounded(stream) -> asyncio.Task | None:
+    """Close promptly when possible; return a still-draining bounded task otherwise."""
+    close = getattr(stream, "aclose", None)
+    if close is None:
+        return None
+    task = asyncio.create_task(close())
+    done, _pending = await asyncio.wait(
+        {task}, timeout=TTS_STREAM_CLOSE_GRACE_SECONDS
+    )
+    if task in done:
+        task.result()
+        return None
+    task.cancel()
+    return task
+
+
 def pack_managed_audio_frame(
     pcm: bytes,
     *,
@@ -2706,6 +2841,7 @@ class Session:
         self.bot_name = "元元"
         self._audible_history = AudibleHistory()
         self._initial_history: list[dict] = []
+        self._pending_turn_resumed = False
         self._short_term_facts: dict[str, str] = {}
         # 兼容现有诊断/测试读取；其中 assistant 永远只含前端确认播完的句段。
         self.history = self._audible_history.messages
@@ -2723,6 +2859,7 @@ class Session:
         self.reply_task: asyncio.Task | None = None
         self._response_generated = False
         self._response_tts_admitted = False
+        self._response_audio_started = False
         self._response_started_at = 0.0
         self.play_enabled = False
         self.playing = False
@@ -2749,6 +2886,7 @@ class Session:
         self.memory_context = "none"
         self.temporal_context = "none"
         self.fresh_topic = "none"
+        self.pending_turn_resume = "none"
         self._fresh_topics: list[dict] = []
         self._turn_temporal_context = ""
         self.proactive_turn = "none"
@@ -3014,7 +3152,7 @@ class Session:
         continuation = bool(
             reason == "turn_detected"
             and scope is not None
-            and not self._response_tts_admitted
+            and not self._response_audio_started
             and self._response_started_at > 0
             and time.perf_counter() - self._response_started_at
             <= CONTINUATION_WINDOW_SECONDS
@@ -3046,6 +3184,7 @@ class Session:
                     )
         self._response_generated = False
         self._response_tts_admitted = False
+        self._response_audio_started = False
         self._response_started_at = 0.0
         self.play_enabled = False
         self.playing = False
@@ -3089,6 +3228,14 @@ class Session:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
         self.bot_name = (msg.get("botName") or "元元").strip() or "元元"
         self._initial_history = sanitize_initial_history(msg.get("initialHistory"))
+        self._short_term_facts = {}
+        for message in self._initial_history:
+            if message.get("role") == "user":
+                self._short_term_facts = update_short_term_facts(
+                    self._short_term_facts,
+                    str(message.get("content") or ""),
+                )
+        self._pending_turn_resumed = False
         offered = msg.get("downlinkAudio")
         self.downlink_audio = (
             MANAGED_AUDIO_CAPABILITY
@@ -3141,6 +3288,14 @@ class Session:
             and FRESH_TOPIC_CAPABILITY in offered_fresh_topic
             else "none"
         )
+        offered_pending_turn_resume = msg.get("pendingTurnResume")
+        self.pending_turn_resume = (
+            PENDING_TURN_RESUME_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and isinstance(offered_pending_turn_resume, list)
+            and PENDING_TURN_RESUME_CAPABILITY in offered_pending_turn_resume
+            else "none"
+        )
         # Startup cache arrives in a second message after this acknowledgement;
         # old clients therefore never receive or retain it from `start`.
         self._fresh_topics = []
@@ -3164,6 +3319,7 @@ class Session:
                 "memoryContext": self.memory_context,
                 "temporalContext": self.temporal_context,
                 "freshTopic": self.fresh_topic,
+                "pendingTurnResume": self.pending_turn_resume,
                 "proactiveTurn": self.proactive_turn,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
@@ -3171,6 +3327,56 @@ class Session:
             }
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
+
+    async def on_resume_pending_turn(self) -> bool:
+        if (
+            self.pending_turn_resume != PENDING_TURN_RESUME_CAPABILITY
+            or self.closed
+            or self._pending_turn_resumed
+            or self._busy()
+        ):
+            return False
+        base_history, pending_text = merge_continuation_request(
+            self._initial_history, ""
+        )
+        if not pending_text:
+            return False
+        self._pending_turn_resumed = True
+        self._initial_history = base_history
+        scope = self._new_scope("response")
+        self.response_scope = scope
+        self._response_generated = False
+        self._response_tts_admitted = False
+        self._response_audio_started = False
+        self._response_started_at = time.perf_counter()
+        self.reply_task = asyncio.create_task(
+            self._resume_pending_turn_pipeline(pending_text, scope)
+        )
+        return True
+
+    async def _resume_pending_turn_pipeline(
+        self, pending_text: str, scope: GenerationCancelScope
+    ) -> None:
+        memory_context = await self._request_turn_memory(scope)
+        if not scope.active:
+            return
+        kwargs = {
+            "short_term_context": format_short_term_facts(self._short_term_facts),
+        }
+        if memory_context:
+            kwargs["memory_context"] = memory_context
+        if self._turn_temporal_context:
+            kwargs["temporal_context"] = self._turn_temporal_context
+        if self._turn_conversation_plan:
+            kwargs["conversation_plan"] = self._turn_conversation_plan
+        if self._turn_fresh_topics:
+            kwargs["fresh_topics"] = self._turn_fresh_topics
+        self._turn_conversation_plan = None
+        self._turn_fresh_topics = []
+        turn_policy = classify_realtime_conversation_turn(pending_text)
+        if turn_policy != "substantive":
+            kwargs["turn_policy"] = turn_policy
+        await self._reply_pipeline(pending_text, scope, **kwargs)
 
     async def on_proactive_turn(self, msg: dict) -> None:
         trigger_id = msg.get("triggerId")
@@ -3228,6 +3434,7 @@ class Session:
         self.response_scope = scope
         self._response_generated = False
         self._response_tts_admitted = False
+        self._response_audio_started = False
         self._response_started_at = time.perf_counter()
         self._proactive_response_generation = scope.generation
         self._proactive_response_trigger_id = trigger_id
@@ -3749,6 +3956,7 @@ class Session:
             self.response_scope = scope
             self._response_generated = False
             self._response_tts_admitted = False
+            self._response_audio_started = False
             self._response_started_at = time.perf_counter()
             reply_kwargs = {}
             if interruption_hint or continuation_hint:
@@ -3908,6 +4116,12 @@ class Session:
                 else self._audible_history.begin_turn(scope.generation, text)
             )
             history_snapshot = [*self._initial_history, *audible_snapshot]
+            request_text = PROACTIVE_PROMPTS.get(proactive_kind, text)
+            if continuation_hint and not proactive_kind:
+                history_snapshot, request_text = merge_continuation_request(
+                    history_snapshot,
+                    request_text,
+                )
             if memory_context:
                 history_snapshot.append({"role": "system", "content": memory_context})
             if temporal_context:
@@ -3949,7 +4163,6 @@ class Session:
             if fresh_topic_hint:
                 history_snapshot.append({"role": "system", "content": fresh_topic_hint})
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
-            request_text = PROACTIVE_PROMPTS.get(proactive_kind, text)
             start_llm_stream_producer(
                 self.system_role,
                 history_snapshot,
@@ -3958,6 +4171,7 @@ class Session:
                 events,
             )
             reply_parts: list[str] = []
+            spoken_reply_parts: list[str] = []
             reply_chars = 0
             llm_usage = {"prompt": 0, "completion": 0, "total": 0}
             llm_provider = "文字模型"
@@ -4129,6 +4343,7 @@ class Session:
                                         (scope.generation, segment_id)
                                     )
                                     return
+                                self._response_audio_started = True
                                 self.playing = True
                                 if not speaking_sent:
                                     self.play_enabled = not self.in_speech
@@ -4199,12 +4414,18 @@ class Session:
                             )
                         raise
                     finally:
+                        draining_close = None
                         try:
-                            close = getattr(stream, "aclose", None)
-                            if close is not None:
-                                await close()
+                            draining_close = await _close_async_stream_bounded(stream)
                         finally:
-                            _tts_stream_slots.release()
+                            if draining_close is None:
+                                _tts_stream_slots.release()
+                            else:
+                                def release_stream_slot(done) -> None:
+                                    _drain_background_future(done)
+                                    _tts_stream_slots.release()
+
+                                draining_close.add_done_callback(release_stream_slot)
                 audio = result["audio"]
                 billed = int(result["billed"] or 0)
                 provider = str(result["provider"] or "").strip()
@@ -4236,6 +4457,7 @@ class Session:
                         (scope.generation, segment_id)
                     )
                     return
+                self._response_audio_started = True
                 self.playing = True
                 if not speaking_sent:
                     self.play_enabled = not self.in_speech
@@ -4298,6 +4520,15 @@ class Session:
                 coalesce_max_chars=REALTIME_TTS_HARD_CHARS,
             )
 
+            async def enqueue_filtered_sentence(sentence: str) -> None:
+                filtered = filter_unsolicited_closing(text, sentence)
+                if not filtered or not scope.active:
+                    return
+                if filtered == CONTINUE_LISTENING_FALLBACK and spoken_reply_parts:
+                    return
+                spoken_reply_parts.append(filtered)
+                await enqueue_sentence(filtered)
+
             stream_done = False
             while scope.active and not stream_done:
                 try:
@@ -4330,7 +4561,7 @@ class Session:
                         return
                     self._response_generated = True
                     for sentence in sentences.feed(delta):
-                        await enqueue_sentence(sentence)
+                        await enqueue_filtered_sentence(sentence)
                 elif event_type == "error":
                     raise SafeRealtimeError(
                         str(event.get("message") or "文字模型请求失败")
@@ -4340,19 +4571,30 @@ class Session:
 
             if not scope.active:
                 return
-            reply = "".join(reply_parts).strip()
+            raw_reply = "".join(reply_parts).strip()
             log(
                 f"LLM {time.perf_counter()-t1:.2f}s "
-                f"tok={llm_usage.get('total', 0)} chars={len(reply or '')}"
+                f"tok={llm_usage.get('total', 0)} chars={len(raw_reply or '')}"
             )
-            if not reply:
+            if not raw_reply:
                 return
 
+            filtered_reply = filter_unsolicited_closing(text, raw_reply)
+            if filtered_reply != raw_reply and not await self.send_json(
+                {"type": "assistant_replace", "text": filtered_reply},
+                scope=scope,
+            ):
+                return
             if not await self.send_json({"type": "assistant_end"}, scope=scope):
                 return
 
             for sentence in sentences.flush():
-                await enqueue_sentence(sentence)
+                await enqueue_filtered_sentence(sentence)
+
+            if not spoken_reply_parts:
+                await enqueue_filtered_sentence(filtered_reply)
+            if not spoken_reply_parts:
+                return
 
             await tts_pipeline.finish()
 
@@ -4386,7 +4628,14 @@ class Session:
                 )
                 log(f"回复失败: {type(e).__name__}")
                 await self.send_json(
-                    {"type": "error", "message": message, "recoverable": True},
+                    {
+                        "type": "error",
+                        "message": message,
+                        "recoverable": True,
+                        "restartRequired": isinstance(
+                            e, VoiceServiceRestartRequired
+                        ),
+                    },
                     scope=scope,
                 )
                 self._audible_history.cancel_turn(scope.generation)
@@ -4457,6 +4706,8 @@ async def _handler(ws):
                 session.on_memory_context(msg)
             elif typ == "fresh_topics":
                 session.on_fresh_topics(msg)
+            elif typ == "resume_pending_turn":
+                await session.on_resume_pending_turn()
             elif typ == "proactive_turn":
                 await session.on_proactive_turn(msg)
     except Exception as e:
