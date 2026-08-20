@@ -6,6 +6,7 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 
 SERVER_PATH = (
@@ -63,6 +64,16 @@ def _load_server():
 
 
 class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
+    def test_windows_uses_realtime_streaming_steps_without_changing_macos_quality(self):
+        server = _load_server()
+        server._reference = lambda: (Path("/fake/ref.wav"), "reference")
+
+        with patch.object(server.sys, "platform", "win32"):
+            self.assertEqual(server._kwargs("hello")["inference_timesteps"], 6)
+
+        with patch.object(server.sys, "platform", "darwin"):
+            self.assertEqual(server._kwargs("hello")["inference_timesteps"], 10)
+
     async def test_cancelled_pull_releases_provider_for_the_next_response(self):
         server = _load_server()
         first_pull_started = threading.Event()
