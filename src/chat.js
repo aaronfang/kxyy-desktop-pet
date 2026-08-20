@@ -58,9 +58,32 @@ import {
   fetchFreshTopics,
   inferFreshTopicLocations,
   inferFreshTopicWorkRoles,
+  needsFreshTopics,
   renderFreshTopicBlock,
   takeFreshTopicsForSession,
 } from "./ai/fresh-topics.js";
+import {
+  applyFreshAssociationFeedback,
+  createFreshAssociationSessionState,
+  isSeriousFreshAssociationQuery,
+  pairFreshAssociations,
+  recordFreshAssociationExposure,
+  renderFreshAssociationBlock,
+  updateFreshAssociationContext,
+} from "./ai/fresh-association.js";
+import {
+  isFreshExposureSuppressed,
+  loadFreshExposureLedger,
+  persistFreshExposureLedger,
+  recordFreshExposure,
+  recordFreshExposureFingerprint,
+} from "./ai/fresh-exposure.js";
+import {
+  createFreshIdleState,
+  markFreshIdleTriggered,
+  recordFreshIdleActivity,
+  shouldTriggerFreshIdle,
+} from "./ai/fresh-idle.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
@@ -295,6 +318,10 @@ let freshTopicWorkRoleKey = "";
 let freshTopicAmbientTurn = 0;
 // 文字聊天的时下信息只在本会话首次实际注入；避免下一轮把同一条线索重新播报。
 const textFreshTopicIds = new Set();
+let freshAssociationSessionState = createFreshAssociationSessionState();
+let freshExposureLedger = loadFreshExposureLedger();
+const freshIdleState = createFreshIdleState();
+let freshIdleTimer = null;
 let activeName = null;      // 当前生效昵称（记忆分档键；无有效昵称时为 null，不落盘）
 const memoryEnqueuedIds = new Set(); // 已可靠写入 Rust 待巩固队列的消息 id
 let memoryBatchSeq = 0;
@@ -315,9 +342,49 @@ function shouldSampleAmbientFreshTopics(query, proactiveKind = "") {
   if (mode === "relevant") return false;
   const text = String(query || "").trim();
   if (text.length < 4) return false;
+  if (/^(?:我最近|最近我|我这(?:几天|阵子|段时间)|这几天我)/u.test(text)) return false;
   freshTopicAmbientTurn += 1;
   const interval = mode === "active" ? 3 : 6;
   return freshTopicAmbientTurn % interval === 0;
+}
+
+function resetFreshIdleTimer() {
+  recordFreshIdleActivity(freshIdleState);
+  if (freshIdleTimer) clearTimeout(freshIdleTimer);
+  freshIdleTimer = setTimeout(() => {
+    freshIdleTimer = null;
+    void maybeTriggerFreshIdleShare();
+  }, freshIdleState.delayMs);
+}
+
+async function maybeTriggerFreshIdleShare() {
+  const eligible = shouldTriggerFreshIdle(freshIdleState, {
+    enabled: settings.webGroundingEnabled === true,
+    participation: settings.freshTopicParticipation || "relevant",
+    ambientUsed: freshAssociationSessionState.ambientUsed,
+    busy,
+    hasPendingMedia: Boolean(pendingImage || pendingSticker),
+    callActive,
+    inputFocused: document.activeElement === inputEl && Boolean(inputEl?.value?.trim()),
+    seriousContext: isSeriousFreshAssociationQuery(lastRealUserMessage()?.content || ""),
+    hidden: document.visibilityState !== "visible",
+    hasConversation: history.some((message) => message?.role === "user"),
+  });
+  if (!eligible || !markFreshIdleTriggered(freshIdleState)) return;
+  const replyId = genMsgId();
+  const streamBubble = addBubble("assistant", "", { mid: replyId });
+  const streamRow = streamBubble.closest(".row");
+  streamRow.classList.add("streaming");
+  setBusy(true);
+  petSignal("thinking");
+  try {
+    await streamAssistantReply(streamBubble, streamRow, { proactiveKind: "idle", replyId });
+  } catch (_) {
+    // 主动分享失败不应影响后续普通聊天。
+  } finally {
+    setBusy(false);
+    scrollBottom();
+  }
 }
 
 function renderRecalledMemory(items) {
@@ -1481,6 +1548,7 @@ async function buildRequestMessages(opts = {}) {
     detectShortTermConversationMood(lastRealUserMessage()?.content || ""),
   );
   let memoryPrompt = "";
+  let recalledMemoryItems = [];
   if (!opts.proactiveKind && activeName) {
     const last = lastRealUserMessage();
     try {
@@ -1493,6 +1561,7 @@ async function buildRequestMessages(opts = {}) {
           maxItems: 6,
         },
       });
+      recalledMemoryItems = recalled?.items || [];
       if (workspaceFeatureEnabled(settings)) {
         let graph = null;
         try {
@@ -1512,7 +1581,7 @@ async function buildRequestMessages(opts = {}) {
         const workspace = buildWorkspace({
           enabled: true,
           mode: settings.memoryWorkspaceMode || "conservative",
-          memoryItems: recalled?.items || [],
+          memoryItems: recalledMemoryItems,
           graph,
           query: last?.content || "",
           imageCaption: last?.imageCaption || "",
@@ -1521,7 +1590,7 @@ async function buildRequestMessages(opts = {}) {
         memoryPrompt = renderWorkspaceObservations(workspace.slots);
         if (chatDebugEnabled()) console.log("[workspace] diagnostics", summarizeWorkspaceDiagnostics(workspace));
       } else {
-        memoryPrompt = renderRecalledMemory(recalled?.items || []);
+        memoryPrompt = renderRecalledMemory(recalledMemoryItems);
       }
       if (chatDebugEnabled() && recalled) {
         console.log("[memory] recall", { count: recalled.items?.length || 0, elapsedMs: recalled.elapsedMs });
@@ -1534,7 +1603,25 @@ async function buildRequestMessages(opts = {}) {
   if (settings.webGroundingEnabled === true) {
     await syncFreshTopicLocations();
     const query = lastRealUserMessage()?.content || "";
-    const ambient = shouldSampleAmbientFreshTopics(query, opts.proactiveKind);
+    updateFreshAssociationContext(freshAssociationSessionState, query);
+    const feedback = applyFreshAssociationFeedback(freshAssociationSessionState, query);
+    if (feedback.rejected && freshAssociationSessionState.lastExposureFingerprint) {
+      recordFreshExposureFingerprint(freshExposureLedger, freshAssociationSessionState.lastExposureFingerprint, {
+        outcome: "rejected",
+      });
+      persistFreshExposureLedger(localStorage, freshExposureLedger);
+    }
+    const idleProactive = opts.proactiveKind === "idle";
+    const directFreshTopicRequest = needsFreshTopics(query, {
+      proactive: Boolean(opts.proactiveKind) && !idleProactive,
+      participation: "relevant",
+      ambient: false,
+    });
+    const ambient = !feedback.rejected
+      && !directFreshTopicRequest
+      && !freshAssociationSessionState.ambientUsed
+      && freshAssociationSessionState.ambientEligible
+      && (idleProactive || shouldSampleAmbientFreshTopics(query, opts.proactiveKind));
     const freshTopics = await fetchFreshTopics({
       enabled: true,
       query,
@@ -1544,10 +1631,54 @@ async function buildRequestMessages(opts = {}) {
       excludedSourceIds: [...textFreshTopicIds],
       invokeImpl: invoke,
     });
-    const unusedFreshTopics = takeFreshTopicsForSession(freshTopics, textFreshTopicIds);
-    webPrompt = renderFreshTopicBlock(unusedFreshTopics);
-    if (chatDebugEnabled() && unusedFreshTopics.length) {
-      console.log("[fresh-topics]", { count: unusedFreshTopics.length });
+    const freshAssociationEnabled = workspaceFeatureEnabled(settings)
+      && settings.webGroundingEnabled === true
+      && (!opts.proactiveKind || idleProactive);
+    if (freshAssociationEnabled) {
+      const [association] = pairFreshAssociations({
+        query,
+        freshTopics,
+        memoryItems: recalledMemoryItems,
+        topicPreferences: settings.topicPreferences || [],
+        offeredSourceIds: [...textFreshTopicIds],
+        sessionState: freshAssociationSessionState,
+        ambient,
+        exposureFingerprints: ambient ? freshExposureLedger.entries.map((entry) => entry.fingerprint) : [],
+      });
+      if (association) {
+        const consumed = takeFreshTopicsForSession([association.freshTopic], textFreshTopicIds);
+        if (consumed.length) {
+          webPrompt = renderFreshAssociationBlock(association);
+          recordFreshAssociationExposure(freshAssociationSessionState, association, { ambient });
+          recordFreshExposure(freshExposureLedger, association, { outcome: "shared" });
+          persistFreshExposureLedger(localStorage, freshExposureLedger);
+          if (chatDebugEnabled()) {
+            console.log("[fresh-association]", {
+              move: association.move,
+              reason: association.associationReason,
+              claimLevel: association.claimLevel,
+            });
+          }
+        }
+      }
+    } else if (!feedback.rejected) {
+      const allowedFreshTopics = freshTopics.filter(
+        (topic) => !freshAssociationSessionState.blockedCategories.includes(topic.category)
+          && (!ambient || !isFreshExposureSuppressed(freshExposureLedger, topic)),
+      );
+      const topicsForPrompt = ambient ? allowedFreshTopics.slice(0, 1) : allowedFreshTopics;
+      const unusedFreshTopics = takeFreshTopicsForSession(topicsForPrompt, textFreshTopicIds);
+      webPrompt = renderFreshTopicBlock(unusedFreshTopics);
+      if (unusedFreshTopics.length) {
+        recordFreshAssociationExposure(freshAssociationSessionState, unusedFreshTopics[0], { ambient });
+        if (ambient) {
+          recordFreshExposure(freshExposureLedger, unusedFreshTopics[0], { outcome: "shared" });
+          persistFreshExposureLedger(localStorage, freshExposureLedger);
+        }
+      }
+      if (chatDebugEnabled() && unusedFreshTopics.length) {
+        console.log("[fresh-topics]", { count: unusedFreshTopics.length });
+      }
     }
   }
   if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
@@ -1863,6 +1994,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
 
 async function send(text, opts = {}) {
   text = (text || "").trim();
+  resetFreshIdleTimer();
   currentTurnDoNotRemember = asksNotToRemember(text);
   const image = pendingImage;
   const sticker = opts.sticker || pendingSticker || null;
@@ -2014,6 +2146,8 @@ let callLastUserMessageId = "";
 let callAudibleTurns = new Map();
 let callProactiveMemoryIds = new Set();
 let callFreshTopicIds = new Set();
+let callFreshAssociationState = createFreshAssociationSessionState();
+let callPendingFreshExposure = null;
 let callWaveSpeaking = false;
 const MAX_CALL_AUDIBLE_TURNS = 4;
 const CALL_CLEANUP_WAIT_MS = 1500;
@@ -2598,7 +2732,7 @@ function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
   void maybeUpdateRecap();
 }
 
-async function provideTurnMemoryContext(session, generation, reason = "turn") {
+async function provideTurnMemoryContext(session, generation, reason = "turn", conversationMove = "none") {
   const temporalContext = computeTemporalContextData(new Date());
   if (!session || !activeName || !Number.isSafeInteger(generation)) {
     session?.sendMemoryContext?.({ generation, items: [], temporalContext });
@@ -2606,6 +2740,7 @@ async function provideTurnMemoryContext(session, generation, reason = "turn") {
   }
   const last = history.find((message) => message.id === callLastUserMessageId);
   const proactiveTopic = reason === "proactive-topic";
+  const lateralAssociation = conversationMove === "associate";
   if (
     !proactiveTopic &&
     (!last || last.role !== "user" || !last.call || !(last.content || "").trim())
@@ -2639,11 +2774,32 @@ async function provideTurnMemoryContext(session, generation, reason = "turn") {
   const fetchedTopics = await fetchFreshTopics({
     enabled: settings.webGroundingEnabled === true,
     query: proactiveTopic ? "" : (last?.content || ""),
-    proactive: proactiveTopic,
+    proactive: proactiveTopic || lateralAssociation,
     excludedSourceIds: [...callFreshTopicIds],
     invokeImpl: invoke,
   });
-  const freshTopics = takeFreshTopicsForSession(fetchedTopics, callFreshTopicIds);
+  let freshTopics = takeFreshTopicsForSession(fetchedTopics, callFreshTopicIds);
+  if ((proactiveTopic || lateralAssociation) && callFreshAssociationState.ambientEligible && !callFreshAssociationState.ambientUsed) {
+    const [association] = pairFreshAssociations({
+      query: lateralAssociation ? (last?.content || "") : "",
+      freshTopics,
+      memoryItems: recalledItems,
+      topicPreferences: settings.topicPreferences || [],
+      sessionState: callFreshAssociationState,
+      ambient: true,
+      exposureFingerprints: freshExposureLedger.entries.map((entry) => entry.fingerprint),
+    });
+    freshTopics = association ? [association.freshTopic] : [];
+    if (association) {
+      recordFreshAssociationExposure(callFreshAssociationState, association, { ambient: true });
+      callPendingFreshExposure = {
+        generation,
+        association,
+      };
+    }
+  } else if (proactiveTopic || lateralAssociation) {
+    freshTopics = [];
+  }
   session.sendMemoryContext({
     generation,
     items: selectRealtimeMemoryItems(recalledItems),
@@ -2670,6 +2826,8 @@ async function startCall() {
   callAudibleTurns = new Map();
   callProactiveMemoryIds = new Set();
   callFreshTopicIds = new Set();
+  callFreshAssociationState = createFreshAssociationSessionState();
+  callPendingFreshExposure = null;
   lastCallTraceSnapshot = null;
   if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "";
 
@@ -2714,8 +2872,8 @@ async function startCall() {
       finalizeCallUserBubble();
       setCallCapsuleStatus("通话中");
     },
-    onMemoryContextRequest: ({ generation, reason }) => {
-      void provideTurnMemoryContext(session, generation, reason);
+    onMemoryContextRequest: ({ generation, reason, conversationMove }) => {
+      void provideTurnMemoryContext(session, generation, reason, conversationMove);
     },
     onThinking: (phase) => {
       if (phase === "reasoning") {
@@ -2736,8 +2894,16 @@ async function startCall() {
     },
     onAssistantDiscarded: (meta) => discardCallAsstBubble(meta),
     onAudibleAssistant: (text, meta) => commitCallAudibleSegment(text, meta),
-    onAudibleResponseComplete: () => void enqueueMemory(),
+    onAudibleResponseComplete: ({ generation } = {}) => {
+      if (callPendingFreshExposure?.generation === generation) {
+        recordFreshExposure(freshExposureLedger, callPendingFreshExposure.association, { outcome: "shared" });
+        persistFreshExposureLedger(localStorage, freshExposureLedger);
+        callPendingFreshExposure = null;
+      }
+      void enqueueMemory();
+    },
     onSpeechCandidate: () => {
+      callPendingFreshExposure = null;
       callWaveEl?.classList.add("candidate");
       setCallCapsuleStatus("聆听中", false, true);
     },
@@ -2773,15 +2939,9 @@ async function startCall() {
 
   try {
     const systemRole = await buildRealtimeSystemRole();
-    const fetchedTopics = await fetchFreshTopics({
-      enabled: settings.webGroundingEnabled === true,
-      proactive: true,
-      excludedSourceIds: [...callFreshTopicIds],
-      invokeImpl: invoke,
-    });
-    // 启动话题只服务主动欢迎；是否真的被模型采用不可观测，不能提前消耗
-    // 后续用户显式查询的通话内冷却名额。
-    const freshTopics = fetchedTopics;
+    // Fresh share 只在播放完成后的 proactive topic turn 选择；启动欢迎不预注入，
+    // 避免一次不可观测的 welcome 消耗通话内唯一主动分享预算。
+    const freshTopics = [];
     // 记忆召回期间用户可能已经点了挂断；不要让迟到的 start 重新打开已关闭的会话。
     if (!callActive || callSession !== session) return;
     await session.start({
@@ -2800,6 +2960,7 @@ async function endCall({ notice = true } = {}) {
   if (!callActive && !callSession) return;
   const s = callSession;
   callSession = null;
+  callPendingFreshExposure = null;
   finalizeCallUserBubble();
   finalizeCallAsstBubble();
   callAudibleReceiptsActive = false;
@@ -2894,6 +3055,7 @@ formEl.addEventListener("submit", (e) => {
   inputEl.value = "";
   send(text);
 });
+inputEl.addEventListener("input", () => resetFreshIdleTimer());
 
 attachBtn.addEventListener("click", () => fileEl.click());
 attachRemoveBtn.addEventListener("click", clearPendingImage);
@@ -3057,6 +3219,7 @@ function resetConversation() {
   memoryBatchSeq = 0;
   textFreshTopicIds.clear();
   freshTopicAmbientTurn = 0;
+  freshAssociationSessionState = createFreshAssociationSessionState();
   sessionId = newMemorySessionId();
   resetRecap();
   clearPendingSticker();
@@ -3283,7 +3446,10 @@ listen("flush-memory-before-quit", async () => {
   }
 });
 
-loadConfig().then(() => inputEl.focus());
+loadConfig().then(() => {
+  inputEl.focus();
+  resetFreshIdleTimer();
+});
 
 // 聊天窗口 show/hide 时 DOM 不重载。
 // 注意：不要每次显示都重置启动状态栏——首次 loadConfig 已探测完毕，
@@ -3291,6 +3457,7 @@ loadConfig().then(() => inputEl.focus());
 let _startupCheckEverDone = false;
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
+  resetFreshIdleTimer();
   // 仅在首次可见时做一次探测，后续 hide/show 不再重查。
   if (_startupCheckEverDone) return;
   _startupCheckEverDone = true;

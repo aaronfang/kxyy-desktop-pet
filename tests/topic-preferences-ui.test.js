@@ -23,6 +23,7 @@ test("settings exposes editable base and custom topic preferences", () => {
   assert.match(settingsJs, /open_external_url/);
   assert.match(settingsJs, /event\.preventDefault\(\)/);
   assert.match(settingsJs, /topicPreferences: collectTopicPreferences\(\)/);
+  assert.match(settingsHtml, /中立 10 条、感兴趣 15 条、不主动聊 0 条/);
 });
 
 test("saving settings does not wait for a forced fresh-topic refresh", () => {
@@ -43,6 +44,6 @@ test("realtime experimental role consumes structured preferences without adding 
 test("text chat keeps a session cooldown for fresh topic sources", () => {
   assert.match(chatJs, /const textFreshTopicIds = new Set\(\)/);
   assert.match(chatJs, /excludedSourceIds: \[\.\.\.textFreshTopicIds\]/);
-  assert.match(chatJs, /takeFreshTopicsForSession\(freshTopics, textFreshTopicIds\)/);
+  assert.match(chatJs, /takeFreshTopicsForSession\(topicsForPrompt, textFreshTopicIds\)/);
   assert.match(chatJs, /textFreshTopicIds\.clear\(\)/);
 });

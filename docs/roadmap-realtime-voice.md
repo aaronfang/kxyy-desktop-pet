@@ -137,6 +137,8 @@ ASR 输入已从“每轮创建临时 WAV → 写盘 → Whisper 再读盘 → �
 
 本地级联管线新增单调 generation 的显式 `GenerationCancelScope`，并把候选 ASR 与当前回复拆成两个取消域。新候选只取消旧 ASR，不会提前停止正在播放的回复；只有 ASR 校验有效后才以同一 scope 从 `asr` 提升为 `response`，取消旧回复并进入 LLM、TTS 和 PCM 发送。ASR、LLM、TTS 每个阻塞阶段返回后，以及每个 80ms PCM chunk 发送前都会检查 scope；取消后的迟到结果不得写入 history、控制事件或后续音频队列。旧任务的清理使用 scope 身份判断，不能清空新 generation 的播放状态。
 
+2026-08-20 补齐了 final ASR 后的回复交接边界：`cancel_reply()` 对旧 reply task 只做最多 100ms 的有界等待；若 provider 清理吞掉取消，旧 scope 已先失效，任务留在既有全局准入内后台收尾，新 ASR 继续请求逐轮 Memory 与 LLM。前端仅累计固定 `replyCancelTimeouts` 计数。短社交附和只允许“嗯/嗯呐/嗯哪/嗯嗯/对/对啊/是啊/哦/好/行”等封闭集合绕过双汉字和 filler 拒绝，仍必须通过 no-speech、RMS、长度、幻觉与重复护栏。
+
 本地控制事件会携带 `generation`，前端保存已见的最大后端 generation，并在 dispatch 前拒绝更旧的 assistant、speaking、usage、ASR 或 error 事件。队列仍保持既有上限：前端未启动时 PCM 暂存最多 64 个 chunk、播放 Worklet 暂停容量最多 3 秒、trace 最多 256 条、对话 history 最多固定消息数；本版本没有新增无界队列。确定性测试使用受控 Future 回放取消后才返回的 ASR/LLM/TTS，并覆盖旧任务清理与 PCM `send()` 竞态，不依赖账户、麦克风或模型。
 
 已实现边界不能扩大解释：`run_in_executor` 中已经开始的 Python 阻塞线程无法被强制终止，只是其返回值会在 active checkpoint 被丢弃；一次已经进入 WebSocket `send()` 的本地/CosyVoice chunk 仍可能成为至多一个在途尾包，但 0.2.19 的 managed header 会让前端按 generation 拒绝其进入当前句段。未协商的 raw fallback 仍由 scoped sender、generation 控制事件和 confirmed audio gate 联合阻断后续旧音频。火山端到端路径未增加或修改任何协议常量，也尚未获得同样的后端 generation。0.2.20 只增加固定、一次性的句中打断提示；句中音素/字级位置和部分文本恢复仍未实现。
@@ -303,7 +305,9 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **真实 smoke / 非准确率结论**：当前 Apple Silicon + CPython 3.14 实测加载约 0.386s、官方中文样例 decode 约 0.088s，得到“开放时间早上9点至下午5点。”；从零安装并 smoke 约 39.5s。这里只证明锁定产物可安装、可加载、可推理，不证明真实房间、回声、方言或重复幻觉场景优于 Whisper，也不是端到端延迟承诺。
 
-**设计占位 / 待实验**：SenseVoice 仍没有 partial、伪流式、VAD/endpoint 或打断决策权；识别出的 language/emotion/event 目前只经过固定 allowlist 清洗，尚未注入 LLM、history、诊断或 `UserAffect`。下一步用逐素材具备权利与声音同意证据的固定录音集，对普通中文、“乖/乱”幻觉、合法短重复、AI 外放回声和粤语做 Whisper/SenseVoice 人工 A/B，再决定是否扩大默认范围。没有该证据前 Whisper 保持默认。
+**已实现——保守的 `UserAffect` 首版（当前工作区）**：SenseVoice final ASR 通过文本护栏后，固定 allowlist 的 emotion 与 `laughter|cry` 事件会进入 session-local `UserAffectTracker`。它只保留最近 3 个枚举信号，不保存文本、PCM、概率或时间戳；同类相邻信号，或 `happy+laughter` / `sad+cry` 才标为 `corroborated`，其余为 `tentative`。非中性情绪及笑/哭事件只向当前 LLM 请求快照追加一次固定 system hint，允许模型轻微调整措辞、节奏和共情程度，并明确要求文本语义优先、不得断言或镜像用户情绪。提示和情绪枚举不进入用户消息、`AudibleHistory`、recap、Memory、前端 ASR 协议或诊断；Whisper/unknown/neutral/cough 等保持无提示。
+
+**仍待实验**：SenseVoice 仍没有 partial、伪流式、VAD/endpoint 或打断决策权。下一步用逐素材具备权利与声音同意证据的固定录音集，对普通中文、情绪/SER 误报、“乖/乱”幻觉、合法短重复、AI 外放回声和粤语做 Whisper/SenseVoice 人工 A/B，再决定是否扩大默认范围或调整 `UserAffect` 策略。没有该证据前 Whisper 保持默认。
 
 ## 3. 外部工程对比
 
@@ -585,7 +589,7 @@ Qwen3-TTS Base 的官方能力表中 `Instruction Control` 为空，不能把 Cu
 
 SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语、韩语，以及情绪和音频事件标签。官方基准描述为同参数量下快于 Whisper-Small 5 倍以上、快于 Whisper-Large 15 倍以上；不能把研究范围中的 50+ 语种当成已发布 Small checkpoint 的能力。
 
-0.2.30 已把 sherpa-onnx 转换的 SenseVoiceSmall INT8 接为本地/CosyVoice 的可选句尾 final ASR，并保留启动期 Whisper 固定回退；这只是实验后端落地，不是默认替换或精度结论。当前 language/emotion/event 标签会被固定 allowlist 清洗，但尚未进入 LLM 或产品情绪闭环。
+0.2.30 已把 sherpa-onnx 转换的 SenseVoiceSmall INT8 接为本地/CosyVoice 的可选句尾 final ASR，并保留启动期 Whisper 固定回退；这只是实验后端落地，不是默认替换或精度结论。当前 emotion 与笑/哭事件在固定 allowlist 清洗后可形成 session-local、一次性的 `UserAffect` LLM 提示；它不改变用户文本，不持久化，也不参与 VAD、endpoint、打断或诊断。
 
 它适合：
 
@@ -642,7 +646,8 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 
 - 落地 `SpeechStyle` 和统一情绪映射。
 - **已实现（0.2.30 实验）**：SenseVoice final ASR 作为可选后端，显式安装且可回退；Whisper 保持默认。
-- **待实验/待实现**：完成许可录音 A/B 后再讨论默认替换；SER/AED 只完成适配器清洗，尚未接入 `UserAffect` 或任何线上决策。
+- **已实现（当前工作区，保守首版）**：SER/AED 固定标签接入有界、仅会话内的 `UserAffect`；只影响当前 LLM 请求的临时提示，不进入用户文本、history/recap/Memory/诊断，也不参与声学管线决策。
+- **待实验**：完成许可录音 A/B 后再讨论默认替换、标签策略或更强的情绪响应；当前不宣称 SER 准确率已经达标。
 - CosyVoice 逐句 instruction；Qwen Base 多参考 prompt 实验；CustomVoice 可选模式。
 - 将 assistant style 同步给桌宠动作和表情，但保持一个权威映射源。
 

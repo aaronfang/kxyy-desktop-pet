@@ -695,6 +695,13 @@ function sanitizeProactiveSummary(raw) {
     earlyPlaybackInterruptions: count("earlyPlaybackInterruptions"),
     proactiveTurns: count("proactiveTurns"),
     topicSwitches: count("topicSwitches"),
+    replyCancelTimeouts: count("replyCancelTimeouts"),
+    conversationMoves: fixedCounts(value.conversationMoves, [
+      "expand", "offerEntry", "deepen", "associate",
+    ]),
+    topicActivity: fixedCounts(value.topicActivity, [
+      "active", "neutral", "settling", "sensitive",
+    ]),
     triggerKinds: fixedCounts(value.triggerKinds, [
       "welcome", "followup", "idle", "memory", "commitment",
     ]),

@@ -2,6 +2,7 @@ export const CONVERSATION_MOVE = Object.freeze({
   EXPAND: "expand",
   OFFER_ENTRY: "offer-entry",
   DEEPEN: "deepen",
+  ASSOCIATE: "associate",
 });
 
 export const RESPONSE_CUE = Object.freeze({
@@ -19,6 +20,17 @@ const DEFAULT_DELAYS = Object.freeze({
 
 const LOW_INTEREST_POLICIES = new Set(["acknowledge"]);
 const POSITIVE_ENGAGEMENT_POLICIES = new Set(["amused", "curious", "agree"]);
+const LATERAL_ELIGIBLE_POLICIES = new Set([
+  "substantive",
+  "acknowledge",
+  "amused",
+  "curious",
+  "agree",
+]);
+const LATERAL_TURN_INTERVAL = 4;
+const MISSED_WINDOW_THRESHOLD = 3;
+const LATERAL_COOLDOWN_TURNS = 5;
+const TOPIC_ACTIVITY = new Set(["active", "neutral", "settling", "sensitive"]);
 const SOFT_INTENTS = new Set([
   "none",
   "invite-opinion",
@@ -209,6 +221,12 @@ class ConversationDirector {
     this.lastMove = "none";
     this.lastResponseCue = RESPONSE_CUE.NONE;
     this.depth = 0;
+    this.initiativeDebt = 0;
+    this.topicTurns = 0;
+    this.lateralMoves = 0;
+    this.lateralRecoveryTurns = 0;
+    this.lateralCooldownTurns = 0;
+    this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
     this._nextQuestionMove = CONVERSATION_MOVE.OFFER_ENTRY;
   }
 
@@ -223,6 +241,16 @@ class ConversationDirector {
         return [];
       case "user-turn-final":
         return this._onUserTurn(event);
+      case "proactive-window-missed":
+        if (
+          this.mode === "ai-leads" &&
+          this.lifecycle === "active" &&
+          !this.paused &&
+          event.reason === "asr"
+        ) {
+          this.initiativeDebt = Math.min(MISSED_WINDOW_THRESHOLD, this.initiativeDebt + 1);
+        }
+        return [];
       case "playback-completed":
         return this._afterPlayback(event.plan);
       case "silence-deadline":
@@ -235,7 +263,9 @@ class ConversationDirector {
           this.lowInterestTurns = 0;
           this.sameTopicContinuations = 0;
           this.depth = 0;
+          this.topicTurns = 0;
         }
+        this.initiativeDebt = 0;
         return [];
       case "hard-control":
         return this._onHardControl(event.control);
@@ -260,6 +290,12 @@ class ConversationDirector {
       lastMove: this.lastMove,
       lastResponseCue: this.lastResponseCue,
       depth: this.depth,
+      initiativeDebt: this.initiativeDebt,
+      topicTurns: this.topicTurns,
+      lateralMoves: this.lateralMoves,
+      lateralRecoveryTurns: this.lateralRecoveryTurns,
+      lateralCooldownTurns: this.lateralCooldownTurns,
+      topicActivity: { ...this.topicActivity },
     };
   }
 
@@ -267,6 +303,10 @@ class ConversationDirector {
     if (this.lifecycle !== "active") return [];
     const policy = typeof event.policy === "string" ? event.policy : "substantive";
     const softIntent = SOFT_INTENTS.has(event.softIntent) ? event.softIntent : "none";
+    const topicActivity = TOPIC_ACTIVITY.has(event.topicActivity)
+      ? event.topicActivity
+      : event.lateralAllowed === false ? "sensitive" : "neutral";
+    this.topicActivity[topicActivity] = Math.min(255, this.topicActivity[topicActivity] + 1);
     this.proactiveTurns = 0;
 
     if (LOW_INTEREST_POLICIES.has(policy)) {
@@ -280,7 +320,39 @@ class ConversationDirector {
     if (policy === "redirect") return this._onHardControl("redirect");
     if (policy === "resume") this._onHardControl("resume");
 
-    const plan = this._nextPlan(softIntent);
+    const lateralAllowed = event.lateralAllowed !== false;
+    if (!lateralAllowed) {
+      this.topicTurns = 0;
+      this.lateralRecoveryTurns = 2;
+    } else if (this.lateralRecoveryTurns > 0) {
+      this.lateralRecoveryTurns -= 1;
+    }
+    const lateralRecovered = lateralAllowed && this.lateralRecoveryTurns === 0;
+    const lateralEligible = lateralRecovered && LATERAL_ELIGIBLE_POLICIES.has(policy);
+    if (lateralEligible && this.lateralCooldownTurns > 0) {
+      this.lateralCooldownTurns -= 1;
+    }
+    if (lateralEligible) {
+      this.topicTurns = Math.min(LATERAL_TURN_INTERVAL, this.topicTurns + 1);
+    }
+    const shouldAssociate =
+      this.mode === "ai-leads" &&
+      lateralRecovered &&
+      softIntent === "none" &&
+      lateralEligible &&
+      topicActivity !== "active" &&
+      this.lateralCooldownTurns === 0 &&
+      (this.initiativeDebt >= MISSED_WINDOW_THRESHOLD || this.topicTurns >= LATERAL_TURN_INTERVAL);
+    const plan = shouldAssociate
+      ? this._plan(CONVERSATION_MOVE.ASSOCIATE, RESPONSE_CUE.LOW_BURDEN, "companion", Math.min(2, this.depth))
+      : this._nextPlan(softIntent);
+    if (shouldAssociate) {
+      this.initiativeDebt = 0;
+      this.topicTurns = 0;
+      this.lateralRecoveryTurns = 0;
+      this.lateralCooldownTurns = LATERAL_COOLDOWN_TURNS;
+      this.lateralMoves = Math.min(255, this.lateralMoves + 1);
+    }
     this._recordPlan(plan);
     if (policy === "substantive") this.depth = Math.min(5, this.depth + 1);
     return [{ type: "request-reply", kind: "response", plan }];
@@ -370,6 +442,10 @@ class ConversationDirector {
       this.lowInterestTurns = 0;
       this.sameTopicContinuations = 0;
       this.depth = 0;
+      this.initiativeDebt = 0;
+      this.topicTurns = 0;
+      this.lateralRecoveryTurns = 0;
+      this.lateralCooldownTurns = 0;
       return [{ type: "cancel-proactive" }, { type: "seal-topic" }];
     }
     this.paused = true;
@@ -385,6 +461,12 @@ class ConversationDirector {
     this.lastMove = "none";
     this.lastResponseCue = RESPONSE_CUE.NONE;
     this.depth = 0;
+    this.initiativeDebt = 0;
+    this.topicTurns = 0;
+    this.lateralMoves = 0;
+    this.lateralRecoveryTurns = 0;
+    this.lateralCooldownTurns = 0;
+    this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
   }
 }
 

@@ -231,6 +231,12 @@ Anthropic 的 J-Space 是模型神经激活中涌现的内部工作空间；普�
 
 **M4-B/C/D 已完成**：Workspace 已组合当前用户消息/图片线索、长期记忆、pending commitment、图扩散、同 predicate 冲突检查和安全候选；诊断只输出开关状态、候选/槽位/冲突数量、来源类型计数与耗时，不输出正文、昵称、卡片 ID 或 API key。`incubateWorkspaceHypothesis` 要求至少两个证据来源和一条反证/待验证条件，并设置短期过期时间；目前没有后台空闲调度，不会偷偷运行或写入记忆。Workspace 默认关闭，设置页新增明确实验开关和联想强度选择；Rust 50 项、JS 67 项与 Python 190 项测试通过。
 
+**M4-E1 / Fresh Association 文字首版已实现**：当用户同时开启时下信息与实验性 Workspace 时，普通文字回复会用纯本地规则把当前问题、当前 scope 的有界 Memory recall 与 Fresh Topic cache 联合排序，每轮最多选择一条短期 `fresh-association` observation。首版支持具体词相关性、显式话题偏好、Memory 回声、source-id 会话冷却、严肃情境 veto，以及 `seen-snippet` / `recent-release` / `ranked` 三档可说事实姿态；没有证据时不得宣称“很火”或第一手体验。候选不写 Memory、Graph、recap 或诊断正文，过期时间不晚于外部条目自身的 7 天硬过期点。联想模式下候选被 veto、疲劳过滤或判为不合格时不回退注入旧 Fresh Topic prompt；关闭 Workspace 时仍保留旧路径。
+
+**M4-E2/E3 / 会话反馈、semantic fatigue 与 ambient share 已实现**：文字会话新增固定上限 16 项的 source/semantic 曝光状态；优先使用 `《作品名》` 作为实体族键，不同来源重复报道同一作品也只会提一次。用户说“别聊这个”“不感兴趣”“换个话题”等固定拒绝表达时，当前回合停止 Fresh Topic 注入，并把上一次联想类别封锁到本会话结束。`occasional / active` 仍按 6/3 个合适回合取得资格，但每个文字会话实际 ambient 分享最多一次；用户明确询问近期电影、游戏等属于 direct request，不消耗该预算。状态只存在前端内存，清空对话或切换人设即重建，不进入 Memory、Graph、recap 或诊断正文。
+
+这仍不代表完整 Subconscious Replay：未带明确作品名的标题只做保守规范化，类别内排序仍是规则基线；后台 replay candidate 生成、跨会话更细事件族抽取和 Volcano 主动联想均未实现。文字 idle scheduler 已按一次/会话、90 秒静默和严格门控接入。E4 的独立 fingerprint 账本与 E5 的本地/CosyVoice 缓存命中路径已接入，但仍需真人重复率、拒绝恢复和设备听感验证。
+
 参考：
 
 - [Anthropic: A global workspace in language models](https://www.anthropic.com/research/global-workspace)
