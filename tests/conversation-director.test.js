@@ -136,6 +136,141 @@ test("soft intents change only the current reply plan", () => {
   assert.equal(normal.plan.stance, "companion");
 });
 
+test("three missed proactive windows become one in-response lateral association", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+
+  for (let index = 0; index < 3; index += 1) {
+    director.dispatch({ type: "proactive-window-missed", reason: "asr" });
+  }
+  const action = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "none",
+    lateralAllowed: true,
+  });
+  assert.deepEqual(action.plan, {
+    move: CONVERSATION_MOVE.ASSOCIATE,
+    responseCue: RESPONSE_CUE.LOW_BURDEN,
+    stance: "companion",
+    depth: 0,
+  });
+  assert.equal(director.snapshot().initiativeDebt, 0);
+  assert.equal(director.snapshot().lateralMoves, 1);
+});
+
+test("four eligible reactive turns create a lateral opening without waiting for silence", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  const moves = [];
+  for (let index = 0; index < 4; index += 1) {
+    moves.push(onlyAction(director, {
+      type: "user-turn-final",
+      policy: "substantive",
+      softIntent: "none",
+      lateralAllowed: true,
+    }).plan.move);
+  }
+  assert.equal(moves.slice(0, 3).includes(CONVERSATION_MOVE.ASSOCIATE), false);
+  assert.equal(moves[3], CONVERSATION_MOVE.ASSOCIATE);
+});
+
+test("an active topic defers lateral pressure until a settling turn", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+
+  for (let index = 0; index < 5; index += 1) {
+    const [action] = director.dispatch({
+      type: "user-turn-final",
+      policy: "substantive",
+      softIntent: "none",
+      lateralAllowed: true,
+      topicActivity: "active",
+    });
+    assert.notEqual(action.plan.move, CONVERSATION_MOVE.ASSOCIATE);
+  }
+
+  const [settling] = director.dispatch({
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    lateralAllowed: true,
+    topicActivity: "settling",
+  });
+  assert.equal(settling.plan.move, CONVERSATION_MOVE.ASSOCIATE);
+  assert.equal(director.snapshot().topicActivity.active, 5);
+  assert.equal(director.snapshot().topicActivity.settling, 1);
+});
+
+test("sensitive turns and explicit intents keep the current topic despite initiative debt", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  for (let index = 0; index < 3; index += 1) {
+    director.dispatch({ type: "proactive-window-missed", reason: "asr" });
+  }
+  const sensitive = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "none",
+    lateralAllowed: false,
+  });
+  assert.notEqual(sensitive.plan.move, CONVERSATION_MOVE.ASSOCIATE);
+  const advice = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "invite-advice",
+    lateralAllowed: true,
+  });
+  assert.notEqual(advice.plan.move, CONVERSATION_MOVE.ASSOCIATE);
+  assert.equal(director.snapshot().initiativeDebt, 3);
+});
+
+test("a sensitive turn requires two calm turns before lateral initiative resumes", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  for (let index = 0; index < 3; index += 1) {
+    director.dispatch({ type: "proactive-window-missed", reason: "asr" });
+  }
+  director.dispatch({
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "none",
+    lateralAllowed: false,
+  });
+  const firstCalm = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "none",
+    lateralAllowed: true,
+  });
+  assert.notEqual(firstCalm.plan.move, CONVERSATION_MOVE.ASSOCIATE);
+  const secondCalm = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    lateralAllowed: true,
+  });
+  assert.equal(secondCalm.plan.move, CONVERSATION_MOVE.ASSOCIATE);
+});
+
+test("a rapid nineteen-turn chat gets bounded lateral moves instead of nineteen followups", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  let lateralMoves = 0;
+  for (let index = 0; index < 19; index += 1) {
+    director.dispatch({ type: "proactive-window-missed", reason: "asr" });
+    const action = onlyAction(director, {
+      type: "user-turn-final",
+      policy: "substantive",
+      softIntent: "none",
+      lateralAllowed: true,
+    });
+    if (action.plan.move === CONVERSATION_MOVE.ASSOCIATE) lateralMoves += 1;
+  }
+  assert.ok(lateralMoves >= 3, `expected several natural openings, got ${lateralMoves}`);
+  assert.ok(lateralMoves <= 5, `lateral moves must remain bounded, got ${lateralMoves}`);
+});
+
 test("hard controls and hangup cancel leading without retaining text", () => {
   const director = createConversationDirector({ mode: "ai-leads" });
   director.dispatch({ type: "session-started" });
@@ -161,6 +296,12 @@ test("hard controls and hangup cancel leading without retaining text", () => {
     lastMove: "none",
     lastResponseCue: "none",
     depth: 0,
+    initiativeDebt: 0,
+    topicTurns: 0,
+    lateralMoves: 0,
+    lateralRecoveryTurns: 0,
+    lateralCooldownTurns: 0,
+    topicActivity: { active: 0, neutral: 0, settling: 0, sensitive: 0 },
   });
   assert.equal(JSON.stringify(director.snapshot()).includes("substantive"), false);
 });

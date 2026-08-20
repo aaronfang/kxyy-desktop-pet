@@ -120,7 +120,7 @@ graph TD
 
 | 现状 | 具体缺口（代码证据） | 影响 |
 |---|---|---|
-| AI 主动带聊已接通本地/CosyVoice | `balanced` 与 `ai-leads` 已通过显式能力协商启用 welcome、同话题续说、一次换题、短回应分类、暂停/恢复和退让节奏；新增动作轮换、渐进深度、思考 UI、有界重要话题账本与低频回溯；计时以最终可听播放回执为准，状态、回溯正文与 Memory id 均只在当前通话存在。 | 代码与 JS/Python/Rust 确定性测试完成；真实设备上的抢话率、等待舒适度、回溯自然度和火山 provider 能力仍待验证。 |
+| AI 主动带聊已接通本地/CosyVoice | `balanced` 与 `ai-leads` 已通过显式能力协商启用 welcome、同话题续说、一次换题、短回应分类、暂停/恢复和退让节奏；`ai-leads` 还会把连续被正常接话取消的主动窗口转成有界的响应内横向联想，不再要求流畅对话必须先沉默 14 秒。新增动作轮换、渐进深度、思考 UI、有界重要话题账本与低频回溯；计时以最终可听播放回执为准，状态、回溯正文与 Memory id 均只在当前通话存在。 | 代码与 JS/Python/Rust 确定性测试完成；真实设备上的横向联想自然度、抢话率、等待舒适度、回溯自然度和火山 provider 能力仍待验证。 |
 | 直播场景曾把对话框在工作现场 | `computeLiveContext()` 现只在普通轮次注入设备本地日期、星期、时间、时区和日常私聊提示；只有用户明确谈主播工作时才附加有界 lore，并明确“日程不能证明当前正在直播”。日常 few-shot 也会过滤直播语境。 | 代码层已从“直播状态机”迁移为“主播身份下的朋友式日常私聊”；真实模型是否仍偶发职业套话，需要持续体验回归。 |
 | 人格卡基础设施已完成，默认元元卡内容治理仍薄弱 | `persona_assets.rs` 支持编译期默认与运行时动态覆盖；设置页已接通 `list_all_cards`、`import_persona_card`、`set_persona_card`、导出和删除命令，并在保存后通知聊天窗口热更新。默认元元卡的权威源仍是 `persona-cards/kxyy-yuanyuan/persona-card.json`，而 `src/ai/persona.js` / `persona-assets.js` 又受上游同步约束。 | 多人设已可用；当前风险从“不能切换”转为“默认卡内容、生成资源和上游副本可能漂移”，所有元元卡改动必须校验卡片、重建加密资源并处理上游镜像。 |
 | Memory v3.1 已形成事件、证据、关系边、实时召回和管理闭环 | App `v0.2.43` 已发布 append-only event、evidence、scope、规范化实体/关系边、可重建派生索引、实时 session/turn recall、列表与关系图；Workspace 仍默认关闭。当前缺口是 M2 设备延迟记录、M5 外部接入和 M6 可选 embedding，而不是继续在 prompt 内堆记忆。 | 后续从发布后的 `main` 建立独立分支，严格按 [Memory Brain M0–M6](./roadmap-memory-brain.md#4-分阶段路线与硬门槛) 推进。 |
@@ -177,7 +177,7 @@ P1-D 的 connector 权限、认证、scope、审计与撤销原则复用 [Memory
 | 现状 | 具体缺口 | 影响 |
 |---|---|---|
 | 火山实时通话已有快速打断信号，本地通话确认仍偏晚 | 本地后端已用较高 RMS 门槛建立 candidate 并让前端立即 duck/暂停；soft-end 后的 fixed reopen 档位为快速约 1.05 秒、默认标准约 1.65 秒、长停顿约 2.25 秒，随后提交整段 Whisper。只有 ASR 验证通过才 confirmed 并清空旧回复，误触会 rejected/resume。0.2.24–0.2.28 已补 512-sample adapter、synthetic provenance、dedicated queue=1 worker、capability-gated 真实 Silero shadow、纯 frame deadline、aggregate evaluator 与可复制 shadow 聚合。 | 两阶段让声已有可跑测版本，但 confirmed 仍受句尾和整段 Whisper 限制；固定档位不会把 Silero 变成线上决策，live 接管、单调时钟 timeout、许可声学阈值与真实 p95 仍待实验。 |
-| **本地 ASR 默认 Whisper；0.2.30 已有可选 SenseVoice final ASR，但缺少用户情绪闭环** | SenseVoiceSmall 的已发布 checkpoint 支持普通话、粤语、英语、日语、韩语，并输出 SER/AED 标签；官方基准称同参数量下快于 Whisper-Small 5 倍以上、快于 Whisper-Large 15 倍以上。0.2.30 只落地显式安装、启动期固定回退的整句识别；它不是原生真流式，第三方伪流式方案会牺牲精度。 | 当前可做真实 Whisper/SenseVoice A/B；SER/AED 仍只在 adapter 内固定清洗，尚未进入 `UserAffect`。不应直接承担快速 VAD 或被描述成无损流式替代。 |
+| **本地 ASR 默认 Whisper；SenseVoice final ASR 已有保守用户情绪闭环** | SenseVoiceSmall 的已发布 checkpoint 支持普通话、粤语、英语、日语、韩语，并输出 SER/AED 标签。当前工作区将固定清洗后的非中性 emotion 与笑/哭事件转换为有界、仅会话内的 `UserAffect`，只给当前 LLM 请求一次低置信提示；不改用户文本，不写 history/recap/Memory/诊断，也不参与 VAD/endpoint/打断。它仍不是原生真流式。 | 已有确定性边界测试；仍需用有权利/同意证据的录音做 SER 误报和 Whisper/SenseVoice A/B。没有声学证据前 Whisper 保持默认，不能把该闭环描述成准确率已达标或无损流式替代。 |
 | 文字 TTS 已部分情绪化，实时链路仍缺统一编排 | 火山文字 TTS 已传 emotion；CosyVoice 已传自然语言 instruction 和 rate；Qwen3-TTS Base 保持复刻音色但官方不支持 instruction。火山端到端路径主要依赖人设和会话级说话风格。 | 需要统一的 provider-neutral `SpeechStyle`，再按后端能力映射；不能继续把所有后端概括成“没有情绪参数”。 |
 | 情绪→动作映射粗粒度 | `app.js::EMOTION_ACTION` 表把 ~15 个情绪词压缩进 6 个既有动作（dance/pet/spin/trip/sit/forcethink），例如"开心""得意""点赞""期待"全部映射为同一个 `dance`。 | 情绪表达的动作区分度低，观感上"AI 情绪很丰富，桌宠动作很单一"。 |
 | 表情包与桌宠动作是两条独立通道 | 聊天气泡里出现的 GIF 表情（`stickers.js`）与主窗口桌宠动作（`pet-engine.js`）分别由 `extractSticker()` 和 `mapEmotionToAction()` 各自解析同一个 `[表情:xx]` 情绪词，**逻辑重复但未真正联动**——桌宠动作只是"看起来像"在配合表情，实际是同源不同步的两次独立映射。 | 两个系统各自维护一份情绪词表，容易出现"聊天窗口发了个'尴尬'表情，桌宠却在跳舞"的不一致（因为两表映射规则不保证一致，`EMOTION_ACTION` 与 `stickers.json` 里的情绪词集合本身就没有强制对齐机制）。 |
@@ -258,7 +258,7 @@ P1-D 的 connector 权限、认证、scope、审计与撤销原则复用 [Memory
 | **两阶段自然打断** | 先将播放迁移到可暂停/恢复/清空的 AudioWorklet；疑似人声在 150–250ms 内降音，400–700ms 内经神经 VAD 确认后取消全管线，误触则恢复缓冲。 | 同时解决本地抢话和“为了防误触只能延迟数秒”的矛盾，是实时语音最高优先级。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) P1 | 大 |
 | **打断后的自然对话上下文** | 0.2.20 已在实际启用 Worklet 的本地/CosyVoice 上按 candidate 绑定精确 source sample 快照；同 candidate confirmed、当前登记句段已播放至少 1 秒时，只向下一次 LLM 请求注入固定临时提示。提示不进 history/recap/长期记忆/日志；legacy、旧端和火山无提示降级。仍不恢复字、音素或部分句文本。 | 避免模型把用户未听到的尾句视为已知，也避免机械化“你打断我”话术。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 4.6 | 中 |
 | **统一 `SpeechStyle` 与情绪后端映射** | 供应商无关地记录 emotion/intensity/pace/source/confidence；火山映射 emotion/角色风格，CosyVoice 映射 instruction/rate，Qwen Base 验证多情绪参考 prompt，CustomVoice 作为可选高表现力模式。 | 保持复刻音色优先，同时允许用户选择更强的情绪表现力。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 第 5 节 | 大 |
-| **SenseVoice final ASR + SER 实验** | 0.2.30 已实现显式安装、句尾识别、启动期固定 Whisper 回退和隐私安全诊断；用户情绪/音频事件仅完成固定标签清洗，尚未接入产品。与独立神经 VAD 配合；不宣称原生真流式，也不在许可录音 A/B 通过前替换 Whisper 默认。 | 以可回退方式先验证识别，再补用户语音情绪，降低直接迁移风险。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 2.24 / 5.4 | 中 |
+| **SenseVoice final ASR + SER 实验** | 已实现显式安装、句尾识别、启动期固定 Whisper 回退和隐私安全诊断；当前工作区又将固定情绪/笑哭事件接成仅当前 LLM 请求可见的 session-local `UserAffect`，带相邻信号佐证和变化提示。它不持久化、不改变声学决策，也不宣称原生真流式或准确率达标。 | 让 AI 可以保守参考用户语气变化，同时把误判限制在单轮响应；许可录音 A/B 通过前不替换 Whisper 默认。 | 详见 [实时语音专项路线图](./roadmap-realtime-voice.md) 2.24 / 5.4 | 中 |
 | **桌宠"待机闲聊气泡"** | 桌宠长时间无互动时，除了聊天窗口内的 idle 主动性（3.1），可让主窗口的桌宠本体偶尔冒出一个极简小气泡（不打开完整聊天窗口，走独立小 IPC/事件），降低"必须点开聊天才有存在感"的门槛。 | 提升桌宠作为"活物"的持续存在感，与聊天窗口的主动性形成互补而非重复。 | `src/app.js`(新气泡渲染)、`src-tauri/src/lib.rs`(可能需要新增极简 IPC) | 大 |
 
 ### 3.4 生态/可扩展性
@@ -602,6 +602,8 @@ P1-D 的 connector 权限、认证、scope、审计与撤销原则复用 [Memory
 | 2026-07-28 | Ackem 参考与 AI 主动带聊规划 | 增加 Ackem clean-room 借鉴审查；定义跟随/均衡/元元带聊三档产品语义，并把实时协议、状态机和后端能力边界路由到语音专项路线图 | 本文件、`docs/roadmap-realtime-voice.md`、`docs/roadmap-memory-brain.md` |
 | 2026-07-28 | 主动带聊首个实现切片 | 落地三档设置、`local-v1` 双向能力门和本地/CosyVoice 每通一次主动问候；candidate 立即让路，火山/旧端降级，完整同题续说与 TopicLeadState 继续按实时语音 4.7 推进 | `src/settings.*`、`src/ai/realtime.js`、`scripts/local-realtime/common.py`、确定性测试 |
 | 2026-07-29 | 主动带聊 A-D 与节奏优化 | 以最后实际播放回执调度 10s/4.5s/14s 节奏；镜像识别四类附和与暂停/换题/恢复；一次确认态负反馈退让 1.5 倍、两次停止；换题 Memory 与话题冷却有界；诊断升至 schema v8 且不含正文 | `src/ai/realtime.js`、`src/ai/realtime-trace.js`、`src-tauri/src/memory.rs`、`scripts/local-realtime/common.py`、JS/Python/Rust 确定性测试 |
+| 2026-08-20 | 连续通话横向联想 | 新增固定 `associate` 动作和有界 initiative debt：快速接话连续取消主动窗口时，下一条普通回复先接住用户再带出一个相邻方向；每次后冷却 5 个合资格回合，严肃/健康上下文后需两轮平静恢复。口语确认分类补充“听你的/没毛病/行啊行”，本地/CosyVoice associate 回合可低频复用 Fresh Topic 缓存。 | `src/ai/conversation-director.js`、`src/ai/realtime.js`、`scripts/local-realtime/common.py`、`src/chat.js`、确定性 JS/Python 测试 |
+| 2026-08-20 | 实时回复交接与自然转题 | 旧 reply task 取消最多等待 100ms；不可强杀的 provider 清理转为 inactive generation 后台收尾，不能再阻塞新 final ASR。短社交附和使用封闭允许列表并统一归类。横向联想增加 `active/neutral/settling/sensitive` 主题活跃度：活跃问题只积累压力，收束回合才释放相邻联想；诊断只导出有界动作、活跃度与取消超时计数，不含正文。 | `scripts/local-realtime/common.py`、`src/ai/realtime.js`、`src/ai/conversation-director.js`、`src/ai/realtime-trace.js`、确定性 JS/Python 测试 |
 | 2026-07-29 | 元元日常人设方向固化 | 记录 7,606 code point、25 组 few-shot 等实测基线；确定日常私聊默认、直播 lore 条件化、食物 motif 冷却、逐轮时间、受限外部观察、深聊与慢关系/快心情边界，并修正人格卡加载文档的过时结论 | 本文件 2.1.1、`persona-cards/README.md`、默认元元卡 README、仓库规则指针 |
 | 2026-07-12 | 构建脚本更新 | `encrypt-assets` 改为指向 `scripts/build-persona-enc.mjs`；新增 `distill` / `validate-card` / `update-persona` npm 脚本；`.gitignore` 新增 persona-distill 本地产物忽略规则 | `package.json`、`.gitignore` |
 | 2026-07-21 | 实时语音专项调研 | 新增实时语音与情绪语音专项路线图；修正 CosyVoice/火山 TTS 情绪能力、SenseVoice 已发布范围和本地打断时序结论；补充两阶段打断、流式管线、`SpeechStyle` 与验证指标 | `docs/roadmap-realtime-voice.md`、本文件 |

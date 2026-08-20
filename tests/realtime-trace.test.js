@@ -389,6 +389,19 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       earlyPlaybackInterruptions: 1,
       proactiveTurns: 3,
       topicSwitches: 1,
+      replyCancelTimeouts: 2,
+      conversationMoves: {
+        expand: 3,
+        offerEntry: 2,
+        deepen: 1,
+        associate: 1,
+      },
+      topicActivity: {
+        active: 5,
+        neutral: 3,
+        settling: 2,
+        sensitive: 1,
+      },
       triggerKinds: {
         welcome: 1,
         followup: 2,
@@ -455,6 +468,19 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     earlyPlaybackInterruptions: 1,
     proactiveTurns: 3,
     topicSwitches: 1,
+    replyCancelTimeouts: 2,
+    conversationMoves: {
+      expand: 3,
+      offerEntry: 2,
+      deepen: 1,
+      associate: 1,
+    },
+    topicActivity: {
+      active: 5,
+      neutral: 3,
+      settling: 2,
+      sensitive: 1,
+    },
     triggerKinds: {
       welcome: 1,
       followup: 2,
@@ -1479,6 +1505,8 @@ test("realtime proactive policy classifies explicit controls without model infer
   const {
     classifyRealtimeConversationTurn,
     classifyRealtimeSoftIntent,
+    classifyRealtimeTopicActivity,
+    isRealtimeLateralShiftSafe,
   } = await import("../src/ai/realtime.js");
   const cases = [
     ["安静一会儿", "pause"], ["先别说话", "pause"], ["暂停一下", "pause"],
@@ -1490,8 +1518,11 @@ test("realtime proactive policy classifies explicit controls without model infer
     ["跳过这个吧", "redirect"], ["不说这个了", "redirect"],
     ["你继续", "resume"], ["继续说吧", "resume"], ["接着讲", "resume"],
     ["你说吧", "resume"], ["可以继续了", "resume"],
-    ["嗯嗯", "acknowledge"], ["哦", "acknowledge"], ["好的", "acknowledge"],
+    ["嗯", "acknowledge"], ["嗯嗯", "acknowledge"],
+    ["嗯呐", "acknowledge"], ["嗯哪", "acknowledge"],
+    ["哦", "acknowledge"], ["好的", "acknowledge"],
     ["明白了", "acknowledge"], ["原来如此", "acknowledge"],
+    ["听你的听你的", "agree"], ["那没毛病", "agree"], ["行啊行", "agree"],
     ["哈哈哈", "amused"], ["嘿嘿", "amused"], ["笑死我了", "amused"],
     ["太逗了", "amused"], ["真好笑", "amused"],
     ["是吗", "curious"], ["真的啊", "curious"], ["然后呢？", "curious"],
@@ -1521,6 +1552,13 @@ test("realtime proactive policy classifies explicit controls without model infer
   for (const [text, expected] of softCases) {
     assert.equal(classifyRealtimeSoftIntent(text), expected, text);
   }
+  assert.equal(isRealtimeLateralShiftSafe("洗衣机刚切到烘干模式"), true);
+  assert.equal(isRealtimeLateralShiftSafe("半夜拉肚子疼醒了"), false);
+  assert.equal(isRealtimeLateralShiftSafe("生产数据库崩了，先帮我排查"), false);
+  assert.equal(classifyRealtimeTopicActivity("你说这个会不会更受欢迎？"), "active");
+  assert.equal(classifyRealtimeTopicActivity("就是这个道理", "agree"), "settling");
+  assert.equal(classifyRealtimeTopicActivity("我刚洗完衣服"), "neutral");
+  assert.equal(classifyRealtimeTopicActivity("我现在肚子疼", "substantive", false), "sensitive");
 });
 
 test("ai-leads schedules bounded plan-aware followups from audible playback", async () => {
@@ -1584,6 +1622,23 @@ test("ai-leads schedules bounded plan-aware followups from audible playback", as
   assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 2);
 });
 
+test("only confirmed speech converts a cancelled proactive window into initiative debt", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session._conversationDirector.dispatch({ type: "session-started" });
+  session._proactiveLeadTimer = setTimeout(() => {}, 1000);
+  session._beginSpeechCandidate({ candidateId: 1 });
+  session._rejectSpeech("voice_rejected");
+  assert.equal(session._conversationDirector.snapshot().initiativeDebt, 0);
+
+  session._proactiveLeadTimer = setTimeout(() => {}, 1000);
+  session._beginSpeechCandidate({ candidateId: 2 });
+  session._confirmSpeech({ candidateId: 2 });
+  assert.equal(session._conversationDirector.snapshot().initiativeDebt, 1);
+  session._cancelProactiveTimers();
+});
+
 test("balanced allows one proactive turn after user engagement", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
@@ -1637,6 +1692,10 @@ test("ai-leads sends a fixed conversation plan with negotiated turn context", as
     depth: 0,
   });
   assert.equal(JSON.stringify(sent.at(-1)).includes("我想听听"), false);
+  session._onMessage({
+    data: JSON.stringify({ type: "reply_cancel_timeout", cancelledGeneration: 6 }),
+  });
+  assert.equal(session.getTraceSnapshot().proactiveSummary.replyCancelTimeouts, 1);
 });
 
 test("thinking feedback is immediate and offers at most one delayed filler signal per turn", async () => {

@@ -617,6 +617,71 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertNotIn("完整请求内容", str(raised.exception))
 
 
+class UserAffectTests(unittest.TestCase):
+    def test_unknown_neutral_and_non_affective_events_do_not_create_a_hint(self):
+        tracker = common.UserAffectTracker()
+
+        self.assertIsNone(tracker.observe("unknown", "unknown"))
+        self.assertIsNone(tracker.observe("neutral", "speech"))
+        self.assertIsNone(tracker.observe("unknown", "cough"))
+
+    def test_affect_is_bounded_corroborated_and_reports_recent_change(self):
+        tracker = common.UserAffectTracker()
+
+        first = tracker.observe("sad", "speech")
+        second = tracker.observe("angry", "speech")
+        third = tracker.observe("angry", "speech")
+
+        self.assertEqual(first["certainty"], "tentative")
+        self.assertEqual(first["source"], "sensevoice-final")
+        self.assertEqual(second["previousEmotion"], "sad")
+        self.assertEqual(third["certainty"], "corroborated")
+        self.assertLessEqual(len(tracker._recent), common.USER_AFFECT_MAX_RECENT)
+        rendered = common.format_user_affect_hint(second)
+        self.assertIn("可能从低落或难过转为生气或不耐烦", rendered)
+        self.assertIn("不要断言用户处于某种情绪", rendered)
+
+    def test_matching_audio_event_corroborates_without_entering_user_text(self):
+        affect = common.UserAffectTracker().observe("happy", "laughter")
+
+        self.assertEqual(affect["certainty"], "corroborated")
+        hint = common.format_user_affect_hint(affect)
+        payload = common.build_llm_proxy_payload(
+            "角色设定",
+            [{"role": "system", "content": hint}],
+            "其实没什么",
+        )
+        self.assertIn("检测到笑声", payload["messages"][1]["content"])
+        self.assertEqual(payload["messages"][-1]["content"], "其实没什么")
+        self.assertNotIn("笑声", payload["messages"][-1]["content"])
+
+    def test_hint_rejects_unreviewed_or_malformed_values(self):
+        self.assertEqual(
+            common.format_user_affect_hint(
+                {
+                    "emotion": ["angry"],
+                    "event": "speech",
+                    "source": "sensevoice-final",
+                    "certainty": "tentative",
+                    "previousEmotion": "unknown",
+                }
+            ),
+            "",
+        )
+        self.assertEqual(
+            common.format_user_affect_hint(
+                {
+                    "emotion": "provider-custom",
+                    "event": "speech",
+                    "source": "sensevoice-final",
+                    "certainty": "tentative",
+                    "previousEmotion": "unknown",
+                }
+            ),
+            "",
+        )
+
+
 class StableSentenceBufferTests(unittest.TestCase):
     def test_reply_novelty_rejects_the_repeated_sims_recommendation(self):
         previous = (
@@ -1543,6 +1608,16 @@ class InMemoryAsrTests(unittest.TestCase):
         self.assertEqual(common.is_valid_asr(within_limit, 0.1, voiced), within_limit)
         self.assertIsNone(common.is_valid_asr(over_limit, 0.1, voiced))
 
+    def test_short_social_acknowledgements_survive_bounded_asr_filtering(self):
+        voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        for text in ("嗯", "嗯呐", "嗯哪", "嗯嗯", "对", "对啊", "是啊", "哦", "好", "行"):
+            with self.subTest(text=text):
+                self.assertEqual(common.is_valid_asr(text, 0.1, voiced), text)
+
+        for text in ("啊", "呃", "那个"):
+            with self.subTest(text=text):
+                self.assertIsNone(common.is_valid_asr(text, 0.1, voiced))
+
 
 class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
     def test_vad_shadow_summary_schema_bounds_and_privacy_are_fixed(self):
@@ -2453,8 +2528,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             ("跳过这个吧", "redirect"), ("不说这个了", "redirect"),
             ("你继续", "resume"), ("继续说吧", "resume"), ("接着讲", "resume"),
             ("你说吧", "resume"), ("可以继续了", "resume"),
-            ("嗯嗯", "acknowledge"), ("哦", "acknowledge"), ("好的", "acknowledge"),
+            ("嗯", "acknowledge"), ("嗯嗯", "acknowledge"),
+            ("嗯呐", "acknowledge"), ("嗯哪", "acknowledge"),
+            ("哦", "acknowledge"), ("好的", "acknowledge"),
             ("明白了", "acknowledge"), ("原来如此", "acknowledge"),
+            ("听你的听你的", "agree"), ("那没毛病", "agree"), ("行啊行", "agree"),
             ("哈哈哈", "amused"), ("嘿嘿", "amused"), ("笑死我了", "amused"),
             ("太逗了", "amused"), ("真好笑", "amused"),
             ("是吗", "curious"), ("真的啊", "curious"), ("然后呢？", "curious"),
@@ -2744,6 +2822,28 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             "depth": 1,
         }))
         self.assertNotIn("forbidden", rendered)
+
+    def test_associate_plan_is_fixed_and_asks_for_one_bounded_lateral_thread(self):
+        plan = {
+            "move": "associate",
+            "responseCue": "low-burden",
+            "stance": "companion",
+            "depth": 2,
+        }
+        rendered = common.format_conversation_plan_hint(plan)
+        self.assertIn("横向联想", rendered)
+        self.assertIn("只带出一个", rendered)
+        self.assertNotIn("突然硬切", rendered)
+
+    def test_default_companion_plan_contributes_without_parroting_or_closing(self):
+        rendered = common.format_conversation_plan_hint({
+            "move": "expand",
+            "responseCue": "none",
+            "stance": "companion",
+            "depth": 1,
+        })
+        self.assertIn("不要同义复述", rendered)
+        self.assertIn("不要替双方结束", rendered)
 
     async def test_proactive_topic_revisit_is_bounded_ephemeral_context(self):
         captured = []
@@ -3256,6 +3356,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
                 "proactiveTurn": [common.PROACTIVE_TURN_CAPABILITY],
                 "memoryContext": [common.TURN_MEMORY_CAPABILITY],
+                "freshTopic": [common.FRESH_TOPIC_CAPABILITY],
             }
         )
         await self.session.on_proactive_turn({"triggerId": 1, "kind": "idle"})
@@ -3266,11 +3367,26 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             {
                 "generation": request["generation"],
                 "items": [{"kind": "fact", "text": "用户最近在学吉他"}],
+                "freshTopics": [{
+                    "sourceName": "测试来源",
+                    "title": "新游《潮汐线》上线",
+                    "shortText": "一款刚上线的合作游戏。",
+                    "canonicalUrl": "https://example.com/topic",
+                    "fetchedAt": "2026-08-19T09:00:00Z",
+                    "publishedAt": "2026-08-19T08:00:00Z",
+                    "category": "games",
+                }],
             }
         )
         await self.session.reply_task
         self.assertEqual(captured[0][1], common.PROACTIVE_IDLE_PROMPT)
-        self.assertIn("用户最近在学吉他", captured[0][0][-1]["content"])
+        system_context = "\n".join(
+            item["content"]
+            for item in captured[0][0]
+            if item.get("role") == "system"
+        )
+        self.assertIn("用户最近在学吉他", system_context)
+        self.assertIn("顺手分享", system_context)
         self.assertNotIn("用户最近在学吉他", str(self.session.history))
 
     async def test_speech_candidate_pauses_sender_until_rejected(self):
@@ -3550,6 +3666,39 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("用户下周有面试", captured_histories[0][-1]["content"])
         self.assertNotIn("用户下周有面试", " ".join(message["content"] for message in self.session.history))
 
+    async def test_user_affect_is_an_ephemeral_observation_in_llm_history(self):
+        captured_histories = []
+
+        def capture_history(_role, history, _text, _scope, out):
+            captured_histories.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common._synth_tts = lambda _text: b"unused"
+        common.start_llm_stream_producer = capture_history
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        affect = self.session._user_affect.observe("sad", "cry")
+        await self.session._reply_pipeline(
+            "我没事",
+            scope,
+            user_affect=affect,
+        )
+
+        rendered = captured_histories[0][-1]["content"]
+        self.assertIn("语气可能偏低落或难过", rendered)
+        self.assertIn("检测到哭声", rendered)
+        self.assertNotIn(rendered, [message["content"] for message in self.session.history])
+        self.assertEqual(self.session.history, [{"role": "user", "content": "我没事"}])
+
+    async def test_user_affect_resets_when_a_new_call_starts(self):
+        self.session._user_affect.observe("sad", "speech")
+
+        await self.session.on_start({})
+        next_affect = self.session._user_affect.observe("angry", "speech")
+
+        self.assertEqual(next_affect["previousEmotion"], "unknown")
+        self.assertEqual(next_affect["certainty"], "tentative")
+
     async def test_valid_candidate_is_confirmed_before_asr_payload(self):
         original_transcribe = common.transcribe
         original_validate = common.is_valid_asr
@@ -3586,6 +3735,42 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("error", types)
         self.assertFalse(self.session.candidate_emitted)
+
+    async def test_sensevoice_affect_reaches_only_the_reply_kwargs(self):
+        original_transcribe = common.transcribe
+        original_validate = common.is_valid_asr
+        captured = {}
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "我真没事",
+            0.01,
+            language="zh",
+            emotion="sad",
+            event="cry",
+        )
+        common.is_valid_asr = lambda text, _nsp, _pcm: text
+
+        async def capture_reply(text, _scope, **kwargs):
+            captured["text"] = text
+            captured["kwargs"] = kwargs
+
+        self.session._reply_pipeline = capture_reply
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        try:
+            await self.session._asr_then_maybe_reply(b"\x01\x00" * 1000, scope)
+            await self.session.reply_task
+        finally:
+            common.transcribe = original_transcribe
+            common.is_valid_asr = original_validate
+
+        self.assertEqual(captured["text"], "我真没事")
+        self.assertEqual(captured["kwargs"]["user_affect"]["emotion"], "sad")
+        asr_message = last_json_of_type(self.ws, "asr")
+        self.assertEqual(asr_message["text"], "我真没事")
+        self.assertFalse(asr_message["interim"])
+        self.assertNotIn("emotion", asr_message)
+        self.assertNotIn("event", asr_message)
+        self.assertNotIn("userAffect", asr_message)
 
     async def test_invalid_candidate_is_rejected_without_user_text(self):
         original_transcribe = common.transcribe
@@ -3803,6 +3988,37 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(await self.session.cancel_reply("turn_detected"))
         self.assertEqual(len(self.ws.json_messages()), before)
+
+    async def test_cancel_reply_detaches_a_task_that_swallows_cancellation(self):
+        release = asyncio.Event()
+
+        async def stubborn_reply():
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        task = asyncio.create_task(stubborn_reply())
+        self.session.reply_task = task
+        original_grace = common.REPLY_CANCEL_GRACE_SECONDS
+        common.REPLY_CANCEL_GRACE_SECONDS = 0.01
+        try:
+            cancel_task = asyncio.create_task(self.session.cancel_reply("turn_detected"))
+            await asyncio.sleep(0.05)
+            self.assertTrue(cancel_task.done(), "new ASR handoff must not await a stuck old reply")
+            self.assertIsNone(cancel_task.exception())
+            self.assertFalse(task.done())
+            self.assertIn(
+                {"type": "reply_cancel_timeout", "cancelledGeneration": scope.generation},
+                self.ws.json_messages(),
+            )
+        finally:
+            common.REPLY_CANCEL_GRACE_SECONDS = original_grace
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_continuation_hint_is_one_request_only_and_not_history(self):
         captured = []

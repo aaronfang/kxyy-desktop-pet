@@ -10,6 +10,7 @@
 //       {type:"endpoint_soft_end|endpoint_reopened|endpoint_committed",silenceMs} /
 //       {type:"asr",text,interim} / {type:"asr_end"} /
 //       {type:"assistant",text} / {type:"assistant_end"} / {type:"tts_start|tts_end"} /
+//       {type:"reply_cancel_timeout",cancelledGeneration} /
 //       {type:"thinking_filler",runtimeGenerated:true,audio:base64} /
 //       {type:"audio_segment_start|audio_segment_end",segmentId,...} /
 //       session/asr_end.vadShadowSummary / {type:"vad_shadow_summary",final:true,summary} /
@@ -83,23 +84,26 @@ const VAD_SHADOW_FINAL_WAIT_MS = 50;
 const MAX_TOPIC_KEY_CHARS = 64;
 const MAX_TOPICS_USED = 8;
 const PROACTIVE_KINDS = new Set(["welcome", "followup", "idle", "revisit", "memory", "commitment"]);
-const CONVERSATION_MOVES = new Set(["expand", "offer-entry", "deepen"]);
+const CONVERSATION_MOVES = new Set(["expand", "offer-entry", "deepen", "associate"]);
 const CONVERSATION_RESPONSE_CUES = new Set(["none", "low-burden", "question"]);
 const CONVERSATION_STANCES = new Set(["companion", "opinion", "advice", "concrete", "light"]);
 
 const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完|先不跟你聊(?:了|啦)?(?:[，,、\s]+我先吃了?(?:啊|呀)?)?|不跟你聊(?:了|啦)?|先吃饭(?:了|啦)?|我先(?:去)?吃饭(?:了|啦)?|我先忙(?:一会儿|一下)?|回头再聊)$/;
 const REDIRECT_TURN_RE = /(?:换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个)/;
 const RESUME_TURN_RE = /^(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)$/;
-const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
+const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|嗯呐|嗯哪|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
 const AMUSED_TURN_RE = /^(?:哈{2,}|嘿{2,}|呵{2,}|笑死(?:我了)?|太逗了|有意思|真好笑)$/;
 const CURIOUS_TURN_RE = /^(?:是吗|真的(?:啊|吗)?|然后呢|后来呢|还有呢|怎么说|为什么(?:呀|啊)?)$/;
-const AGREE_TURN_RE = /^(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理)$/;
+const AGREE_TURN_RE = /^(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理|听你的(?:听你的)*|那?没毛病|行(?:啊|呀|吧)?行?)$/;
+const LATERAL_SHIFT_VETO_RE = /生产|数据库|报错|故障|崩溃|紧急|修复|排查|事故|报警|求救|自杀|想死|伤害自己|去世|住院|诊断|用药|发烧|拉肚子|腹泻|疼醒|肚子疼|头晕|晕晕乎乎|喘不上气|胸痛|转账|诈骗|律师|法律|欠债|焦虑|恐慌|害怕|委屈|失落|痛苦/i;
 const ENGAGEMENT_POLICIES = new Set(["acknowledge", "amused", "curious", "agree"]);
 const INVITE_ADVICE_RE = /你觉得我?(?:该|应该)?怎么办|我(?:该|应该)怎么办|换成你(?:会)?怎么做|你会怎么做|给我.{0,12}(?:建议|主意)/;
 const INVITE_OPINION_RE = /你(?:是)?怎么(?:看|想)(?:的)?|你有(?:什么|啥)看法|想听听你(?:是)?怎么(?:想|看)|换成你(?:会)?怎么(?:想|看待)/;
 const DEEPEN_RE = /深入(?:点|一点)?.{0,6}(?:聊|说|讲)|聊深(?:点|一点)|多(?:说|讲|聊)(?:点|一点|一些)|展开(?:说|讲|聊)|详细(?:说|讲|聊)/;
 const LIGHTEN_RE = /轻松(?:点|一点)|别(?:聊|说)得?这么沉重|聊点轻松的/;
 const CONCRETIZE_RE = /(?:说|讲)具体(?:点|一点)|举个例子|比如呢|说清楚(?:点|一点)?/;
+const SETTLING_TOPIC_RE = /就是这个道理|反正|总归|就这样|先这样|不说这个|先不说|准备(?:准备)?(?:去|开播|开始)|那就(?:这么|这样)|行了行了|大不了/;
+const ACTIVE_TOPIC_RE = /[?？]|为什么|怎么(?:办|样|说)|会不会|能不能|要不要|该不该|如果|万一|紧张|担心|拿不准|没底|不知道/;
 
 /** Fixed, local-only policy. It never asks a model to decide whether proactive speech is allowed. */
 export function classifyRealtimeConversationTurn(text) {
@@ -126,6 +130,21 @@ export function classifyRealtimeSoftIntent(text) {
   if (LIGHTEN_RE.test(value)) return "lighten";
   if (CONCRETIZE_RE.test(value)) return "concretize";
   return "none";
+}
+
+export function classifyRealtimeTopicActivity(text, policy = "substantive", lateralAllowed = true) {
+  const value = String(text || "").trim();
+  if (!lateralAllowed) return "sensitive";
+  if (["acknowledge", "agree"].includes(policy) || SETTLING_TOPIC_RE.test(value)) {
+    return "settling";
+  }
+  if (ACTIVE_TOPIC_RE.test(value)) return "active";
+  return "neutral";
+}
+
+export function isRealtimeLateralShiftSafe(text) {
+  const value = String(text || "").trim();
+  return Boolean(value) && !LATERAL_SHIFT_VETO_RE.test(value);
 }
 
 function sanitizeConversationPlan(value) {
@@ -439,6 +458,7 @@ export class RealtimeSession {
     this._proactiveWelcomeSent = false;
     this._proactiveGreetingTimer = 0;
     this._proactiveLeadTimer = 0;
+    this._missedProactiveWindowPending = false;
     this._proactivePending = new Map();
     this._activeProactiveTriggerId = null;
     this._activeProactiveGeneration = null;
@@ -479,6 +499,9 @@ export class RealtimeSession {
       earlyPlaybackInterruptions: 0,
       proactiveTurns: 0,
       topicSwitches: 0,
+      replyCancelTimeouts: 0,
+      conversationMoves: { expand: 0, offerEntry: 0, deepen: 0, associate: 0 },
+      topicActivity: { active: 0, neutral: 0, settling: 0, sensitive: 0 },
       triggerKinds: { welcome: 0, followup: 0, idle: 0, memory: 0, commitment: 0 },
       engagementCategories: {
         acknowledge: 0,
@@ -868,6 +891,7 @@ export class RealtimeSession {
     this._lastAudibleGeneration = null;
     this._lastDurableAudibleGeneration = null;
     this._activeProactiveGeneration = null;
+    this._missedProactiveWindowPending = false;
     this._conversationPlans.clear();
     this._proactiveConversationPlans.clear();
     this._pendingConversationPlanGeneration = null;
@@ -1070,15 +1094,45 @@ export class RealtimeSession {
           this._traceAsrFinalSeen = true;
           this._latestFinalAsr = msg.text || "";
           const policy = classifyRealtimeConversationTurn(this._latestFinalAsr);
+          const lateralAllowed = isRealtimeLateralShiftSafe(this._latestFinalAsr);
+          const topicActivity = classifyRealtimeTopicActivity(
+            this._latestFinalAsr,
+            policy,
+            lateralAllowed,
+          );
+          this._proactiveSummary.topicActivity ||= {
+            active: 0, neutral: 0, settling: 0, sensitive: 0,
+          };
+          this._proactiveSummary.topicActivity[topicActivity] = Math.min(
+            255,
+            this._proactiveSummary.topicActivity[topicActivity] + 1,
+          );
           this._applyUserTurnPolicy(policy);
           if (this._conversationDirector) {
             const actions = this._conversationDirector.dispatch({
               type: "user-turn-final",
               policy,
               softIntent: classifyRealtimeSoftIntent(this._latestFinalAsr),
+              lateralAllowed,
+              topicActivity,
             });
             const request = actions.find((action) => action.type === "request-reply");
             this._pendingConversationPlan = sanitizeConversationPlan(request?.plan);
+            this._proactiveSummary.conversationMoves ||= {
+              expand: 0, offerEntry: 0, deepen: 0, associate: 0,
+            };
+            const moveKey = {
+              expand: "expand",
+              "offer-entry": "offerEntry",
+              deepen: "deepen",
+              associate: "associate",
+            }[this._pendingConversationPlan?.move];
+            if (moveKey) {
+              this._proactiveSummary.conversationMoves[moveKey] = Math.min(
+                255,
+                this._proactiveSummary.conversationMoves[moveKey] + 1,
+              );
+            }
             this._pendingConversationPlanGeneration = this._backendGeneration;
           }
           if (policy === "substantive") this._observeImportantTopic(this._latestFinalAsr);
@@ -1115,9 +1169,11 @@ export class RealtimeSession {
           }
           this._memoryContextRequestedAt = performance.now();
           this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
+          const conversationMove = sanitizeConversationPlan(this._pendingConversationPlan)?.move || "none";
           this.cb.onMemoryContextRequest?.({
             generation: msg.generation,
             reason: msg.reason === "proactive-topic" ? "proactive-topic" : "turn",
+            ...(conversationMove === "associate" ? { conversationMove } : {}),
           });
         }
         break;
@@ -1175,6 +1231,13 @@ export class RealtimeSession {
         this.cb.onAssistantDiscarded?.({ generation: msg.generation });
         if (msg.generation === this._assistantDraftGeneration) {
           this._assistantDraftGeneration = null;
+        }
+        break;
+      case "reply_cancel_timeout":
+        if (usesManagedCascade(this.trace.provider)) {
+          const current = this._proactiveSummary.replyCancelTimeouts;
+          this._proactiveSummary.replyCancelTimeouts =
+            Number.isSafeInteger(current) && current >= 0 ? Math.min(255, current + 1) : 1;
         }
         break;
       case "proactive_turn_status":
@@ -1516,6 +1579,7 @@ export class RealtimeSession {
     this._resetInterruptionCandidate();
     if (this._proactiveGreetingTimer || this._proactiveLeadTimer) {
       this._noteProactiveVeto("speech");
+      if (this._proactiveLeadTimer) this._missedProactiveWindowPending = true;
     }
     this._pendingProactiveRhythmSignal = this._captureProactiveRhythmSignal();
     this._cancelProactiveTimers();
@@ -1737,7 +1801,12 @@ export class RealtimeSession {
   }
 
   _applyUserTurnPolicy(policy) {
-    if (this._proactiveLeadTimer) this._noteProactiveVeto("asr");
+    if (this._proactiveLeadTimer) {
+      this._noteProactiveVeto("asr");
+      if (!["pause", "redirect"].includes(policy)) {
+        this._conversationDirector?.dispatch({ type: "proactive-window-missed", reason: "asr" });
+      }
+    }
     this._cancelProactiveTimers();
     this._activeProactiveGeneration = null;
     this._activeProactiveFirstAudioAt = 0;
@@ -2266,6 +2335,11 @@ export class RealtimeSession {
 
   _confirmSpeech(msg = {}) {
     if (this._userTurnOpen) return false;
+    if (this._proactiveLeadTimer || this._missedProactiveWindowPending) {
+      this._conversationDirector?.dispatch({ type: "proactive-window-missed", reason: "asr" });
+    }
+    this._missedProactiveWindowPending = false;
+    this._cancelProactiveTimers();
     const interruptsResponse = this._candidateInterruptsResponse;
     const confirmedCandidateId = msg.candidateId;
     const candidateMatches =
@@ -2301,6 +2375,7 @@ export class RealtimeSession {
   _rejectSpeech(reason = "voice_rejected") {
     if (!this._speechCandidate) return false;
     this._speechCandidate = false;
+    this._missedProactiveWindowPending = false;
     this._pendingProactiveRhythmSignal = null;
     this._candidateInterruptsResponse = false;
     this._resetInterruptionCandidate();
@@ -2665,6 +2740,7 @@ export class RealtimeSession {
     this._endThinkingFeedback();
     this._cancelProactiveTimers();
     this._pendingProactiveRhythmSignal = null;
+    this._missedProactiveWindowPending = false;
     this._sessionTopicLedger?.stop();
     this._activeImportantTopicKey = "";
     this._proactiveTopicProposals.clear();
@@ -2758,6 +2834,8 @@ export class RealtimeSession {
         triggerKinds: { ...this._proactiveSummary.triggerKinds },
         engagementCategories: { ...this._proactiveSummary.engagementCategories },
         vetoReasons: { ...this._proactiveSummary.vetoReasons },
+        conversationMoves: { ...this._proactiveSummary.conversationMoves },
+        topicActivity: { ...this._proactiveSummary.topicActivity },
       },
     };
   }
