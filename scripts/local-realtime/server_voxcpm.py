@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sys
 import threading
 
 import common
@@ -19,6 +20,8 @@ PORT = 19878
 MODEL_DIR = common.REPO / "scripts" / "voxcpm-ab" / "work" / "models" / "VoxCPM2"
 OUTPUT_RATE = 48000
 FIXED_SEED = 424242
+WINDOWS_STREAMING_INFERENCE_STEPS = 6
+DEFAULT_INFERENCE_STEPS = 10
 _model = None
 _ref_wav = None
 _ref_text = ""
@@ -69,7 +72,13 @@ def _kwargs(text: str) -> dict:
     _ref_wav, _ref_text = _reference()
     return dict(text=_spoken(text), prompt_wav_path=str(_ref_wav),
                 prompt_text=_ref_text, reference_wav_path=str(_ref_wav),
-                cfg_value=2.0, inference_timesteps=10, seed=FIXED_SEED)
+                cfg_value=2.0,
+                inference_timesteps=(
+                    WINDOWS_STREAMING_INFERENCE_STEPS
+                    if sys.platform == "win32"
+                    else DEFAULT_INFERENCE_STEPS
+                ),
+                seed=FIXED_SEED)
 
 
 def _synth(text: str) -> bytes:

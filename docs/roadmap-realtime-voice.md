@@ -1,5 +1,11 @@
 # 实时语音与情绪语音优化路线图
 
+## Windows VoxCPM2 流式连续性（2026-08-20）
+
+Windows RTX 5080 / Torch 2.11.0+cu128 的真实流式基准显示，VoxCPM2 默认 10 个扩散步在短中文句上稳态 RTF 约为 1.32，持续慢于 1× 播放并导致 240ms Worklet reservoir 反复耗尽。对同一文本、参考音、固定 seed 的 10/8/6/4 步比较中，6 步 TTFA 约 169ms、RTF 约 0.94，能够继续使用 `provider-pcm-v1` 真流式下行；4 步虽更快但质量余量更小。因此 Windows 固定使用 6 步，macOS 继续使用原 10 步，不改 MPS 路径、播放缓冲、KXAU envelope、发送 pacing 或打断协议。
+
+该结论只覆盖当前 Windows 设备和已听测可接受的 6 步体验，不应泛化为 VoxCPM2 的跨设备质量结论。后续若调整步数，必须同时复测 TTFA、RTF、长句连续性、音色、咬字和取消清理；不得用整句生成后切块冒充流式，也不得为 Windows 性能回归改动 macOS 的 10 步基线。
+
 ## 0.2.51 实时通话恢复与对话连续性
 
 本地受管通话现在把 TTS 故障恢复视为传输恢复，而不是新对话。前端先在同一端点有界重连；只有 VoxCPM 明确报告 provider iterator 清理超时，或连续三次新 session 握手失败时，才调用 App 管理的最后手段进程恢复。Rust 在同一个生命周期锁内重新校验 backend、ASR provider、opaque fingerprint 与 desired epoch，设置变更永远优先于旧恢复任务。模型仍在加载时状态保持 `starting`，不会用短固定超时误判失败。
