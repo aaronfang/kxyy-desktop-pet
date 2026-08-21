@@ -89,6 +89,7 @@ import { RealtimeSession } from "./ai/realtime.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 import { localVoicePresetById } from "./ai/voice-presets.js";
+import { createSiriWaveModernRenderer } from "./siriwave-modern.js";
 import {
   buildTopicPreferencePrompt,
   inferTopicPreferenceCandidates,
@@ -420,8 +421,7 @@ const callCapsuleEl = document.getElementById("call-capsule");
 const callCapsuleWaveEl = document.getElementById("call-capsule-wave");
 const callCapsuleActionsEl = document.getElementById("call-capsule-actions");
 const capsuleWaveCanvas = document.getElementById("capsule-wave-canvas");
-const capsuleWaveCtx = capsuleWaveCanvas?.getContext("2d");
-const capsuleWaveEnvelope = new Float32Array(48);
+const capsuleWaveRenderer = createSiriWaveModernRenderer(capsuleWaveCanvas);
 const callCapsuleOpenBtn = document.getElementById("call-capsule-open");
 const callCapsuleHangupBtn = document.getElementById("call-capsule-hangup");
 let callCapsuleEdge = null;
@@ -2149,6 +2149,7 @@ let callFreshTopicIds = new Set();
 let callFreshAssociationState = createFreshAssociationSessionState();
 let callPendingFreshExposure = null;
 let callWaveSpeaking = false;
+let callWaveState = "idle";
 const MAX_CALL_AUDIBLE_TURNS = 4;
 const CALL_CLEANUP_WAIT_MS = 1500;
 let callAudibleReceiptsActive = false;
@@ -2224,10 +2225,9 @@ function callUsesAudibleReceipts() {
 }
 
 const callWaveEl = document.getElementById("call-wave");
-const callWaveBarsEl = callWaveEl?.querySelector(".call-wave-bars");
+const callWaveCanvas = document.getElementById("call-wave-canvas");
+const callWaveRenderer = createSiriWaveModernRenderer(callWaveCanvas);
 const callStatusEl = document.getElementById("call-status");
-const CALL_WAVE_BAR_COUNT = 28;
-let callWaveBars = [];
 let topicPreferenceInferenceBusy = false;
 
 async function inferAndPersistTopicPreferences(text) {
@@ -2332,171 +2332,28 @@ function buildRealtimeInitialHistory() {
   return messages;
 }
 
-function ensureCallWaveBars() {
-  if (!callWaveBarsEl || callWaveBars.length) return;
-  callWaveBarsEl.innerHTML = "";
-  callWaveBars = [];
-  for (let i = 0; i < CALL_WAVE_BAR_COUNT; i++) {
-    const bar = document.createElement("span");
-    // 中间高、两侧低的静态轮廓，安静时也有形状。
-    const base = 0.18 + 0.55 * Math.sin((Math.PI * i) / (CALL_WAVE_BAR_COUNT - 1));
-    bar.dataset.base = String(base);
-    bar.style.height = `${Math.round(base * 100)}%`;
-    callWaveBarsEl.appendChild(bar);
-    callWaveBars.push(bar);
-  }
-}
-
 function showCallWave(show) {
   if (!callWaveEl) return;
   if (show) {
-    ensureCallWaveBars();
     callWaveEl.hidden = false;
     callWaveEl.setAttribute("aria-hidden", "false");
   } else {
     callWaveEl.hidden = true;
     callWaveEl.setAttribute("aria-hidden", "true");
-    callWaveEl.classList.remove("speaking", "candidate", "thinking");
     if (callStatusEl) callStatusEl.textContent = "通话中";
     callWaveSpeaking = false;
-    for (const bar of callWaveBars) {
-      const base = Number(bar.dataset.base) || 0.2;
-      bar.style.height = `${Math.round(base * 100)}%`;
-    }
+    setCallWaveState("idle");
   }
 }
 
 function drawCapsuleWave(level = 0, waveform = null) {
-  if (!capsuleWaveCtx || !capsuleWaveCanvas) return;
-  const ctx = capsuleWaveCtx;
-  const width = capsuleWaveCanvas.width;
-  const height = capsuleWaveCanvas.height;
-  const center = height / 2;
-  const count = 56;
-  ctx.clearRect(0, 0, width, height);
-
-  const values = waveform instanceof Float32Array ? waveform : null;
-  const now = performance.now() / 1000;
-  for (let i = 0; i < capsuleWaveEnvelope.length; i++) {
-    const target = values ? Math.min(1, values[i] || 0) : 0;
-    const current = capsuleWaveEnvelope[i];
-    capsuleWaveEnvelope[i] = target > current
-      ? current * .48 + target * .52
-      : current * .84 + target * .16;
-  }
-  const smoothEnvelope = new Float32Array(capsuleWaveEnvelope);
-  for (let pass = 0; pass < 3; pass++) {
-    for (let i = 0; i < smoothEnvelope.length; i++) {
-      let sum = 0;
-      let count = 0;
-      for (let j = Math.max(0, i - 2); j <= Math.min(smoothEnvelope.length - 1, i + 2); j++) {
-        sum += smoothEnvelope[j];
-        count++;
-      }
-      capsuleWaveEnvelope[i] = sum / count;
-    }
-    smoothEnvelope.set(capsuleWaveEnvelope);
-  }
-  const sampleAt = (t) => {
-    const p = Math.max(0, Math.min(capsuleWaveEnvelope.length - 1, t * (capsuleWaveEnvelope.length - 1)));
-    const a = Math.floor(p);
-    const b = Math.min(capsuleWaveEnvelope.length - 1, a + 1);
-    return capsuleWaveEnvelope[a] * (1 - (p - a)) + capsuleWaveEnvelope[b] * (p - a);
-  };
-  const gaussian = (x, centerAt, spread) => {
-    const distance = (x - centerAt) / spread;
-    return Math.exp(-distance * distance * 2.2);
-  };
-  const layerSpecs = [
-    { color: "#29eda8", center: .33, width: .105, flowWidth: .19, gain: 19, phase: .2, speed: 1.05, alpha: .56 },
-    { color: "#23dfff", center: .45, width: .13, flowWidth: .21, gain: 25, phase: 1.55, speed: .94, alpha: .54 },
-    { color: "#317dff", center: .54, width: .115, flowWidth: .2, gain: 29, phase: 2.8, speed: 1.12, alpha: .52 },
-    { color: "#ed65e8", center: .62, width: .12, flowWidth: .19, gain: 24, phase: 4.15, speed: 1, alpha: .52 },
-    { color: "#ff9d62", center: .73, width: .105, flowWidth: .17, gain: 18, phase: 5.4, speed: 1.08, alpha: .5 },
-  ];
-
-  const makePath = (spec) => {
-    const top = [];
-    const bottom = [];
-    for (let i = 0; i < count; i++) {
-      const t = i / (count - 1);
-      const local = gaussian(t, spec.center, spec.width);
-      const flowArea = gaussian(t, spec.center, spec.flowWidth);
-      const envelope = Math.min(1, Math.max(sampleAt(t) * 1.3, level * .2, .055));
-      const flow = Math.sin(now * spec.speed + spec.phase + t * (6.2 + spec.center * 2.4));
-      const pulse = .68 + .32 * Math.sin(now * spec.speed * .7 + spec.phase * 1.3 + t * 7.4) ** 2;
-      const centerLine = center + flow * (1.4 + envelope * 8.5) * flowArea;
-      const thickness = .18 + spec.gain * envelope * local * pulse;
-      top.push([t * width, centerLine - thickness]);
-      bottom.push([t * width, centerLine + thickness]);
-    }
-    const path = new Path2D();
-    path.moveTo(0, center);
-    for (let i = 0; i < top.length - 1; i++) {
-      const [x, y] = top[i];
-      const [nx, ny] = top[i + 1];
-      path.quadraticCurveTo(x, y, (x + nx) / 2, (y + ny) / 2);
-    }
-    const [lastX, lastY] = top[top.length - 1];
-    path.quadraticCurveTo(lastX, lastY, width, center);
-    for (let i = bottom.length - 1; i >= 0; i--) {
-      const [x, y] = bottom[i];
-      if (i === bottom.length - 1) path.lineTo(x, y);
-      else {
-        const [px, py] = bottom[i + 1];
-        path.quadraticCurveTo(px, py, (x + px) / 2, (y + py) / 2);
-      }
-    }
-    path.closePath();
-    return path;
-  };
-
-  for (const spec of layerSpecs) {
-    const path = makePath(spec);
-    ctx.save();
-    ctx.globalCompositeOperation = "lighter";
-    ctx.globalAlpha = spec.alpha * .55;
-    ctx.filter = "blur(5px)";
-    ctx.fillStyle = spec.color;
-    ctx.fill(path);
-    ctx.restore();
-    ctx.save();
-    ctx.globalCompositeOperation = "lighter";
-    ctx.globalAlpha = spec.alpha;
-    ctx.fillStyle = spec.color;
-    ctx.fill(path);
-    ctx.restore();
-  }
-
-  const baseline = ctx.createLinearGradient(0, 0, width, 0);
-  baseline.addColorStop(0, "rgba(255,255,255,0)");
-  baseline.addColorStop(.12, "rgba(255,255,255,.7)");
-  baseline.addColorStop(.88, "rgba(255,255,255,.7)");
-  baseline.addColorStop(1, "rgba(255,255,255,0)");
-  ctx.strokeStyle = baseline;
-  ctx.lineWidth = .8;
-  ctx.beginPath();
-  ctx.moveTo(0, center);
-  ctx.lineTo(width, center);
-  ctx.stroke();
+  capsuleWaveRenderer.draw(level, waveform);
 }
 
 /** level ∈ [0,1]：麦克风与下行播放的合成电平。 */
 function updateCallWave(level, waveform) {
   drawCapsuleWave(level, waveform);
-  if (!callWaveBars.length || callWaveEl?.hidden) return;
-  const t = performance.now() / 1000;
-  const idle = 0.08 + 0.04 * Math.sin(t * 2.2);
-  const amp = Math.max(idle, Math.min(1, level));
-  for (let i = 0; i < callWaveBars.length; i++) {
-    const bar = callWaveBars[i];
-    const base = Number(bar.dataset.base) || 0.2;
-    // 相位错开，形成从中心向外扩散的律动。
-    const phase = t * 6 + i * 0.45;
-    const wobble = 0.55 + 0.45 * Math.sin(phase);
-    const h = Math.min(1, base * (0.35 + amp * 1.35 * wobble));
-    bar.style.height = `${Math.max(12, Math.round(h * 100))}%`;
-  }
+  if (!callWaveEl?.hidden) callWaveRenderer.draw(level, waveform);
 }
 
 function setCallActive(next) {
@@ -2520,7 +2377,10 @@ function setCallActive(next) {
   if (chatCollapseBtn) chatCollapseBtn.hidden = !next;
   if (callCapsuleEl && !next) callCapsuleEl.hidden = true;
   if (callCapsuleActionsEl) callCapsuleActionsEl.hidden = !next;
-  if (!next) capsuleWaveEnvelope.fill(0);
+  if (!next) {
+    capsuleWaveRenderer.reset();
+    callWaveRenderer.reset();
+  }
 }
 
 function clearCallCapsuleCollapseTimer() {
@@ -2564,11 +2424,23 @@ async function setChatCompact(compact) {
   }
 }
 
-function setCallCapsuleStatus(text, speaking = false, listening = false) {
+function setCallWaveState(state) {
+  callWaveState = state;
+  const now = performance.now();
+  callWaveRenderer.setState(state, now);
+  capsuleWaveRenderer.setState(state, now);
+}
+
+function setCallCapsuleStatus(text, speaking = false, listening = false, explicitState = null) {
   const label = String(text || "通话中");
   const thinking = /思考|组织语音/.test(label);
+  const state = explicitState
+    || (speaking ? "speaking" : null)
+    || (listening ? "listening" : null)
+    || (thinking ? "thinking" : null)
+    || (/失败|异常|错误/.test(label) ? "error" : "idle");
   if (callStatusEl) callStatusEl.textContent = label;
-  callWaveEl?.classList.toggle("thinking", thinking);
+  setCallWaveState(state);
   callCapsuleEl?.classList.toggle("speaking", speaking);
   callCapsuleEl?.classList.toggle("listening", listening);
   callCapsuleEl?.classList.toggle("thinking", thinking);
@@ -2604,7 +2476,7 @@ function finalizeCallAsstBubble() {
   callAsstText = "";
   callAsstGeneration = null;
   callWaveSpeaking = false;
-  callWaveEl?.classList.remove("speaking");
+  if (callWaveState === "speaking") setCallWaveState("idle");
   // 气泡展示 generatedText；对话/长期记忆只由实际播完的句段回执写入。
   if (text && !callUsesAudibleReceipts()) {
     history.push({ role: "assistant", content: text, id: mid, call: true });
@@ -2847,7 +2719,7 @@ async function startCall() {
         setCallCapsuleStatus("通话中");
         petSignal("reply");
       } else if (state === "recovering") {
-        setCallCapsuleStatus("语音恢复中…");
+        setCallCapsuleStatus("语音恢复中…", false, false, "thinking");
         petSignal("thinking");
       } else if (state === "ended") {
         endCall({ notice: true });
@@ -2857,7 +2729,6 @@ async function startCall() {
     onTransportReset: () => callAudibleTurns.clear(),
     onAsrStart: () => {
       // 新一轮用户说话：定稿上一轮用户气泡（若有），并打断助手。
-      callWaveEl?.classList.remove("candidate", "speaking");
       finalizeCallUserBubble();
       finalizeCallAsstBubble();
       petSignal("user");
@@ -2882,8 +2753,8 @@ async function startCall() {
       } else if (phase === "synthesizing") {
         setCallCapsuleStatus("组织语音…");
       } else {
-        callWaveEl?.classList.remove("thinking");
         callCapsuleEl?.classList.remove("thinking");
+        if (callWaveState === "thinking") setCallWaveState("idle");
       }
     },
     onThinkingFillerOffer: () => setCallCapsuleStatus("还在思考…"),
@@ -2904,16 +2775,13 @@ async function startCall() {
     },
     onSpeechCandidate: () => {
       callPendingFreshExposure = null;
-      callWaveEl?.classList.add("candidate");
-      setCallCapsuleStatus("聆听中", false, true);
+      setCallCapsuleStatus("聆听中", false, true, "candidate");
     },
     onSpeechRejected: () => {
-      callWaveEl?.classList.remove("candidate");
+      setCallCapsuleStatus(callWaveSpeaking ? "元元说话" : "通话中", callWaveSpeaking);
     },
     onSpeaking: () => {
-      callWaveEl?.classList.remove("candidate");
       callWaveSpeaking = true;
-      callWaveEl?.classList.add("speaking");
       petSignal("speaking");
       setCallCapsuleStatus("元元说话", true);
     },
@@ -2921,10 +2789,9 @@ async function startCall() {
     onLevel: (level, waveform) => updateCallWave(level, waveform),
     onResponseError: (e) => {
       callWaveSpeaking = false;
-      callWaveEl?.classList.remove("candidate", "speaking");
       petSignal("abort");
       appendPatNotice(`📞 本轮回复失败，可继续说话重试：${e.message || e}`);
-      setCallCapsuleStatus("可继续说话");
+      setCallCapsuleStatus("可继续说话", false, false, "error");
     },
     onError: (e) => {
       appendPatNotice(`📞 通话出错：${e.message || e}`);

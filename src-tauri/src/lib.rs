@@ -614,6 +614,9 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
 
     let backend = settings.realtime_backend.trim().to_ascii_lowercase();
     let mut hasher = DefaultHasher::new();
+    // Bump whenever bundled local realtime behavior changes in a way that
+    // requires a running Python child to reload its modules.
+    "local-realtime-policy-v3".hash(&mut hasher);
     backend.hash(&mut hasher);
     settings.vad_shadow_enabled.hash(&mut hasher);
     normalize_asr_provider(&settings.asr_provider).hash(&mut hasher);

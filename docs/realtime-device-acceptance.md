@@ -71,6 +71,7 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml --lib
 
 - LLM 首 token、TTS 请求、首个下行音频、实际首个可听样本的时间戳。
 - TTFA p50/p95、每轮等待主观评分（1 至 5）、音量和音质异常次数。
+- 对含至少两段稳定句的长回复，记录 schema v9 `segmentContinuity.audibleGapMs` 的 count/p50/p95，并与听感中的第二句停顿逐轮对照。
 - 元元主动续说等待是否从最终播放回执开始；三次未回应后保持安静。
 
 ### 4.2 AEC、插话与恢复
@@ -104,4 +105,4 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml --lib
 - AEC 造成持续自激、确认/拒绝打断状态错误、音频顺序或速度明显异常。
 - filler 超过一轮、正文 admission 后插入、用户开口后仍继续播放，或 filler 污染历史。
 
-交付物：一份每设备一页的计时/主观评分表、脱敏 `diagnosticSchemaVersion:8`（如开启调试）、缓存 provider 状态截图/固定事件、失败步骤和复现条件。当前仓库只完成自动化与实现，真实设备项目在人工执行前保持“待验收”。
+交付物：一份每设备一页的计时/主观评分表、脱敏 `diagnosticSchemaVersion:9`（如开启调试）、缓存 provider 状态截图/固定事件、失败步骤和复现条件。当前仓库只完成自动化与实现，真实设备项目在人工执行前保持“待验收”。

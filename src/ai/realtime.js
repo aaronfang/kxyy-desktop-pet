@@ -943,7 +943,9 @@ export class RealtimeSession {
       this.trace.recordOnce("playback_queued", TRACE_EVENT.PLAYBACK_QUEUED, {
         metrics: { audioBytes: pcm?.byteLength || 0 },
       });
-      this._notePlayLevel(pcm);
+      // Worklet reports RMS from samples at the actual speaker boundary. The
+      // legacy scheduler has no output callback, so it retains enqueue-time RMS.
+      if (!this.playbackNode) this._notePlayLevel(pcm);
       this._enqueuePcm(pcm, segment);
       return;
     }
@@ -1261,9 +1263,6 @@ export class RealtimeSession {
       case "tts_end":
         this._backendAudioPending = false;
         if (!this._hasPlayback()) this._schedulePlaybackCompletion();
-        if (this._lastAudibleGeneration !== null) {
-          this._maybeScheduleTopicLeadAfterPlayback(this._lastAudibleGeneration);
-        }
         break;
       case "audio_segment_start":
         this._beginAudioSegment(msg);
@@ -2187,6 +2186,10 @@ export class RealtimeSession {
     }
     this._audioSegments.set(key, segment);
     this._currentAudioSegment = segment;
+    this.trace.record(TRACE_EVENT.TTS_SEGMENT_STARTED, {
+      generationId: generation,
+      metrics: { segmentIndex: segmentId },
+    });
     this.playbackNode?.port.postMessage({ type: "segment_start", generation, segmentId });
     if (!this.playbackNode) {
       while (!this._legacySegments.has(key) && this._legacySegments.size >= MAX_AUDIO_SEGMENTS) {
@@ -2274,6 +2277,10 @@ export class RealtimeSession {
       segment.completed = true;
       return;
     }
+    this.trace.record(TRACE_EVENT.PLAYBACK_SEGMENT_COMPLETED, {
+      generationId: generation,
+      metrics: { segmentIndex: segmentId },
+    });
     this._audioSegments.delete(key);
     this._legacySegments.delete(key);
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -2290,7 +2297,6 @@ export class RealtimeSession {
     this._pendingUserTurn = false;
     this._noteAudibleTopic(segment.text);
     this._lastAudibleGeneration = generation;
-    this._maybeScheduleTopicLeadAfterPlayback(generation);
   }
 
   _commitDeferredAudioSegments() {
@@ -2468,6 +2474,19 @@ export class RealtimeSession {
       this._acceptCandidateSnapshot(message);
     } else if (message.type === "segment_completed") {
       this._handleSegmentCompleted(message);
+    } else if (message.type === "segment_started") {
+      const generation = message.generation;
+      const segmentId = message.segmentId;
+      if (
+        Number.isSafeInteger(generation) &&
+        Number.isSafeInteger(segmentId) &&
+        this._audioSegments.has(this._segmentKey(generation, segmentId))
+      ) {
+        this.trace.record(TRACE_EVENT.PLAYBACK_SEGMENT_STARTED, {
+          generationId: generation,
+          metrics: { segmentIndex: segmentId },
+        });
+      }
     } else if (message.type === "started") {
       this.trace.recordOnce("playback_started", TRACE_EVENT.PLAYBACK_STARTED, {
         metrics: { queuedMs: this._playbackQueuedMs },
@@ -2475,6 +2494,9 @@ export class RealtimeSession {
     } else if (message.type === "drained") {
       this._playbackQueuedMs = 0;
       this._schedulePlaybackCompletion();
+    } else if (message.type === "level") {
+      const rms = Number(message.rms);
+      this._playLevel = Number.isFinite(rms) ? Math.min(1, Math.max(0, rms)) : 0;
     }
     if (message.type === "stats") {
       const stats = {
@@ -2527,6 +2549,7 @@ export class RealtimeSession {
         this.cb.onAudibleResponseComplete?.({
           generation: this._lastAudibleGeneration,
         });
+        this._scheduleTopicLeadAfterPlayback(this._lastAudibleGeneration);
       }
     }, PLAYBACK_DRAIN_GRACE_MS);
   }

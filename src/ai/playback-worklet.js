@@ -43,6 +43,8 @@ class PcmPlayback extends AudioWorkletProcessor {
     this.droppedSamples = 0;
     this.playedSamples = 0;
     this.outputFramesSinceStats = 0;
+    this.outputFramesSinceLevel = 0;
+    this.outputLevelEnergy = 0;
     this.wasAudible = false;
     this.spans = [];
     this.segments = new Map();
@@ -318,6 +320,7 @@ class PcmPlayback extends AudioWorkletProcessor {
         underrunThisBlock = this.wasAudible;
       } else {
         output[i] = sample * gain;
+        this.outputLevelEnergy += output[i] * output[i];
         audibleThisBlock = audibleThisBlock || gain > 0;
       }
     }
@@ -330,6 +333,14 @@ class PcmPlayback extends AudioWorkletProcessor {
     if (this.size === 0 && audibleThisBlock) this.buffering = this.startupSamples > 0;
     this.wasAudible =
       audibleThisBlock || (this.size > 0 && this.state !== "paused" && !this.buffering);
+
+    this.outputFramesSinceLevel += output.length;
+    if (this.outputFramesSinceLevel >= sampleRate / 30) {
+      const rms = Math.sqrt(this.outputLevelEnergy / this.outputFramesSinceLevel);
+      this._post("level", { rms: Math.min(1, Math.max(0, rms)) });
+      this.outputFramesSinceLevel = 0;
+      this.outputLevelEnergy = 0;
+    }
 
     this.outputFramesSinceStats += output.length;
     if (this.outputFramesSinceStats >= sampleRate / 2) {

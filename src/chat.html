@@ -58,7 +58,9 @@
     </div>
     <div id="call-wave" hidden aria-hidden="true">
       <span id="call-status" aria-live="polite">通话中</span>
-      <div class="call-wave-bars"></div>
+      <div class="call-wave-siri" aria-label="实时声音波形">
+        <canvas id="call-wave-canvas"></canvas>
+      </div>
     </div>
     <div id="startup-status" aria-live="polite">
       <span class="svc-dot voice pending"></span><span class="svc-label">语音</span>

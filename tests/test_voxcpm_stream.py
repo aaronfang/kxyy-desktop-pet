@@ -4,6 +4,7 @@ import sys
 import threading
 import types
 import unittest
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -73,6 +74,87 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(server.sys, "platform", "darwin"):
             self.assertEqual(server._kwargs("hello")["inference_timesteps"], 10)
+
+    def test_prompt_cache_is_reused_until_the_reference_changes(self):
+        server = _load_server()
+        built = []
+
+        @dataclass
+        class Stat:
+            st_mtime_ns: int
+            st_size: int
+
+        class FakeTtsModel:
+            def build_prompt_cache(self, **kwargs):
+                built.append(kwargs)
+                return {"cache": len(built)}
+
+        class FakeModel:
+            tts_model = FakeTtsModel()
+
+        server._model = FakeModel()
+        server._ref_wav = Path("/fake/ref.wav")
+        server._ref_text = "reference"
+        server._prompt_cache = None
+        server._prompt_cache_key = None
+
+        with patch.object(server.Path, "stat", side_effect=[Stat(1, 10), Stat(1, 10), Stat(2, 10)]):
+            first = server._ensure_prompt_cache()
+            second = server._ensure_prompt_cache()
+            changed = server._ensure_prompt_cache()
+
+        self.assertIs(first, second)
+        self.assertIsNot(second, changed)
+        self.assertEqual(len(built), 2)
+        self.assertEqual(built[0]["prompt_wav_path"], "/fake/ref.wav")
+        self.assertEqual(built[0]["prompt_text"], "reference")
+        self.assertEqual(built[0]["reference_wav_path"], "/fake/ref.wav")
+
+    def test_stream_uses_cached_prompt_generation_api(self):
+        server = _load_server()
+        calls = []
+
+        class FakeTtsModel:
+            def generate_with_prompt_cache_streaming(self, **kwargs):
+                calls.append(kwargs)
+                yield (b"audio", None, None)
+
+        server._model = types.SimpleNamespace(tts_model=FakeTtsModel())
+        server._ensure_prompt_cache = lambda: {"cached": True}
+        generator = server._provider_stream("hello")
+
+        self.assertEqual(next(generator), b"audio")
+        with self.assertRaises(StopIteration):
+            next(generator)
+        self.assertEqual(calls[0]["target_text"], "hello")
+        self.assertEqual(calls[0]["prompt_cache"], {"cached": True})
+        self.assertEqual(calls[0]["inference_timesteps"], 10)
+
+    def test_stream_does_not_restart_after_cached_audio_was_emitted(self):
+        server = _load_server()
+        fallback_calls = 0
+
+        class FakeTtsModel:
+            def generate_with_prompt_cache_streaming(self, **_kwargs):
+                yield (b"first", None, None)
+                raise RuntimeError("provider failed after audio")
+
+        class FakeModel:
+            tts_model = FakeTtsModel()
+
+            def generate_streaming(self, **_kwargs):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                yield b"duplicate"
+
+        server._model = FakeModel()
+        server._ensure_prompt_cache = lambda: {"cached": True}
+        generator = server._provider_stream("hello")
+
+        self.assertEqual(next(generator), b"first")
+        with self.assertRaises(RuntimeError):
+            next(generator)
+        self.assertEqual(fallback_calls, 0)
 
     async def test_cancelled_pull_releases_provider_for_the_next_response(self):
         server = _load_server()

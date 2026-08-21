@@ -93,6 +93,23 @@ test("playback worklet resamples 24k PCM into a 48k output", async () => {
   assert.equal(player.size, 0);
 });
 
+test("playback worklet reports level only from audio actually sent to the speaker", async () => {
+  const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
+  const player = new Playback({
+    processorOptions: { sourceRate: 24000, maxQueueMs: 1000, startupBufferMs: 240 },
+  });
+  const pcm = new Int16Array(2400).fill(16384);
+  player.port.dispatch({ type: "audio", pcm: pcm.buffer });
+  for (let i = 0; i < 13; i++) player.process([], outputBlock(128));
+  const bufferedLevel = player.port.messages.find((message) => message.type === "level");
+  assert.equal(bufferedLevel?.rms, 0, "queued audio must not animate before playback starts");
+
+  player.port.dispatch({ type: "startup_buffer", milliseconds: 0 });
+  for (let i = 0; i < 13; i++) player.process([], outputBlock(128));
+  const levels = player.port.messages.filter((message) => message.type === "level");
+  assert.ok(levels.at(-1).rms > .49 && levels.at(-1).rms < .51);
+});
+
 test("playback worklet acknowledges only fully consumed sentence segments", async () => {
   const Playback = await loadProcessor("playback-worklet.js", "pcm-playback", 48000);
   const player = new Playback({
