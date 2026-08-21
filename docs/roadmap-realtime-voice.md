@@ -1,5 +1,15 @@
 # 实时语音与情绪语音优化路线图
 
+## 0.2.51 VoxCPM2 参考音缓存与句间空隙诊断（2026-08-21）
+
+上一轮 schema v8 诊断显示长回复的第二句停顿不是 Worklet 丢样或队列溢出：样本中 `underruns=0`、`droppedSamples=0`，最大采样队列约 328ms。确定性管线测试同时确认当前实现有意禁止播放期间合成下一句；这是单路有序、可取消和有界资源约束，不能为掩盖停顿而开启 next-sentence prefetch。
+
+VoxCPM2 现在使用上游 `build_prompt_cache` 与 `generate_with_prompt_cache*` API，把当前参考音的 prompt 编码按绝对路径、mtime、文件大小和参考文案缓存；切换或修改参考音会在下一次合成前原子重建。缓存 API 在输出首块音频前不可用时仍可回退到直接编码，已经输出任何音频后则禁止从头回退，避免重复播音。固定文本的本机实测从 8.270 秒降至 7.509--7.543 秒，约节省 0.74 秒；输出时长仍为 7.84 秒且 PCM SHA-256 完全一致。
+
+诊断升级为 schema v9。Worklet 对每个 managed 句段上报实际首个播放采样与最终完成回执，脱敏聚合 `aggregate.segmentContinuity.audibleGapMs` 给出相邻句段真实无声间隔的 count/p50/p95；另保留 TTS 首块到达事件以区分生成等待与播放等待。事件只携带别名 generation 和 1--64 的句段序号，不包含正文、参考音路径、PCM、模型错误或设备信息。legacy playback 无精确句段开播回执，不得伪造该指标。
+
+2026-08-21 的同设备真实通话复测确认缓存优化进入产品路径：`ttsRequestToFirstAudio` 从 schema v8 的 p50 1697ms / p95 1720ms 降至 schema v9 的 p50 746ms / p95 762ms。13 个 managed 句段全部完成，`underruns=0`、`droppedSamples=0`、最大采样队列 336ms。5 个可配对的第二句实际无声间隔为 618--656ms，p50 643ms / p95 656ms，其中约一半来自下一句首块生成、另一半来自既有 240ms reservoir。真人听感已不再认为整体对话延迟明显，因此本版保留单路生成、禁止下一句预取和 240ms reservoir，不用降低稳定性换取更小的数字。
+
 ## Windows VoxCPM2 流式连续性（2026-08-20）
 
 Windows RTX 5080 / Torch 2.11.0+cu128 的真实流式基准显示，VoxCPM2 默认 10 个扩散步在短中文句上稳态 RTF 约为 1.32，持续慢于 1× 播放并导致 240ms Worklet reservoir 反复耗尽。对同一文本、参考音、固定 seed 的 10/8/6/4 步比较中，6 步 TTFA 约 169ms、RTF 约 0.94，能够继续使用 `provider-pcm-v1` 真流式下行；4 步虽更快但质量余量更小。因此 Windows 固定使用 6 步，macOS 继续使用原 10 步，不改 MPS 路径、播放缓冲、KXAU envelope、发送 pacing 或打断协议。
@@ -20,7 +30,7 @@ Windows RTX 5080 / Torch 2.11.0+cu128 的真实流式基准显示，VoxCPM2 默�
 
 VoxCPM2 零样本后端现可在 Apple Silicon macOS 上由应用首次选择时自动配置。venv、模型和完成标记位于用户可写的 Application Support `voice-runtime`，不会写入 DMG 资源或 Git；MPS 运行强制使用 FP32，以避免上游记录的扩散漂移。Intel macOS 明确不支持该后端，当前版本也不宣称实时性能，需在真实设备上验证启动时延、RTF、断续和音色稳定性。Windows 继续使用独立 PowerShell setup，默认 Qwen3 行为不变。
 
-> 状态基准：2026-08-18（当前工作区版本 `v0.2.51`）。本文档记录当前实现、外部方案对比、目标接口和分阶段实施顺序，供后续开发使用；除明确标记为“已实现”的能力外，其余内容均不是当前产品承诺。
+> 状态基准：2026-08-22（当前发布候选 `v0.2.51`）。本文档记录当前实现、外部方案对比、目标接口和分阶段实施顺序，供后续开发使用；除明确标记为“已实现”的能力外，其余内容均不是当前产品承诺。
 >
 > 本文只负责音频管线、自然打断、ASR/TTS 与情绪语音。实时通话的逐轮记忆、写入边界、延迟预算和协议能力门统一以 [《Memory Brain 开发路线图》M2](./roadmap-memory-brain.md#m2实时通话逐轮记忆) 为准，避免在两份文档中维护不同的记忆接入方案。
 
@@ -301,7 +311,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 **已实现——显式、可审计安装**：用户必须先选择 SenseVoice 并保存，再点击安装。安装器锁定 `sherpa-onnx 1.13.4`/core 的 CPython 3.10–3.14、macOS arm64/x64 与 Windows x64 wheel 文件名、大小和 SHA-256；SenseVoiceSmall INT8 archive 及内部 `model.int8.onnx`、`tokens.txt`、license/readme 也逐项锁定。下载有界，拒绝 tar traversal/symlink，使用 ABI fingerprint 版本目录、staging、installer lock、marker-last 和可恢复 sibling swap，发布前执行真实模型推理。0.2.44 针对部分 macOS 网络 IPv6 已连接却长期无数据的问题改为 IPv4 优先，并在单次 socket 超时后有界回退 IPv6；UI 只接收固定枚举、大小受限且不含路径/URL/异常的下载、安装、解包和真实推理进度。安装包只携带安装器、lock 与 notice，不携带 wheel、模型、cache、staging 或 ready marker。macOS wheel tag 不是系统版本兼容承诺；目标机 smoke 失败即保持 Whisper。
 
-**已实现——诊断与隐私**：当前诊断 schema v8 继续只导出固定 ASR 能力枚举，并增加不含文本的主动带聊触发、互动、否决与节奏聚合。`runtime.asr` 只允许 `requested=whisper|sensevoice`、`active=whisper-mlx|whisper-openai|sensevoice-sherpa-onnx|none` 和 `status=active|fallback|unavailable|not-reported`。不导出 runtime/model 路径、转写文本、原始 PCM、标签概率、异常、话题/Memory 正文或设备信息。所有队列/admission 继续有界。`sherpa-onnx` runtime 采用 Apache-2.0；转换后的 SenseVoiceSmall 权重仍受 FunASR Model Open Source License Agreement 1.1 约束，不能把模型许可写成 Apache-2.0。
+**已实现——诊断与隐私**：当前诊断 schema v9 继续只导出固定 ASR 能力枚举、不含文本的主动带聊聚合，并新增 managed Worklet 句段实际开播/播完边界和句间空隙分布。`runtime.asr` 只允许 `requested=whisper|sensevoice`、`active=whisper-mlx|whisper-openai|sensevoice-sherpa-onnx|none` 和 `status=active|fallback|unavailable|not-reported`。不导出 runtime/model 路径、转写文本、原始 PCM、标签概率、异常、话题/Memory 正文、参考音路径或设备信息。所有队列/admission 继续有界。`sherpa-onnx` runtime 采用 Apache-2.0；转换后的 SenseVoiceSmall 权重仍受 FunASR Model Open Source License Agreement 1.1 约束，不能把模型许可写成 Apache-2.0。
 
 **真实 smoke / 非准确率结论**：当前 Apple Silicon + CPython 3.14 实测加载约 0.386s、官方中文样例 decode 约 0.088s，得到“开放时间早上9点至下午5点。”；从零安装并 smoke 约 39.5s。这里只证明锁定产物可安装、可加载、可推理，不证明真实房间、回声、方言或重复幻觉场景优于 Whisper，也不是端到端延迟承诺。
 
@@ -428,6 +438,10 @@ response_completed{ responseId, generation, status }
 目标不是简单增加一个静默定时器，而是提供显式的**语音陪聊主导方式**，让不擅长找话题的用户可以主要倾听和附和。该能力默认保持当前行为，用户主动选择后才提高 AI 主导程度。
 
 **2026-07-29 本地/CosyVoice A-D 实现与节奏优化**：设置、Rust 持久化白名单和 `local-v1` 能力协商保持不变；`follow-user` 仍是兼容默认值，`balanced` 最多一次主动续说，`ai-leads` 最多三个连续主动回合和一次换题。计时只从同 generation 最后一个实际播放完成回执开始；默认等待为 balanced 同题 10 秒，ai-leads 同题 4.5 秒、换题 14 秒。固定规则把短回应分为 `acknowledge/amused/curious/agree`，另识别 `pause/redirect/resume`；candidate 立即让路，但只有 confirmed 的首音频前抢回或出声后 1 秒内打断才算负反馈。一次负反馈令后续等待乘 1.5，两次后本通停止主动调度，明确 resume 可恢复。后端接受 `welcome/followup/idle` 并再次检查固定 veto reason；`idle` 的空查询 Memory recall 最多 3 条/300 字，只取置顶、未完成 commitment 和 30 天内非敏感 episode，候选 ID 与 topicKey 各在通话内保留最多 8 项。控制提示不伪造成 user history，仍只有完整播放回执确认的 assistant 句段进入上下文。诊断 schema v8 只导出固定枚举和计数。旧服务、legacy playback 与火山继续降级为 `none`；真实设备抢话率、等待感和连续倾听舒适度尚未验证。
+
+**2026-08-21 真人聊天节奏修正**：主动静默窗口统一从整轮音频实际 drain 且 durable audible generation 提交后启动一次，不再由每个中间句段回执或 `tts_end` 重复尝试；重复 drain 不会重启窗口。`associate` 计划要求角色先贡献一个相邻的新具体对象、作品、事件或场景，不能再反问用户提供素材；强主题、敏感话题、显式建议/观点请求和横向冷却仍优先，用户不接新方向时下一轮跟回用户。各本地后端的系统后缀同时明确禁止用户未告别时使用“你先忙/我先去忙”等变体擅自收口，并禁止承诺发照片、主动联系、线下共同活动或虚构正在现实中执行的日常行为。
+
+**2026-08-21 短附和实测纠正**：设备 trace 证明第一版只识别了“可以可以”，单独“可以”仍被当作 `substantive`；同时 `associate` 与 `agree` 的“推进当前话题”提示并存，模型把拍照承诺误当作横向新细节。后续设计不再继续扩张“有没有新内容”的本地正则，也撤回固定影视/游戏等领域轮换：本地规则只保留暂停、明确换题、恢复、敏感话题等硬控制和有限节奏建议；同一次回复 LLM 在生成前比较最新用户话语与最近可听历史，语义判断是否新增事实、观点、问题、选择或感受变化。没有新增且当前分支已重复时，模型应结束该分支并自行选择一个具体新话题；来源可以是人设边界、已有记忆、时间场景、普通生活联想或时下信息，Fresh Topic 不是必需条件。判断过程不输出、不持久化，也不进入诊断。`associate` 回合仍抑制相冲突的同题短附和提示。语音配置指纹包含本地实时策略修订号，新的 App 构建会重启仍加载旧 `common.py` 的托管子进程。
 
 | 设置值 | 用户体验 | 主动行为 |
 |---|---|---|
@@ -639,7 +653,7 @@ SenseVoiceSmall 已发布 checkpoint 支持普通话、粤语、英语、日语�
 - **已实现（0.2.31 体验修复）**：本地/CosyVoice 的句中续说改为固定三档 reopen，默认总 1650ms；实时 TTS 最小稳定块提升为 30 字，并用 provider metadata 无关的 chunk-sequence 测试锁定。它不合并已经 committed 的两次 ASR，也不撤回已显示/已播放的回复；超出所选窗口仍是新轮。
 - **已实现（0.2.32 未播音收敛）**：本地/CosyVoice 的新确认人声若在旧 response 启动后 8 秒内到达，且旧 response 尚未取得任何 TTS admission，则取消旧 generation、按 generation 撤回未播临时助手气泡，并只向下一次 LLM history snapshot 注入固定 continuation hint。旧用户消息由既有有界 audible history 提供上下文；完整转写不进入 control event、日志或诊断。已开始 TTS、超时、挂断、旧服务和火山继续走原 supersede/barge-in，不撤回已播放内容。此切片不等待或强杀 blocking Future，也不宣称跨 committed ASR 已原子合并成一条用户消息。
 - **待实现**：许可声学回放、live 单调时钟候选上限、阈值/超时实验、噪声自适应和满足 p95 600ms 目标的 adaptive endpoint；当前不能把真实 shadow 或合成 evaluator 称为神经 VAD 完整方案或 live takeover。
-- **本地实现完成、设备体验待测（主动陪聊 A-D）**：本地/CosyVoice 已具备三档设置、`local-v1` 协商、接通问候、最终播放回执计时、四类短回应、暂停/恢复、一次换题、受限 Memory、确认态节奏退让和 schema v8 无文本计数。candidate 撤销、两次负反馈停止、旧端/火山降级、无伪 user history 与可听回执语义有 JS/Python/Rust 确定性测试；真实设备抢话率、等待感、连续倾听舒适度和火山 E 能力门仍待验证。
+- **本地实现完成、设备体验待测（主动陪聊 A-D）**：本地/CosyVoice 已具备三档设置、`local-v1` 协商、接通问候、最终播放回执计时、四类短回应、暂停/恢复、一次换题、受限 Memory、确认态节奏退让和 schema v9 无文本诊断。candidate 撤销、两次负反馈停止、旧端/火山降级、无伪 user history、可听回执与句段空隙聚合语义有 JS/Python/Rust 确定性测试；真实设备抢话率、等待感、连续倾听舒适度和火山 E 能力门仍待验证。
 - **待实验**：用有权利/同意证据的固定录音集比较 Whisper/SenseVoice；实测 CosyVoice、macOS MLX Qwen 与 Windows faster Qwen 的 TTFA/接缝/取消资源恢复。Linux 继续等待可维护的公开 iterator。不得把整段音频再切块冒充真 streaming。
 
 ### P3：情绪闭环

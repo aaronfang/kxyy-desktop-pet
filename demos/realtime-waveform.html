@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实时语音波形预览</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      color-scheme: dark;
+      --text: #f4f2fb;
+      --muted: rgba(244, 242, 251, .62);
+      --panel: rgba(20, 19, 28, .88);
+      --accent: #8d72ec;
+    }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 32px 20px;
+      background: #111015;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    main {
+      width: min(680px, 100%);
+      display: grid;
+      gap: 24px;
+    }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+    #state {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .stage {
+      display: grid;
+      place-items: center;
+      min-height: 190px;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+      border-bottom: 1px solid rgba(255, 255, 255, .08);
+      background: #17161d;
+    }
+    .capsule {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      width: 252px;
+      height: 48px;
+      padding: 0 7px 0 11px;
+      border-radius: 24px;
+      background: rgba(0, 0, 0, .7);
+      filter: drop-shadow(0 3px 3px rgba(0, 0, 0, .48)) drop-shadow(0 1px 1px rgba(0, 0, 0, .3));
+      backdrop-filter: blur(18px) saturate(1.12);
+    }
+    .capsule-wave {
+      flex: 1 1 auto;
+      min-width: 0;
+      height: 34px;
+      filter: drop-shadow(0 0 5px rgba(78, 199, 255, .24));
+    }
+    #wave-canvas { display: block; width: 100%; height: 100%; }
+    .capsule-actions {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      padding-left: 7px;
+      border-left: 1px solid rgba(255, 255, 255, .09);
+    }
+    .hangup {
+      display: grid;
+      place-items: center;
+      width: 31px;
+      height: 31px;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(229, 72, 77, .82);
+      color: #fff;
+      font-size: 17px;
+      transform: rotate(135deg);
+    }
+    .state-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, .09);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .09);
+    }
+    .state-option {
+      display: grid;
+      grid-template-columns: 76px 1fr;
+      align-items: center;
+      gap: 8px;
+      width: auto;
+      height: 56px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 0;
+      background: #19181f;
+      text-align: left;
+    }
+    .state-option:hover { background: #201e28; }
+    .state-option[aria-pressed="true"] {
+      background: #282531;
+      box-shadow: inset 3px 0 var(--accent);
+    }
+    .state-name {
+      display: grid;
+      gap: 2px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .state-name small {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 400;
+    }
+    .state-wave {
+      display: block;
+      width: 100%;
+      height: 34px;
+    }
+    .transport {
+      display: grid;
+      grid-template-columns: 40px 40px 1fr auto;
+      align-items: center;
+      gap: 10px;
+    }
+    button {
+      display: grid;
+      place-items: center;
+      width: 40px;
+      height: 40px;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, .12);
+      border-radius: 50%;
+      background: rgba(255, 255, 255, .07);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover { background: rgba(255, 255, 255, .13); }
+    #play { background: var(--accent); border-color: transparent; }
+    #play:hover { background: #9d84f2; }
+    #progress {
+      width: 100%;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    #time {
+      min-width: 74px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      text-align: right;
+    }
+    audio { display: none; }
+    @media (max-width: 520px) {
+      body { padding: 24px 16px; }
+      header { align-items: start; flex-direction: column; gap: 6px; }
+      .stage { min-height: 160px; }
+      .state-grid { grid-template-columns: 1fr; }
+      .transport { grid-template-columns: 40px 40px 1fr; }
+      #time { grid-column: 3; text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>实时语音波形</h1>
+      <span id="state">准备播放</span>
+    </header>
+
+    <section class="stage" aria-label="悬浮通话胶囊预览">
+      <div class="capsule">
+        <div class="capsule-wave"><canvas id="wave-canvas"></canvas></div>
+        <div class="capsule-actions"><span class="hangup" aria-hidden="true">☎</span></div>
+      </div>
+    </section>
+
+    <section id="state-grid" class="state-grid" aria-label="通话状态波形配色"></section>
+
+    <div class="transport">
+      <button id="play" type="button" aria-label="播放" title="播放">▶</button>
+      <button id="restart" type="button" aria-label="重新播放" title="重新播放">↻</button>
+      <input id="progress" type="range" min="0" max="1000" value="0" aria-label="播放进度">
+      <span id="time">0:00 / 0:00</span>
+    </div>
+
+    <audio id="audio" preload="auto" src="../scripts/local-realtime/assets/kxyy-yuanyuan/utt_b26b8f2ec4ac.wav"></audio>
+  </main>
+
+  <script type="module">
+    import { createSiriWaveModernRenderer, SIRIWAVE_STATES } from "../src/siriwave-modern.js";
+
+    const audio = document.getElementById("audio");
+    const playButton = document.getElementById("play");
+    const restartButton = document.getElementById("restart");
+    const progress = document.getElementById("progress");
+    const timeLabel = document.getElementById("time");
+    const stateLabel = document.getElementById("state");
+    const canvas = document.getElementById("wave-canvas");
+    const waveRenderer = createSiriWaveModernRenderer(canvas);
+    const stateGrid = document.getElementById("state-grid");
+    const stateRenderers = [];
+    const envelope = new Float32Array(48);
+    let audioContext;
+    let decodedAudio;
+    let decodedSamples;
+    const stateLabels = {
+      idle: ["待机", "已连接"],
+      listening: ["聆听", "接收声音"],
+      candidate: ["候选语音", "等待确认"],
+      thinking: ["思考", "组织回复"],
+      speaking: ["说话", "播放回复"],
+      error: ["异常", "需要处理"],
+    };
+
+    function selectState(state, now = performance.now()) {
+      waveRenderer.setState(state, now);
+      for (const { button, state: itemState } of stateRenderers) {
+        button.setAttribute("aria-pressed", String(itemState === state));
+      }
+    }
+
+    for (const state of SIRIWAVE_STATES) {
+      const button = document.createElement("button");
+      button.className = "state-option";
+      button.type = "button";
+      button.setAttribute("aria-pressed", String(state === "idle"));
+      const name = document.createElement("span");
+      name.className = "state-name";
+      name.append(stateLabels[state][0]);
+      const detail = document.createElement("small");
+      detail.textContent = stateLabels[state][1];
+      name.appendChild(detail);
+      const stateCanvas = document.createElement("canvas");
+      stateCanvas.className = "state-wave";
+      button.append(name, stateCanvas);
+      button.addEventListener("click", () => selectState(state));
+      stateGrid.appendChild(button);
+      stateRenderers.push({ button, state, renderer: createSiriWaveModernRenderer(stateCanvas, { state }) });
+    }
+
+    async function setupAudio() {
+      if (decodedAudio) return;
+      audioContext = new AudioContext();
+      const response = await fetch(audio.currentSrc || audio.src);
+      if (!response.ok) throw new Error(`audio ${response.status}`);
+      decodedAudio = await audioContext.decodeAudioData(await response.arrayBuffer());
+      decodedSamples = decodedAudio.getChannelData(0);
+    }
+
+    function updateEnvelope() {
+      if (!decodedAudio || audio.paused) {
+        envelope.fill(0);
+        return 0;
+      }
+      const windowSize = Math.min(1024, decodedSamples.length);
+      const playedSamples = Math.floor(audio.currentTime * decodedAudio.sampleRate);
+      const windowStart = Math.max(0, Math.min(decodedSamples.length - windowSize, playedSamples - windowSize));
+      let total = 0;
+      for (let segment = 0; segment < envelope.length; segment++) {
+        const start = windowStart + Math.floor(segment * windowSize / envelope.length);
+        const end = windowStart + Math.max(segment + 1, Math.floor((segment + 1) * windowSize / envelope.length));
+        let energy = 0;
+        for (let i = start; i < end; i++) energy += decodedSamples[i] * decodedSamples[i];
+        const rms = Math.sqrt(energy / (end - start));
+        const value = Math.min(1, rms * 3.6);
+        envelope[segment] = value;
+        total += value * value;
+      }
+      return Math.min(1, Math.sqrt(total / envelope.length) / 1.5);
+    }
+
+    function formatTime(value) {
+      if (!Number.isFinite(value)) return "0:00";
+      const minutes = Math.floor(value / 60);
+      const seconds = Math.floor(value % 60).toString().padStart(2, "0");
+      return `${minutes}:${seconds}`;
+    }
+
+    function frame(now) {
+      const currentLevel = updateEnvelope();
+      waveRenderer.draw(currentLevel, envelope, now);
+      for (const { renderer } of stateRenderers) renderer.draw(currentLevel, envelope, now);
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        progress.value = Math.round(audio.currentTime / audio.duration * 1000);
+        timeLabel.textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
+      }
+      requestAnimationFrame(frame);
+    }
+
+    playButton.addEventListener("click", async () => {
+      await setupAudio();
+      await audioContext.resume();
+      if (audio.paused) await audio.play(); else audio.pause();
+    });
+    restartButton.addEventListener("click", async () => {
+      await setupAudio();
+      await audioContext.resume();
+      audio.currentTime = 0;
+      await audio.play();
+    });
+    progress.addEventListener("input", () => {
+      if (Number.isFinite(audio.duration)) audio.currentTime = Number(progress.value) / 1000 * audio.duration;
+    });
+    audio.addEventListener("play", () => {
+      playButton.textContent = "❚❚";
+      playButton.setAttribute("aria-label", "暂停");
+      playButton.title = "暂停";
+      stateLabel.textContent = "播放中";
+    });
+    audio.addEventListener("pause", () => {
+      playButton.textContent = "▶";
+      playButton.setAttribute("aria-label", "播放");
+      playButton.title = "播放";
+      stateLabel.textContent = audio.ended ? "播放完成" : "已暂停";
+    });
+    audio.addEventListener("loadedmetadata", () => {
+      timeLabel.textContent = `0:00 / ${formatTime(audio.duration)}`;
+    });
+    audio.addEventListener("error", () => { stateLabel.textContent = "音频加载失败"; });
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>

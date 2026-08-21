@@ -2,7 +2,7 @@
 
 一个会在桌面散步、攀爬、陪你聊天的跨平台桌宠。支持 **Windows / macOS**，基于 **Tauri 2 + Rust + WebView**。
 
-当前正式版：[`v0.2.49`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.49)
+当前正式版：[`v0.2.51`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.51)
 
 VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安装到 Application Support，当前仅支持 Apple Silicon，属于实验功能；Intel 版本仍可安装但应使用 Qwen3/云端语音。
 
@@ -76,6 +76,7 @@ VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安
 | 火山引擎 | 配置简单的云端朗读与端到端实时语音 | TTS Key、实时语音 App ID / Access Key、`voice_id` |
 | CosyVoice | 云端克隆音色 + 本地 ASR/文字模型编排 | DashScope Key、CosyVoice 音色 ID |
 | Qwen3-TTS 本地 | 不消耗云端 TTS token、使用本机克隆音色 | Python 环境、10–20 秒参考音频 |
+| VoxCPM2 本地（实验） | Apple Silicon / Windows 上测试零样本克隆音色 | 首次选择时安装运行时与模型 |
 
 实时通话入口在聊天输入框最左侧的电话按钮，对所有人设卡可用。通话中会暂时禁用文字输入、图片和表情库；可将聊天窗收起为可拖动的置顶通话胶囊，拖到屏幕左右边缘后会自动收窄，宽度可在设置中调整。第一次使用需要允许麦克风权限。
 
@@ -85,7 +86,7 @@ VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安
 
 使用 10–20 秒、单人、清晰、背景噪声较少的录音。设置参考音频和可选文案后，保存并重启语音服务。
 
-苗疆元元的本地 Qwen3-TTS 设置页还提供 6 个发布音色：自动评分最高的 5 个参考音，以及当前最早的内置旧基线。选择菜单项后 Python 服务会在下一句合成前热加载，不会重启服务；手动填写参考音频会覆盖菜单选择。发布包只包含这 5 个新音频、旧 `ref.wav/ref.txt` 和清单，75 条试听样例及其余候选只保留在本地忽略目录。
+苗疆元元的本地语音设置页还提供 6 个发布 preset：自动评分最高的 5 个参考音，以及固化为 `legacy-12s.wav/.txt` 的最早内置基线。当前默认音独立使用新的 `ref.wav/ref.txt`。选择菜单项后 Python 服务会在下一句合成前热加载，不会重启服务；手动填写参考音频会覆盖菜单选择。发布包只包含新默认音、5 个评分参考音、旧基线和清单，75 条试听样例及其余候选只保留在本地忽略目录。
 
 ### 2. 安装运行时
 

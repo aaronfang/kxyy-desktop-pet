@@ -25,6 +25,8 @@ DEFAULT_INFERENCE_STEPS = 10
 _model = None
 _ref_wav = None
 _ref_text = ""
+_prompt_cache = None
+_prompt_cache_key = None
 _gate = threading.BoundedSemaphore(1)
 _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxcpm")
 _DONE = object()
@@ -81,11 +83,101 @@ def _kwargs(text: str) -> dict:
                 seed=FIXED_SEED)
 
 
+def _prompt_cache_identity() -> tuple[str, int, int, str]:
+    if _ref_wav is None:
+        raise RuntimeError("VoxCPM2 reference is not ready")
+    stat = _ref_wav.stat()
+    return (str(_ref_wav.absolute()), stat.st_mtime_ns, stat.st_size, _ref_text)
+
+
+def _ensure_prompt_cache():
+    """Encode the current reference once; rebuild atomically after a hot switch."""
+    global _prompt_cache, _prompt_cache_key
+    key = _prompt_cache_identity()
+    if _prompt_cache is not None and key == _prompt_cache_key:
+        return _prompt_cache
+    tts_model = getattr(_model, "tts_model", None)
+    build = getattr(tts_model, "build_prompt_cache", None)
+    if not callable(build):
+        raise RuntimeError("VoxCPM2 prompt cache API is unavailable")
+    built = build(
+        prompt_text=_ref_text,
+        prompt_wav_path=str(_ref_wav),
+        reference_wav_path=str(_ref_wav),
+    )
+    _prompt_cache = built
+    _prompt_cache_key = key
+    return built
+
+
+def _cached_generation_kwargs(text: str) -> dict:
+    steps = WINDOWS_STREAMING_INFERENCE_STEPS if sys.platform == "win32" else DEFAULT_INFERENCE_STEPS
+    return {
+        "target_text": _spoken(text),
+        "prompt_cache": _ensure_prompt_cache(),
+        "cfg_value": 2.0,
+        "inference_timesteps": steps,
+        "max_len": 4096,
+        "retry_badcase": True,
+        "retry_badcase_max_times": 3,
+        "retry_badcase_ratio_threshold": 6.0,
+        "seed": FIXED_SEED,
+    }
+
+
+def _audio_to_numpy(audio):
+    value = audio
+    if hasattr(value, "squeeze"):
+        value = value.squeeze(0)
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return value
+
+
+def _provider_stream(text: str):
+    # Refresh the hot-selectable reference before resolving its cache identity.
+    fallback_kwargs = _kwargs(text)
+    tts_model = getattr(_model, "tts_model", None)
+    generate = getattr(tts_model, "generate_with_prompt_cache_streaming", None)
+    if callable(generate):
+        emitted = False
+        try:
+            for result in generate(**_cached_generation_kwargs(text)):
+                audio = result[0] if isinstance(result, tuple) else result
+                converted = _audio_to_numpy(audio)
+                emitted = True
+                yield converted
+            return
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            if emitted:
+                raise
+            common.log("VoxCPM2 prompt cache unavailable; using direct reference encoding")
+    yield from _model.generate_streaming(**fallback_kwargs)
+
+
+def _provider_generate(text: str):
+    fallback_kwargs = _kwargs(text)
+    tts_model = getattr(_model, "tts_model", None)
+    generate = getattr(tts_model, "generate_with_prompt_cache", None)
+    if callable(generate):
+        try:
+            result = generate(**_cached_generation_kwargs(text))
+            audio = result[0] if isinstance(result, tuple) else result
+            return _audio_to_numpy(audio)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            common.log("VoxCPM2 prompt cache unavailable; using direct reference encoding")
+    return _model.generate(**fallback_kwargs)
+
+
 def _synth(text: str) -> bytes:
     if not _gate.acquire(blocking=False):
         raise RuntimeError("VoxCPM2 正忙，请稍后再试")
     try:
-        return _to_pcm24(_model.generate(**_kwargs(text)))
+        return _to_pcm24(_provider_generate(text))
     finally:
         _gate.release()
 
@@ -112,7 +204,7 @@ async def _synth_stream(text: str):
         await asyncio.sleep(0.02)
     generator = None
     try:
-        generator = _model.generate_streaming(**_kwargs(text))
+        generator = _provider_stream(text)
         while True:
             chunk = await loop.run_in_executor(_pool, _pull, generator)
             if chunk is _DONE:
@@ -165,6 +257,11 @@ def _prepare() -> None:
     if device:
         kwargs["device"] = device
     _model = VoxCPM.from_pretrained(_model_path(), **kwargs)
+    try:
+        _ensure_prompt_cache()
+        common.log("VoxCPM2 参考音 prompt cache 已就绪")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        common.log("VoxCPM2 prompt cache unavailable; using direct reference encoding")
     common.load_whisper_on_mlx_thread()
     common.log(f"VoxCPM2 就绪 ({OUTPUT_RATE}Hz provider -> {common.OUTPUT_RATE}Hz PCM)")
 

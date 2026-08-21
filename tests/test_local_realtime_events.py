@@ -939,7 +939,7 @@ class ShortTermFactTests(unittest.TestCase):
         self.assertNotIn("角色今日直播状态", outfit_only)
 
     def test_all_local_backends_share_the_no_unsolicited_closing_constraint(self):
-        self.assertIn("用户没有明确说要睡、道别或挂断时", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("用户没有明确说要睡、道别、离开或挂断时", common.CONTINUE_CONVERSATION_SUFFIX)
         self.assertIn("不要主动", common.CONTINUE_CONVERSATION_SUFFIX)
         self.assertIn("明天见", common.CONTINUE_CONVERSATION_SUFFIX)
 
@@ -2609,7 +2609,12 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         }
         await session._reply_pipeline("简短回应", scope, conversation_plan=plan)
 
-        rendered = captured[0][-1]["content"]
+        system_contents = [
+            message["content"] for message in captured[0] if message["role"] == "system"
+        ]
+        rendered = next(
+            content for content in system_contents if content.startswith("本轮对话节奏")
+        )
         self.assertEqual(rendered, common.format_conversation_plan_hint(plan))
         self.assertIn("先贡献具体内容", rendered)
         self.assertIn("低负担", rendered)
@@ -2831,9 +2836,40 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             "depth": 2,
         }
         rendered = common.format_conversation_plan_hint(plan)
-        self.assertIn("横向联想", rendered)
+        self.assertIn("语义状态", rendered)
         self.assertIn("只带出一个", rendered)
+        self.assertIn("新的具体名词", rendered)
+        self.assertIn("不要反问用户提供素材", rendered)
+        self.assertIn("普通生活联想", rendered)
         self.assertNotIn("突然硬切", rendered)
+
+    def test_associate_plan_suppresses_conflicting_short_agreement_hint(self):
+        plan = {
+            "move": "associate",
+            "responseCue": "none",
+            "stance": "companion",
+            "depth": 1,
+        }
+        self.assertEqual(common.select_turn_policy_hint("agree", plan), "")
+        self.assertEqual(
+            common.select_turn_policy_hint("agree", {**plan, "move": "expand"}),
+            common.AGREE_HINT_TEXT,
+        )
+
+    def test_reply_model_judges_semantic_novelty_without_fixed_topic_catalog(self):
+        hint = common.SEMANTIC_TOPIC_AUTONOMY_HINT
+        self.assertIn("语义判断", hint)
+        self.assertIn("是否新增", hint)
+        self.assertIn("新话题不要求是新闻或时下信息", hint)
+        self.assertIn("其他自然联想", hint)
+        self.assertIn("不要输出判断过程", hint)
+        self.assertNotIn("leadDomain", hint)
+        self.assertIn(hint, common.CONTINUE_CONVERSATION_SUFFIX)
+
+    def test_conversation_continuity_forbids_uninvited_closing_and_fake_commitments(self):
+        self.assertIn("你先忙", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("不可兑现", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("现实中正在", common.CONTINUE_CONVERSATION_SUFFIX)
 
     def test_default_companion_plan_contributes_without_parroting_or_closing(self):
         rendered = common.format_conversation_plan_hint({

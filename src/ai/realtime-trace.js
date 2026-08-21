@@ -5,7 +5,7 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 8;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 9;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
@@ -69,6 +69,9 @@ export const TRACE_EVENT = Object.freeze({
   LLM_RESPONSE: "llm_response",
   TTS_REQUEST: "tts_request",
   TTS_FIRST_AUDIO: "tts_first_audio",
+  TTS_SEGMENT_STARTED: "tts_segment_started",
+  PLAYBACK_SEGMENT_STARTED: "playback_segment_started",
+  PLAYBACK_SEGMENT_COMPLETED: "playback_segment_completed",
   PLAYBACK_QUEUED: "playback_queued",
   PLAYBACK_STARTED: "playback_started",
   PLAYBACK_STATS: "playback_stats",
@@ -107,6 +110,7 @@ const SAFE_METRICS = new Set([
   "accepted",
   "timedOut",
   "stale",
+  "segmentIndex",
 ]);
 
 let fallbackId = 0;
@@ -225,6 +229,9 @@ function reject(state, reason) {
 
 const GENERATION_GATED_EVENTS = new Set([
   TRACE_EVENT.TTS_FIRST_AUDIO,
+  TRACE_EVENT.TTS_SEGMENT_STARTED,
+  TRACE_EVENT.PLAYBACK_SEGMENT_STARTED,
+  TRACE_EVENT.PLAYBACK_SEGMENT_COMPLETED,
   TRACE_EVENT.PLAYBACK_QUEUED,
   TRACE_EVENT.PLAYBACK_STARTED,
   TRACE_EVENT.RESPONSE_COMPLETED,
@@ -440,6 +447,36 @@ function summarizeCandidateOutcomes(events) {
     candidateToConfirmedMs: summarizeDistribution(confirmed),
     candidateToRejectedMs: summarizeDistribution(rejected),
     unmatchedCandidates,
+  };
+}
+
+function summarizeSegmentContinuity(events) {
+  const completedAt = new Map();
+  const gaps = [];
+  let segmentsStarted = 0;
+  let segmentsCompleted = 0;
+  for (const event of events) {
+    const segmentIndex = event.metrics?.segmentIndex;
+    if (!Number.isSafeInteger(segmentIndex) || segmentIndex < 1 || segmentIndex > 64) {
+      continue;
+    }
+    const key = `${event.generationId}:${segmentIndex}`;
+    if (event.eventType === TRACE_EVENT.PLAYBACK_SEGMENT_COMPLETED) {
+      completedAt.set(key, event.timestampMs);
+      segmentsCompleted += 1;
+    } else if (event.eventType === TRACE_EVENT.PLAYBACK_SEGMENT_STARTED) {
+      segmentsStarted += 1;
+      if (segmentIndex <= 1) continue;
+      const previousAt = completedAt.get(`${event.generationId}:${segmentIndex - 1}`);
+      if (Number.isFinite(previousAt)) {
+        gaps.push(Math.max(0, event.timestampMs - previousAt));
+      }
+    }
+  }
+  return {
+    segmentsStarted,
+    segmentsCompleted,
+    audibleGapMs: summarizeDistribution(gaps),
   };
 }
 
@@ -810,6 +847,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
     aggregate: {
       latency,
       interruptions: summarizeCandidateOutcomes(events),
+      segmentContinuity: summarizeSegmentContinuity(events),
       memoryContext: summarizeMemoryContext(events),
       proactive: sanitizeProactiveSummary(source.proactiveSummary),
       vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),

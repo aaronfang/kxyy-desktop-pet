@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 
 const root = new URL("../", import.meta.url);
 const chatSource = fs.readFileSync(new URL("src/chat.js", root), "utf8");
@@ -55,6 +56,25 @@ test("bundled non-kxyy persona cards include their own local voice references", 
       `${cardId} must include ref.txt`,
     );
   }
+});
+
+test("the previous default voice remains a hash-locked legacy preset", () => {
+  const assetRoot = new URL(
+    "scripts/local-realtime/assets/kxyy-yuanyuan/",
+    root,
+  );
+  const catalog = JSON.parse(
+    fs.readFileSync(new URL("voices.json", assetRoot), "utf8"),
+  );
+  const legacy = catalog.voices.find((voice) => voice.id === "legacy-12s");
+  assert.ok(legacy);
+  assert.equal(legacy.audio, "legacy-12s.wav");
+
+  const legacyAudio = fs.readFileSync(new URL(legacy.audio, assetRoot));
+  const defaultAudio = fs.readFileSync(new URL("ref.wav", assetRoot));
+  assert.equal(createHash("sha256").update(legacyAudio).digest("hex"), legacy.sha256);
+  assert.notDeepEqual(defaultAudio, legacyAudio);
+  assert.equal(fs.existsSync(new URL("legacy-12s.txt", assetRoot)), true);
 });
 
 test("call capsule starts native dragging only from the waveform hot zone", () => {

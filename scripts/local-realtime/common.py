@@ -475,9 +475,9 @@ MERGED_MP3 = REPO / "merged.mp3"
 
 # 内置兜底参考音文案（仅对应默认卡 kxyy-yuanyuan/ref.*）。
 _DEFAULT_REF_TEXT = (
-    "对的，这是先实验一个小聚会，然后这个要是成功了的话，咱们之后就可以再换一个地方，"
-    "然后之后咱们办一个稍微大一点的，然后去的可以稍微多一点，因为现在太敏感了。"
-    "现在的话, 这个时候, 嗯这两天就很敏感"
+    "我平常一点半左右睡，我一般和你们道完晚安之后，我会去洗个澡，然后看会小说，"
+    "然后我再睡觉。并不是道完晚安就直接睡了，就是会留给一点点自己的时间去干点，"
+    "看会小说啥的，看会小说，然后看会漫剧什么的，我看会那种电影解说。"
 )
 
 
@@ -912,9 +912,10 @@ CONVERSATION_MOVE_HINTS = {
     "offer-entry": "先贡献具体内容，再留一个低负担、容易回应的入口；不要只把问题抛回用户。",
     "deepen": "沿当前话题自然深入一层，优先触及感受、原因、价值判断或个人选择，不要突然换题。",
     "associate": (
-        "先用一句准确接住用户，再做一次自然的横向联想，只带出一个相邻的新方向。"
-        "可以借当前细节、已有短期上下文或本轮提供的时下观察搭桥；不要硬切、不要罗列多个话题，"
-        "新方向必须增加一个当前对话尚未反复讨论的具体对象、场景或观察，不能只是换句话继续安慰或认同。"
+        "先用一句准确接住用户，再根据最近对话的语义状态决定是否只带出一个新方向。"
+        "可以借当前细节、已有短期上下文、普通生活联想或本轮提供的时下观察搭桥；不要罗列多个话题，"
+        "新方向必须出现至少一个当前对话尚未出现的新的具体名词、对象、作品、事件或场景，"
+        "不能只是换句话继续安慰或认同。先把这个新方向讲出一点实际内容，不要反问用户提供素材。"
         "也不要为了显得有生活而虚构亲身经历。用户不接这个方向时，下一轮立刻跟回用户。"
     ),
 }
@@ -1044,6 +1045,32 @@ def format_conversation_plan_hint(value) -> str:
         + CONVERSATION_STANCE_HINTS[plan["stance"]]
         + f"当前渐进深度为 {plan['depth']}；它只控制本轮表达，不是用户事实。"
     )
+
+
+SEMANTIC_TOPIC_AUTONOMY_HINT = (
+    "回复前先在内部比较用户最新一句与最近几轮可听对话，语义判断这句话是否新增了具体事实、观点、"
+    "问题、选择、感受变化或明确的新方向；不要输出判断过程或分类标签。"
+    "如果没有新增内容，而且当前分支已经出现重复附和、提醒、承诺或同义展开，就停止围绕该分支打转，"
+    "自然换到一个具体的新话题并由你先贡献内容。新话题不要求是新闻或时下信息，也可以来自人设中可靠的"
+    "兴趣与经历边界、已有但未说完的记忆线索、当前时间场景、普通生活观察、作品、游戏、地点或其他自然联想。"
+    "只选一个切入点，不要像栏目轮播，不要反问用户替你找素材。"
+    "如果用户正在追问、提供了实质新内容、明确想继续，或话题涉及健康、安全、强情绪和严肃求助，则保持当前方向。"
+)
+
+
+def select_turn_policy_hint(turn_policy: str, conversation_plan) -> str:
+    plan = sanitize_conversation_plan(conversation_plan)
+    if plan is not None and plan["move"] == "associate":
+        return ""
+    return {
+        "acknowledge": ACKNOWLEDGE_HINT_TEXT,
+        "amused": AMUSED_HINT_TEXT,
+        "curious": CURIOUS_HINT_TEXT,
+        "agree": AGREE_HINT_TEXT,
+        "resume": RESUME_HINT_TEXT,
+        "redirect": REDIRECT_HINT_TEXT,
+        "pause": PAUSE_HINT_TEXT,
+    }.get(turn_policy, "")
 
 
 def format_turn_memory_context(items) -> str:
@@ -1519,8 +1546,11 @@ class VoiceServiceRestartRequired(SafeRealtimeError):
 
 # 各本地后端都必须遵守的对话持续性约束；其余风格后缀目前仅 CosyVoice 使用。
 CONTINUE_CONVERSATION_SUFFIX = (
-    "\n用户没有明确说要睡、道别或挂断时，不要主动用先这样、回头再聊、早点休息、"
-    "明天见等话术结束对话。"
+    "\n用户没有明确说要睡、道别、离开或挂断时，不要主动用先这样、你先忙、我先去忙、"
+    "回头再聊、早点休息、明天见等任何措辞替双方结束对话，也不要擅自安排用户接下来做什么。"
+    "不要承诺稍后发照片、主动联系、线下见面或共同活动等系统不可兑现的未来行为；"
+    "不要为了显得有生活而声称自己现实中正在买菜、做饭、出门或收拾东西。\n"
+    + SEMANTIC_TOPIC_AUTONOMY_HINT
 )
 
 
@@ -4252,15 +4282,7 @@ class Session:
                 history_snapshot.append(
                     {"role": "system", "content": CONTINUATION_HINT_TEXT}
                 )
-            policy_hint = {
-                "acknowledge": ACKNOWLEDGE_HINT_TEXT,
-                "amused": AMUSED_HINT_TEXT,
-                "curious": CURIOUS_HINT_TEXT,
-                "agree": AGREE_HINT_TEXT,
-                "resume": RESUME_HINT_TEXT,
-                "redirect": REDIRECT_HINT_TEXT,
-                "pause": PAUSE_HINT_TEXT,
-            }.get(turn_policy)
+            policy_hint = select_turn_policy_hint(turn_policy, conversation_plan)
             if policy_hint:
                 history_snapshot.append({"role": "system", "content": policy_hint})
             conversation_hint = format_conversation_plan_hint(conversation_plan)

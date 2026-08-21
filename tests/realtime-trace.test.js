@@ -430,7 +430,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 8);
+  assert.equal(report.diagnosticSchemaVersion, 9);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -735,6 +735,38 @@ test("diagnostic report aggregates latency and interruption distributions", () =
     drainInclusiveUnderruns: 3,
     underrunSemantics: "includes-natural-drain",
   });
+});
+
+test("diagnostic report measures text-free audible gaps between managed segments", () => {
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.PLAYBACK_SEGMENT_STARTED, 100, {
+        generationId: 2,
+        metrics: { segmentIndex: 1 },
+      }),
+      fixtureEvent(TRACE_EVENT.PLAYBACK_SEGMENT_COMPLETED, 1000, {
+        generationId: 2,
+        metrics: { segmentIndex: 1 },
+      }),
+      fixtureEvent(TRACE_EVENT.PLAYBACK_SEGMENT_STARTED, 1450, {
+        generationId: 2,
+        metrics: { segmentIndex: 2 },
+      }),
+      fixtureEvent(TRACE_EVENT.PLAYBACK_SEGMENT_COMPLETED, 2200, {
+        generationId: 2,
+        metrics: { segmentIndex: 2 },
+      }),
+    ],
+  });
+
+  assert.equal(report.diagnosticSchemaVersion, 9);
+  assert.deepEqual(report.aggregate.segmentContinuity, {
+    segmentsStarted: 2,
+    segmentsCompleted: 2,
+    audibleGapMs: { count: 1, p50: 450, p95: 450 },
+  });
+  assert.equal(JSON.stringify(report).includes("segmentId"), false);
+  assert.equal(JSON.stringify(report).includes("句段正文"), false);
 });
 
 test("endpoint latency pairs commit with the latest soft end after a reopen", () => {
@@ -1639,6 +1671,31 @@ test("only confirmed speech converts a cancelled proactive window into initiativ
   session._cancelProactiveTimers();
 });
 
+test("managed playback schedules proactive speech once from final audible drain", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session._proactiveTurnMode = "local-v1";
+  session._lastAudibleGeneration = 4;
+  session._lastDurableAudibleGeneration = 3;
+  let schedules = 0;
+  session._scheduleTopicLeadAfterPlayback = (generation) => {
+    assert.equal(generation, 4);
+    schedules += 1;
+  };
+
+  session._backendAudioPending = false;
+  session._playbackQueuedMs = 0;
+  session._schedulePlaybackCompletion();
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  assert.equal(schedules, 1);
+
+  session._schedulePlaybackCompletion();
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  assert.equal(schedules, 1, "duplicate drained notices must not restart the silence window");
+});
+
 test("balanced allows one proactive turn after user engagement", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
@@ -1870,7 +1927,7 @@ test("proactive rhythm backs off once, stops after two negative signals, and res
   clearTimeout(session._proactiveLeadTimer);
 });
 
-test("topic lead timer starts only after the final audible segment", async () => {
+test("topic lead timer starts only after the final audible drain", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -1896,6 +1953,10 @@ test("topic lead timer starts only after the final audible segment", async () =>
   assert.equal(session._proactiveLeadTimer, 0);
   session._backendAudioPending = false;
   session._handleSegmentCompleted({ generation: 1, segmentId: 2 });
+  assert.equal(session._proactiveLeadTimer, 0);
+  session._playbackQueuedMs = 0;
+  session._schedulePlaybackCompletion();
+  await new Promise((resolve) => setTimeout(resolve, 750));
   assert.notEqual(session._proactiveLeadTimer, 0);
   clearTimeout(session._proactiveLeadTimer);
 });
@@ -2656,6 +2717,7 @@ test("desktop session returns text-free receipts only for current completed segm
   });
   session.ws = { readyState: 1, send: (message) => sent.push(JSON.parse(message)) };
   session.playbackNode = { port: { postMessage: () => {} } };
+  session.trace.startSession();
 
   session._onMessage({
     data: JSON.stringify({
@@ -2668,6 +2730,11 @@ test("desktop session returns text-free receipts only for current completed segm
   });
   session._onMessage({
     data: JSON.stringify({ type: "audio_segment_end", generation: 3, segmentId: 1 }),
+  });
+  session._onPlaybackMessage({
+    type: "segment_started",
+    generation: 3,
+    segmentId: 1,
   });
   session._onPlaybackMessage({
     type: "segment_completed",
@@ -2687,6 +2754,15 @@ test("desktop session returns text-free receipts only for current completed segm
     { type: "playback_segment", generation: 3, segmentId: 1, state: "completed" },
   ]);
   assert.equal(JSON.stringify(sent).includes("已经播完"), false);
+  const segmentEvents = session
+    .getTraceSnapshot()
+    .events.filter((event) => event.metrics.segmentIndex === 1)
+    .map((event) => [event.eventType, event.generationId]);
+  assert.deepEqual(segmentEvents, [
+    [TRACE_EVENT.TTS_SEGMENT_STARTED, 3],
+    [TRACE_EVENT.PLAYBACK_SEGMENT_STARTED, 3],
+    [TRACE_EVENT.PLAYBACK_SEGMENT_COMPLETED, 3],
+  ]);
 });
 
 test("candidate defers a completed segment until rejection and discards it on confirmation", async () => {

@@ -66,7 +66,7 @@
 
 ## 发布音色清单
 
-发布资源位于 `scripts/local-realtime/assets/kxyy-yuanyuan/voices.json`：只收录 5 个通过 75 条训练外样例自动评分的最高参考音（最高 CAM++ 均值 `0.705453`）和现有最早 `ref.wav/ref.txt` 基线。设置页的 `localVoicePreset` 只保存这 6 个 allow-list id；Python 每句合成前校验目录、文案长度和 SHA-256 后热加载，未通过校验会保留当前音色。75 条生成样例、其余候选、模型和报告继续留在 `.gitignore` 覆盖的本地目录，不能提交或上传。语气表现力微调按当前验收结论延期。
+发布资源位于 `scripts/local-realtime/assets/kxyy-yuanyuan/voices.json`：只收录 5 个通过 75 条训练外样例自动评分的最高参考音（最高 CAM++ 均值 `0.705453`）和固化为 `legacy-12s.wav/.txt` 的最早基线。当前默认参考音独立使用 `ref.wav/ref.txt`。设置页的 `localVoicePreset` 只保存这 6 个 allow-list id；Python 每句合成前校验目录、文案长度和 SHA-256 后热加载，未通过校验会保留当前音色。75 条生成样例、其余候选、模型和报告继续留在 `.gitignore` 覆盖的本地目录，不能提交或上传。语气表现力微调按当前验收结论延期。
 
 ## 2026-07-31 声纹尾部稳定性实验
 

@@ -342,9 +342,17 @@ class ConversationDirector {
       lateralEligible &&
       topicActivity !== "active" &&
       this.lateralCooldownTurns === 0 &&
-      (this.initiativeDebt >= MISSED_WINDOW_THRESHOLD || this.topicTurns >= LATERAL_TURN_INTERVAL);
+      (
+        this.initiativeDebt >= MISSED_WINDOW_THRESHOLD ||
+        this.topicTurns >= LATERAL_TURN_INTERVAL
+      );
     const plan = shouldAssociate
-      ? this._plan(CONVERSATION_MOVE.ASSOCIATE, RESPONSE_CUE.LOW_BURDEN, "companion", Math.min(2, this.depth))
+      ? this._plan(
+          CONVERSATION_MOVE.ASSOCIATE,
+          RESPONSE_CUE.LOW_BURDEN,
+          "companion",
+          Math.min(2, this.depth),
+        )
       : this._nextPlan(softIntent);
     if (shouldAssociate) {
       this.initiativeDebt = 0;

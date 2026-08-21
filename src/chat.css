@@ -748,57 +748,18 @@ body {
   text-align: center;
   white-space: nowrap;
 }
-#call-wave.thinking #call-status {
-  color: rgba(118, 226, 194, .95);
-}
-#call-wave.thinking .call-wave-bars span {
-  background: linear-gradient(
-    180deg,
-    rgba(118, 226, 194, .96) 0%,
-    rgba(54, 155, 132, .74) 100%
-  );
-  box-shadow: 0 0 7px rgba(94, 213, 179, .35);
-}
-.call-wave-bars {
+.call-wave-siri {
   flex: 1 1 auto;
   min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
   width: 100%;
-  height: 22px;
+  height: 26px;
+  overflow: hidden;
+  filter: drop-shadow(0 0 5px rgba(78, 199, 255, .2));
 }
-.call-wave-bars span {
-  flex: 1 1 0;
-  max-width: 4px;
-  min-width: 2px;
-  height: 20%;
-  border-radius: 99px;
-  background: linear-gradient(
-    180deg,
-    rgba(183, 156, 255, 0.95) 0%,
-    rgba(122, 94, 219, 0.75) 100%
-  );
-  box-shadow: 0 0 6px rgba(183, 156, 255, 0.35);
-  transform-origin: center;
-  transition: height 0.06s linear;
-}
-#call-wave.speaking .call-wave-bars span {
-  background: linear-gradient(
-    180deg,
-    rgba(255, 170, 190, 0.95) 0%,
-    rgba(229, 72, 77, 0.7) 100%
-  );
-  box-shadow: 0 0 6px rgba(229, 72, 77, 0.35);
-}
-#call-wave.candidate .call-wave-bars span {
-  background: linear-gradient(
-    180deg,
-    rgba(255, 224, 130, 0.98) 0%,
-    rgba(232, 157, 45, 0.78) 100%
-  );
-  box-shadow: 0 0 8px rgba(232, 157, 45, 0.45);
+#call-wave-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 /* 表情库面板：底部弹出的半透明深色网格 */
