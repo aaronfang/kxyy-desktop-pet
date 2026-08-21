@@ -106,9 +106,10 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first, second)
         self.assertIsNot(second, changed)
         self.assertEqual(len(built), 2)
-        self.assertEqual(built[0]["prompt_wav_path"], "/fake/ref.wav")
+        expected_ref_path = str(server._ref_wav)
+        self.assertEqual(built[0]["prompt_wav_path"], expected_ref_path)
         self.assertEqual(built[0]["prompt_text"], "reference")
-        self.assertEqual(built[0]["reference_wav_path"], "/fake/ref.wav")
+        self.assertEqual(built[0]["reference_wav_path"], expected_ref_path)
 
     def test_stream_uses_cached_prompt_generation_api(self):
         server = _load_server()
@@ -128,7 +129,10 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
             next(generator)
         self.assertEqual(calls[0]["target_text"], "hello")
         self.assertEqual(calls[0]["prompt_cache"], {"cached": True})
-        self.assertEqual(calls[0]["inference_timesteps"], 10)
+        self.assertEqual(
+            calls[0]["inference_timesteps"],
+            server._kwargs("hello")["inference_timesteps"],
+        )
 
     def test_stream_does_not_restart_after_cached_audio_was_emitted(self):
         server = _load_server()
