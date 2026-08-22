@@ -81,6 +81,13 @@ export const TRACE_EVENT = Object.freeze({
   RESPONSE_CANCELLED: "response_cancelled",
   MEMORY_CONTEXT_REQUEST: "memory_context_request",
   MEMORY_CONTEXT_RESPONSE: "memory_context_response",
+  PROACTIVE_TURN_ACCEPTED: "proactive_turn_accepted",
+  PROACTIVE_TURN_VETOED: "proactive_turn_vetoed",
+  PROACTIVE_TURN_CANCELLED: "proactive_turn_cancelled",
+  INTERRUPTION_RECOVERY_SCHEDULED: "interruption_recovery_scheduled",
+  INTERRUPTION_RECOVERY_STARTED: "interruption_recovery_started",
+  INTERRUPTION_RECOVERY_CANCELLED: "interruption_recovery_cancelled",
+  INTERRUPTION_RECOVERY_COMPLETED: "interruption_recovery_completed",
 });
 
 const EVENT_TYPES = new Set(Object.values(TRACE_EVENT));
@@ -90,10 +97,23 @@ const SAMPLED_EVENT_TYPES = new Set([
   TRACE_EVENT.PLAYBACK_STATS,
 ]);
 const PROTECTED_EVENT_TYPES = new Set([
+  TRACE_EVENT.SESSION_STARTED,
+  TRACE_EVENT.SESSION_ENDED,
   TRACE_EVENT.SPEECH_CANDIDATE,
   TRACE_EVENT.SPEECH_CONFIRMED,
   TRACE_EVENT.SPEECH_REJECTED,
+  TRACE_EVENT.RESPONSE_STARTED,
+  TRACE_EVENT.RESPONSE_COMPLETED,
+  TRACE_EVENT.RESPONSE_CANCELLED,
+  TRACE_EVENT.PROACTIVE_TURN_ACCEPTED,
+  TRACE_EVENT.PROACTIVE_TURN_VETOED,
+  TRACE_EVENT.PROACTIVE_TURN_CANCELLED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_STARTED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_CANCELLED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_COMPLETED,
 ]);
+const OPAQUE_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_REASONS = new Set([
   "completed",
   "error",
@@ -170,29 +190,65 @@ function safeIdentifier(value, name, required = false) {
     return null;
   }
   const text = String(value);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(text)) {
+  if (!OPAQUE_IDENTIFIER_PATTERN.test(text)) {
     throw new Error(`${name} must be an opaque identifier of at most 128 characters`);
   }
   return text;
 }
 
+function laneToEvict(protectedCount, observationCount, maximum) {
+  const protectedReserve = Math.ceil(maximum / 2);
+  const observationReserve = maximum - protectedReserve;
+  return protectedCount > protectedReserve && observationCount <= observationReserve
+    ? "protected"
+    : "observation";
+}
+
+function rawIdentifierCanBeSanitized(value, required = false) {
+  if (value === null || value === undefined || value === "") return !required;
+  return typeof value === "string" && OPAQUE_IDENTIFIER_PATTERN.test(value);
+}
+
+function isPotentialProtectedEvent(event) {
+  try {
+    return event?.schemaVersion === TRACE_SCHEMA_VERSION &&
+      PROTECTED_EVENT_TYPES.has(event.eventType) &&
+      Number.isFinite(event.timestampMs) &&
+      event.timestampMs >= 0 &&
+      Number.isSafeInteger(event.generationId) &&
+      event.generationId >= 0 &&
+      rawIdentifierCanBeSanitized(event.sessionId, true) &&
+      rawIdentifierCanBeSanitized(event.turnId) &&
+      rawIdentifierCanBeSanitized(event.responseId);
+  } catch {
+    return false;
+  }
+}
+
 function selectBoundedEvents(source, maximum) {
-  const events = Array.isArray(source) ? source : [];
-  if (events.length <= maximum) return events.slice();
   const protectedEvents = [];
-  const remaining = [];
-  events.forEach((event, index) => {
-    (PROTECTED_EVENT_TYPES.has(event?.eventType) ? protectedEvents : remaining).push({
-      event,
-      index,
-    });
+  const observations = [];
+  source.forEach((event, index) => {
+    const lane = isPotentialProtectedEvent(event) ? protectedEvents : observations;
+    let timestampMs = Number.POSITIVE_INFINITY;
+    try {
+      if (Number.isFinite(event?.timestampMs) && event.timestampMs >= 0) {
+        timestampMs = event.timestampMs;
+      }
+    } catch {
+      // Invalid imported values remain ordinary candidates and fail full sanitization.
+    }
+    lane.push({ event, index, timestampMs });
+    if (lane.length > maximum) lane.shift();
   });
-  const selected = protectedEvents.length >= maximum
-    ? protectedEvents.slice(-maximum)
-    : protectedEvents.concat(remaining.slice(-(maximum - protectedEvents.length)));
-  return selected
-    .sort((left, right) => left.index - right.index)
-    .map(({ event }) => event);
+  while (protectedEvents.length + observations.length > maximum) {
+    const lane = laneToEvict(protectedEvents.length, observations.length, maximum);
+    (lane === "protected" ? protectedEvents : observations).shift();
+  }
+  return protectedEvents.concat(observations)
+    .sort((left, right) =>
+      left.timestampMs - right.timestampMs || left.index - right.index,
+    );
 }
 
 /** Build one immutable v1 trace event. Primarily useful for deterministic tests. */
@@ -821,7 +877,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
     return aliases.get(value);
   };
   let rejectedItems = 0;
-  for (const event of candidateEvents) {
+  for (const { event } of candidateEvents) {
     try {
       if (event?.schemaVersion !== TRACE_SCHEMA_VERSION) throw new Error("schema mismatch");
       const safe = createTraceEvent(event);
@@ -911,6 +967,9 @@ export class RealtimeTrace {
     this.idFactory = idFactory;
     this.onEvent = typeof onEvent === "function" ? onEvent : null;
     this.events = [];
+    this._protectedEvents = [];
+    this._observationEvents = [];
+    this._lastRecordedEvent = null;
     this.droppedEvents = 0;
     this.state = createReplayState();
     this.sessionId = null;
@@ -930,6 +989,9 @@ export class RealtimeTrace {
     this.generationId = 0;
     this.originMs = this.clock();
     this.events = [];
+    this._protectedEvents = [];
+    this._observationEvents = [];
+    this._lastRecordedEvent = null;
     this.droppedEvents = 0;
     this.state = createReplayState();
     this._once.clear();
@@ -990,9 +1052,13 @@ export class RealtimeTrace {
         updateLatencySummary(this._latencyByGeneration.get(event.generationId), event),
       );
     }
-    const last = this.events.at(-1);
+    const lane = PROTECTED_EVENT_TYPES.has(event.eventType)
+      ? this._protectedEvents
+      : this._observationEvents;
+    const last = lane.at(-1);
     if (
       event.eventType === TRACE_EVENT.PLAYBACK_STATS &&
+      this._lastRecordedEvent === last &&
       last?.eventType === TRACE_EVENT.PLAYBACK_STATS &&
       last.generationId === event.generationId
     ) {
@@ -1007,33 +1073,32 @@ export class RealtimeTrace {
           ),
         },
       });
-      this.events[this.events.length - 1] = event;
+      lane[lane.length - 1] = event;
       this.coalescedPlaybackStats += 1;
     } else {
-      if (this.events.length >= this.maxEvents) {
-        this.droppedEvents += 1;
-        const sampledIndex = this.events.findIndex((candidate) =>
-          SAMPLED_EVENT_TYPES.has(candidate.eventType),
+      lane.push(event);
+      if (this._protectedEvents.length + this._observationEvents.length > this.maxEvents) {
+        const laneToTrim = laneToEvict(
+          this._protectedEvents.length,
+          this._observationEvents.length,
+          this.maxEvents,
         );
-        const ordinaryIndex = this.events.findIndex((candidate) =>
-          !PROTECTED_EVENT_TYPES.has(candidate.eventType),
-        );
-        const evictIndex = sampledIndex >= 0 ? sampledIndex : ordinaryIndex;
-        if (evictIndex >= 0) {
-          this.events.splice(evictIndex, 1);
-        } else if (!PROTECTED_EVENT_TYPES.has(event.eventType)) {
-          try {
-            this.onEvent?.(event, this.state.lastDecision);
-          } catch {
-            // Observability callbacks must never change the live conversation path.
-          }
-          return event;
+        if (laneToTrim === "protected") {
+          this._protectedEvents.shift();
         } else {
-          this.events.shift();
+          const newestIndex = this._observationEvents.length - 1;
+          const sampledIndex = this._observationEvents.findIndex((candidate, index) =>
+            index < newestIndex && SAMPLED_EVENT_TYPES.has(candidate.eventType),
+          );
+          const evictIndex = sampledIndex >= 0 ? sampledIndex : 0;
+          this._observationEvents.splice(evictIndex, 1);
         }
+        this.droppedEvents += 1;
       }
-      this.events.push(event);
     }
+    this.events = this._protectedEvents.concat(this._observationEvents)
+      .sort((left, right) => left.timestampMs - right.timestampMs);
+    this._lastRecordedEvent = event;
     try {
       this.onEvent?.(event, this.state.lastDecision);
     } catch {

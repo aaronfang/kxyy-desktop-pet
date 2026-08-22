@@ -1746,6 +1746,16 @@ export class RealtimeSession {
         ? this._topicLead.lastProactiveKind
         : null);
     if (!kind) return;
+    const traceEvent = {
+      accepted: TRACE_EVENT.PROACTIVE_TURN_ACCEPTED,
+      vetoed: TRACE_EVENT.PROACTIVE_TURN_VETOED,
+      cancelled: TRACE_EVENT.PROACTIVE_TURN_CANCELLED,
+    }[msg.state];
+    this.trace.record(traceEvent, {
+      generationId: Number.isSafeInteger(msg.generation) && msg.generation >= 0
+        ? msg.generation
+        : undefined,
+    });
     if (msg.state === "vetoed") {
       this._proactivePending.delete(msg.triggerId);
       this._proactiveConversationPlans.delete(msg.triggerId);

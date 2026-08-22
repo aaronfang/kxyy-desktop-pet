@@ -340,6 +340,123 @@ test("long-call playback sampling cannot evict early interruption outcomes", () 
   assert.equal(report.exportStats.truncatedEvents, 46);
 });
 
+test("response, proactive, and recovery events survive sampled observation floods", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  trace.startResponse();
+  trace.record(TRACE_EVENT.PROACTIVE_TURN_ACCEPTED);
+  trace.record(TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED);
+  for (let index = 0; index < 20; index += 1) {
+    trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: index } });
+    trace.record(TRACE_EVENT.MIC_AUDIO_INPUT, { metrics: { audioBytes: 640 } });
+  }
+
+  const eventTypes = trace.snapshot().events.map((event) => event.eventType);
+  assert.ok(eventTypes.includes(TRACE_EVENT.RESPONSE_STARTED));
+  assert.ok(eventTypes.includes(TRACE_EVENT.PROACTIVE_TURN_ACCEPTED));
+  assert.ok(eventTypes.includes(TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED));
+});
+
+test("critical event floods leave bounded capacity for observations", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  for (let index = 0; index < 20; index += 1) {
+    trace.record(TRACE_EVENT.SPEECH_CANDIDATE);
+    trace.record(TRACE_EVENT.SPEECH_REJECTED);
+  }
+  trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 320 } });
+
+  const eventTypes = trace.snapshot().events.map((event) => event.eventType);
+  assert.ok(eventTypes.includes(TRACE_EVENT.MEMORY_CONTEXT_REQUEST));
+  assert.ok(eventTypes.includes(TRACE_EVENT.PLAYBACK_STATS));
+  assert.ok(eventTypes.some((eventType) => eventType.startsWith("speech_")));
+});
+
+test("diagnostic export validates before prioritizing and orders monotonic time", () => {
+  const malformedProtected = Array.from({ length: 300 }, (_, index) => ({
+    ...fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 500 + index),
+    schemaVersion: 999,
+  }));
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 10),
+      ...malformedProtected,
+      fixtureEvent(TRACE_EVENT.SPEECH_CONFIRMED, 20),
+      fixtureEvent(TRACE_EVENT.MEMORY_CONTEXT_REQUEST, 25),
+      fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, 30, { metrics: { queuedMs: 30 } }),
+    ],
+  });
+
+  assert.equal(report.exportStats.rejectedItems, 252);
+  assert.deepEqual(
+    report.events.map((event) => event.timestampMs),
+    [10, 20, 25, 30],
+  );
+  assert.deepEqual(
+    report.events.map((event) => event.eventType),
+    [
+      TRACE_EVENT.SPEECH_CANDIDATE,
+      TRACE_EVENT.SPEECH_CONFIRMED,
+      TRACE_EVENT.MEMORY_CONTEXT_REQUEST,
+      TRACE_EVENT.PLAYBACK_STATS,
+    ],
+  );
+});
+
+test("diagnostic export rejects hostile timestamps without aborting", () => {
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 10),
+      {
+        ...fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, 20),
+        timestampMs: Symbol("hostile-timestamp"),
+      },
+    ],
+  });
+
+  assert.equal(report.exportStats.rejectedItems, 1);
+  assert.deepEqual(report.events.map((event) => event.timestampMs), [10]);
+});
+
+test("playback stats only coalesce when globally consecutive", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 100 } });
+  trace.record(TRACE_EVENT.SPEECH_CANDIDATE);
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 200 } });
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 300 } });
+
+  const snapshot = trace.snapshot();
+  const playbackStats = snapshot.events.filter(
+    (event) => event.eventType === TRACE_EVENT.PLAYBACK_STATS,
+  );
+  assert.equal(playbackStats.length, 2);
+  assert.equal(snapshot.coalescedPlaybackStats, 1);
+  assert.deepEqual(playbackStats.map((event) => event.metrics.queuedMs), [100, 300]);
+});
+
 test("keeps eight generation latency summaries outside the rolling event queue", () => {
   let now = 0;
   let id = 0;
@@ -1495,6 +1612,7 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   const { RealtimeSession } = await import("../src/ai/realtime.js");
   const open = async (options, started = {}) => {
     const session = new RealtimeSession({ proactiveGreetingDelayMs: 0, ...options });
+    session.trace.startSession();
     session._playbackMode = "worklet";
     session.playbackNode = { port: { postMessage: () => {} } };
     session._micReady = true;
@@ -1547,8 +1665,19 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   active.session._onMessage({
     data: JSON.stringify({ type: "speech_confirmed", candidateId: 1 }),
   });
-  assert.equal(active.session.getTraceSnapshot().proactiveSummary.cancelled, 1);
-  assert.equal(active.session.getTraceSnapshot().proactiveSummary.preAudioUserReclaims, 1);
+  const activeSnapshot = active.session.getTraceSnapshot();
+  assert.equal(activeSnapshot.proactiveSummary.cancelled, 1);
+  assert.equal(activeSnapshot.proactiveSummary.preAudioUserReclaims, 1);
+  assert.ok(
+    activeSnapshot.events.some(
+      (event) => event.eventType === TRACE_EVENT.PROACTIVE_TURN_ACCEPTED,
+    ),
+  );
+  assert.ok(
+    activeSnapshot.events.some(
+      (event) => event.eventType === TRACE_EVENT.PROACTIVE_TURN_CANCELLED,
+    ),
+  );
 
   const interrupted = await open(
     { provider: "cosyvoice", conversationMode: "balanced", proactiveGreetingDelayMs: 20 },
