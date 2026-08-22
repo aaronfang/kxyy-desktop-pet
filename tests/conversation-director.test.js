@@ -141,6 +141,125 @@ test("soft intents change only the current turn strategy", () => {
   assert.equal(normal.strategy.stance, "support");
 });
 
+test("explicit opinion requests opine without turning the reply into an interview", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+
+  const action = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "invite-opinion",
+    topicActivity: "neutral",
+  });
+
+  assert.equal(action.strategy.stance, PERSONA_STANCE.OPINE);
+  assert.equal(action.strategy.responseCue, RESPONSE_CUE.NONE);
+});
+
+test("repeated low-information agreement rotates bounded agency on safe topics", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+
+  const stances = Array.from({ length: 3 }, () => onlyAction(director, {
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    topicActivity: "settling",
+    lateralAllowed: true,
+  }).strategy.stance);
+
+  assert.deepEqual(stances, [
+    PERSONA_STANCE.SUPPORT,
+    PERSONA_STANCE.CONTRAST,
+    PERSONA_STANCE.LEAD,
+  ]);
+
+  const resetDirector = createConversationDirector({ mode: "balanced" });
+  resetDirector.dispatch({ type: "session-started" });
+  resetDirector.dispatch({
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    topicActivity: "settling",
+    lateralAllowed: true,
+  });
+  resetDirector.dispatch({ type: "hard-control", control: "pause" });
+  resetDirector.dispatch({ type: "hard-control", control: "resume" });
+  const resumed = onlyAction(resetDirector, {
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    topicActivity: "settling",
+    lateralAllowed: true,
+  });
+  assert.equal(resumed.strategy.stance, PERSONA_STANCE.SUPPORT);
+});
+
+test("sensitive disclosures suppress contrast and leadership until calm recovery", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  director.dispatch({
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    topicActivity: "settling",
+    lateralAllowed: true,
+  });
+
+  const sensitive = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "invite-opinion",
+    topicActivity: "sensitive",
+    lateralAllowed: true,
+  });
+  assert.equal(sensitive.strategy.stance, PERSONA_STANCE.SUPPORT);
+  assert.notEqual(sensitive.strategy.move, CONVERSATION_MOVE.ASSOCIATE);
+
+  const firstCalm = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    topicActivity: "neutral",
+    lateralAllowed: true,
+  });
+  assert.equal(firstCalm.strategy.stance, PERSONA_STANCE.SUPPORT);
+});
+
+test("rejecting a led direction returns the same turn to the user topic", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  for (let index = 0; index < 3; index += 1) {
+    director.dispatch({ type: "proactive-window-missed", reason: "asr" });
+  }
+  const led = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "agree",
+    softIntent: "none",
+    topicActivity: "settling",
+    lateralAllowed: true,
+  });
+  assert.equal(led.strategy.stance, PERSONA_STANCE.LEAD);
+
+  const redirected = director.dispatch({
+    type: "user-turn-final",
+    policy: "redirect",
+    softIntent: "none",
+    topicActivity: "neutral",
+  });
+  assert.deepEqual(redirected.at(-1), {
+    type: "request-reply",
+    kind: "response",
+    strategy: {
+      move: CONVERSATION_MOVE.RESPOND,
+      responseCue: RESPONSE_CUE.NONE,
+      stance: PERSONA_STANCE.SUPPORT,
+      reasoningPolicy: REASONING_POLICY.FAST,
+      depth: 0,
+    },
+  });
+});
+
 test("three missed proactive windows become one in-response lateral association", () => {
   const director = createConversationDirector({ mode: "ai-leads" });
   director.dispatch({ type: "session-started" });

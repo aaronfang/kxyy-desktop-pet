@@ -2945,6 +2945,20 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要同义复述", rendered)
         self.assertIn("不要替双方结束", rendered)
 
+    def test_agency_stance_hints_preserve_persona_facts_and_forbid_fake_experience(self):
+        for stance in ("opine", "contrast", "lead"):
+            rendered = common.format_turn_strategy_hint({
+                "move": "respond",
+                "responseCue": "none",
+                "stance": stance,
+                "reasoningPolicy": "fast",
+                "depth": 0,
+            })
+            with self.subTest(stance=stance):
+                self.assertIn("人设", rendered)
+                self.assertIn("不虚构亲身经历", rendered)
+                self.assertIn("先贡献", rendered)
+
     async def test_proactive_topic_revisit_is_bounded_ephemeral_context(self):
         captured = []
         common._synth_tts = lambda _text: b"unused"

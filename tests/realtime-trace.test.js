@@ -2210,6 +2210,38 @@ test("ai-leads sends a fixed turn strategy with negotiated turn context", async 
   assert.equal(session.getTraceSnapshot().proactiveSummary.replyCancelTimeouts, 1);
 });
 
+test("rejecting a led topic sends a support strategy back through managed context", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._memoryContextMode = "turn-final-v1";
+  session._backendGeneration = 9;
+  session._userTurnOpen = true;
+  session._onMessage({
+    data: JSON.stringify({
+      type: "asr",
+      text: "不聊这个了，还是说说我的生物钟吧",
+      interim: false,
+      generation: 9,
+    }),
+  });
+
+  assert.equal(session.sendMemoryContext({ generation: 9, items: [] }), true);
+  assert.deepEqual(sent.at(-1).turnStrategy, {
+    move: "respond",
+    responseCue: "none",
+    stance: "support",
+    reasoningPolicy: "fast",
+    depth: 0,
+  });
+  const diagnostic = JSON.stringify(session.getTraceSnapshot());
+  assert.equal(diagnostic.includes("生物钟"), false);
+  assert.equal(session.getTraceSnapshot().turnStrategySummary.stances.support, 1);
+});
+
 test("thinking feedback is immediate and offers at most one delayed filler signal per turn", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");

@@ -273,6 +273,8 @@ class ConversationDirector {
     this.lateralMoves = 0;
     this.lateralRecoveryTurns = 0;
     this.lateralCooldownTurns = 0;
+    this.agreementStreak = 0;
+    this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
     this._nextQuestionMove = CONVERSATION_MOVE.RESPOND;
   }
@@ -311,6 +313,8 @@ class ConversationDirector {
           this.sameTopicContinuations = 0;
           this.depth = 0;
           this.topicTurns = 0;
+          this.agreementStreak = 0;
+          this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
         }
         this.initiativeDebt = 0;
         return [];
@@ -364,17 +368,29 @@ class ConversationDirector {
     }
 
     if (policy === "pause") return this._onHardControl("pause");
-    if (policy === "redirect") return this._onHardControl("redirect");
+    if (policy === "redirect") {
+      const controls = this._onHardControl("redirect");
+      const strategy = this._strategy(
+        CONVERSATION_MOVE.RESPOND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        0,
+      );
+      this._recordStrategy(strategy);
+      return [...controls, { type: "request-reply", kind: "response", strategy }];
+    }
     if (policy === "resume") this._onHardControl("resume");
 
     const lateralAllowed = event.lateralAllowed !== false;
-    if (!lateralAllowed) {
+    const sensitive = topicActivity === "sensitive" || !lateralAllowed;
+    if (sensitive) {
       this.topicTurns = 0;
       this.lateralRecoveryTurns = 2;
     } else if (this.lateralRecoveryTurns > 0) {
       this.lateralRecoveryTurns -= 1;
     }
-    const lateralRecovered = lateralAllowed && this.lateralRecoveryTurns === 0;
+    const lateralRecovered = !sensitive && this.lateralRecoveryTurns === 0;
     const lateralEligible = lateralRecovered && LATERAL_ELIGIBLE_POLICIES.has(policy);
     if (lateralEligible && this.lateralCooldownTurns > 0) {
       this.lateralCooldownTurns -= 1;
@@ -387,7 +403,7 @@ class ConversationDirector {
       lateralRecovered &&
       softIntent === "none" &&
       lateralEligible &&
-      topicActivity !== "active" &&
+      !["active", "sensitive"].includes(topicActivity) &&
       this.lateralCooldownTurns === 0 &&
       (
         this.initiativeDebt >= MISSED_WINDOW_THRESHOLD ||
@@ -398,7 +414,26 @@ class ConversationDirector {
       ? event.conversationDepth
       : softIntent === "deepen" ? 2 : topicActivity === "sensitive" ? 1 : 0;
     this.depth = semanticDepth;
-    const strategy = shouldAssociate
+    const agencyEligible =
+      !sensitive &&
+      this.lateralRecoveryTurns === 0 &&
+      softIntent === "none" &&
+      policy === "agree" &&
+      ["neutral", "settling"].includes(topicActivity);
+    if (agencyEligible) {
+      this.agreementStreak = Math.min(3, this.agreementStreak + 1);
+    } else {
+      this.agreementStreak = 0;
+    }
+    const agencyStance = this.agreementStreak >= 2
+      ? this._nextAgencyStance
+      : null;
+    if (agencyStance && !shouldAssociate) {
+      this._nextAgencyStance = agencyStance === PERSONA_STANCE.CONTRAST
+        ? PERSONA_STANCE.LEAD
+        : PERSONA_STANCE.CONTRAST;
+    }
+    let strategy = shouldAssociate
       ? this._strategy(
           CONVERSATION_MOVE.ASSOCIATE,
           RESPONSE_CUE.LOW_BURDEN,
@@ -407,6 +442,11 @@ class ConversationDirector {
           Math.min(2, semanticDepth),
         )
       : this._nextStrategy(softIntent, semanticDepth);
+    if (!shouldAssociate && sensitive) {
+      strategy = sanitizeTurnStrategy({ ...strategy, stance: PERSONA_STANCE.SUPPORT });
+    } else if (!shouldAssociate && agencyStance) {
+      strategy = sanitizeTurnStrategy({ ...strategy, stance: agencyStance });
+    }
     if (shouldAssociate) {
       this.initiativeDebt = 0;
       this.topicTurns = 0;
@@ -541,6 +581,8 @@ class ConversationDirector {
   }
 
   _onHardControl(control) {
+    this.agreementStreak = 0;
+    this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     if (control === "resume") {
       this.paused = false;
       return [{ type: "resume-leading" }];
@@ -573,6 +615,8 @@ class ConversationDirector {
     this.lateralMoves = 0;
     this.lateralRecoveryTurns = 0;
     this.lateralCooldownTurns = 0;
+    this.agreementStreak = 0;
+    this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
   }
 }
