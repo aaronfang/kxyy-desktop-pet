@@ -81,13 +81,49 @@ export const TRACE_EVENT = Object.freeze({
   RESPONSE_CANCELLED: "response_cancelled",
   MEMORY_CONTEXT_REQUEST: "memory_context_request",
   MEMORY_CONTEXT_RESPONSE: "memory_context_response",
+  PROACTIVE_TURN_ACCEPTED: "proactive_turn_accepted",
+  PROACTIVE_TURN_VETOED: "proactive_turn_vetoed",
+  PROACTIVE_TURN_CANCELLED: "proactive_turn_cancelled",
+  INTERRUPTION_RECOVERY_SCHEDULED: "interruption_recovery_scheduled",
+  INTERRUPTION_RECOVERY_STARTED: "interruption_recovery_started",
+  INTERRUPTION_RECOVERY_CANCELLED: "interruption_recovery_cancelled",
+  INTERRUPTION_RECOVERY_COMPLETED: "interruption_recovery_completed",
 });
 
 const EVENT_TYPES = new Set(Object.values(TRACE_EVENT));
+const SAMPLED_EVENT_TYPES = new Set([
+  TRACE_EVENT.MIC_AUDIO_INPUT,
+  TRACE_EVENT.PLAYBACK_QUEUED,
+  TRACE_EVENT.PLAYBACK_STATS,
+]);
+const PROTECTED_EVENT_TYPES = new Set([
+  TRACE_EVENT.SESSION_STARTED,
+  TRACE_EVENT.SESSION_ENDED,
+  TRACE_EVENT.SPEECH_CANDIDATE,
+  TRACE_EVENT.SPEECH_CONFIRMED,
+  TRACE_EVENT.SPEECH_REJECTED,
+  TRACE_EVENT.RESPONSE_STARTED,
+  TRACE_EVENT.RESPONSE_COMPLETED,
+  TRACE_EVENT.RESPONSE_CANCELLED,
+  TRACE_EVENT.PROACTIVE_TURN_ACCEPTED,
+  TRACE_EVENT.PROACTIVE_TURN_VETOED,
+  TRACE_EVENT.PROACTIVE_TURN_CANCELLED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_STARTED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_CANCELLED,
+  TRACE_EVENT.INTERRUPTION_RECOVERY_COMPLETED,
+]);
+const OPAQUE_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_REASONS = new Set([
+  "app_quit",
+  "backend_switch",
   "completed",
   "error",
+  "explicit_conversation_clear",
   "hangup",
+  "persona_switch",
+  "provider_terminal",
+  "recovery_failed",
   "reconnect",
   "session_ended",
   "turn_detected",
@@ -160,10 +196,65 @@ function safeIdentifier(value, name, required = false) {
     return null;
   }
   const text = String(value);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(text)) {
+  if (!OPAQUE_IDENTIFIER_PATTERN.test(text)) {
     throw new Error(`${name} must be an opaque identifier of at most 128 characters`);
   }
   return text;
+}
+
+function laneToEvict(protectedCount, observationCount, maximum) {
+  const protectedReserve = Math.ceil(maximum / 2);
+  const observationReserve = maximum - protectedReserve;
+  return protectedCount > protectedReserve && observationCount <= observationReserve
+    ? "protected"
+    : "observation";
+}
+
+function rawIdentifierCanBeSanitized(value, required = false) {
+  if (value === null || value === undefined || value === "") return !required;
+  return typeof value === "string" && OPAQUE_IDENTIFIER_PATTERN.test(value);
+}
+
+function isPotentialProtectedEvent(event) {
+  try {
+    return event?.schemaVersion === TRACE_SCHEMA_VERSION &&
+      PROTECTED_EVENT_TYPES.has(event.eventType) &&
+      Number.isFinite(event.timestampMs) &&
+      event.timestampMs >= 0 &&
+      Number.isSafeInteger(event.generationId) &&
+      event.generationId >= 0 &&
+      rawIdentifierCanBeSanitized(event.sessionId, true) &&
+      rawIdentifierCanBeSanitized(event.turnId) &&
+      rawIdentifierCanBeSanitized(event.responseId);
+  } catch {
+    return false;
+  }
+}
+
+function selectBoundedEvents(source, maximum) {
+  const protectedEvents = [];
+  const observations = [];
+  source.forEach((event, index) => {
+    const lane = isPotentialProtectedEvent(event) ? protectedEvents : observations;
+    let timestampMs = Number.POSITIVE_INFINITY;
+    try {
+      if (Number.isFinite(event?.timestampMs) && event.timestampMs >= 0) {
+        timestampMs = event.timestampMs;
+      }
+    } catch {
+      // Invalid imported values remain ordinary candidates and fail full sanitization.
+    }
+    lane.push({ event, index, timestampMs });
+    if (lane.length > maximum) lane.shift();
+  });
+  while (protectedEvents.length + observations.length > maximum) {
+    const lane = laneToEvict(protectedEvents.length, observations.length, maximum);
+    (lane === "protected" ? protectedEvents : observations).shift();
+  }
+  return protectedEvents.concat(observations)
+    .sort((left, right) =>
+      left.timestampMs - right.timestampMs || left.index - right.index,
+    );
 }
 
 /** Build one immutable v1 trace event. Primarily useful for deterministic tests. */
@@ -674,6 +765,11 @@ function sanitizeRuntimeSummary(runtime) {
       ["candidate-snapshot-v1", "none"],
       "none",
     ),
+    interruptionRecovery: safeEnum(
+      value.interruptionRecovery,
+      ["empty-confirmed-v1", "none"],
+      "none",
+    ),
     memoryContext: safeEnum(
       value.memoryContext,
       ["session-start-v1", "turn-final-v1", "none"],
@@ -734,7 +830,7 @@ function sanitizeProactiveSummary(raw) {
     topicSwitches: count("topicSwitches"),
     replyCancelTimeouts: count("replyCancelTimeouts"),
     conversationMoves: fixedCounts(value.conversationMoves, [
-      "expand", "offerEntry", "deepen", "associate",
+      "respond", "expand", "deepen", "associate", "recover",
     ]),
     topicActivity: fixedCounts(value.topicActivity, [
       "active", "neutral", "settling", "sensitive",
@@ -754,6 +850,46 @@ function sanitizeProactiveSummary(raw) {
       stops: count("rhythmStops"),
       stopped: value.rhythmStopped === true,
     },
+  });
+}
+
+function sanitizeTurnStrategySummary(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const fixedCounts = (source, names) => {
+    const input = source && typeof source === "object" ? source : {};
+    return Object.fromEntries(names.map((name) => {
+      const count = input[name];
+      return [name, Number.isSafeInteger(count) && count >= 0 && count <= 255 ? count : 0];
+    }));
+  };
+  return Object.freeze({
+    moves: fixedCounts(value.moves, ["respond", "expand", "deepen", "associate", "recover"]),
+    stances: fixedCounts(value.stances, ["support", "opine", "contrast", "lead"]),
+    reasoningPolicies: fixedCounts(value.reasoningPolicies, ["fast", "deliberate"]),
+    responseCues: fixedCounts(value.responseCues, ["none", "lowBurden", "question"]),
+    depths: fixedCounts(value.depths, ["zero", "one", "two", "three"]),
+    sources: fixedCounts(value.sources, [
+      "preferenceOff",
+      "preferenceAlways",
+      "automaticSignal",
+      "automaticCarry",
+      "automaticFast",
+      "fastControl",
+    ]),
+  });
+}
+
+function sanitizeRecoverySummary(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const count = (name) =>
+    Number.isSafeInteger(value[name]) && value[name] >= 0 && value[name] <= 255
+      ? value[name]
+      : 0;
+  return Object.freeze({
+    scheduled: count("scheduled"),
+    started: count("started"),
+    cancelled: count("cancelled"),
+    completed: count("completed"),
   });
 }
 
@@ -781,7 +917,7 @@ function sanitizeLatencySummary(summary) {
 export function buildRealtimeDiagnosticReport(snapshot) {
   const source = snapshot && typeof snapshot === "object" ? snapshot : {};
   const sourceEvents = Array.isArray(source.events) ? source.events : [];
-  const candidateEvents = sourceEvents.slice(-MAX_DIAGNOSTIC_EVENTS);
+  const candidateEvents = selectBoundedEvents(sourceEvents, MAX_DIAGNOSTIC_EVENTS);
   const events = [];
   const sessionIds = new Map();
   const turnIds = new Map();
@@ -792,7 +928,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
     return aliases.get(value);
   };
   let rejectedItems = 0;
-  for (const event of candidateEvents) {
+  for (const { event } of candidateEvents) {
     try {
       if (event?.schemaVersion !== TRACE_SCHEMA_VERSION) throw new Error("schema mismatch");
       const safe = createTraceEvent(event);
@@ -850,6 +986,8 @@ export function buildRealtimeDiagnosticReport(snapshot) {
       segmentContinuity: summarizeSegmentContinuity(events),
       memoryContext: summarizeMemoryContext(events),
       proactive: sanitizeProactiveSummary(source.proactiveSummary),
+      recovery: sanitizeRecoverySummary(source.recoverySummary),
+      turnStrategy: sanitizeTurnStrategySummary(source.turnStrategySummary),
       vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),
       playback: {
         maxSampledQueuedMs:
@@ -882,6 +1020,9 @@ export class RealtimeTrace {
     this.idFactory = idFactory;
     this.onEvent = typeof onEvent === "function" ? onEvent : null;
     this.events = [];
+    this._protectedEvents = [];
+    this._observationEvents = [];
+    this._lastRecordedEvent = null;
     this.droppedEvents = 0;
     this.state = createReplayState();
     this.sessionId = null;
@@ -901,6 +1042,9 @@ export class RealtimeTrace {
     this.generationId = 0;
     this.originMs = this.clock();
     this.events = [];
+    this._protectedEvents = [];
+    this._observationEvents = [];
+    this._lastRecordedEvent = null;
     this.droppedEvents = 0;
     this.state = createReplayState();
     this._once.clear();
@@ -961,9 +1105,13 @@ export class RealtimeTrace {
         updateLatencySummary(this._latencyByGeneration.get(event.generationId), event),
       );
     }
-    const last = this.events.at(-1);
+    const lane = PROTECTED_EVENT_TYPES.has(event.eventType)
+      ? this._protectedEvents
+      : this._observationEvents;
+    const last = lane.at(-1);
     if (
       event.eventType === TRACE_EVENT.PLAYBACK_STATS &&
+      this._lastRecordedEvent === last &&
       last?.eventType === TRACE_EVENT.PLAYBACK_STATS &&
       last.generationId === event.generationId
     ) {
@@ -978,15 +1126,32 @@ export class RealtimeTrace {
           ),
         },
       });
-      this.events[this.events.length - 1] = event;
+      lane[lane.length - 1] = event;
       this.coalescedPlaybackStats += 1;
     } else {
-      if (this.events.length >= this.maxEvents) {
-        this.events.shift();
+      lane.push(event);
+      if (this._protectedEvents.length + this._observationEvents.length > this.maxEvents) {
+        const laneToTrim = laneToEvict(
+          this._protectedEvents.length,
+          this._observationEvents.length,
+          this.maxEvents,
+        );
+        if (laneToTrim === "protected") {
+          this._protectedEvents.shift();
+        } else {
+          const newestIndex = this._observationEvents.length - 1;
+          const sampledIndex = this._observationEvents.findIndex((candidate, index) =>
+            index < newestIndex && SAMPLED_EVENT_TYPES.has(candidate.eventType),
+          );
+          const evictIndex = sampledIndex >= 0 ? sampledIndex : 0;
+          this._observationEvents.splice(evictIndex, 1);
+        }
         this.droppedEvents += 1;
       }
-      this.events.push(event);
     }
+    this.events = this._protectedEvents.concat(this._observationEvents)
+      .sort((left, right) => left.timestampMs - right.timestampMs);
+    this._lastRecordedEvent = event;
     try {
       this.onEvent?.(event, this.state.lastDecision);
     } catch {

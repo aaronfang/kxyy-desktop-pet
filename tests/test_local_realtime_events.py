@@ -390,12 +390,18 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertEqual(payload["provider"], "text")
         self.assertFalse("model" in payload)
         self.assertFalse("apiKey" in payload)
-        self.assertFalse("thinking" in payload)
         self.assertFalse("temperature" in payload)
+        self.assertEqual(payload["thinking"], False)
         self.assertTrue(payload["stream"])
         self.assertGreaterEqual(payload["max_tokens"], 512)
         self.assertNotIn("一两句即可", payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][-1]["content"], "这一轮")
+
+    def test_realtime_proxy_payload_sends_explicit_reasoning_policy_every_time(self):
+        fast = common.build_llm_proxy_payload("角色设定", [], "普通回应", thinking=False)
+        deliberate = common.build_llm_proxy_payload("角色设定", [], "深入回应", thinking=True)
+        self.assertEqual(fast["thinking"], False)
+        self.assertEqual(deliberate["thinking"], True)
 
     def test_proxy_request_preserves_recent_facts_and_message_boundaries(self):
         history = []
@@ -415,6 +421,52 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertEqual(payload["messages"][2]["role"], "user")
         self.assertIn("牛肉饭", str(payload["messages"]))
         self.assertNotEqual(payload["messages"][2]["role"], "assistant")
+
+    def test_turn_strategy_sanitizer_accepts_only_the_v2_fixed_schema(self):
+        base = {
+            "move": "respond",
+            "responseCue": "none",
+            "stance": "support",
+            "reasoningPolicy": "fast",
+            "depth": 0,
+        }
+        dimensions = {
+            "move": ("respond", "expand", "deepen", "associate", "recover"),
+            "responseCue": ("none", "low-burden", "question"),
+            "stance": ("support", "opine", "contrast", "lead"),
+            "reasoningPolicy": ("fast", "deliberate"),
+            "depth": (0, 1, 2, 3),
+        }
+        for field, values in dimensions.items():
+            for value in values:
+                strategy = {**base, field: value}
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(common.sanitize_turn_strategy(strategy), strategy)
+
+        invalid_values = (
+            {**base, "move": "offer-entry"},
+            {**base, "stance": "companion"},
+            {**base, "reasoningPolicy": "automatic"},
+            {**base, "responseCue": "open-ended"},
+            {**base, "depth": -1},
+            {**base, "depth": 4},
+            {**base, "depth": True},
+        )
+        for strategy in invalid_values:
+            with self.subTest(strategy=strategy):
+                self.assertIsNone(common.sanitize_turn_strategy(strategy))
+
+    def test_reasoning_policy_sanitizer_fails_closed_to_fast(self):
+        self.assertEqual(common.sanitize_reasoning_policy("fast"), "fast")
+        self.assertEqual(common.sanitize_reasoning_policy("deliberate"), "deliberate")
+        for value in (None, "automatic", "reasoning text", True, 1):
+            self.assertEqual(common.sanitize_reasoning_policy(value), "fast")
+        self.assertEqual(
+            common.sanitize_reasoning_policy(None, "deliberate"),
+            "deliberate",
+        )
+        self.assertEqual(common.reasoning_preference_fallback("always"), "deliberate")
+        self.assertEqual(common.reasoning_preference_fallback("automatic"), "fast")
 
     def test_llm_stream_uses_loopback_proxy_and_parses_deltas_and_usage(self):
         captured = {}
@@ -517,13 +569,14 @@ class TextProviderAdapterTests(unittest.TestCase):
             return FakeResponse()
 
         common.urllib.request.urlopen = fake_urlopen
-        plan = {
+        strategy = {
             "move": "expand",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 1,
         }
-        hint = common.format_conversation_plan_hint(plan)
+        hint = common.format_turn_strategy_hint(strategy)
         events = list(
             common.iter_llm_stream(
                 "角色设定",
@@ -950,7 +1003,7 @@ class BoundedLlmProducerTests(unittest.TestCase):
         scope = common.GenerationCancelScope(1, "response")
         events = queue.Queue(maxsize=1)
         events.put({"type": "occupied"})
-        common.iter_llm_stream = lambda *_args: iter([{"type": "delta", "text": "late"}])
+        common.iter_llm_stream = lambda *_args, **_kwargs: iter([{"type": "delta", "text": "late"}])
         try:
             thread = common.start_llm_stream_producer("role", [], "user", scope, events)
             self.assertIsNotNone(thread)
@@ -967,7 +1020,7 @@ class BoundedLlmProducerTests(unittest.TestCase):
         )
         release = threading.Event()
 
-        def blocking_iter(*_args):
+        def blocking_iter(*_args, **_kwargs):
             release.wait(timeout=1)
             return
             yield  # pragma: no cover - keeps this a generator
@@ -999,7 +1052,7 @@ class BoundedLlmProducerTests(unittest.TestCase):
         common._llm_stream_slots = threading.BoundedSemaphore(
             common.LLM_STREAM_MAX_PRODUCERS
         )
-        common.iter_llm_stream = lambda *_args: (_ for _ in ()).throw(
+        common.iter_llm_stream = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             ValueError("raw upstream secret and full text")
         )
         scope = common.GenerationCancelScope(4, "response")
@@ -1617,6 +1670,27 @@ class InMemoryAsrTests(unittest.TestCase):
         for text in ("啊", "呃", "那个"):
             with self.subTest(text=text):
                 self.assertIsNone(common.is_valid_asr(text, 0.1, voiced))
+
+    def test_empty_confirmed_interruption_accepts_only_voiced_empty_or_filler_asr(self):
+        voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        quiet = struct.pack("<h", 1) * common.FRAME_SAMPLES
+        for text, no_speech_prob in (("", 0.1), ("呃", 0.1), ("那个", None)):
+            with self.subTest(text=text, no_speech_prob=no_speech_prob):
+                self.assertTrue(
+                    common.is_empty_confirmed_interruption(text, no_speech_prob, voiced)
+                )
+        for text, no_speech_prob, pcm in (
+            ("嗯", 0.1, voiced),
+            ("字幕由某某提供", 0.1, voiced),
+            ("这是一段中文对话，角色名字叫元元", 0.1, voiced),
+            ("啊" * 40, 0.1, voiced),
+            ("", 0.9, voiced),
+            ("呃", 0.1, quiet),
+        ):
+            with self.subTest(text=text, no_speech_prob=no_speech_prob):
+                self.assertFalse(
+                    common.is_empty_confirmed_interruption(text, no_speech_prob, pcm)
+                )
 
 
 class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
@@ -2589,7 +2663,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured, [[{"role": "system", "content": expected_hint}]])
             self.assertFalse(any(message.get("content") == expected_hint for message in session.history))
 
-    async def test_conversation_plan_hint_is_fixed_and_ephemeral(self):
+    async def test_turn_strategy_hint_is_fixed_and_ephemeral(self):
         captured = []
         common._synth_tts = lambda _text: b"unused"
 
@@ -2601,13 +2675,14 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         session = common.Session(FakeWebSocket())
         scope = session._new_scope("response")
         session.response_scope = scope
-        plan = {
-            "move": "offer-entry",
+        strategy = {
+            "move": "respond",
             "responseCue": "low-burden",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 2,
         }
-        await session._reply_pipeline("简短回应", scope, conversation_plan=plan)
+        await session._reply_pipeline("简短回应", scope, turn_strategy=strategy)
 
         system_contents = [
             message["content"] for message in captured[0] if message["role"] == "system"
@@ -2615,9 +2690,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         rendered = next(
             content for content in system_contents if content.startswith("本轮对话节奏")
         )
-        self.assertEqual(rendered, common.format_conversation_plan_hint(plan))
-        self.assertIn("先贡献具体内容", rendered)
+        self.assertEqual(rendered, common.format_turn_strategy_hint(strategy))
+        self.assertIn("贡献具体内容", rendered)
         self.assertIn("低负担", rendered)
+        self.assertIn("当前语义深度", rendered)
+        self.assertNotIn("渐进深度", rendered)
         self.assertNotIn("简短回应", rendered)
         self.assertFalse(any(message.get("content") == rendered for message in session.history))
 
@@ -2793,7 +2870,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         finally:
             common.THINKING_FILLER_DELAY_SECONDS = original_delay
 
-    async def test_proactive_conversation_plan_crosses_only_as_fixed_enums(self):
+    async def test_proactive_turn_strategy_crosses_only_as_fixed_enums(self):
         captured = []
         common._synth_tts = lambda _text: b"unused"
 
@@ -2809,10 +2886,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         await self.session.on_proactive_turn({
             "triggerId": 1,
             "kind": "followup",
-            "conversationPlan": {
+            "turnStrategy": {
                 "move": "expand",
                 "responseCue": "none",
-                "stance": "companion",
+                "stance": "support",
+                "reasoningPolicy": "fast",
                 "depth": 1,
                 "injected": "forbidden",
             },
@@ -2820,22 +2898,24 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         await self.session.reply_task
 
         rendered = captured[0][-1]["content"]
-        self.assertEqual(rendered, common.format_conversation_plan_hint({
+        self.assertEqual(rendered, common.format_turn_strategy_hint({
             "move": "expand",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 1,
         }))
         self.assertNotIn("forbidden", rendered)
 
-    def test_associate_plan_is_fixed_and_asks_for_one_bounded_lateral_thread(self):
-        plan = {
+    def test_associate_strategy_is_fixed_and_asks_for_one_bounded_lateral_thread(self):
+        strategy = {
             "move": "associate",
             "responseCue": "low-burden",
-            "stance": "companion",
+            "stance": "lead",
+            "reasoningPolicy": "fast",
             "depth": 2,
         }
-        rendered = common.format_conversation_plan_hint(plan)
+        rendered = common.format_turn_strategy_hint(strategy)
         self.assertIn("语义状态", rendered)
         self.assertIn("只带出一个", rendered)
         self.assertIn("新的具体名词", rendered)
@@ -2843,16 +2923,17 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("普通生活联想", rendered)
         self.assertNotIn("突然硬切", rendered)
 
-    def test_associate_plan_suppresses_conflicting_short_agreement_hint(self):
-        plan = {
+    def test_associate_strategy_suppresses_conflicting_short_agreement_hint(self):
+        strategy = {
             "move": "associate",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "lead",
+            "reasoningPolicy": "fast",
             "depth": 1,
         }
-        self.assertEqual(common.select_turn_policy_hint("agree", plan), "")
+        self.assertEqual(common.select_turn_policy_hint("agree", strategy), "")
         self.assertEqual(
-            common.select_turn_policy_hint("agree", {**plan, "move": "expand"}),
+            common.select_turn_policy_hint("agree", {**strategy, "move": "expand"}),
             common.AGREE_HINT_TEXT,
         )
 
@@ -2871,15 +2952,30 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不可兑现", common.CONTINUE_CONVERSATION_SUFFIX)
         self.assertIn("现实中正在", common.CONTINUE_CONVERSATION_SUFFIX)
 
-    def test_default_companion_plan_contributes_without_parroting_or_closing(self):
-        rendered = common.format_conversation_plan_hint({
+    def test_default_support_strategy_contributes_without_parroting_or_closing(self):
+        rendered = common.format_turn_strategy_hint({
             "move": "expand",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 1,
         })
         self.assertIn("不要同义复述", rendered)
         self.assertIn("不要替双方结束", rendered)
+
+    def test_agency_stance_hints_preserve_persona_facts_and_forbid_fake_experience(self):
+        for stance in ("opine", "contrast", "lead"):
+            rendered = common.format_turn_strategy_hint({
+                "move": "respond",
+                "responseCue": "none",
+                "stance": stance,
+                "reasoningPolicy": "fast",
+                "depth": 0,
+            })
+            with self.subTest(stance=stance):
+                self.assertIn("人设", rendered)
+                self.assertIn("不虚构亲身经历", rendered)
+                self.assertIn("先贡献", rendered)
 
     async def test_proactive_topic_revisit_is_bounded_ephemeral_context(self):
         captured = []
@@ -2943,6 +3039,139 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             "state": "vetoed",
             "reason": "speech",
         })
+
+    async def test_empty_interruption_recovery_uses_only_audible_history(self):
+        captured = []
+        common._synth_tts = lambda _text: b"unused"
+
+        def capture(_role, history, text, _scope, out):
+            captured.append(([dict(message) for message in history], text))
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+            "initialHistory": [
+                {"role": "user", "content": "不可用的启动历史"},
+                {"role": "assistant", "content": "也没有在这次通话播放"},
+            ],
+        })
+        self.session._audible_history.begin_proactive_turn(1)
+        self.assertTrue(self.session._audible_history.add_segment(1, 1, "已经实际播完的内容"))
+        self.assertTrue(self.session._audible_history.acknowledge(1, 1, "completed"))
+        self.session.gen_id = 3
+
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 3,
+            "userText": "forbidden fake user",
+        })
+        await self.session.reply_task
+
+        statuses = [
+            message for message in self.ws.json_messages()
+            if message.get("type") == "interruption_recovery_status"
+        ]
+        self.assertEqual([message["state"] for message in statuses], ["started", "completed"])
+        history, request_text = captured[0]
+        self.assertEqual(request_text, common.INTERRUPTION_RECOVERY_PROMPT)
+        self.assertEqual(history, [{"role": "assistant", "content": "已经实际播完的内容"}])
+        self.assertNotIn("forbidden fake user", json.dumps(captured, ensure_ascii=False))
+        self.assertNotIn("forbidden fake user", json.dumps(self.session.history, ensure_ascii=False))
+
+    async def test_interruption_recovery_failure_emits_one_cancelled_terminal_status(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session._audible_history.begin_proactive_turn(1)
+        self.session._audible_history.add_segment(1, 1, "可听内容")
+        self.session._audible_history.acknowledge(1, 1, "completed")
+        self.session.gen_id = 2
+
+        async def fail_reply(_text, scope, **_kwargs):
+            scope.cancel("response_error")
+
+        self.session._reply_pipeline = fail_reply
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 2,
+        })
+        await self.session.reply_task
+
+        statuses = [
+            message["state"]
+            for message in self.ws.json_messages()
+            if message.get("type") == "interruption_recovery_status"
+        ]
+        self.assertEqual(statuses, ["started", "cancelled"])
+
+    async def test_interruption_recovery_defers_receipts_and_rejects_stale_or_empty_history(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session.gen_id = 4
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 4,
+        })
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "cancelled")
+
+        self.session._audible_history.begin_proactive_turn(1)
+        self.session._audible_history.add_segment(1, 1, "可听内容")
+        self.session._audible_history.acknowledge(1, 1, "completed")
+        self.session._pending_playback_segments.add((2, 1))
+        await self.session.on_interruption_recovery({
+            "requestId": 2,
+            "expectedGeneration": 4,
+        })
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "deferred")
+        self.session._pending_playback_segments.clear()
+
+        async def no_reply(_scope, _request_id, _turn_strategy=None):
+            return None
+
+        self.session._interruption_recovery_pipeline = no_reply
+        await self.session.on_interruption_recovery({
+            "requestId": 2,
+            "expectedGeneration": 4,
+        })
+        await self.session.reply_task
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "started")
+
+        await self.session.on_interruption_recovery({
+            "requestId": 3,
+            "expectedGeneration": 1,
+        })
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "cancelled")
+
+    async def test_speech_candidate_cancels_active_interruption_recovery(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session._audible_history.begin_proactive_turn(1)
+        self.session._audible_history.add_segment(1, 1, "可听内容")
+        self.session._audible_history.acknowledge(1, 1, "completed")
+        self.session.gen_id = 5
+        blocker = asyncio.Event()
+
+        async def blocked_reply(_scope, _request_id, _turn_strategy=None):
+            await blocker.wait()
+
+        self.session._interruption_recovery_pipeline = blocked_reply
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 5,
+        })
+        await self.session._emit_speech_candidate()
+        statuses = [
+            message for message in self.ws.json_messages()
+            if message.get("type") == "interruption_recovery_status"
+        ]
+        self.assertEqual([message["state"] for message in statuses], ["started", "cancelled"])
 
     async def asyncTearDown(self):
         if self.session.reply_task:
@@ -3125,7 +3354,8 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         original_once = common._iter_llm_stream_once
 
-        def retrying_stream(_role, history, user_text):
+        def retrying_stream(_role, history, user_text, *, thinking=False):
+            self.assertFalse(thinking)
             calls.append(([dict(message) for message in history], user_text))
             return iter([
                 {"type": "meta", "provider": "Ollama", "thinking": False},
@@ -3197,7 +3427,13 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(scope.active)
             self.assertEqual(reason, "turn")
             self.session._turn_temporal_context = "当前时间上下文"
-            self.session._turn_conversation_plan = {"mode": "follow-up"}
+            self.session._turn_strategy = {
+                "move": "respond",
+                "stance": "support",
+                "reasoningPolicy": "fast",
+                "responseCue": "none",
+                "depth": 0,
+            }
             self.session._turn_fresh_topics = [{"title": "本轮话题"}]
             return "本轮记忆上下文"
 
@@ -3206,7 +3442,9 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.session._request_turn_memory = request_memory
         self.session._reply_pipeline = capture_reply
-        self.assertTrue(await self.session.on_resume_pending_turn())
+        self.assertTrue(await self.session.on_resume_pending_turn({
+            "reasoningPolicy": "deliberate",
+        }))
         task = self.session.reply_task
         if task is not None:
             await task
@@ -3219,7 +3457,14 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 "short_term_context": "",
                 "memory_context": "本轮记忆上下文",
                 "temporal_context": "当前时间上下文",
-                "conversation_plan": {"mode": "follow-up"},
+                "turn_strategy": {
+                    "move": "respond",
+                    "stance": "support",
+                    "reasoningPolicy": "fast",
+                    "responseCue": "none",
+                    "depth": 0,
+                },
+                "reasoning_policy": "deliberate",
                 "fresh_topics": [{"title": "本轮话题"}],
             },
         )
@@ -3331,6 +3576,98 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 3)
         self.assertEqual(captured[2][2], common.PROACTIVE_IDLE_PROMPT)
         self.assertEqual(self.session._last_proactive_trigger_id, 3)
+
+    async def test_managed_reasoning_policy_reaches_only_eligible_generations(self):
+        captured = []
+        common._synth_tts = lambda _text: b"\x00\x00"
+
+        def capture_start(_role, _history, _text, scope, out):
+            captured.append(scope.reasoning_policy)
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture_start
+        deliberate = {
+            "move": "deepen",
+            "responseCue": "none",
+            "stance": "support",
+            "reasoningPolicy": "deliberate",
+            "depth": 2,
+        }
+
+        ordinary = self.session._new_scope("response")
+        self.session.response_scope = ordinary
+        await self.session._reply_pipeline(
+            "我在认真考虑这个选择",
+            ordinary,
+            reasoning_policy="deliberate",
+        )
+
+        proactive = self.session._new_scope("response")
+        self.session.response_scope = proactive
+        await self.session._reply_pipeline(
+            "",
+            proactive,
+            proactive_kind="welcome",
+            reasoning_policy="deliberate",
+            turn_strategy=deliberate,
+        )
+
+        recovery = self.session._new_scope("response")
+        self.session.response_scope = recovery
+        await self.session._reply_pipeline(
+            "",
+            recovery,
+            proactive_kind="recovery",
+            reasoning_policy="deliberate",
+            turn_strategy=deliberate,
+        )
+
+        self.assertEqual(captured, ["deliberate", "fast", "fast"])
+
+    async def test_memory_context_sanitizes_the_reactive_reasoning_policy(self):
+        self.session.memory_context = common.TURN_MEMORY_CAPABILITY
+        future = self.session.loop.create_future()
+        self.session._memory_context_waiter = (7, future)
+        self.session.on_memory_context({
+            "generation": 7,
+            "items": [],
+            "reasoningPolicy": "deliberate",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+
+        future = self.session.loop.create_future()
+        self.session._memory_context_waiter = (8, future)
+        self.session.on_memory_context({
+            "generation": 8,
+            "items": [],
+            "reasoningPolicy": "private chain of thought",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "fast")
+
+    async def test_generation_reasoning_policy_uses_persisted_preference_fallback(self):
+        await self.session.on_start({"reasoningPreference": "always"})
+        self.session.gen_id = 7
+        self.session.on_reasoning_policy({
+            "generation": 7,
+            "policy": "deliberate",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+        self.session.on_reasoning_policy({
+            "generation": 7,
+            "policy": "private chain of thought",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+        self.session.on_reasoning_policy({"generation": 6, "policy": "fast"})
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+
+    async def test_generation_policy_releases_no_memory_fallback_barrier(self):
+        self.session.gen_id = 7
+        scope = common.GenerationCancelScope(7, "response")
+        pending = asyncio.create_task(self.session._request_turn_memory(scope))
+        await asyncio.sleep(0)
+        self.session.on_reasoning_policy({"generation": 7, "policy": "deliberate"})
+        self.assertEqual(await pending, "")
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
 
     async def test_speech_candidate_cancels_only_an_active_proactive_generation(self):
         common._synth_tts = lambda _text: b"\x00\x00"
@@ -3743,7 +4080,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         common.is_valid_asr = lambda text, _nsp, _pcm: text
 
-        async def no_reply(_text, _generation):
+        async def no_reply(_text, _generation, **_kwargs):
             return None
 
         self.session._reply_pipeline = no_reply
@@ -3840,6 +4177,70 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertNotIn("幻觉文本", json.dumps(messages, ensure_ascii=False))
+
+    async def test_playback_filler_takes_the_floor_without_creating_user_text(self):
+        original_transcribe = common.transcribe
+        original_cancel_reply = self.session.cancel_reply
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "呃", 0.1, language="zh"
+        )
+        cancelled = []
+
+        async def capture_cancel(reason="superseded"):
+            cancelled.append(reason)
+            return await original_cancel_reply(reason)
+
+        self.session.cancel_reply = capture_cancel
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session.candidate_emitted = True
+        self.session.playing = True
+        self.session.play_enabled = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        try:
+            await self.session._asr_then_maybe_reply(
+                b"\x88\x13" * 1000,
+                scope,
+                from_play_barge=True,
+            )
+        finally:
+            common.transcribe = original_transcribe
+
+        messages = self.ws.json_messages()
+        self.assertEqual(
+            [message["type"] for message in messages if message["type"] != "session"],
+            ["speech_confirmed", "asr_start", "asr_end"],
+        )
+        self.assertEqual(cancelled, ["turn_detected"])
+        self.assertFalse(any(message.get("type") == "asr" for message in messages))
+        self.assertFalse(any(message.get("role") == "user" for message in self.session.history))
+
+    async def test_playback_filler_stays_rejected_without_recovery_negotiation(self):
+        original_transcribe = common.transcribe
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "呃", 0.1, language="zh"
+        )
+        self.session.candidate_emitted = True
+        self.session.playing = True
+        self.session.play_enabled = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        try:
+            await self.session._asr_then_maybe_reply(
+                b"\x88\x13" * 1000,
+                scope,
+                from_play_barge=True,
+            )
+        finally:
+            common.transcribe = original_transcribe
+
+        self.assertEqual(
+            [message["type"] for message in self.ws.json_messages()],
+            ["speech_rejected"],
+        )
 
     async def test_cancelled_asr_scope_drops_late_result(self):
         future = asyncio.get_running_loop().create_future()

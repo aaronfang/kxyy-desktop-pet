@@ -8,6 +8,7 @@ import {
   TOPIC_PREFERENCE_STATUSES,
 } from "./ai/topic-preferences.js";
 import { memoryHealthState } from "./memory-ui.js";
+import { DEEPSEEK_VISION_MODEL } from "./deepseek-multimodal.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -100,6 +101,11 @@ function currentTurnPauseTolerance() {
 function currentRealtimeConversationMode() {
   const value = (el("realtimeConversationMode")?.value || "follow-user").toLowerCase();
   return value === "balanced" || value === "ai-leads" ? value : "follow-user";
+}
+
+function currentReasoningMode() {
+  const value = (el("reasoningMode")?.value || "off").toLowerCase();
+  return value === "automatic" || value === "always" ? value : "off";
 }
 
 function topicPreferenceStatusSelect(status) {
@@ -239,6 +245,7 @@ function currentTextProvider() {
 function syncTextFields() {
   const provider = currentTextProvider();
   el("textFieldsDeepseek").hidden = provider !== "deepseek";
+  el("deepseekKeyFields").hidden = provider !== "deepseek" && currentVlProvider() !== "deepseek";
   el("textFieldsLocal").hidden = provider !== "local";
   const privacy = el("memoryPrivacy");
   if (privacy) {
@@ -468,17 +475,28 @@ async function refreshFreshTopics() {
   }
 }
 
-/** 视觉模型服务商：qwen（在线）/ local（本地 Ollama VL）。 */
+/** 视觉模型服务商：qwen / deepseek（在线）/ local（本地 Ollama VL）。 */
 function currentVlProvider() {
   const v = (el("vlProvider").value || "qwen").toLowerCase();
-  return v === "local" ? "local" : "qwen";
+  return ["deepseek", "local"].includes(v) ? v : "qwen";
+}
+
+function usesDirectVisionTextModel() {
+  return currentTextProvider() === "deepseek"
+    && el("textModel").value === DEEPSEEK_VISION_MODEL;
 }
 
 /** 按所选视觉服务商只展示对应设置项。 */
 function syncVlFields() {
   const provider = currentVlProvider();
-  el("vlFieldsQwen").hidden = provider !== "qwen";
-  el("vlFieldsLocal").hidden = provider !== "local";
+  const bypassed = usesDirectVisionTextModel();
+  el("vlProvider").disabled = bypassed;
+  el("vlFieldsQwen").hidden = bypassed || provider !== "qwen";
+  el("vlFieldsDeepseek").hidden = bypassed || provider !== "deepseek";
+  el("vlFieldsLocal").hidden = bypassed || provider !== "local";
+  el("vlBypassedHint").hidden = !bypassed;
+  el("vlRoutingHint").hidden = bypassed;
+  syncTextFields();
 }
 
 function fill(s) {
@@ -535,10 +553,14 @@ function fill(s) {
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
   el("localVlModel").value = s.localVlModel || "";
-  el("vlProvider").value = s.vlProvider === "local" ? "local" : "qwen";
+  el("vlProvider").value = ["deepseek", "local"].includes(s.vlProvider) ? s.vlProvider : "qwen";
   syncTextFields();
   syncVlFields();
-  el("thinking").checked = !!s.thinking;
+  el("reasoningMode").value = ["off", "automatic", "always"].includes(s.reasoningMode)
+    ? s.reasoningMode
+    : s.thinking
+      ? "always"
+      : "off";
   if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
   if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
@@ -935,7 +957,8 @@ function collect() {
     localTextModel: el("localTextModel").value.trim(),
     localVlModel: el("localVlModel").value.trim(),
     vlProvider: currentVlProvider(),
-    thinking: el("thinking").checked,
+    reasoningMode: currentReasoningMode(),
+    thinking: currentReasoningMode() === "always",
     memoryWorkspace: el("memoryWorkspace")?.checked === true,
     memoryWorkspaceMode: el("memoryWorkspaceMode")?.value || "conservative",
     temperature: Number(el("temperature").value) || 0.8,
@@ -989,8 +1012,6 @@ async function save() {
       throw new Error("请填写 Tavily API Key");
     }
     await invoke("set_ai_settings", { settings: payload });
-    // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
-    emit("apply-settings", payload);
     statusEl.style.color = "#16a34a";
     statusEl.textContent = "已保存";
   } catch (e) {
@@ -1245,9 +1266,10 @@ el("realtimeBackend").addEventListener("change", () => {
 });
 el("asrProvider")?.addEventListener("change", syncVoiceFields);
 el("textProvider").addEventListener("change", () => {
-  syncTextFields();
+  syncVlFields();
   probeLocalTextStatus();
 });
+el("textModel").addEventListener("change", syncVlFields);
 el("webGroundingProvider")?.addEventListener("change", syncWebGroundingFields);
 el("refreshFreshTopicStatus")?.addEventListener("click", () => {
   const status = el("freshTopicRefreshStatus");

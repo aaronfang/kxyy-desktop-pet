@@ -12,8 +12,9 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 const TEXT_BASE_URL: &str = "https://api.deepseek.com";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
-const VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-const VL_MODEL: &str = "qwen3-vl-plus";
+const QWEN_VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const QWEN_VL_MODEL: &str = "qwen3-vl-plus";
+const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
 // 本地文字模型：Ollama 的 OpenAI 兼容端点，无需 Key（Authorization 头会被忽略）。
 const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 // 仅受托管本地语音子进程携带；普通 WebView 请求不得用它绕过 Windows SSE 缓冲路径。
@@ -25,12 +26,21 @@ const WEB_RESULT_MAX_ITEMS: usize = 4;
 const WEB_RESULT_TEXT_MAX_CHARS: usize = 700;
 
 /// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
-fn normalize_deepseek_model(configured: &str, thinking: bool) -> &'static str {
+fn normalize_deepseek_model(configured: &str) -> &'static str {
     match configured.trim() {
         "deepseek-v4-flash" | "deepseek-chat" => DEEPSEEK_FLASH_MODEL,
         "deepseek-v4-pro" | "deepseek-reasoner" => DEEPSEEK_PRO_MODEL,
-        _ if thinking => DEEPSEEK_PRO_MODEL,
+        "deepseek-v4-flash-vision-exp" => DEEPSEEK_VISION_MODEL,
         _ => DEEPSEEK_FLASH_MODEL,
+    }
+}
+
+/// 在线视觉模型只允许已审核的固定端点和模型名，未知设置回退到既有 Qwen 路径。
+fn online_vision_route(provider: &str) -> (&'static str, &'static str, &'static str) {
+    if provider == "deepseek" {
+        (TEXT_BASE_URL, DEEPSEEK_VISION_MODEL, "DeepSeek 看图")
+    } else {
+        (QWEN_VL_BASE_URL, QWEN_VL_MODEL, "通义千问")
     }
 }
 
@@ -44,6 +54,19 @@ fn apply_deepseek_generation_options(
     });
     if !thinking {
         payload["temperature"] = serde_json::json!(temperature);
+    }
+}
+
+fn apply_selected_deepseek_generation_options(
+    payload: &mut serde_json::Value,
+    model: &str,
+    thinking: bool,
+    temperature: f64,
+) {
+    if model == DEEPSEEK_VISION_MODEL {
+        payload["temperature"] = serde_json::json!(temperature);
+    } else {
+        apply_deepseek_generation_options(payload, thinking, temperature);
     }
 }
 
@@ -326,7 +349,7 @@ pub(crate) fn complete_memory_json(
         }
         (
             format!("{TEXT_BASE_URL}/chat/completions"),
-            normalize_deepseek_model("", false).to_string(),
+            normalize_deepseek_model("").to_string(),
             cfg.deepseek_key.clone(),
             "DeepSeek",
         )
@@ -467,9 +490,14 @@ fn proxy_chat(
         .get("thinking")
         .and_then(|v| v.as_bool())
         .unwrap_or(cfg.thinking_default);
+    // 模型档位与 reasoning 独立：自动模型始终使用成本较低的 Flash，
+    // thinking 只通过下方 thinking.type 控制；Pro 仅由显式配置选择。
+    let normalized_text_model = normalize_deepseek_model(&cfg.text_model);
 
     let is_local_text = !use_vision && cfg.text_provider == "local";
     let is_local_vl = use_vision && cfg.vl_provider == "local";
+    let is_deepseek_multimodal_text =
+        !use_vision && !is_local_text && normalized_text_model == DEEPSEEK_VISION_MODEL;
 
     let (base_url, model, api_key, provider_name) = if is_local_vl {
         let model = if !cfg.local_vl_model.is_empty() {
@@ -484,11 +512,17 @@ fn proxy_chat(
             "本地看图",
         )
     } else if use_vision {
+        let (base_url, model, provider_name) = online_vision_route(&cfg.vl_provider);
+        let api_key = if cfg.vl_provider == "deepseek" {
+            cfg.deepseek_key.clone()
+        } else {
+            cfg.qwen_vl_key.clone()
+        };
         (
-            VL_BASE_URL.to_string(),
-            VL_MODEL.to_string(),
-            cfg.qwen_vl_key.clone(),
-            "通义千问",
+            base_url.to_string(),
+            model.to_string(),
+            api_key,
+            provider_name,
         )
     } else if is_local_text {
         let model = if !cfg.local_text_model.is_empty() {
@@ -504,17 +538,18 @@ fn proxy_chat(
             "本地模型",
         )
     } else {
-        let model = normalize_deepseek_model(&cfg.text_model, thinking).to_string();
         (
             TEXT_BASE_URL.to_string(),
-            model,
+            normalized_text_model.to_string(),
             cfg.deepseek_key.clone(),
             "DeepSeek",
         )
     };
 
     if api_key.is_empty() && !is_local_vl {
-        let msg = if use_vision {
+        let msg = if use_vision && cfg.vl_provider == "deepseek" {
+            "未配置 DeepSeek API Key，无法使用 DeepSeek 看图"
+        } else if use_vision {
             "未配置通义千问(看图) API Key，请在设置里填写"
         } else {
             "未配置 DeepSeek API Key，请在设置里填写"
@@ -522,7 +557,8 @@ fn proxy_chat(
         return error_json(request, 401, msg);
     }
 
-    let deepseek_thinking = !use_vision && !is_local_text && thinking;
+    let deepseek_thinking =
+        !use_vision && !is_local_text && !is_deepseek_multimodal_text && thinking;
     let reasoning_enabled = deepseek_thinking || (is_local_text && thinking);
     let temperature = body
         .get("temperature")
@@ -559,7 +595,12 @@ fn proxy_chat(
     }
     // 思考模式由当前 DeepSeek API 的 thinking.type 显式控制；思考时不下发 temperature。
     if !use_vision && !is_local_text {
-        apply_deepseek_generation_options(&mut payload, deepseek_thinking, temperature);
+        apply_selected_deepseek_generation_options(
+            &mut payload,
+            normalized_text_model,
+            deepseek_thinking,
+            temperature,
+        );
     } else if !reasoning_enabled {
         payload["temperature"] = serde_json::json!(temperature);
     }
@@ -984,10 +1025,11 @@ fn proxy_web_observations(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_deepseek_generation_options, header, internal_secret_matches,
-        normalize_deepseek_model, normalize_tavily_items, req_header, safe_web_source_url,
-        should_passthrough_internal_sse, web_observation_status, DEEPSEEK_FLASH_MODEL,
-        DEEPSEEK_PRO_MODEL,
+        apply_deepseek_generation_options, apply_selected_deepseek_generation_options, header,
+        internal_secret_matches, normalize_deepseek_model, normalize_tavily_items,
+        online_vision_route, req_header, safe_web_source_url, should_passthrough_internal_sse,
+        web_observation_status, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL,
+        QWEN_VL_BASE_URL, QWEN_VL_MODEL, TEXT_BASE_URL,
     };
     use std::io::Cursor;
     use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
@@ -1070,31 +1112,47 @@ mod tests {
     #[test]
     fn deepseek_models_are_allowlisted_and_legacy_values_migrate() {
         assert_eq!(
-            normalize_deepseek_model("deepseek-v4-flash", true),
+            normalize_deepseek_model("deepseek-v4-flash"),
             DEEPSEEK_FLASH_MODEL
         );
         assert_eq!(
-            normalize_deepseek_model("deepseek-v4-pro", false),
+            normalize_deepseek_model("deepseek-v4-pro"),
             DEEPSEEK_PRO_MODEL
         );
         assert_eq!(
-            normalize_deepseek_model("deepseek-chat", true),
+            normalize_deepseek_model("deepseek-chat"),
             DEEPSEEK_FLASH_MODEL
         );
         assert_eq!(
-            normalize_deepseek_model("deepseek-reasoner", false),
+            normalize_deepseek_model("deepseek-reasoner"),
             DEEPSEEK_PRO_MODEL
         );
-        assert_eq!(normalize_deepseek_model("", false), DEEPSEEK_FLASH_MODEL);
-        assert_eq!(normalize_deepseek_model("", true), DEEPSEEK_PRO_MODEL);
         assert_eq!(
-            normalize_deepseek_model("qwen3:8b", false),
+            normalize_deepseek_model("deepseek-v4-flash-vision-exp"),
+            DEEPSEEK_VISION_MODEL
+        );
+        assert_eq!(normalize_deepseek_model(""), DEEPSEEK_FLASH_MODEL);
+        assert_eq!(
+            normalize_deepseek_model("qwen3:8b"),
             DEEPSEEK_FLASH_MODEL
         );
         assert_eq!(
-            normalize_deepseek_model("unreviewed", true),
-            DEEPSEEK_PRO_MODEL
+            normalize_deepseek_model("unreviewed"),
+            DEEPSEEK_FLASH_MODEL
         );
+    }
+
+    #[test]
+    fn online_vision_models_are_fixed_and_unknown_providers_fall_back_to_qwen() {
+        assert_eq!(
+            online_vision_route("deepseek"),
+            (TEXT_BASE_URL, DEEPSEEK_VISION_MODEL, "DeepSeek 看图")
+        );
+        assert_eq!(
+            online_vision_route("qwen"),
+            (QWEN_VL_BASE_URL, QWEN_VL_MODEL, "通义千问")
+        );
+        assert_eq!(online_vision_route("unknown"), online_vision_route("qwen"));
     }
 
     #[test]
@@ -1108,6 +1166,11 @@ mod tests {
         apply_deepseek_generation_options(&mut disabled, false, 0.7);
         assert_eq!(disabled["thinking"]["type"], "disabled");
         assert_eq!(disabled["temperature"], 0.7);
+
+        let mut vision = serde_json::json!({});
+        apply_selected_deepseek_generation_options(&mut vision, DEEPSEEK_VISION_MODEL, true, 0.2);
+        assert!(vision.get("thinking").is_none());
+        assert_eq!(vision["temperature"], 0.2);
     }
 
     #[test]

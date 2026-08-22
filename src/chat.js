@@ -5,7 +5,13 @@
 // 阶段 2：
 //   A. 情绪驱动桌宠——聊天各阶段通过 Tauri 事件 "pet-chat" 通知 main 窗口驱动桌宠动作。
 //   B. 表情包——回复里的 [表情:情绪] 标记渲染成 gif 贴纸气泡。
-//   C. 看图(VL)——发图先经通义千问识图成文字描述，再让 DeepSeek 以元元口吻回应。
+//   C. 看图(VL)——发图先经所选视觉模型识图成文字描述，再让文字模型以元元口吻回应。
+
+import { renderUnhandledTurnError } from "./chat-turn-error.js";
+import {
+  buildDeepseekMultimodalMessages,
+  usesDeepseekMultimodalModel,
+} from "./deepseek-multimodal.js";
 
 import {
   buildSystemPrompt,
@@ -38,6 +44,7 @@ import {
   parseBilingualReply,
   stripSpeakBlockForDisplay,
   needsBilingualTts,
+  trimHistory,
 } from "./ai/persona.js";
 import {
   loadStickers,
@@ -86,6 +93,8 @@ import {
 } from "./ai/fresh-idle.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
+import { classifyReasoningSignal } from "./ai/conversation-director.js";
+import { classifySettingsUpdate } from "./ai/settings-update-policy.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 import { localVoicePresetById } from "./ai/voice-presets.js";
@@ -589,6 +598,7 @@ const textGenDebug = {
   timer: null,
   chars: 0,
   thinking: false,
+  reasoningMode: "off",
 };
 /** TTS 计费字符（CosyVoice / 火山按字计费，非 LLM token）。 */
 const ttsUsageDebug = {
@@ -1716,7 +1726,7 @@ async function buildRequestMessages(opts = {}) {
   });
 }
 
-/** 识图：通义千问 VL 只描述本轮图片（无历史、无人设），返回文字描述。 */
+/** 识图：所选 VL 只描述本轮图片（无历史、无人设），返回文字描述。 */
 async function describeImage(imageDataUrl, userText) {
   if (!apiBase || !apiBase.startsWith("http://")) {
     throw new Error("API 代理未就绪，无法识图");
@@ -1741,7 +1751,11 @@ async function describeImage(imageDataUrl, userText) {
     throw new Error(err);
   }
   const data = await resp.json();
-  const vlProvider = settings.vlProvider === "local" ? "本地看图" : "通义千问";
+  const vlProvider = settings.vlProvider === "local"
+    ? "本地看图"
+    : settings.vlProvider === "deepseek"
+      ? "DeepSeek 看图"
+      : "通义千问";
   noteApiUsage(vlProvider, extractUsage(data));
   const caption = data.choices?.[0]?.message?.content?.trim();
   if (!caption) throw new Error("识图描述为空");
@@ -1792,6 +1806,16 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
   // 深聊模式：仅普通轮次（非拍一拍 / 非追问等主动开口）按观众用词判定；命中则本轮放开字数与
   // 拆条上限、注入「深聊但保持人设」提示，让元元能展开多聊，但性格口吻不变。
   const deep = !proactiveKind && detectDeepIntent(lastRealUserMessage()?.content || "");
+  const reasoningSignal = classifyReasoningSignal(lastRealUserMessage()?.content || "", {
+    explicitDepth: deep,
+  });
+  const reasoningMode = ["off", "automatic", "always"].includes(settings.reasoningMode)
+    ? settings.reasoningMode
+    : settings.thinking
+      ? "always"
+      : "off";
+  const deliberate = reasoningMode === "always" ||
+    (reasoningMode === "automatic" && !proactiveKind && reasoningSignal !== "none");
   const isLocalText = settings.textProvider === "local";
   let localGenStarted = false;
   try {
@@ -1804,10 +1828,16 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       }
     }
     if (isLocalText) {
-      beginLocalTextGen({ thinking: !!settings.thinking });
+      beginLocalTextGen({ thinking: deliberate });
       localGenStarted = true;
     }
-    const requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
+    let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
+    if (usesDeepseekMultimodalModel(settings)) {
+      requestMessages = buildDeepseekMultimodalMessages(
+        requestMessages,
+        trimHistory(history, MAX_TURNS),
+      );
+    }
     const resp = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1816,7 +1846,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         stream: true,
         provider: "text",
         temperature: settings.temperature ?? 0.8,
-        thinking: !!settings.thinking,
+        thinking: deliberate,
         max_tokens: replyMaxTokens({
           proactiveKind,
           lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
@@ -2019,7 +2049,7 @@ async function send(text, opts = {}) {
 
   try {
     let caption = "";
-    if (image) {
+    if (image && !usesDeepseekMultimodalModel(settings)) {
       streamBubble.textContent = "（正在看图…）";
       caption = await describeImage(image.dataUrl, text);
       streamBubble.textContent = "";
@@ -2074,8 +2104,11 @@ async function send(text, opts = {}) {
         }
       }
     }
-  } catch (_) {
-    /* streamAssistantReply 已渲染错误气泡 */
+  } catch (error) {
+    // describeImage 在文字流之前执行，失败时尚没有任何函数负责呈现错误。
+    if (renderUnhandledTurnError(streamBubble, streamRow, error)) {
+      petSignal("abort");
+    }
   } finally {
     currentTurnDoNotRemember = false;
     setBusy(false);
@@ -2712,6 +2745,7 @@ async function startCall() {
   session = new RealtimeSession({
     provider: settings.realtimeBackend,
     conversationMode: settings.realtimeConversationMode,
+    reasoningPreference: settings.reasoningMode ?? settings.thinking,
     onState: (state) => {
       if (state === "started") {
         if (!callSessionStarted) appendPatNotice("📞 通话已接通");
@@ -2722,7 +2756,7 @@ async function startCall() {
         setCallCapsuleStatus("语音恢复中…", false, false, "thinking");
         petSignal("thinking");
       } else if (state === "ended") {
-        endCall({ notice: true });
+        endCall({ notice: true, reason: "provider_terminal" });
       }
     },
     getRecoveryHistory: () => buildRealtimeInitialHistory(),
@@ -2795,7 +2829,7 @@ async function startCall() {
     },
     onError: (e) => {
       appendPatNotice(`📞 通话出错：${e.message || e}`);
-      endCall({ notice: false });
+      endCall({ notice: false, reason: "provider_terminal" });
     },
   });
   callSession = session;
@@ -2819,11 +2853,11 @@ async function startCall() {
     });
   } catch (e) {
     appendPatNotice(`📞 无法开始通话：${e.message || e}`);
-    endCall({ notice: false });
+    endCall({ notice: false, reason: "provider_terminal" });
   }
 }
 
-async function endCall({ notice = true } = {}) {
+async function endCall({ notice = true, reason = "hangup" } = {}) {
   if (!callActive && !callSession) return;
   const s = callSession;
   callSession = null;
@@ -2840,7 +2874,7 @@ async function endCall({ notice = true } = {}) {
     updateRealtimeDiagnosticAction();
     let cleanupSettled = true;
     try {
-      cleanupSettled = await waitForCallCleanup(s.stop());
+      cleanupSettled = await waitForCallCleanup(s.stop(reason));
     } catch {
       // 诊断收尾不能妨碍挂断路径。
     }
@@ -2861,7 +2895,7 @@ async function endCall({ notice = true } = {}) {
 }
 
 function toggleCall() {
-  if (callActive) void endCall({ notice: true });
+  if (callActive) void endCall({ notice: true, reason: "hangup" });
   else startCall();
 }
 
@@ -2931,7 +2965,7 @@ stickersBtn.addEventListener("click", toggleStickerPanel);
 callBtn.addEventListener("click", toggleCall);
 chatCollapseBtn?.addEventListener("click", () => void setChatCompact(true));
 callCapsuleOpenBtn?.addEventListener("click", () => void setChatCompact(false));
-callCapsuleHangupBtn?.addEventListener("click", () => void endCall({ notice: true }));
+callCapsuleHangupBtn?.addEventListener("click", () => void endCall({ notice: true, reason: "hangup" }));
 callCapsuleEl?.addEventListener("mouseenter", () => {
   callCapsuleHovered = true;
   setCallCapsuleCollapsed(false);
@@ -3077,9 +3111,9 @@ function clearChatHistory() {
   resetConversation();
 }
 
-/** 切换人设时静默清空当前会话气泡与上下文（不弹确认）。 */
+/** 用户确认后清空当前会话气泡与上下文。 */
 function resetConversation() {
-  if (callActive) endCall({ notice: false });
+  if (callActive) endCall({ notice: false, reason: "explicit_conversation_clear" });
   history.length = 0;
   messagesEl.innerHTML = "";
   memoryEnqueuedIds.clear();
@@ -3206,41 +3240,30 @@ listen("voice-service-status", ({ payload }) => {
 listen("apply-settings", async ({ payload }) => {
   console.log("[chat] apply-settings 收到:", JSON.stringify({ showChatDebug: payload?.showChatDebug, hasShowChatDebug: "showChatDebug" in (payload || {}) }));
   if (!payload) return;
-  const identityKeys = [
-    "userName",
-    "personaRelationship",
-    "personaFacts",
-    "personaJokes",
-    "personaTreatAs",
-  ];
-  const identityChanged = identityKeys.some(
-    (k) => k in payload && payload[k] !== settings[k]
-  );
+  const { personaChanged, backendChanged, identityChanged } =
+    classifySettingsUpdate(settings, payload);
   const debugWasOn = settings.showChatDebug === true;
   const prevCardId = (settings.personaCardId || "").trim();
   const prevBackend = (settings.realtimeBackend || "").trim().toLowerCase();
-  if (
-    ("personaCardId" in payload && (payload.personaCardId || "").trim() !== prevCardId) ||
-    ("userName" in payload && payload.userName !== settings.userName)
-  ) {
+  if (personaChanged || ("userName" in payload && payload.userName !== settings.userName)) {
     await enqueueMemory();
   }
   settings = { ...settings, ...payload };
   const nextCardId = (settings.personaCardId || "").trim();
   const nextBackend = (settings.realtimeBackend || "").trim().toLowerCase();
-  const cardChanged = "personaCardId" in payload && prevCardId !== nextCardId;
-  const backendChanged = "realtimeBackend" in payload && prevBackend !== nextBackend;
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
   // 切人设 / 换语音后端：重建 Web Audio，避免挂起的 AudioContext 导致「合成成功却静音」。
-  if (cardChanged || backendChanged) {
-    if (callActive) endCall({ notice: false });
+  if (personaChanged || backendChanged) {
+    if (callActive) {
+      const reason = personaChanged ? "persona_switch" : "backend_switch";
+      endCall({ notice: false, reason });
+    }
     console.log("[chat] 重置音频播放管线", { prevCardId, nextCardId, prevBackend, nextBackend });
     resetPlaybackPipeline();
   }
-  // 人设相关保存都刷新资产，避免同 ID 卡内容更新或启动时缓存漂移。
-  if ("personaCardId" in payload) {
-    console.log("[chat] 人设设置已保存，清空会话并重新加载 assets...");
-    resetConversation();
+  // 只有实际切换人设才重载资产；保留当前可见历史，避免保存无关设置清空会话。
+  if (personaChanged) {
+    console.log("[chat] 人设已切换，重新加载 assets...");
     reloadAssetsWithMatchingCard(nextCardId).then((a) => {
       assets = a;
       window.__kxyy_active_card_id = nextCardId || null;
@@ -3281,8 +3304,8 @@ async function prepareAndFlushMemory({ hangup = true } = {}) {
   // 后继续接收文字和音频。此时也不能提前巩固正在增长的可听助手句段，
   // 否则同一消息 ID 被标成已入队后，恢复窗口继续播放的尾段会永久漏记。
   if (!hangup && callActive) return;
-  // 真正退出/设置变更时才释放会话和音频设备，并在定稿后一次性入队。
-  if (hangup && callActive) await endCall({ notice: false });
+  // 真正退出时才释放会话和音频设备，并在定稿后一次性入队。
+  if (hangup && callActive) await endCall({ notice: false, reason: "app_quit" });
   if (!callActive) {
     stopSpeak();
     resetTtsQueue();

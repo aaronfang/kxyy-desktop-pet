@@ -594,11 +594,17 @@ PROACTIVE_REVISIT_PROMPT = (
     "先承接并补充一个新的具体观察，不要像总结或翻旧账，也不要假装用户已经做出决定。"
     "只说一到两句，留一个容易退出或回应的口，不要连续追问。）"
 )
+INTERRUPTION_RECOVERY_PROMPT = (
+    "（内部控制：用户刚才打断后没有留下可用内容，并且随后保持安静。"
+    "只根据已经实际播完的对话，自然接回你刚才未说完的思路；补充一个具体观点或细节。"
+    "不要声称用户说过任何话，不要提及打断机制，只说一到两句，不要连续追问。）"
+)
 PROACTIVE_PROMPTS = {
     "welcome": PROACTIVE_WELCOME_PROMPT,
     "followup": PROACTIVE_FOLLOWUP_PROMPT,
     "idle": PROACTIVE_IDLE_PROMPT,
     "revisit": PROACTIVE_REVISIT_PROMPT,
+    "recovery": INTERRUPTION_RECOVERY_PROMPT,
 }
 PROACTIVE_KINDS = frozenset(("welcome", "followup", "idle", "revisit", "memory", "commitment"))
 MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
@@ -606,6 +612,7 @@ TURN_MEMORY_CAPABILITY = "turn-final-v1"
 TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1"
 FRESH_TOPIC_CAPABILITY = "fresh-topic-v1"
 PENDING_TURN_RESUME_CAPABILITY = "pending-turn-resume-v1"
+INTERRUPTION_RECOVERY_CAPABILITY = "empty-confirmed-v1"
 
 
 def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> float:
@@ -613,6 +620,7 @@ def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> f
 
     return max(0.0, samples_sent / OUTPUT_RATE - max(0.0, elapsed_seconds))
 TURN_MEMORY_WAIT_SECONDS = 0.1
+REASONING_POLICY_WAIT_SECONDS = 0.05
 TURN_MEMORY_MAX_ITEMS = 3
 TURN_MEMORY_MAX_CHARS = 300
 FRESH_TOPIC_MAX_ITEMS = 3
@@ -904,12 +912,13 @@ def format_user_affect_hint(value) -> str:
         "优先相信用户实际说出的内容；不要断言用户处于某种情绪，不要替用户解释原因，"
         "也不要镜像愤怒或刻意模仿哭笑。只在措辞、节奏和共情程度上做轻微调整，并允许用户纠正。"
     )
-CONVERSATION_PLAN_MOVES = frozenset(("expand", "offer-entry", "deepen", "associate"))
-CONVERSATION_PLAN_CUES = frozenset(("none", "low-burden", "question"))
-CONVERSATION_PLAN_STANCES = frozenset(("companion", "opinion", "advice", "concrete", "light"))
+TURN_STRATEGY_MOVES = frozenset(("respond", "expand", "deepen", "associate", "recover"))
+TURN_STRATEGY_CUES = frozenset(("none", "low-burden", "question"))
+TURN_STRATEGY_STANCES = frozenset(("support", "opine", "contrast", "lead"))
+TURN_STRATEGY_REASONING_POLICIES = frozenset(("fast", "deliberate"))
 CONVERSATION_MOVE_HINTS = {
+    "respond": "先直接回应用户当前表达并贡献具体内容，不要只做同义复述或把问题原样抛回去。",
     "expand": "用一句接住用户刚才的具体表达，不要同义复述；随后主动补充一个新观点、细节、例子或有依据的小故事。",
-    "offer-entry": "先贡献具体内容，再留一个低负担、容易回应的入口；不要只把问题抛回用户。",
     "deepen": "沿当前话题自然深入一层，优先触及感受、原因、价值判断或个人选择，不要突然换题。",
     "associate": (
         "先用一句准确接住用户，再根据最近对话的语义状态决定是否只带出一个新方向。"
@@ -918,6 +927,7 @@ CONVERSATION_MOVE_HINTS = {
         "不能只是换句话继续安慰或认同。先把这个新方向讲出一点实际内容，不要反问用户提供素材。"
         "也不要为了显得有生活而虚构亲身经历。用户不接这个方向时，下一轮立刻跟回用户。"
     ),
+    "recover": "自然接回刚才中断的思路，只依据实际可听历史补充一小步，不要提及内部恢复机制。",
 }
 CONVERSATION_CUE_HINTS = {
     "none": "本轮不必提问，不要总结收口；用户没有明确道别时，不要替双方结束对话，给后续交流保留空间。",
@@ -925,11 +935,14 @@ CONVERSATION_CUE_HINTS = {
     "question": "本轮最多问一个具体问题；前一部分必须先贡献内容，不能连续盘问。",
 }
 CONVERSATION_STANCE_HINTS = {
-    "companion": "默认陪聊：先理解和展开，除非用户明确求助，否则不要急着给建议。",
-    "opinion": "用户明确想听你的想法：给出有理由的具体观点，减少反问，可以温和不同意。",
-    "advice": "用户已明确邀请建议：结合处境给出具体看法，但不要用总结人生道理收尾。",
-    "concrete": "用户要求更具体：补一个清楚的例子、细节或可观察区别。",
-    "light": "用户要求轻松一点：降低深度和沉重感，保持具体自然，不要追问敏感内容。",
+    "support": "先准确理解并支持用户当前表达；支持不等于机械附和，仍要贡献一个具体观察或细节。",
+    "opine": "先贡献一个有理由的具体立场，减少反问；只使用稳定人设偏好和当前上下文，不虚构亲身经历，也不改写现有人设事实。",
+    "contrast": "先贡献一个温和、有理由的不同角度；先承接再对比，不为了反对而反对，只使用稳定人设偏好，不虚构亲身经历，也不改写现有人设事实。",
+    "lead": "先贡献实际内容，再主动带出一个明确方向；用户不接时立刻合作地跟回用户，只使用稳定人设偏好，不虚构亲身经历，也不改写现有人设事实。",
+}
+TURN_STRATEGY_REASONING_HINTS = {
+    "fast": "本轮采用快速策略，直接、自然地作答，不展开冗长分析。",
+    "deliberate": "本轮采用审慎策略，在内部比较原因和取舍后再给出清楚结论，不展示推理过程。",
 }
 CONTINUATION_WINDOW_SECONDS = 8.0
 LLM_REPLY_MAX_CHARS = 4096
@@ -979,27 +992,50 @@ def classify_realtime_soft_intent(text: str) -> str:
     return "none"
 
 
-def sanitize_conversation_plan(value) -> dict | None:
+def sanitize_turn_strategy(value) -> dict | None:
     if not isinstance(value, dict):
         return None
     move = value.get("move")
     cue = value.get("responseCue")
     stance = value.get("stance")
+    reasoning_policy = value.get("reasoningPolicy")
     depth = value.get("depth")
     if (
-        move not in CONVERSATION_PLAN_MOVES
-        or cue not in CONVERSATION_PLAN_CUES
-        or stance not in CONVERSATION_PLAN_STANCES
+        move not in TURN_STRATEGY_MOVES
+        or cue not in TURN_STRATEGY_CUES
+        or stance not in TURN_STRATEGY_STANCES
+        or reasoning_policy not in TURN_STRATEGY_REASONING_POLICIES
         or not isinstance(depth, int)
         or isinstance(depth, bool)
+        or depth < 0
+        or depth > 3
     ):
         return None
     return {
         "move": move,
         "responseCue": cue,
         "stance": stance,
-        "depth": max(0, min(5, depth)),
+        "reasoningPolicy": reasoning_policy,
+        "depth": depth,
     }
+
+
+def normalize_reasoning_preference(value) -> str:
+    return value if value in ("off", "automatic", "always") else "off"
+
+
+def reasoning_preference_fallback(value) -> str:
+    return "deliberate" if normalize_reasoning_preference(value) == "always" else "fast"
+
+
+def sanitize_reasoning_policy(value, fallback="fast") -> str:
+    return (
+        value
+        if value in TURN_STRATEGY_REASONING_POLICIES
+        else sanitize_reasoning_policy(fallback)
+        if fallback in TURN_STRATEGY_REASONING_POLICIES
+        else "fast"
+    )
 
 
 TOPIC_REVISIT_CATEGORIES = frozenset(
@@ -1034,16 +1070,17 @@ def format_topic_revisit_hint(value) -> str:
     )
 
 
-def format_conversation_plan_hint(value) -> str:
-    plan = sanitize_conversation_plan(value)
-    if plan is None:
+def format_turn_strategy_hint(value) -> str:
+    strategy = sanitize_turn_strategy(value)
+    if strategy is None:
         return ""
     return (
         "本轮对话节奏（内部固定策略，不要复述）："
-        + CONVERSATION_MOVE_HINTS[plan["move"]]
-        + CONVERSATION_CUE_HINTS[plan["responseCue"]]
-        + CONVERSATION_STANCE_HINTS[plan["stance"]]
-        + f"当前渐进深度为 {plan['depth']}；它只控制本轮表达，不是用户事实。"
+        + CONVERSATION_MOVE_HINTS[strategy["move"]]
+        + CONVERSATION_CUE_HINTS[strategy["responseCue"]]
+        + CONVERSATION_STANCE_HINTS[strategy["stance"]]
+        + TURN_STRATEGY_REASONING_HINTS[strategy["reasoningPolicy"]]
+        + f"当前语义深度为 {strategy['depth']}；它只控制本轮表达，不是用户事实。"
     )
 
 
@@ -1058,9 +1095,9 @@ SEMANTIC_TOPIC_AUTONOMY_HINT = (
 )
 
 
-def select_turn_policy_hint(turn_policy: str, conversation_plan) -> str:
-    plan = sanitize_conversation_plan(conversation_plan)
-    if plan is not None and plan["move"] == "associate":
+def select_turn_policy_hint(turn_policy: str, turn_strategy) -> str:
+    strategy = sanitize_turn_strategy(turn_strategy)
+    if strategy is not None and strategy["move"] == "associate":
         return ""
     return {
         "acknowledge": ACKNOWLEDGE_HINT_TEXT,
@@ -1232,6 +1269,7 @@ class GenerationCancelScope:
         self.stage = stage
         self.state = "active"
         self.reason = ""
+        self.reasoning_policy = "fast"
         self.inactive = threading.Event()
 
     @property
@@ -1452,6 +1490,9 @@ class AudibleHistory:
             and segment_id in turn["segmentIds"]
             and segment_id not in turn["completed"]
         )
+
+    def has_audible_assistant(self) -> bool:
+        return any(message.get("role") == "assistant" for message in self.messages)
 
     def _trim(self) -> None:
         overflow = len(self.messages) - self.max_messages
@@ -1796,6 +1837,8 @@ def build_llm_proxy_payload(
     system_role: str,
     history: list[dict],
     user_text: str,
+    *,
+    thinking: bool = False,
 ) -> dict:
     """构造桌面 `/api/chat` 请求；provider/model 由 Rust 当前设置统一选择。"""
     role = system_role or "你是元元，口语化、像真人闲聊，先贡献具体内容再留回应入口。"
@@ -1848,6 +1891,7 @@ def build_llm_proxy_payload(
         "messages": messages,
         "max_tokens": 512,
         "stream": True,
+        "thinking": thinking is True,
     }
 
 
@@ -2321,9 +2365,49 @@ def is_valid_asr(text: str, no_speech_prob: float | None, pcm: bytes) -> str | N
     return text
 
 
-def _iter_llm_stream_once(system_role: str, history: list[dict], user_text: str):
+def is_empty_confirmed_interruption(
+    text: str,
+    no_speech_prob: float | None,
+    pcm: bytes,
+) -> bool:
+    """Keep a voiced filler distinct from silence and unsafe ASR output."""
+    if no_speech_prob is not None and no_speech_prob >= NO_SPEECH_PROB_MAX:
+        return False
+    if pcm16_rms(pcm) < SPEECH_RMS * 0.55:
+        return False
+    text = (text or "").strip()
+    if not text:
+        return True
+    if len(text) > ASR_TEXT_MAX_CHARS:
+        return False
+    if _HALLUCINATION_RE.search(text):
+        return False
+    if _WHISPER_PROMPT_CONTEXT_RE.search(text) and _WHISPER_PROMPT_ROLE_RE.search(text):
+        return False
+    if has_pathological_asr_repetition(text):
+        return False
+    bare = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+    return bool(
+        bare
+        and not _SHORT_SOCIAL_ASR_RE.fullmatch(text)
+        and _FILLER_RE.fullmatch(bare)
+    )
+
+
+def _iter_llm_stream_once(
+    system_role: str,
+    history: list[dict],
+    user_text: str,
+    *,
+    thinking: bool = False,
+):
     """Parse one desktop-proxy SSE attempt without exposing provider credentials."""
-    payload = build_llm_proxy_payload(system_role, history, user_text)
+    payload = build_llm_proxy_payload(
+        system_role,
+        history,
+        user_text,
+        thinking=thinking,
+    )
     body = json.dumps(payload).encode("utf-8")
     secret = os.environ.get("KXYY_TTS_SECRET") or ""
     if not secret:
@@ -2406,7 +2490,13 @@ def _iter_llm_stream_once(system_role: str, history: list[dict], user_text: str)
         raise SafeRealtimeError("本地文字代理连接失败，请稍后重试") from e
 
 
-def iter_llm_stream(system_role: str, history: list[dict], user_text: str):
+def iter_llm_stream(
+    system_role: str,
+    history: list[dict],
+    user_text: str,
+    *,
+    thinking: bool = False,
+):
     """Stream cloud replies, while gating local replies against recent repetition."""
     recent_assistant = [
         str(message.get("content") or "")
@@ -2415,7 +2505,14 @@ def iter_llm_stream(system_role: str, history: list[dict], user_text: str):
     ][-4:]
     attempt_history = [dict(message) for message in history]
     for attempt in range(2):
-        stream = iter(_iter_llm_stream_once(system_role, attempt_history, user_text))
+        stream = iter(
+            _iter_llm_stream_once(
+                system_role,
+                attempt_history,
+                user_text,
+                thinking=thinking,
+            )
+        )
         try:
             first = next(stream)
         except StopIteration:
@@ -2480,7 +2577,12 @@ def start_llm_stream_producer(
 
     def produce() -> None:
         try:
-            for event in iter_llm_stream(system_role, history, user_text):
+            for event in iter_llm_stream(
+                system_role,
+                history,
+                user_text,
+                thinking=scope.reasoning_policy == "deliberate",
+            ):
                 if not _put_llm_event(out, scope, event):
                     return
             _put_llm_event(out, scope, {"type": "done"})
@@ -2997,7 +3099,11 @@ class Session:
         # LLM delta 与有序音频 sender 可并行推进，但同一 WebSocket 只允许一个 send 在途。
         self._send_lock = asyncio.Lock()
         self._memory_context_waiter: tuple[int, asyncio.Future] | None = None
-        self._turn_conversation_plan: dict | None = None
+        self._turn_strategy: dict | None = None
+        self._turn_reasoning_policy = "fast"
+        self._turn_reasoning_generation: int | None = None
+        self._reasoning_policy_waiter: tuple[int, asyncio.Future] | None = None
+        self.reasoning_preference = "off"
         self._turn_fresh_topics: list[dict] = []
         self.asr_task: asyncio.Task | None = None
         self.tts_parallelism = _tts_parallelism
@@ -3009,10 +3115,14 @@ class Session:
         self.temporal_context = "none"
         self.fresh_topic = "none"
         self.pending_turn_resume = "none"
+        self.interruption_recovery = "none"
         self._fresh_topics: list[dict] = []
         self._turn_temporal_context = ""
         self.proactive_turn = "none"
         self._last_proactive_trigger_id = 0
+        self._last_interruption_recovery_request_id = 0
+        self._interruption_recovery_generation: int | None = None
+        self._interruption_recovery_request_id: int | None = None
         self._proactive_response_generation: int | None = None
         self._proactive_response_trigger_id: int | None = None
         self._candidate_sequence = 0
@@ -3271,6 +3381,12 @@ class Session:
     async def cancel_reply(self, reason: str = "superseded") -> bool:
         scope = self.response_scope
         self.response_scope = None
+        recovery_request_id = (
+            self._interruption_recovery_request_id
+            if scope is not None
+            and scope.generation == self._interruption_recovery_generation
+            else None
+        )
         continuation = bool(
             reason == "turn_detected"
             and scope is not None
@@ -3304,6 +3420,15 @@ class Session:
                             "generation": scope.generation,
                         }
                     )
+            if recovery_request_id is not None:
+                self._interruption_recovery_generation = None
+                self._interruption_recovery_request_id = None
+                await self.send_json({
+                    "type": "interruption_recovery_status",
+                    "requestId": recovery_request_id,
+                    "state": "cancelled",
+                    "generation": scope.generation,
+                })
         self._response_generated = False
         self._response_tts_admitted = False
         self._response_audio_started = False
@@ -3362,6 +3487,13 @@ class Session:
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
         self.bot_name = (msg.get("botName") or "元元").strip() or "元元"
+        self.reasoning_preference = normalize_reasoning_preference(
+            msg.get("reasoningPreference")
+        )
+        self._turn_reasoning_policy = reasoning_preference_fallback(
+            self.reasoning_preference
+        )
+        self._turn_reasoning_generation = None
         self._initial_history = sanitize_initial_history(msg.get("initialHistory"))
         self._short_term_facts = {}
         self._user_affect = UserAffectTracker()
@@ -3432,6 +3564,14 @@ class Session:
             and PENDING_TURN_RESUME_CAPABILITY in offered_pending_turn_resume
             else "none"
         )
+        offered_interruption_recovery = msg.get("interruptionRecovery")
+        self.interruption_recovery = (
+            INTERRUPTION_RECOVERY_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and isinstance(offered_interruption_recovery, list)
+            and INTERRUPTION_RECOVERY_CAPABILITY in offered_interruption_recovery
+            else "none"
+        )
         # Startup cache arrives in a second message after this acknowledgement;
         # old clients therefore never receive or retain it from `start`.
         self._fresh_topics = []
@@ -3444,6 +3584,9 @@ class Session:
             else "none"
         )
         self._clear_interruption_candidate()
+        self._last_interruption_recovery_request_id = 0
+        self._interruption_recovery_generation = None
+        self._interruption_recovery_request_id = None
         vad_shadow = await self._start_or_reset_vad_shadow()
         await self.send_json(
             {
@@ -3456,6 +3599,7 @@ class Session:
                 "temporalContext": self.temporal_context,
                 "freshTopic": self.fresh_topic,
                 "pendingTurnResume": self.pending_turn_resume,
+                "interruptionRecovery": self.interruption_recovery,
                 "proactiveTurn": self.proactive_turn,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
@@ -3464,7 +3608,7 @@ class Session:
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
 
-    async def on_resume_pending_turn(self) -> bool:
+    async def on_resume_pending_turn(self, msg: dict | None = None) -> bool:
         if (
             self.pending_turn_resume != PENDING_TURN_RESUME_CAPABILITY
             or self.closed
@@ -3480,6 +3624,11 @@ class Session:
         self._pending_turn_resumed = True
         self._initial_history = base_history
         scope = self._new_scope("response")
+        self._turn_reasoning_policy = sanitize_reasoning_policy(
+            (msg or {}).get("reasoningPolicy"),
+            reasoning_preference_fallback(self.reasoning_preference),
+        )
+        self._turn_reasoning_generation = scope.generation
         self.response_scope = scope
         self._response_generated = False
         self._response_tts_admitted = False
@@ -3503,11 +3652,14 @@ class Session:
             kwargs["memory_context"] = memory_context
         if self._turn_temporal_context:
             kwargs["temporal_context"] = self._turn_temporal_context
-        if self._turn_conversation_plan:
-            kwargs["conversation_plan"] = self._turn_conversation_plan
+        if self._turn_strategy:
+            kwargs["turn_strategy"] = self._turn_strategy
+        kwargs["reasoning_policy"] = self._turn_reasoning_policy
         if self._turn_fresh_topics:
             kwargs["fresh_topics"] = self._turn_fresh_topics
-        self._turn_conversation_plan = None
+        self._turn_strategy = None
+        self._turn_reasoning_policy = "fast"
+        self._turn_reasoning_generation = None
         self._turn_fresh_topics = []
         turn_policy = classify_realtime_conversation_turn(pending_text)
         if turn_policy != "substantive":
@@ -3574,7 +3726,7 @@ class Session:
         self._response_started_at = time.perf_counter()
         self._proactive_response_generation = scope.generation
         self._proactive_response_trigger_id = trigger_id
-        conversation_plan = sanitize_conversation_plan(msg.get("conversationPlan"))
+        turn_strategy = sanitize_turn_strategy(msg.get("turnStrategy"))
         await self.send_json(
             {
                 "type": "proactive_turn_status",
@@ -3584,14 +3736,14 @@ class Session:
             }
         )
         self.reply_task = asyncio.create_task(
-            self._proactive_reply_pipeline(scope, kind, conversation_plan, topic_revisit)
+            self._proactive_reply_pipeline(scope, kind, turn_strategy, topic_revisit)
         )
 
     async def _proactive_reply_pipeline(
         self,
         scope: GenerationCancelScope,
         kind: str,
-        conversation_plan: dict | None = None,
+        turn_strategy: dict | None = None,
         topic_revisit: dict | None = None,
     ) -> None:
         memory_context = await self._request_turn_memory(
@@ -3608,9 +3760,103 @@ class Session:
             temporal_context=self._turn_temporal_context,
             short_term_context=format_short_term_facts(self._short_term_facts),
             fresh_topics=self._fresh_topics or self._turn_fresh_topics,
-            conversation_plan=conversation_plan,
+            turn_strategy=turn_strategy,
             topic_revisit=topic_revisit,
         )
+
+    async def on_interruption_recovery(self, msg: dict) -> None:
+        request_id = msg.get("requestId")
+        expected_generation = msg.get("expectedGeneration")
+        turn_strategy = sanitize_turn_strategy(msg.get("turnStrategy"))
+        valid_request = (
+            isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+            and 1 <= request_id <= 0xFFFFFFFF
+            and request_id > self._last_interruption_recovery_request_id
+        )
+        if not valid_request:
+            return
+        if (
+            self.interruption_recovery != INTERRUPTION_RECOVERY_CAPABILITY
+            or self.closed
+            or not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation != self.gen_id
+            or not self._audible_history.has_audible_assistant()
+        ):
+            self._last_interruption_recovery_request_id = request_id
+            await self.send_json({
+                "type": "interruption_recovery_status",
+                "requestId": request_id,
+                "state": "cancelled",
+            })
+            return
+        if (
+            self.in_speech
+            or self.candidate_emitted
+            or self.asr_scope is not None
+            or (self.asr_task is not None and not self.asr_task.done())
+            or self._busy()
+            or self.playing
+            or self._pending_playback_segments
+        ):
+            await self.send_json({
+                "type": "interruption_recovery_status",
+                "requestId": request_id,
+                "state": "deferred",
+            })
+            return
+
+        self._last_interruption_recovery_request_id = request_id
+        scope = self._new_scope("response")
+        self.response_scope = scope
+        self._response_generated = False
+        self._response_tts_admitted = False
+        self._response_audio_started = False
+        self._response_started_at = time.perf_counter()
+        self._interruption_recovery_generation = scope.generation
+        self._interruption_recovery_request_id = request_id
+        await self.send_json({
+            "type": "interruption_recovery_status",
+            "requestId": request_id,
+            "state": "started",
+            "generation": scope.generation,
+        })
+        self.reply_task = asyncio.create_task(
+            self._interruption_recovery_pipeline(scope, request_id, turn_strategy)
+        )
+
+    async def _interruption_recovery_pipeline(
+        self,
+        scope: GenerationCancelScope,
+        request_id: int,
+        turn_strategy: dict | None = None,
+    ) -> None:
+        try:
+            await self._reply_pipeline(
+                "",
+                scope,
+                proactive_kind="recovery",
+                turn_strategy=turn_strategy,
+            )
+            if scope.state == "completed":
+                await self.send_json({
+                    "type": "interruption_recovery_status",
+                    "requestId": request_id,
+                    "state": "completed",
+                    "generation": scope.generation,
+                })
+        finally:
+            if self._interruption_recovery_generation == scope.generation:
+                if scope.state != "completed":
+                    await self.send_json({
+                        "type": "interruption_recovery_status",
+                        "requestId": request_id,
+                        "state": "cancelled",
+                        "generation": scope.generation,
+                    })
+                self._interruption_recovery_generation = None
+                self._interruption_recovery_request_id = None
 
     async def send_vad_shadow_summary(self, *, final: bool) -> bool:
         """Send one bounded, text-free aggregate outside the per-frame path."""
@@ -3676,15 +3922,48 @@ class Session:
             if self.temporal_context == TEMPORAL_CONTEXT_CAPABILITY
             else ""
         )
-        self._turn_conversation_plan = sanitize_conversation_plan(
-            msg.get("conversationPlan")
+        self._turn_strategy = sanitize_turn_strategy(
+            msg.get("turnStrategy")
         )
+        self._turn_reasoning_policy = sanitize_reasoning_policy(
+            msg.get("reasoningPolicy"),
+            reasoning_preference_fallback(self.reasoning_preference),
+        )
+        self._turn_reasoning_generation = generation
+        policy_waiter = self._reasoning_policy_waiter
+        if (
+            policy_waiter is not None
+            and policy_waiter[0] == generation
+            and not policy_waiter[1].done()
+        ):
+            policy_waiter[1].set_result(None)
         self._turn_fresh_topics = (
             sanitize_fresh_topics(msg.get("freshTopics"))
             if self.fresh_topic == FRESH_TOPIC_CAPABILITY
             else []
         )
         waiter[1].set_result(format_turn_memory_context(msg.get("items")))
+
+    def on_reasoning_policy(self, msg: dict) -> None:
+        generation = msg.get("generation")
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation != self.gen_id
+        ):
+            return
+        self._turn_reasoning_policy = sanitize_reasoning_policy(
+            msg.get("policy"),
+            reasoning_preference_fallback(self.reasoning_preference),
+        )
+        self._turn_reasoning_generation = generation
+        policy_waiter = self._reasoning_policy_waiter
+        if (
+            policy_waiter is not None
+            and policy_waiter[0] == generation
+            and not policy_waiter[1].done()
+        ):
+            policy_waiter[1].set_result(None)
 
     def on_fresh_topics(self, msg: dict) -> None:
         """Accept startup cache only after the session capability is confirmed."""
@@ -3693,12 +3972,34 @@ class Session:
         self._fresh_topics = sanitize_fresh_topics(msg.get("items"))
 
     async def _request_turn_memory(
-        self, scope: GenerationCancelScope, *, reason: str = "turn"
+        self,
+        scope: GenerationCancelScope,
+        *,
+        reason: str = "turn",
+        await_reasoning_policy: bool = False,
     ) -> str:
+        if await_reasoning_policy and self._turn_reasoning_generation != scope.generation:
+            future = self.loop.create_future()
+            self._reasoning_policy_waiter = (scope.generation, future)
+            try:
+                await asyncio.wait_for(future, timeout=REASONING_POLICY_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                if (
+                    self._reasoning_policy_waiter is not None
+                    and self._reasoning_policy_waiter[1] is future
+                ):
+                    self._reasoning_policy_waiter = None
+        if self._turn_reasoning_generation != scope.generation:
+            self._turn_reasoning_policy = reasoning_preference_fallback(
+                self.reasoning_preference
+            )
+            self._turn_reasoning_generation = scope.generation
         if self.memory_context != TURN_MEMORY_CAPABILITY or not scope.active:
             return ""
         self._turn_temporal_context = ""
-        self._turn_conversation_plan = None
+        self._turn_strategy = None
         self._turn_fresh_topics = []
         future = self.loop.create_future()
         self._memory_context_waiter = (scope.generation, future)
@@ -3837,11 +4138,11 @@ class Session:
         # the 3-second ring and drop already identified managed audio.
         if self.playing and self.play_enabled:
             self.play_enabled = False
-        if (
-            self.response_scope is not None
-            and self.response_scope.generation == self._proactive_response_generation
-        ):
-            await self.cancel_reply("proactive_speech_candidate")
+        if self.response_scope is not None:
+            if self.response_scope.generation == self._proactive_response_generation:
+                await self.cancel_reply("proactive_speech_candidate")
+            elif self.response_scope.generation == self._interruption_recovery_generation:
+                await self.cancel_reply("recovery_speech_candidate")
         payload = {"type": "speech_candidate"}
         if self.interruption_hint == INTERRUPTION_HINT_CAPABILITY:
             self._candidate_sequence = (self._candidate_sequence % 0xFFFFFFFF) + 1
@@ -4045,6 +4346,27 @@ class Session:
             )
             cleaned = is_valid_asr(result.text, nsp, pcm)
             if not cleaned:
+                if (
+                    from_play_barge
+                    and self.interruption_recovery == INTERRUPTION_RECOVERY_CAPABILITY
+                    and self.candidate_emitted
+                    and is_empty_confirmed_interruption(result.text, nsp, pcm)
+                ):
+                    log("确认空打断，等待前端恢复")
+                    if self.playing:
+                        self._invalidate_play()
+                    candidate_id = await self._emit_speech_confirmed(scope)
+                    await self._emit_asr_start(scope)
+                    await self.send_json(self._asr_end_payload(), scope=scope)
+                    self.asr_started = False
+                    if not scope.active:
+                        return
+                    await self._consume_interruption_hint(candidate_id)
+                    if not scope.active:
+                        return
+                    await self.cancel_reply("turn_detected")
+                    scope.complete()
+                    return
                 log("无效人声，忽略" + ("（播报未中断）" if from_play_barge else ""))
                 await self._emit_asr_end_only(scope)
                 await self._emit_speech_rejected(scope)
@@ -4080,13 +4402,19 @@ class Session:
             continuation_hint = await self.cancel_reply("turn_detected")
             if not scope.active:
                 return
-            turn_memory_context = await self._request_turn_memory(scope)
+            turn_memory_context = await self._request_turn_memory(
+                scope,
+                await_reasoning_policy=True,
+            )
             if not scope.active:
                 return
             turn_temporal_context = self._turn_temporal_context
-            turn_conversation_plan = self._turn_conversation_plan
+            turn_strategy = self._turn_strategy
+            turn_reasoning_policy = self._turn_reasoning_policy
             turn_fresh_topics = self._turn_fresh_topics
-            self._turn_conversation_plan = None
+            self._turn_strategy = None
+            self._turn_reasoning_policy = "fast"
+            self._turn_reasoning_generation = None
             self._turn_fresh_topics = []
             scope.promote("response")
             if self.asr_scope is scope:
@@ -4109,8 +4437,9 @@ class Session:
             short_term_context = format_short_term_facts(self._short_term_facts)
             if short_term_context:
                 reply_kwargs["short_term_context"] = short_term_context
-            if turn_conversation_plan:
-                reply_kwargs["conversation_plan"] = turn_conversation_plan
+            if turn_strategy:
+                reply_kwargs["turn_strategy"] = turn_strategy
+            reply_kwargs["reasoning_policy"] = turn_reasoning_policy
             if turn_fresh_topics:
                 reply_kwargs["fresh_topics"] = turn_fresh_topics
             if user_affect:
@@ -4237,7 +4566,8 @@ class Session:
         short_term_context: str = "",
         proactive_kind: str = "",
         turn_policy: str = "substantive",
-        conversation_plan: dict | None = None,
+        turn_strategy: dict | None = None,
+        reasoning_policy: str = "fast",
         topic_revisit: dict | None = None,
         fresh_topics: list[dict] | None = None,
         user_affect: dict | None = None,
@@ -4256,7 +4586,11 @@ class Session:
                 if proactive_kind
                 else self._audible_history.begin_turn(scope.generation, text)
             )
-            history_snapshot = [*self._initial_history, *audible_snapshot]
+            history_snapshot = (
+                audible_snapshot
+                if proactive_kind == "recovery"
+                else [*self._initial_history, *audible_snapshot]
+            )
             request_text = PROACTIVE_PROMPTS.get(proactive_kind, text)
             if continuation_hint and not proactive_kind:
                 history_snapshot, request_text = merge_continuation_request(
@@ -4282,10 +4616,10 @@ class Session:
                 history_snapshot.append(
                     {"role": "system", "content": CONTINUATION_HINT_TEXT}
                 )
-            policy_hint = select_turn_policy_hint(turn_policy, conversation_plan)
+            policy_hint = select_turn_policy_hint(turn_policy, turn_strategy)
             if policy_hint:
                 history_snapshot.append({"role": "system", "content": policy_hint})
-            conversation_hint = format_conversation_plan_hint(conversation_plan)
+            conversation_hint = format_turn_strategy_hint(turn_strategy)
             if conversation_hint:
                 history_snapshot.append(
                     {"role": "system", "content": conversation_hint}
@@ -4302,6 +4636,15 @@ class Session:
             if fresh_topic_hint:
                 history_snapshot.append({"role": "system", "content": fresh_topic_hint})
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
+            strategy = sanitize_turn_strategy(turn_strategy)
+            if proactive_kind:
+                scope.reasoning_policy = "fast"
+            else:
+                scope.reasoning_policy = (
+                    strategy["reasoningPolicy"]
+                    if strategy is not None
+                    else sanitize_reasoning_policy(reasoning_policy)
+                )
             start_llm_stream_producer(
                 self.system_role,
                 history_snapshot,
@@ -4822,12 +5165,16 @@ async def _handler(ws):
                 session.on_playback_interruption(msg)
             elif typ == "memory_context":
                 session.on_memory_context(msg)
+            elif typ == "reasoning_policy":
+                session.on_reasoning_policy(msg)
             elif typ == "fresh_topics":
                 session.on_fresh_topics(msg)
             elif typ == "resume_pending_turn":
-                await session.on_resume_pending_turn()
+                await session.on_resume_pending_turn(msg)
             elif typ == "proactive_turn":
                 await session.on_proactive_turn(msg)
+            elif typ == "interruption_recovery":
+                await session.on_interruption_recovery(msg)
     except Exception as e:
         log(f"连接结束: {e}")
     finally:

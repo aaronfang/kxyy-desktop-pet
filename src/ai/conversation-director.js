@@ -1,9 +1,52 @@
 export const CONVERSATION_MOVE = Object.freeze({
+  RESPOND: "respond",
   EXPAND: "expand",
-  OFFER_ENTRY: "offer-entry",
   DEEPEN: "deepen",
   ASSOCIATE: "associate",
+  RECOVER: "recover",
 });
+
+export const PERSONA_STANCE = Object.freeze({
+  SUPPORT: "support",
+  OPINE: "opine",
+  CONTRAST: "contrast",
+  LEAD: "lead",
+});
+
+export const REASONING_POLICY = Object.freeze({
+  FAST: "fast",
+  DELIBERATE: "deliberate",
+});
+
+export const REASONING_PREFERENCE = Object.freeze({
+  OFF: "off",
+  AUTOMATIC: "automatic",
+  ALWAYS: "always",
+});
+
+const DELIBERATE_REASONING_SIGNALS = new Set([
+  "explicit-depth",
+  "reasons",
+  "decision",
+  "relationship",
+  "emotion",
+  "comparison",
+  "long-running",
+  "goal",
+]);
+const FAST_REASONING_POLICIES = new Set([
+  "acknowledge",
+  "amused",
+  "agree",
+  "pause",
+  "redirect",
+  "resume",
+  "proactive",
+  "recovery",
+  "greeting",
+  "farewell",
+]);
+const REASONING_CARRY_TURNS = 2;
 
 export const RESPONSE_CUE = Object.freeze({
   NONE: "none",
@@ -39,6 +82,10 @@ const SOFT_INTENTS = new Set([
   "lighten",
   "concretize",
 ]);
+const CONVERSATION_MOVES = new Set(Object.values(CONVERSATION_MOVE));
+const PERSONA_STANCES = new Set(Object.values(PERSONA_STANCE));
+const REASONING_POLICIES = new Set(Object.values(REASONING_POLICY));
+const RESPONSE_CUES = new Set(Object.values(RESPONSE_CUE));
 const IMPORTANT_TOPIC_CATEGORIES = new Set([
   "emotion",
   "decision",
@@ -52,6 +99,54 @@ const GOAL_RE = /(?:我的|今年|最近|接下来|以后).{0,8}(?:目标|计划
 const RELATIONSHIP_RE = /我(?:和|跟).{0,12}(?:家人|家里人|父母|爸妈|妈妈|爸爸|朋友|伴侣|对象|爱人|同事|室友).{0,24}(?:关系|矛盾|冲突|疏远|难受|困扰|在意|担心)|(?:家人|家里人|父母|爸妈|妈妈|爸爸|朋友|伴侣|对象|爱人|同事|室友).{0,12}(?:和我的关系|让我.{0,6}(?:难受|困扰|在意|担心))/;
 const EMOTION_RE = /(?:焦虑|难受|委屈|害怕|担心|失落|孤独|压抑|内疚|愧疚|迷茫|崩溃|痛苦|烦躁|不安|很开心|特别开心|很期待|特别期待)/;
 const LONG_RUNNING_RE = /(?:一直|长期|反复|好多年|好几年|几个月|很久).{0,18}(?:困扰|烦恼|问题|放不下|过不去|没解决)|(?:困扰|烦恼|问题|放不下|过不去|没解决).{0,18}(?:一直|长期|反复|好多年|好几年|几个月|很久)/;
+const REASONING_REASONS_RE = /为什么|啥原因|什么原因|原因是|怎么理解|怎么想|怎么看/;
+const REASONING_COMPARISON_RE = /对比|比较|区别|哪个更|哪种更|哪个好|一方面.{0,40}另一方面|如果.{0,30}(?:又|同时|但是)/;
+
+export function normalizeReasoningPreference(value) {
+  if (value === true) return REASONING_PREFERENCE.ALWAYS;
+  if (value === false) return REASONING_PREFERENCE.OFF;
+  return Object.values(REASONING_PREFERENCE).includes(value)
+    ? value
+    : REASONING_PREFERENCE.OFF;
+}
+
+class ReasoningPolicyController {
+  constructor({ preference } = {}) {
+    this.preference = normalizeReasoningPreference(preference);
+    this.carryTurns = 0;
+  }
+
+  select({ turnCategory = "substantive", signal = "none", topicChanged = false } = {}) {
+    if (topicChanged || FAST_REASONING_POLICIES.has(turnCategory)) {
+      this.carryTurns = 0;
+      return { policy: REASONING_POLICY.FAST, source: "fast-control" };
+    }
+    if (this.preference === REASONING_PREFERENCE.OFF) {
+      this.carryTurns = 0;
+      return { policy: REASONING_POLICY.FAST, source: "preference-off" };
+    }
+    if (this.preference === REASONING_PREFERENCE.ALWAYS) {
+      this.carryTurns = 0;
+      return { policy: REASONING_POLICY.DELIBERATE, source: "preference-always" };
+    }
+    if (DELIBERATE_REASONING_SIGNALS.has(signal)) {
+      this.carryTurns = REASONING_CARRY_TURNS;
+      return {
+        policy: REASONING_POLICY.DELIBERATE,
+        source: `automatic-${signal}`,
+      };
+    }
+    if (turnCategory === "substantive" && this.carryTurns > 0) {
+      this.carryTurns -= 1;
+      return { policy: REASONING_POLICY.DELIBERATE, source: "automatic-carry" };
+    }
+    return { policy: REASONING_POLICY.FAST, source: "automatic-fast" };
+  }
+}
+
+export function createReasoningPolicyController(options = {}) {
+  return new ReasoningPolicyController(options);
+}
 
 function normalizeMode(value) {
   return value === "ai-leads" || value === "balanced" ? value : "follow-user";
@@ -67,10 +162,40 @@ function normalizeDelays(value) {
   return result;
 }
 
-function responseDelay(plan, delays) {
-  if (plan?.responseCue === RESPONSE_CUE.QUESTION) return delays.question;
-  if (plan?.responseCue === RESPONSE_CUE.LOW_BURDEN) return delays.lowBurden;
+function responseDelay(strategy, delays) {
+  if (strategy?.responseCue === RESPONSE_CUE.QUESTION) return delays.question;
+  if (strategy?.responseCue === RESPONSE_CUE.LOW_BURDEN) return delays.lowBurden;
   return delays.statement;
+}
+
+export function sanitizeTurnStrategy(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (
+    !CONVERSATION_MOVES.has(value.move) ||
+    !PERSONA_STANCES.has(value.stance) ||
+    !REASONING_POLICIES.has(value.reasoningPolicy) ||
+    !RESPONSE_CUES.has(value.responseCue) ||
+    !Number.isSafeInteger(value.depth) ||
+    value.depth < 0 ||
+    value.depth > 3
+  ) return null;
+  return {
+    move: value.move,
+    stance: value.stance,
+    reasoningPolicy: value.reasoningPolicy,
+    responseCue: value.responseCue,
+    depth: value.depth,
+  };
+}
+
+export function createRecoveryTurnStrategy() {
+  return Object.freeze({
+    move: CONVERSATION_MOVE.RECOVER,
+    stance: PERSONA_STANCE.SUPPORT,
+    reasoningPolicy: REASONING_POLICY.FAST,
+    responseCue: RESPONSE_CUE.NONE,
+    depth: 0,
+  });
 }
 
 function topicBigrams(value) {
@@ -79,7 +204,7 @@ function topicBigrams(value) {
   return new Set(chars.slice(0, -1).map((char, index) => char + chars[index + 1]));
 }
 
-function relatedTopicKeys(left, right) {
+export function relatedTopicKeys(left, right) {
   if (left === right) return true;
   if (!/[\p{Script=Han}]/u.test(`${left}${right}`)) return false;
   const a = topicBigrams(left);
@@ -101,6 +226,14 @@ export function classifyImportantTopicBranch(text) {
   if (EMOTION_RE.test(value)) return "emotion";
   if (LONG_RUNNING_RE.test(value)) return "long-running";
   return "none";
+}
+
+export function classifyReasoningSignal(text, { explicitDepth = false } = {}) {
+  const value = String(text || "").trim();
+  if (explicitDepth) return "explicit-depth";
+  if (REASONING_REASONS_RE.test(value)) return "reasons";
+  if (REASONING_COMPARISON_RE.test(value)) return "comparison";
+  return classifyImportantTopicBranch(value);
 }
 
 class SessionTopicLedger {
@@ -226,8 +359,10 @@ class ConversationDirector {
     this.lateralMoves = 0;
     this.lateralRecoveryTurns = 0;
     this.lateralCooldownTurns = 0;
+    this.agreementStreak = 0;
+    this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
-    this._nextQuestionMove = CONVERSATION_MOVE.OFFER_ENTRY;
+    this._nextQuestionMove = CONVERSATION_MOVE.RESPOND;
   }
 
   dispatch(event) {
@@ -252,7 +387,7 @@ class ConversationDirector {
         }
         return [];
       case "playback-completed":
-        return this._afterPlayback(event.plan);
+        return this._afterPlayback(event.strategy);
       case "silence-deadline":
         return this._onSilenceDeadline(event.kind);
       case "proactive-accepted":
@@ -264,6 +399,8 @@ class ConversationDirector {
           this.sameTopicContinuations = 0;
           this.depth = 0;
           this.topicTurns = 0;
+          this.agreementStreak = 0;
+          this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
         }
         this.initiativeDebt = 0;
         return [];
@@ -317,17 +454,29 @@ class ConversationDirector {
     }
 
     if (policy === "pause") return this._onHardControl("pause");
-    if (policy === "redirect") return this._onHardControl("redirect");
+    if (policy === "redirect") {
+      const controls = this._onHardControl("redirect");
+      const strategy = this._strategy(
+        CONVERSATION_MOVE.RESPOND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        0,
+      );
+      this._recordStrategy(strategy);
+      return [...controls, { type: "request-reply", kind: "response", strategy }];
+    }
     if (policy === "resume") this._onHardControl("resume");
 
     const lateralAllowed = event.lateralAllowed !== false;
-    if (!lateralAllowed) {
+    const sensitive = topicActivity === "sensitive" || !lateralAllowed;
+    if (sensitive) {
       this.topicTurns = 0;
       this.lateralRecoveryTurns = 2;
     } else if (this.lateralRecoveryTurns > 0) {
       this.lateralRecoveryTurns -= 1;
     }
-    const lateralRecovered = lateralAllowed && this.lateralRecoveryTurns === 0;
+    const lateralRecovered = !sensitive && this.lateralRecoveryTurns === 0;
     const lateralEligible = lateralRecovered && LATERAL_ELIGIBLE_POLICIES.has(policy);
     if (lateralEligible && this.lateralCooldownTurns > 0) {
       this.lateralCooldownTurns -= 1;
@@ -340,20 +489,50 @@ class ConversationDirector {
       lateralRecovered &&
       softIntent === "none" &&
       lateralEligible &&
-      topicActivity !== "active" &&
+      !["active", "sensitive"].includes(topicActivity) &&
       this.lateralCooldownTurns === 0 &&
       (
         this.initiativeDebt >= MISSED_WINDOW_THRESHOLD ||
         this.topicTurns >= LATERAL_TURN_INTERVAL
       );
-    const plan = shouldAssociate
-      ? this._plan(
+    const semanticDepth = Number.isSafeInteger(event.conversationDepth) &&
+      event.conversationDepth >= 0 && event.conversationDepth <= 3
+      ? event.conversationDepth
+      : softIntent === "deepen" ? 2 : topicActivity === "sensitive" ? 1 : 0;
+    this.depth = semanticDepth;
+    const agencyEligible =
+      !sensitive &&
+      this.lateralRecoveryTurns === 0 &&
+      softIntent === "none" &&
+      policy === "agree" &&
+      ["neutral", "settling"].includes(topicActivity);
+    if (agencyEligible) {
+      this.agreementStreak = Math.min(3, this.agreementStreak + 1);
+    } else {
+      this.agreementStreak = 0;
+    }
+    const agencyStance = this.agreementStreak >= 2
+      ? this._nextAgencyStance
+      : null;
+    if (agencyStance && !shouldAssociate) {
+      this._nextAgencyStance = agencyStance === PERSONA_STANCE.CONTRAST
+        ? PERSONA_STANCE.LEAD
+        : PERSONA_STANCE.CONTRAST;
+    }
+    let strategy = shouldAssociate
+      ? this._strategy(
           CONVERSATION_MOVE.ASSOCIATE,
           RESPONSE_CUE.LOW_BURDEN,
-          "companion",
-          Math.min(2, this.depth),
+          PERSONA_STANCE.LEAD,
+          REASONING_POLICY.FAST,
+          Math.min(2, semanticDepth),
         )
-      : this._nextPlan(softIntent);
+      : this._nextStrategy(softIntent, semanticDepth);
+    if (!shouldAssociate && sensitive) {
+      strategy = sanitizeTurnStrategy({ ...strategy, stance: PERSONA_STANCE.SUPPORT });
+    } else if (!shouldAssociate && agencyStance) {
+      strategy = sanitizeTurnStrategy({ ...strategy, stance: agencyStance });
+    }
     if (shouldAssociate) {
       this.initiativeDebt = 0;
       this.topicTurns = 0;
@@ -361,52 +540,98 @@ class ConversationDirector {
       this.lateralCooldownTurns = LATERAL_COOLDOWN_TURNS;
       this.lateralMoves = Math.min(255, this.lateralMoves + 1);
     }
-    this._recordPlan(plan);
-    if (policy === "substantive") this.depth = Math.min(5, this.depth + 1);
-    return [{ type: "request-reply", kind: "response", plan }];
+    this._recordStrategy(strategy);
+    return [{ type: "request-reply", kind: "response", strategy }];
   }
 
-  _nextPlan(softIntent = "none") {
-    const depth = this.depth;
+  _nextStrategy(softIntent = "none", depth = this.depth) {
     if (softIntent === "invite-opinion") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "opinion", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.EXPAND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.OPINE,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "invite-advice") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "advice", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.RESPOND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "deepen") {
-      return this._plan(CONVERSATION_MOVE.DEEPEN, RESPONSE_CUE.NONE, "companion", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.DEEPEN,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "concretize") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "concrete", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.EXPAND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "lighten") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "light", Math.max(0, depth - 1));
+      return this._strategy(
+        CONVERSATION_MOVE.RESPOND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        0,
+      );
     }
 
     if (this.lastResponseCue !== RESPONSE_CUE.NONE || this.lastMove === "none") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "companion", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.EXPAND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     const questionMove = this._nextQuestionMove;
-    this._nextQuestionMove = questionMove === CONVERSATION_MOVE.OFFER_ENTRY
+    this._nextQuestionMove = questionMove === CONVERSATION_MOVE.RESPOND
       ? CONVERSATION_MOVE.DEEPEN
-      : CONVERSATION_MOVE.OFFER_ENTRY;
-    if (questionMove === CONVERSATION_MOVE.OFFER_ENTRY) {
-      return this._plan(questionMove, RESPONSE_CUE.LOW_BURDEN, "companion", depth);
+      : CONVERSATION_MOVE.RESPOND;
+    if (questionMove === CONVERSATION_MOVE.RESPOND) {
+      return this._strategy(
+        questionMove,
+        RESPONSE_CUE.LOW_BURDEN,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
-    return this._plan(questionMove, RESPONSE_CUE.QUESTION, "companion", depth);
+    return this._strategy(
+      questionMove,
+      RESPONSE_CUE.QUESTION,
+      PERSONA_STANCE.SUPPORT,
+      REASONING_POLICY.FAST,
+      depth,
+    );
   }
 
-  _plan(move, responseCue, stance, depth) {
-    return { move, responseCue, stance, depth };
+  _strategy(move, responseCue, stance, reasoningPolicy, depth) {
+    return sanitizeTurnStrategy({ move, responseCue, stance, reasoningPolicy, depth });
   }
 
-  _recordPlan(plan) {
-    this.lastMove = plan?.move || "none";
-    this.lastResponseCue = plan?.responseCue || RESPONSE_CUE.NONE;
+  _recordStrategy(strategy) {
+    this.lastMove = strategy?.move || "none";
+    this.lastResponseCue = strategy?.responseCue || RESPONSE_CUE.NONE;
   }
 
-  _afterPlayback(plan) {
+  _afterPlayback(strategy) {
     if (
       this.lifecycle !== "active" ||
       this.paused ||
@@ -422,7 +647,7 @@ class ConversationDirector {
     return [{
       type: "schedule-proactive",
       kind: switchTopic ? "idle" : "followup",
-      delayMs: switchTopic ? this.delays.topicSwitch : responseDelay(plan, this.delays),
+      delayMs: switchTopic ? this.delays.topicSwitch : responseDelay(strategy, this.delays),
     }];
   }
 
@@ -436,12 +661,14 @@ class ConversationDirector {
       return [];
     }
     const proactiveKind = kind === "idle" ? "idle" : "followup";
-    const plan = this._nextPlan();
-    this._recordPlan(plan);
-    return [{ type: "request-reply", kind: proactiveKind, plan }];
+    const strategy = this._nextStrategy();
+    this._recordStrategy(strategy);
+    return [{ type: "request-reply", kind: proactiveKind, strategy }];
   }
 
   _onHardControl(control) {
+    this.agreementStreak = 0;
+    this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     if (control === "resume") {
       this.paused = false;
       return [{ type: "resume-leading" }];
@@ -474,6 +701,8 @@ class ConversationDirector {
     this.lateralMoves = 0;
     this.lateralRecoveryTurns = 0;
     this.lateralCooldownTurns = 0;
+    this.agreementStreak = 0;
+    this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
   }
 }

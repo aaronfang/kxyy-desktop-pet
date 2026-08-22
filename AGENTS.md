@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## What this is
 
-元元桌宠 (kxyy-desktop-pet): a cross-platform (macOS / Windows) desktop pet built with **Tauri 2**. A web-based animation engine (ported from [webmeji](https://github.com/lars-rooij/webmeji)) runs in a transparent always-on-top WebView; a Rust main process handles the tray, windows, persistence, global shortcuts, and a local AI proxy. It also embeds an **AI chat** feature (DeepSeek text, Qwen-VL vision, Volcano TTS, and Volcano **realtime voice call**).
+元元桌宠 (kxyy-desktop-pet): a cross-platform (macOS / Windows) desktop pet built with **Tauri 2**. A web-based animation engine (ported from [webmeji](https://github.com/lars-rooij/webmeji)) runs in a transparent always-on-top WebView; a Rust main process handles the tray, windows, persistence, global shortcuts, and a local AI proxy. It also embeds an **AI chat** feature (DeepSeek text, DeepSeek/Qwen-VL vision, Volcano TTS, and Volcano **realtime voice call**).
 
 On macOS the app is a **menu-bar tray app** (no Dock icon). The app icon is a **head close-up of 苗疆元元** (`build/icon-square.png` → `npx tauri icon`), chosen so it stays legible at tray/small sizes.
 
@@ -43,7 +43,7 @@ There is no linter configured. Realtime voice has deterministic JS/Python/Rust t
 - `lib.rs` `setup` also calls `app.set_activation_policy(ActivationPolicy::Accessory)` so **dev mode** (`tauri dev`) hides the Dock too (plist alone does not cover that).
 
 **Local AI proxy** (`src-tauri/src/api.rs`): a `tiny_http` loopback server started at runtime on a random port. The frontend calls `invoke("get_api_base")` → `http://127.0.0.1:<port>`. Routes replicate the upstream `/api/chat` (SSE streaming) contract so synced logic modules work unchanged:
-- `GET/POST /api/chat` — proxies to DeepSeek (`deepseek-v4-flash`/`deepseek-v4-pro`, with explicit `thinking.type`) or, when an image is present, Qwen-VL (DashScope compatible-mode). Old/unknown DeepSeek model settings are normalized locally and never forwarded verbatim.
+- `GET/POST /api/chat` — proxies text to the selected DeepSeek model (`deepseek-v4-flash`/`deepseek-v4-pro`, with explicit `thinking.type`, or the direct multimodal `deepseek-v4-flash-vision-exp`). When the selected text model is not multimodal, images first go to the configured DeepSeek experimental vision model, Qwen-VL (DashScope compatible-mode), or local Ollama VL for a caption. Old/unknown DeepSeek text model settings and unknown vision-provider settings are normalized locally and never forwarded verbatim.
 - `POST /api/tts` — Volcano TTS (returns `audio/mpeg`).
 - `POST /api/web-observations` — disabled-by-default provider-neutral current-information contract. The allow-listed `tavily` adapter uses Tavily Search's fixed HTTPS endpoint with a local-only key, basic search, four-result/response/time limits, and no answer/raw-content fetch. Unknown/unconfigured providers fail closed; adapters must preserve source/time/size/injection boundaries and must not write observation text to Memory or diagnostics.
 - `GET /api/assets` — decrypted persona corpus.

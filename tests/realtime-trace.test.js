@@ -294,6 +294,177 @@ test("runtime collector stays bounded and strips unsafe metadata", () => {
   assert.equal(JSON.stringify(snapshot).includes("forbidden"), false);
 });
 
+test("runtime collector preserves the fixed recovery failure reason", () => {
+  const event = fixtureEvent(TRACE_EVENT.SESSION_ENDED, 20, {
+    reason: "recovery_failed",
+  });
+
+  assert.equal(event.reason, "recovery_failed");
+});
+
+test("long-call playback sampling cannot evict early interruption outcomes", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  trace.record(TRACE_EVENT.SPEECH_CANDIDATE);
+  trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
+  trace.record(TRACE_EVENT.ASR_FINAL);
+  for (let index = 0; index < 40; index += 1) {
+    trace.record(TRACE_EVENT.PLAYBACK_STATS, {
+      metrics: { queuedMs: index, playedSamples: index * 128 },
+    });
+    trace.record(TRACE_EVENT.MIC_AUDIO_INPUT, { metrics: { audioBytes: 640 } });
+  }
+
+  const snapshot = trace.snapshot();
+  const eventTypes = snapshot.events.map((event) => event.eventType);
+  assert.ok(snapshot.events.length <= 16);
+  assert.ok(eventTypes.includes(TRACE_EVENT.SPEECH_CANDIDATE));
+  assert.ok(eventTypes.includes(TRACE_EVENT.SPEECH_CONFIRMED));
+  assert.ok(eventTypes.includes(TRACE_EVENT.ASR_FINAL));
+
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 1),
+      fixtureEvent(TRACE_EVENT.SPEECH_REJECTED, 2),
+      ...Array.from({ length: 300 }, (_, index) =>
+        fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, index + 3, {
+          metrics: { queuedMs: index },
+        }),
+      ),
+    ],
+  });
+  assert.equal(report.events.length, 256);
+  assert.deepEqual(
+    report.events.slice(0, 2).map((event) => event.eventType),
+    [TRACE_EVENT.SPEECH_CANDIDATE, TRACE_EVENT.SPEECH_REJECTED],
+  );
+  assert.equal(report.exportStats.truncatedEvents, 46);
+});
+
+test("response, proactive, and recovery events survive sampled observation floods", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  trace.startResponse();
+  trace.record(TRACE_EVENT.PROACTIVE_TURN_ACCEPTED);
+  trace.record(TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED);
+  for (let index = 0; index < 20; index += 1) {
+    trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: index } });
+    trace.record(TRACE_EVENT.MIC_AUDIO_INPUT, { metrics: { audioBytes: 640 } });
+  }
+
+  const eventTypes = trace.snapshot().events.map((event) => event.eventType);
+  assert.ok(eventTypes.includes(TRACE_EVENT.RESPONSE_STARTED));
+  assert.ok(eventTypes.includes(TRACE_EVENT.PROACTIVE_TURN_ACCEPTED));
+  assert.ok(eventTypes.includes(TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED));
+});
+
+test("critical event floods leave bounded capacity for observations", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  for (let index = 0; index < 20; index += 1) {
+    trace.record(TRACE_EVENT.SPEECH_CANDIDATE);
+    trace.record(TRACE_EVENT.SPEECH_REJECTED);
+  }
+  trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 320 } });
+
+  const eventTypes = trace.snapshot().events.map((event) => event.eventType);
+  assert.ok(eventTypes.includes(TRACE_EVENT.MEMORY_CONTEXT_REQUEST));
+  assert.ok(eventTypes.includes(TRACE_EVENT.PLAYBACK_STATS));
+  assert.ok(eventTypes.some((eventType) => eventType.startsWith("speech_")));
+});
+
+test("diagnostic export validates before prioritizing and orders monotonic time", () => {
+  const malformedProtected = Array.from({ length: 300 }, (_, index) => ({
+    ...fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 500 + index),
+    schemaVersion: 999,
+  }));
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 10),
+      ...malformedProtected,
+      fixtureEvent(TRACE_EVENT.SPEECH_CONFIRMED, 20),
+      fixtureEvent(TRACE_EVENT.MEMORY_CONTEXT_REQUEST, 25),
+      fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, 30, { metrics: { queuedMs: 30 } }),
+    ],
+  });
+
+  assert.equal(report.exportStats.rejectedItems, 252);
+  assert.deepEqual(
+    report.events.map((event) => event.timestampMs),
+    [10, 20, 25, 30],
+  );
+  assert.deepEqual(
+    report.events.map((event) => event.eventType),
+    [
+      TRACE_EVENT.SPEECH_CANDIDATE,
+      TRACE_EVENT.SPEECH_CONFIRMED,
+      TRACE_EVENT.MEMORY_CONTEXT_REQUEST,
+      TRACE_EVENT.PLAYBACK_STATS,
+    ],
+  );
+});
+
+test("diagnostic export rejects hostile timestamps without aborting", () => {
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 10),
+      {
+        ...fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, 20),
+        timestampMs: Symbol("hostile-timestamp"),
+      },
+    ],
+  });
+
+  assert.equal(report.exportStats.rejectedItems, 1);
+  assert.deepEqual(report.events.map((event) => event.timestampMs), [10]);
+});
+
+test("playback stats only coalesce when globally consecutive", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 100 } });
+  trace.record(TRACE_EVENT.SPEECH_CANDIDATE);
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 200 } });
+  trace.record(TRACE_EVENT.PLAYBACK_STATS, { metrics: { queuedMs: 300 } });
+
+  const snapshot = trace.snapshot();
+  const playbackStats = snapshot.events.filter(
+    (event) => event.eventType === TRACE_EVENT.PLAYBACK_STATS,
+  );
+  assert.equal(playbackStats.length, 2);
+  assert.equal(snapshot.coalescedPlaybackStats, 1);
+  assert.deepEqual(playbackStats.map((event) => event.metrics.queuedMs), [100, 300]);
+});
+
 test("keeps eight generation latency summaries outside the rolling event queue", () => {
   let now = 0;
   let id = 0;
@@ -362,6 +533,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
+      interruptionRecovery: "empty-confirmed-v1",
       memoryContext: "turn-final-v1",
       vadShadow: "silero-onnx-shadow-v1",
       asr: {
@@ -391,10 +563,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       topicSwitches: 1,
       replyCancelTimeouts: 2,
       conversationMoves: {
+        respond: 2,
         expand: 3,
-        offerEntry: 2,
         deepen: 1,
         associate: 1,
+        recover: 0,
       },
       topicActivity: {
         active: 5,
@@ -425,6 +598,43 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       rhythmStopped: true,
       topicText: "forbidden-topic",
     },
+    recoverySummary: {
+      scheduled: 255,
+      started: 3,
+      cancelled: -1,
+      completed: 256,
+      rawReason: "forbidden-recovery-reason",
+    },
+    turnStrategySummary: {
+      moves: {
+        respond: 1,
+        expand: 255,
+        deepen: -1,
+        associate: 256,
+        recover: 2.5,
+        "offer-entry": 9,
+      },
+      stances: {
+        support: 2,
+        opine: 3,
+        contrast: Number.MAX_SAFE_INTEGER + 1,
+        lead: 4,
+        companion: 8,
+      },
+      reasoningPolicies: { fast: 5, deliberate: 6, automatic: 7 },
+      responseCues: { none: 7, lowBurden: 8, question: 9, transcript: "forbidden-strategy-text" },
+      depths: { zero: 10, one: 11, two: 12, three: 13, four: 14 },
+      sources: {
+        preferenceOff: 1,
+        preferenceAlways: 2,
+        automaticSignal: 3,
+        automaticCarry: 4,
+        automaticFast: 5,
+        fastControl: 6,
+        transcript: "forbidden-reasoning-source",
+      },
+      reason: "forbidden-strategy-reason",
+    },
     events,
     latencies: [summarizeTraceLatency(events, 0)],
     persona: "forbidden-persona",
@@ -438,6 +648,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    interruptionRecovery: "empty-confirmed-v1",
     memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
     asr: {
@@ -470,10 +681,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     topicSwitches: 1,
     replyCancelTimeouts: 2,
     conversationMoves: {
+      respond: 2,
       expand: 3,
-      offerEntry: 2,
       deepen: 1,
       associate: 1,
+      recover: 0,
     },
     topicActivity: {
       active: 5,
@@ -510,6 +722,27 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     },
     rhythm: { backoffs: 1, stops: 1, stopped: true },
   });
+  assert.deepEqual(report.aggregate.recovery, {
+    scheduled: 255,
+    started: 3,
+    cancelled: 0,
+    completed: 0,
+  });
+  assert.deepEqual(report.aggregate.turnStrategy, {
+    moves: { respond: 1, expand: 255, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 2, opine: 3, contrast: 0, lead: 4 },
+    reasoningPolicies: { fast: 5, deliberate: 6 },
+    responseCues: { none: 7, lowBurden: 8, question: 9 },
+    depths: { zero: 10, one: 11, two: 12, three: 13 },
+    sources: {
+      preferenceOff: 1,
+      preferenceAlways: 2,
+      automaticSignal: 3,
+      automaticCarry: 4,
+      automaticFast: 5,
+      fastControl: 6,
+    },
+  });
   assert.equal(report.appVersion, "0.2.23");
   assert.equal(report.events.length, 255);
   assert.equal(report.events.at(-1).metrics.audioBytes, 259);
@@ -539,6 +772,12 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "rawProbability",
     "forbidden-model-path",
     "forbidden-topic",
+    "forbidden-recovery-reason",
+    "forbidden-strategy-text",
+    "forbidden-strategy-reason",
+    "forbidden-reasoning-source",
+    "offer-entry",
+    "companion",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -602,6 +841,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
       downlinkAudio: "future-envelope",
       ttsStream: "future-stream",
       interruptionHint: "future-hint",
+      interruptionRecovery: "future-recovery",
       vadShadow: "future-shadow",
       asr: {
         requested: "future-asr",
@@ -616,6 +856,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     downlinkAudio: "raw",
     ttsStream: "none",
     interruptionHint: "none",
+    interruptionRecovery: "none",
     memoryContext: "none",
     vadShadow: "disabled",
     asr: {
@@ -936,6 +1177,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
       downlinkAudio: "managed-v1",
       memoryContext: "turn-final-v1",
       interruptionHint: "candidate-snapshot-v1",
+      interruptionRecovery: "empty-confirmed-v1",
       ttsStream: "provider-pcm-v1",
       proactiveTurn: "local-v1",
       freshTopic: "fresh-topic-v1",
@@ -945,6 +1187,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+  assert.deepEqual(sockets[0].sent[0].interruptionRecovery, ["empty-confirmed-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
   assert.deepEqual(sockets[0].sent[0].proactiveTurn, ["local-v1"]);
   assert.equal("freshTopics" in sockets[0].sent[0], false);
@@ -1007,6 +1250,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    interruptionRecovery: "empty-confirmed-v1",
     memoryContext: "turn-final-v1",
     vadShadow: "disabled",
     asr: {
@@ -1037,6 +1281,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     type: "memory_context",
     generation: 7,
     items: [{ kind: "fact", text: "记忆线索", uncertain: false, pinned: false }],
+    reasoningPolicy: "fast",
     freshTopics: [freshTopic],
   });
 
@@ -1052,6 +1297,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+  assert.deepEqual(sockets[1].sent[0].interruptionRecovery, ["empty-confirmed-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
   assert.deepEqual(sockets[1].sent[0].proactiveTurn, ["local-v1"]);
 
@@ -1076,6 +1322,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
+  assert.deepEqual(sockets[2].sent[0].interruptionRecovery, ["empty-confirmed-v1"]);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
   assert.equal("proactiveTurn" in sockets[2].sent[0], false);
   assert.equal("freshTopics" in sockets[2].sent[0], false);
@@ -1100,6 +1347,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   await volcanoOpen;
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
+  assert.equal("interruptionRecovery" in sockets[3].sent[0], false);
   assert.equal("ttsStream" in sockets[3].sent[0], false);
   assert.equal("proactiveTurn" in sockets[3].sent[0], false);
   assert.equal("initialHistory" in sockets[3].sent[0], false);
@@ -1160,8 +1408,59 @@ test("managed transport reconnects with current history before requesting servic
   assert.deepEqual(sockets[1].sent[0].initialHistory, [
     { role: "user", content: "重连前的历史" },
   ]);
-  assert.deepEqual(sockets[1].sent[1], { type: "resume_pending_turn" });
+  assert.deepEqual(sockets[1].sent[1], {
+    type: "resume_pending_turn",
+    reasoningPolicy: "fast",
+  });
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary.reasoningPolicies, {
+    fast: 1,
+    deliberate: 0,
+  });
+  assert.equal(
+    session.getTraceSnapshot().turnStrategySummary.sources.preferenceOff,
+    1,
+  );
   session.stopped = true;
+});
+
+test("provider-originated session endings retain the provider terminal reason", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 1;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+    close() {}
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+
+  const socketEnded = new RealtimeSession({ provider: "volc" });
+  socketEnded.trace.startSession();
+  const opening = socketEnded._openSocket("ws://volc", {
+    systemRole: "role",
+    botName: "元元",
+  });
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({ type: "session", state: "started" }),
+  });
+  await opening;
+  sockets[0].onclose();
+
+  const messageEnded = new RealtimeSession({ provider: "local" });
+  messageEnded.trace.startSession();
+  messageEnded._onMessage({
+    data: JSON.stringify({ type: "session", state: "ended" }),
+  });
+
+  assert.equal(socketEnded.getTraceSnapshot().events.at(-1).reason, "provider_terminal");
+  assert.equal(messageEnded.getTraceSnapshot().events.at(-1).reason, "provider_terminal");
 });
 
 test("transport recovery does not resume an old trailing user message", async () => {
@@ -1449,6 +1748,7 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   const { RealtimeSession } = await import("../src/ai/realtime.js");
   const open = async (options, started = {}) => {
     const session = new RealtimeSession({ proactiveGreetingDelayMs: 0, ...options });
+    session.trace.startSession();
     session._playbackMode = "worklet";
     session.playbackNode = { port: { postMessage: () => {} } };
     session._micReady = true;
@@ -1474,7 +1774,7 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(
     active.socket.sent.filter((message) => message.type === "proactive_turn"),
-    [{ type: "proactive_turn", triggerId: 1, kind: "welcome" }],
+    [{ type: "proactive_turn", triggerId: 1, kind: "welcome", reasoningPolicy: "fast" }],
   );
   active.session._scheduleProactiveWelcome();
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1501,8 +1801,19 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   active.session._onMessage({
     data: JSON.stringify({ type: "speech_confirmed", candidateId: 1 }),
   });
-  assert.equal(active.session.getTraceSnapshot().proactiveSummary.cancelled, 1);
-  assert.equal(active.session.getTraceSnapshot().proactiveSummary.preAudioUserReclaims, 1);
+  const activeSnapshot = active.session.getTraceSnapshot();
+  assert.equal(activeSnapshot.proactiveSummary.cancelled, 1);
+  assert.equal(activeSnapshot.proactiveSummary.preAudioUserReclaims, 1);
+  assert.ok(
+    activeSnapshot.events.some(
+      (event) => event.eventType === TRACE_EVENT.PROACTIVE_TURN_ACCEPTED,
+    ),
+  );
+  assert.ok(
+    activeSnapshot.events.some(
+      (event) => event.eventType === TRACE_EVENT.PROACTIVE_TURN_CANCELLED,
+    ),
+  );
 
   const interrupted = await open(
     { provider: "cosyvoice", conversationMode: "balanced", proactiveGreetingDelayMs: 20 },
@@ -1530,6 +1841,192 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   const oldServer = await open({ provider: "local", conversationMode: "ai-leads" });
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(oldServer.socket.sent.filter((message) => message.type === "proactive_turn").length, 0);
+});
+
+test("empty confirmed interruption requests one recovery and records fixed lifecycle counts", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = class { static OPEN = 1; };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    interruptionRecoveryGraceMs: 0,
+    interruptionRecoveryDeferMs: 0,
+  });
+  session.trace.startSession();
+  session.ws = { readyState: 1, send: (value) => sent.push(JSON.parse(value)) };
+  session._sessionStarted = true;
+  session._interruptionRecoveryMode = "empty-confirmed-v1";
+  session._backendGeneration = 7;
+  session._candidateInterruptsResponse = true;
+  assert.equal(session._confirmSpeech(), true);
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 7 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(
+    sent.filter((message) => message.type === "interruption_recovery"),
+    [{
+      type: "interruption_recovery",
+      requestId: 1,
+      expectedGeneration: 7,
+      reasoningPolicy: "fast",
+      turnStrategy: {
+        move: "recover",
+        stance: "support",
+        reasoningPolicy: "fast",
+        responseCue: "none",
+        depth: 0,
+      },
+    }],
+  );
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "started",
+      generation: 8,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "started",
+      generation: 8,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "completed",
+      generation: 8,
+    }),
+  });
+  const snapshot = session.getTraceSnapshot();
+  assert.deepEqual(snapshot.recoverySummary, {
+    scheduled: 1,
+    started: 1,
+    cancelled: 0,
+    completed: 1,
+  });
+  assert.deepEqual(snapshot.turnStrategySummary, {
+    moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 1 },
+    stances: { support: 1, opine: 0, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 1, deliberate: 0 },
+    responseCues: { none: 1, lowBurden: 0, question: 0 },
+    depths: { zero: 1, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 0,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 1,
+    },
+  });
+  assert.equal(JSON.stringify(snapshot).includes("userText"), false);
+});
+
+test("valid speech cancels recovery while temporary occupancy only defers it", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = class { static OPEN = 1; };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const makeSession = () => {
+    const sent = [];
+    const session = new RealtimeSession({
+      provider: "local",
+      interruptionRecoveryGraceMs: 0,
+      interruptionRecoveryDeferMs: 1,
+    });
+    session.trace.startSession();
+    session.ws = { readyState: 1, send: (value) => sent.push(JSON.parse(value)) };
+    session._sessionStarted = true;
+    session._interruptionRecoveryMode = "empty-confirmed-v1";
+    session._backendGeneration = 3;
+    session._candidateInterruptsResponse = true;
+    session._confirmSpeech();
+    return { session, sent };
+  };
+
+  const valid = makeSession();
+  valid.session._onMessage({
+    data: JSON.stringify({ type: "asr", text: "我还想继续说", interim: false, generation: 3 }),
+  });
+  valid.session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 3 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(valid.sent.some((message) => message.type === "interruption_recovery"), false);
+
+  const deferred = makeSession();
+  deferred.session._backendAudioPending = true;
+  deferred.session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 3 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(deferred.sent.some((message) => message.type === "interruption_recovery"), false);
+  deferred.session._backendAudioPending = false;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(
+    deferred.sent.filter((message) => message.type === "interruption_recovery").length,
+    1,
+  );
+
+  const cancelled = makeSession();
+  cancelled.session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 3 }) });
+  cancelled.session._beginSpeechCandidate();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(cancelled.sent.some((message) => message.type === "interruption_recovery"), false);
+  assert.equal(cancelled.session.getTraceSnapshot().recoverySummary.cancelled, 1);
+});
+
+test("hard controls, stale generations and hangup cancel pending recovery timers", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const makePending = () => {
+    const sent = [];
+    const session = new RealtimeSession({
+      provider: "local",
+      interruptionRecoveryGraceMs: 20,
+      interruptionRecoveryDeferMs: 1,
+    });
+    session.trace.startSession();
+    session.ws = {
+      readyState: 1,
+      send: (value) => sent.push(JSON.parse(value)),
+      close() {},
+    };
+    session._sessionStarted = true;
+    session._interruptionRecoveryMode = "empty-confirmed-v1";
+    session._backendGeneration = 3;
+    assert.equal(session._scheduleInterruptionRecovery(), true);
+    return { session, sent };
+  };
+
+  for (const control of ["先别说话", "换个话题吧"]) {
+    const current = makePending();
+    current.session._onMessage({
+      data: JSON.stringify({ type: "asr", text: control, interim: false, generation: 3 }),
+    });
+    current.session._onMessage({
+      data: JSON.stringify({ type: "asr_end", generation: 3 }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(
+      current.sent.some((message) => message.type === "interruption_recovery"),
+      false,
+    );
+  }
+
+  const stale = makePending();
+  stale.session._backendGeneration = 4;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(stale.sent.some((message) => message.type === "interruption_recovery"), false);
+  assert.equal(stale.session.getTraceSnapshot().recoverySummary.cancelled, 1);
+
+  const hungUp = makePending();
+  await hungUp.session.stop();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(hungUp.sent.some((message) => message.type === "interruption_recovery"), false);
+  assert.equal(hungUp.session.getTraceSnapshot().recoverySummary.cancelled, 1);
 });
 
 test("realtime proactive policy classifies explicit controls without model inference", async () => {
@@ -1593,7 +2090,7 @@ test("realtime proactive policy classifies explicit controls without model infer
   assert.equal(classifyRealtimeTopicActivity("我现在肚子疼", "substantive", false), "sensitive");
 });
 
-test("ai-leads schedules bounded plan-aware followups from audible playback", async () => {
+test("ai-leads schedules bounded strategy-aware followups from audible playback", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -1614,10 +2111,11 @@ test("ai-leads schedules bounded plan-aware followups from audible playback", as
   session._scheduleTopicLeadAfterPlayback(1);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.at(-1).kind, "followup");
-  assert.deepEqual(sent.at(-1).conversationPlan, {
+  assert.deepEqual(sent.at(-1).turnStrategy, {
     move: "expand",
     responseCue: "none",
-    stance: "companion",
+    stance: "support",
+    reasoningPolicy: "fast",
     depth: 0,
   });
 
@@ -1630,11 +2128,27 @@ test("ai-leads schedules bounded plan-aware followups from audible playback", as
   session._scheduleTopicLeadAfterPlayback(2);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.at(-1).kind, "followup");
-  assert.deepEqual(sent.at(-1).conversationPlan, {
-    move: "offer-entry",
+  assert.deepEqual(sent.at(-1).turnStrategy, {
+    move: "respond",
     responseCue: "low-burden",
-    stance: "companion",
+    stance: "support",
+    reasoningPolicy: "fast",
     depth: 0,
+  });
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
+    moves: { respond: 1, expand: 1, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 2, opine: 0, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 2, deliberate: 0 },
+    responseCues: { none: 1, lowBurden: 1, question: 0 },
+    depths: { zero: 2, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 0,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 2,
+    },
   });
 
   session._noteProactiveStatus({
@@ -1722,7 +2236,42 @@ test("balanced allows one proactive turn after user engagement", async () => {
   assert.equal(sent[0].kind, "followup");
 });
 
-test("ai-leads sends a fixed conversation plan with negotiated turn context", async () => {
+test("malformed proactive strategy is omitted from wire and diagnostics", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+
+  assert.equal(session._sendProactiveTurn("followup", {
+    move: "offer-entry",
+    responseCue: "none",
+    stance: "companion",
+    reasoningPolicy: "automatic",
+    depth: 4,
+  }), true);
+
+  assert.equal(Object.hasOwn(sent[0], "turnStrategy"), false);
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
+    moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 0, opine: 0, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 1, deliberate: 0 },
+    responseCues: { none: 0, lowBurden: 0, question: 0 },
+    depths: { zero: 0, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 0,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 1,
+    },
+  });
+});
+
+test("ai-leads sends a fixed turn strategy with negotiated turn context", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -1742,17 +2291,145 @@ test("ai-leads sends a fixed conversation plan with negotiated turn context", as
   });
 
   assert.equal(session.sendMemoryContext({ generation: 7, items: [] }), true);
-  assert.deepEqual(sent.at(-1).conversationPlan, {
+  assert.deepEqual(sent.at(-1).turnStrategy, {
     move: "expand",
     responseCue: "none",
-    stance: "opinion",
+    stance: "opine",
+    reasoningPolicy: "fast",
     depth: 0,
+  });
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
+    moves: { respond: 0, expand: 1, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 0, opine: 1, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 1, deliberate: 0 },
+    responseCues: { none: 1, lowBurden: 0, question: 0 },
+    depths: { zero: 1, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 1,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 0,
+    },
   });
   assert.equal(JSON.stringify(sent.at(-1)).includes("我想听听"), false);
   session._onMessage({
     data: JSON.stringify({ type: "reply_cancel_timeout", cancelledGeneration: 6 }),
   });
   assert.equal(session.getTraceSnapshot().proactiveSummary.replyCancelTimeouts, 1);
+});
+
+test("automatic reasoning carries for two managed follow-ups then returns to fast", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    reasoningPreference: "automatic",
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._sessionStarted = true;
+  session._memoryContextMode = "turn-final-v1";
+
+  const userTurns = [
+    "我不知道该不该换工作",
+    "我还在想这件事",
+    "确实还有一些顾虑",
+    "先慢慢看看吧",
+  ];
+  userTurns.forEach((text, index) => {
+    const generation = index + 1;
+    session._backendGeneration = generation;
+    session._userTurnOpen = true;
+    session._onMessage({
+      data: JSON.stringify({ type: "asr", text, interim: false, generation }),
+    });
+    assert.equal(session.sendMemoryContext({ generation, items: [] }), true);
+  });
+
+  const policies = sent
+    .filter((message) => message.type === "memory_context")
+    .map((message) => message.reasoningPolicy);
+  assert.deepEqual(policies, ["deliberate", "deliberate", "deliberate", "fast"]);
+  assert.deepEqual(
+    sent.filter((message) => message.type === "reasoning_policy").map(({ policy }) => policy),
+    ["deliberate", "deliberate", "deliberate", "fast"],
+  );
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary.sources, {
+    preferenceOff: 0,
+    preferenceAlways: 0,
+    automaticSignal: 1,
+    automaticCarry: 2,
+    automaticFast: 1,
+    fastControl: 0,
+  });
+  const diagnostic = JSON.stringify(session.getTraceSnapshot());
+  for (const text of userTurns) assert.equal(diagnostic.includes(text), false);
+});
+
+test("automatic reasoning carry resets on a natural unrelated topic change", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    reasoningPreference: "automatic",
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._sessionStarted = true;
+  session._memoryContextMode = "turn-final-v1";
+  for (const [generation, text] of [
+    [1, "我不知道该不该换工作"],
+    [2, "我最近看了一部电影"],
+  ]) {
+    session._backendGeneration = generation;
+    session._userTurnOpen = true;
+    session._onMessage({
+      data: JSON.stringify({ type: "asr", text, interim: false, generation }),
+    });
+    session.sendMemoryContext({ generation, items: [] });
+  }
+  assert.deepEqual(
+    sent.filter((message) => message.type === "reasoning_policy").map(({ policy }) => policy),
+    ["deliberate", "fast"],
+  );
+});
+
+test("rejecting a led topic sends a support strategy back through managed context", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._memoryContextMode = "turn-final-v1";
+  session._backendGeneration = 9;
+  session._userTurnOpen = true;
+  session._onMessage({
+    data: JSON.stringify({
+      type: "asr",
+      text: "不聊这个了，还是说说我的生物钟吧",
+      interim: false,
+      generation: 9,
+    }),
+  });
+
+  assert.equal(session.sendMemoryContext({ generation: 9, items: [] }), true);
+  assert.deepEqual(sent.at(-1).turnStrategy, {
+    move: "respond",
+    responseCue: "none",
+    stance: "support",
+    reasoningPolicy: "fast",
+    depth: 0,
+  });
+  const diagnostic = JSON.stringify(session.getTraceSnapshot());
+  assert.equal(diagnostic.includes("生物钟"), false);
+  assert.equal(session.getTraceSnapshot().turnStrategySummary.stances.support, 1);
 });
 
 test("thinking feedback is immediate and offers at most one delayed filler signal per turn", async () => {
@@ -1843,7 +2520,8 @@ test("important topic revisit is a bounded accepted transition and stays out of 
     session._sendTopicTransition({
       move: "expand",
       responseCue: "none",
-      stance: "companion",
+      stance: "support",
+      reasoningPolicy: "fast",
       depth: 1,
     });
     const message = sent.at(-1);
@@ -1859,7 +2537,8 @@ test("important topic revisit is a bounded accepted transition and stays out of 
   session._sendTopicTransition({
     move: "deepen",
     responseCue: "low-burden",
-    stance: "companion",
+    stance: "support",
+    reasoningPolicy: "fast",
     depth: 2,
   });
   const revisit = sent.at(-1);
@@ -3161,7 +3840,7 @@ test("old local services time out on one short wait while Volcano never waits", 
   }
 });
 
-test("stop records a final diagnostic snapshot before audio cleanup settles", async () => {
+test("stop records a fixed call-end reason before audio cleanup settles", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
   const session = new RealtimeSession({ provider: "local" });
@@ -3172,17 +3851,29 @@ test("stop records a final diagnostic snapshot before audio cleanup settles", as
     close: () => new Promise(() => {}),
   };
 
-  void session.stop();
+  void session.stop("app_quit");
   const snapshot = session.getTraceSnapshot();
   assert.equal(session.stopped, true);
   assert.equal(snapshot.state.lifecycle, "ended");
   assert.deepEqual(
     snapshot.events.slice(-2).map((event) => [event.eventType, event.reason]),
     [
-      [TRACE_EVENT.RESPONSE_CANCELLED, "hangup"],
-      [TRACE_EVENT.SESSION_ENDED, "hangup"],
+      [TRACE_EVENT.RESPONSE_CANCELLED, "app_quit"],
+      [TRACE_EVENT.SESSION_ENDED, "app_quit"],
     ],
   );
+});
+
+test("unknown call-end reasons fail closed to provider terminal", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  session.trace.startSession();
+  session.ws = { readyState: 1, send() {}, close() {} };
+
+  await session.stop("conversation text must not enter diagnostics");
+
+  assert.equal(session.getTraceSnapshot().events.at(-1).reason, "provider_terminal");
 });
 
 test("desktop session records privacy-safe soft endpoint transitions", async () => {
