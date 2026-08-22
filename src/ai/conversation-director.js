@@ -18,6 +18,36 @@ export const REASONING_POLICY = Object.freeze({
   DELIBERATE: "deliberate",
 });
 
+export const REASONING_PREFERENCE = Object.freeze({
+  OFF: "off",
+  AUTOMATIC: "automatic",
+  ALWAYS: "always",
+});
+
+const DELIBERATE_REASONING_SIGNALS = new Set([
+  "explicit-depth",
+  "reasons",
+  "decision",
+  "relationship",
+  "emotion",
+  "comparison",
+  "long-running",
+  "goal",
+]);
+const FAST_REASONING_POLICIES = new Set([
+  "acknowledge",
+  "amused",
+  "agree",
+  "pause",
+  "redirect",
+  "resume",
+  "proactive",
+  "recovery",
+  "greeting",
+  "farewell",
+]);
+const REASONING_CARRY_TURNS = 2;
+
 export const RESPONSE_CUE = Object.freeze({
   NONE: "none",
   LOW_BURDEN: "low-burden",
@@ -69,6 +99,54 @@ const GOAL_RE = /(?:我的|今年|最近|接下来|以后).{0,8}(?:目标|计划
 const RELATIONSHIP_RE = /我(?:和|跟).{0,12}(?:家人|家里人|父母|爸妈|妈妈|爸爸|朋友|伴侣|对象|爱人|同事|室友).{0,24}(?:关系|矛盾|冲突|疏远|难受|困扰|在意|担心)|(?:家人|家里人|父母|爸妈|妈妈|爸爸|朋友|伴侣|对象|爱人|同事|室友).{0,12}(?:和我的关系|让我.{0,6}(?:难受|困扰|在意|担心))/;
 const EMOTION_RE = /(?:焦虑|难受|委屈|害怕|担心|失落|孤独|压抑|内疚|愧疚|迷茫|崩溃|痛苦|烦躁|不安|很开心|特别开心|很期待|特别期待)/;
 const LONG_RUNNING_RE = /(?:一直|长期|反复|好多年|好几年|几个月|很久).{0,18}(?:困扰|烦恼|问题|放不下|过不去|没解决)|(?:困扰|烦恼|问题|放不下|过不去|没解决).{0,18}(?:一直|长期|反复|好多年|好几年|几个月|很久)/;
+const REASONING_REASONS_RE = /为什么|啥原因|什么原因|原因是|怎么理解|怎么想|怎么看/;
+const REASONING_COMPARISON_RE = /对比|比较|区别|哪个更|哪种更|哪个好|一方面.{0,40}另一方面|如果.{0,30}(?:又|同时|但是)/;
+
+export function normalizeReasoningPreference(value) {
+  if (value === true) return REASONING_PREFERENCE.ALWAYS;
+  if (value === false) return REASONING_PREFERENCE.OFF;
+  return Object.values(REASONING_PREFERENCE).includes(value)
+    ? value
+    : REASONING_PREFERENCE.OFF;
+}
+
+class ReasoningPolicyController {
+  constructor({ preference } = {}) {
+    this.preference = normalizeReasoningPreference(preference);
+    this.carryTurns = 0;
+  }
+
+  select({ turnCategory = "substantive", signal = "none", topicChanged = false } = {}) {
+    if (topicChanged || FAST_REASONING_POLICIES.has(turnCategory)) {
+      this.carryTurns = 0;
+      return { policy: REASONING_POLICY.FAST, source: "fast-control" };
+    }
+    if (this.preference === REASONING_PREFERENCE.OFF) {
+      this.carryTurns = 0;
+      return { policy: REASONING_POLICY.FAST, source: "preference-off" };
+    }
+    if (this.preference === REASONING_PREFERENCE.ALWAYS) {
+      this.carryTurns = 0;
+      return { policy: REASONING_POLICY.DELIBERATE, source: "preference-always" };
+    }
+    if (DELIBERATE_REASONING_SIGNALS.has(signal)) {
+      this.carryTurns = REASONING_CARRY_TURNS;
+      return {
+        policy: REASONING_POLICY.DELIBERATE,
+        source: `automatic-${signal}`,
+      };
+    }
+    if (turnCategory === "substantive" && this.carryTurns > 0) {
+      this.carryTurns -= 1;
+      return { policy: REASONING_POLICY.DELIBERATE, source: "automatic-carry" };
+    }
+    return { policy: REASONING_POLICY.FAST, source: "automatic-fast" };
+  }
+}
+
+export function createReasoningPolicyController(options = {}) {
+  return new ReasoningPolicyController(options);
+}
 
 function normalizeMode(value) {
   return value === "ai-leads" || value === "balanced" ? value : "follow-user";
@@ -126,7 +204,7 @@ function topicBigrams(value) {
   return new Set(chars.slice(0, -1).map((char, index) => char + chars[index + 1]));
 }
 
-function relatedTopicKeys(left, right) {
+export function relatedTopicKeys(left, right) {
   if (left === right) return true;
   if (!/[\p{Script=Han}]/u.test(`${left}${right}`)) return false;
   const a = topicBigrams(left);
@@ -148,6 +226,14 @@ export function classifyImportantTopicBranch(text) {
   if (EMOTION_RE.test(value)) return "emotion";
   if (LONG_RUNNING_RE.test(value)) return "long-running";
   return "none";
+}
+
+export function classifyReasoningSignal(text, { explicitDepth = false } = {}) {
+  const value = String(text || "").trim();
+  if (explicitDepth) return "explicit-depth";
+  if (REASONING_REASONS_RE.test(value)) return "reasons";
+  if (REASONING_COMPARISON_RE.test(value)) return "comparison";
+  return classifyImportantTopicBranch(value);
 }
 
 class SessionTopicLedger {

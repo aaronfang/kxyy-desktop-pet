@@ -862,6 +862,14 @@ function sanitizeTurnStrategySummary(raw) {
     reasoningPolicies: fixedCounts(value.reasoningPolicies, ["fast", "deliberate"]),
     responseCues: fixedCounts(value.responseCues, ["none", "lowBurden", "question"]),
     depths: fixedCounts(value.depths, ["zero", "one", "two", "three"]),
+    sources: fixedCounts(value.sources, [
+      "preferenceOff",
+      "preferenceAlways",
+      "automaticSignal",
+      "automaticCarry",
+      "automaticFast",
+      "fastControl",
+    ]),
   });
 }
 

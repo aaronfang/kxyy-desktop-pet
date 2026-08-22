@@ -239,6 +239,9 @@ struct Settings {
     /// 思考模式（DeepSeek thinking.type / 本地 Qwen reasoning_effort）。
     #[serde(default)]
     thinking: bool,
+    /// 回复推理偏好：`off` / `automatic` / `always`。空值按旧版 thinking 迁移。
+    #[serde(default)]
+    reasoning_mode: String,
     /// M4 Global Workspace 实验开关；默认关闭，开启后仍只使用有界内部观察。
     #[serde(default)]
     memory_workspace: bool,
@@ -447,6 +450,7 @@ impl Settings {
             local_vl_model: String::new(),
             vl_provider: default_vl_provider(),
             thinking: false,
+            reasoning_mode: "off".into(),
             memory_workspace: false,
             memory_workspace_mode: default_workspace_mode(),
             temperature: default_temperature(),
@@ -661,6 +665,16 @@ fn normalize_realtime_conversation_mode(value: &str) -> &'static str {
     }
 }
 
+fn normalize_reasoning_mode(value: &str, legacy_thinking: bool) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => "off",
+        "automatic" => "automatic",
+        "always" => "always",
+        _ if legacy_thinking => "always",
+        _ => "off",
+    }
+}
+
 fn normalize_fresh_topic_participation(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "occasional" => "occasional",
@@ -695,6 +709,8 @@ fn load_settings(app: &AppHandle) -> Settings {
                     s.tts_voice = s.realtime_voice.trim().to_string();
                 }
                 s.realtime_voice.clear();
+                s.reasoning_mode = normalize_reasoning_mode(&s.reasoning_mode, s.thinking).into();
+                s.thinking = s.reasoning_mode == "always";
                 return s;
             }
         }
@@ -1852,6 +1868,8 @@ struct AiSettingsInput {
     vl_provider: String,
     thinking: bool,
     #[serde(default)]
+    reasoning_mode: String,
+    #[serde(default)]
     memory_workspace: bool,
     #[serde(default = "default_workspace_mode")]
     memory_workspace_mode: String,
@@ -2074,7 +2092,12 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             "local" => "local".into(),
             _ => "qwen".into(),
         };
-        s.thinking = settings.thinking;
+        s.reasoning_mode = normalize_reasoning_mode(
+            &settings.reasoning_mode,
+            settings.thinking,
+        )
+        .into();
+        s.thinking = s.reasoning_mode == "always";
         s.memory_workspace = settings.memory_workspace;
         s.memory_workspace_mode = match settings.memory_workspace_mode.trim() {
             "balanced" | "exploratory" => settings.memory_workspace_mode.trim().into(),
@@ -2486,9 +2509,21 @@ mod tests {
     use super::{
         capsule_collapsed_width, capsule_drag_result, capsule_resized_x, normalize_asr_provider,
         normalize_local_voice_preset, normalize_realtime_conversation_mode,
-        normalize_topic_preferences, normalize_turn_pause_tolerance, voice_config_fingerprint,
-        CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT, CAPSULE_WIDTH,
+        normalize_reasoning_mode, normalize_topic_preferences, normalize_turn_pause_tolerance,
+        voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT,
+        CAPSULE_WIDTH,
     };
+
+    #[test]
+    fn reasoning_mode_migrates_legacy_boolean_and_preserves_fixed_preferences() {
+        assert_eq!(normalize_reasoning_mode("", false), "off");
+        assert_eq!(normalize_reasoning_mode("", true), "always");
+        assert_eq!(normalize_reasoning_mode("unknown", false), "off");
+        assert_eq!(normalize_reasoning_mode("unknown", true), "always");
+        assert_eq!(normalize_reasoning_mode("off", true), "off");
+        assert_eq!(normalize_reasoning_mode("automatic", true), "automatic");
+        assert_eq!(normalize_reasoning_mode("always", false), "always");
+    }
 
     #[test]
     fn capsule_drag_snaps_to_nearby_edges_and_clamps_vertically() {

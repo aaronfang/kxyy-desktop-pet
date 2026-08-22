@@ -616,6 +616,15 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       reasoningPolicies: { fast: 5, deliberate: 6, automatic: 7 },
       responseCues: { none: 7, lowBurden: 8, question: 9, transcript: "forbidden-strategy-text" },
       depths: { zero: 10, one: 11, two: 12, three: 13, four: 14 },
+      sources: {
+        preferenceOff: 1,
+        preferenceAlways: 2,
+        automaticSignal: 3,
+        automaticCarry: 4,
+        automaticFast: 5,
+        fastControl: 6,
+        transcript: "forbidden-reasoning-source",
+      },
       reason: "forbidden-strategy-reason",
     },
     events,
@@ -717,6 +726,14 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     reasoningPolicies: { fast: 5, deliberate: 6 },
     responseCues: { none: 7, lowBurden: 8, question: 9 },
     depths: { zero: 10, one: 11, two: 12, three: 13 },
+    sources: {
+      preferenceOff: 1,
+      preferenceAlways: 2,
+      automaticSignal: 3,
+      automaticCarry: 4,
+      automaticFast: 5,
+      fastControl: 6,
+    },
   });
   assert.equal(report.appVersion, "0.2.23");
   assert.equal(report.events.length, 255);
@@ -750,9 +767,9 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "forbidden-recovery-reason",
     "forbidden-strategy-text",
     "forbidden-strategy-reason",
+    "forbidden-reasoning-source",
     "offer-entry",
     "companion",
-    "automatic",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -1256,6 +1273,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     type: "memory_context",
     generation: 7,
     items: [{ kind: "fact", text: "记忆线索", uncertain: false, pinned: false }],
+    reasoningPolicy: "fast",
     freshTopics: [freshTopic],
   });
 
@@ -1382,7 +1400,18 @@ test("managed transport reconnects with current history before requesting servic
   assert.deepEqual(sockets[1].sent[0].initialHistory, [
     { role: "user", content: "重连前的历史" },
   ]);
-  assert.deepEqual(sockets[1].sent[1], { type: "resume_pending_turn" });
+  assert.deepEqual(sockets[1].sent[1], {
+    type: "resume_pending_turn",
+    reasoningPolicy: "fast",
+  });
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary.reasoningPolicies, {
+    fast: 1,
+    deliberate: 0,
+  });
+  assert.equal(
+    session.getTraceSnapshot().turnStrategySummary.sources.preferenceOff,
+    1,
+  );
   session.stopped = true;
 });
 
@@ -1697,7 +1726,7 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(
     active.socket.sent.filter((message) => message.type === "proactive_turn"),
-    [{ type: "proactive_turn", triggerId: 1, kind: "welcome" }],
+    [{ type: "proactive_turn", triggerId: 1, kind: "welcome", reasoningPolicy: "fast" }],
   );
   active.session._scheduleProactiveWelcome();
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1792,6 +1821,7 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
       type: "interruption_recovery",
       requestId: 1,
       expectedGeneration: 7,
+      reasoningPolicy: "fast",
       turnStrategy: {
         move: "recover",
         stance: "support",
@@ -1838,6 +1868,14 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
     reasoningPolicies: { fast: 1, deliberate: 0 },
     responseCues: { none: 1, lowBurden: 0, question: 0 },
     depths: { zero: 1, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 0,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 1,
+    },
   });
   assert.equal(JSON.stringify(snapshot).includes("userText"), false);
 });
@@ -2055,6 +2093,14 @@ test("ai-leads schedules bounded strategy-aware followups from audible playback"
     reasoningPolicies: { fast: 2, deliberate: 0 },
     responseCues: { none: 1, lowBurden: 1, question: 0 },
     depths: { zero: 2, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 0,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 2,
+    },
   });
 
   session._noteProactiveStatus({
@@ -2163,9 +2209,17 @@ test("malformed proactive strategy is omitted from wire and diagnostics", async 
   assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
     moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 0 },
     stances: { support: 0, opine: 0, contrast: 0, lead: 0 },
-    reasoningPolicies: { fast: 0, deliberate: 0 },
+    reasoningPolicies: { fast: 1, deliberate: 0 },
     responseCues: { none: 0, lowBurden: 0, question: 0 },
     depths: { zero: 0, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 0,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 1,
+    },
   });
 });
 
@@ -2202,12 +2256,100 @@ test("ai-leads sends a fixed turn strategy with negotiated turn context", async 
     reasoningPolicies: { fast: 1, deliberate: 0 },
     responseCues: { none: 1, lowBurden: 0, question: 0 },
     depths: { zero: 1, one: 0, two: 0, three: 0 },
+    sources: {
+      preferenceOff: 1,
+      preferenceAlways: 0,
+      automaticSignal: 0,
+      automaticCarry: 0,
+      automaticFast: 0,
+      fastControl: 0,
+    },
   });
   assert.equal(JSON.stringify(sent.at(-1)).includes("我想听听"), false);
   session._onMessage({
     data: JSON.stringify({ type: "reply_cancel_timeout", cancelledGeneration: 6 }),
   });
   assert.equal(session.getTraceSnapshot().proactiveSummary.replyCancelTimeouts, 1);
+});
+
+test("automatic reasoning carries for two managed follow-ups then returns to fast", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    reasoningPreference: "automatic",
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._sessionStarted = true;
+  session._memoryContextMode = "turn-final-v1";
+
+  const userTurns = [
+    "我不知道该不该换工作",
+    "我还在想这件事",
+    "确实还有一些顾虑",
+    "先慢慢看看吧",
+  ];
+  userTurns.forEach((text, index) => {
+    const generation = index + 1;
+    session._backendGeneration = generation;
+    session._userTurnOpen = true;
+    session._onMessage({
+      data: JSON.stringify({ type: "asr", text, interim: false, generation }),
+    });
+    assert.equal(session.sendMemoryContext({ generation, items: [] }), true);
+  });
+
+  const policies = sent
+    .filter((message) => message.type === "memory_context")
+    .map((message) => message.reasoningPolicy);
+  assert.deepEqual(policies, ["deliberate", "deliberate", "deliberate", "fast"]);
+  assert.deepEqual(
+    sent.filter((message) => message.type === "reasoning_policy").map(({ policy }) => policy),
+    ["deliberate", "deliberate", "deliberate", "fast"],
+  );
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary.sources, {
+    preferenceOff: 0,
+    preferenceAlways: 0,
+    automaticSignal: 1,
+    automaticCarry: 2,
+    automaticFast: 1,
+    fastControl: 0,
+  });
+  const diagnostic = JSON.stringify(session.getTraceSnapshot());
+  for (const text of userTurns) assert.equal(diagnostic.includes(text), false);
+});
+
+test("automatic reasoning carry resets on a natural unrelated topic change", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    conversationMode: "ai-leads",
+    reasoningPreference: "automatic",
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._sessionStarted = true;
+  session._memoryContextMode = "turn-final-v1";
+  for (const [generation, text] of [
+    [1, "我不知道该不该换工作"],
+    [2, "我最近看了一部电影"],
+  ]) {
+    session._backendGeneration = generation;
+    session._userTurnOpen = true;
+    session._onMessage({
+      data: JSON.stringify({ type: "asr", text, interim: false, generation }),
+    });
+    session.sendMemoryContext({ generation, items: [] });
+  }
+  assert.deepEqual(
+    sent.filter((message) => message.type === "reasoning_policy").map(({ policy }) => policy),
+    ["deliberate", "fast"],
+  );
 });
 
 test("rejecting a led topic sends a support strategy back through managed context", async () => {

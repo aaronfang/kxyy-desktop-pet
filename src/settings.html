@@ -94,9 +94,13 @@
             </p>
           </div>
 
-          <label class="row-inline">
-            <input id="thinking" type="checkbox" />
-            <span>开启思考模式<small>DeepSeek / 本地 Qwen3 均适用；更慢，回复预算会自动加大</small></span>
+          <label>
+            <span>推理偏好<small>DeepSeek / 本地 Qwen3 均适用</small></span>
+            <select id="reasoningMode">
+              <option value="off">关闭（响应更快）</option>
+              <option value="automatic">自动（深话题按需开启）</option>
+              <option value="always">始终开启（回复更慢）</option>
+            </select>
           </label>
 
           <label>

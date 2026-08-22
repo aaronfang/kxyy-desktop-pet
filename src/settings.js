@@ -102,6 +102,11 @@ function currentRealtimeConversationMode() {
   return value === "balanced" || value === "ai-leads" ? value : "follow-user";
 }
 
+function currentReasoningMode() {
+  const value = (el("reasoningMode")?.value || "off").toLowerCase();
+  return value === "automatic" || value === "always" ? value : "off";
+}
+
 function topicPreferenceStatusSelect(status) {
   const select = document.createElement("select");
   select.className = "topic-preference-status";
@@ -538,7 +543,11 @@ function fill(s) {
   el("vlProvider").value = s.vlProvider === "local" ? "local" : "qwen";
   syncTextFields();
   syncVlFields();
-  el("thinking").checked = !!s.thinking;
+  el("reasoningMode").value = ["off", "automatic", "always"].includes(s.reasoningMode)
+    ? s.reasoningMode
+    : s.thinking
+      ? "always"
+      : "off";
   if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
   if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
@@ -935,7 +944,8 @@ function collect() {
     localTextModel: el("localTextModel").value.trim(),
     localVlModel: el("localVlModel").value.trim(),
     vlProvider: currentVlProvider(),
-    thinking: el("thinking").checked,
+    reasoningMode: currentReasoningMode(),
+    thinking: currentReasoningMode() === "always",
     memoryWorkspace: el("memoryWorkspace")?.checked === true,
     memoryWorkspaceMode: el("memoryWorkspaceMode")?.value || "conservative",
     temperature: Number(el("temperature").value) || 0.8,

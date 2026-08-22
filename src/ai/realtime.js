@@ -32,9 +32,13 @@
 import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
 import {
   classifyImportantTopicBranch,
+  classifyReasoningSignal,
   createRecoveryTurnStrategy,
   createConversationDirector,
+  createReasoningPolicyController,
   createSessionTopicLedger,
+  normalizeReasoningPreference,
+  relatedTopicKeys,
   sanitizeTurnStrategy,
 } from "./conversation-director.js";
 import {
@@ -92,6 +96,8 @@ const PROACTIVE_KINDS = new Set(["welcome", "followup", "idle", "revisit", "memo
 
 const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完|先不跟你聊(?:了|啦)?(?:[，,、\s]+我先吃了?(?:啊|呀)?)?|不跟你聊(?:了|啦)?|先吃饭(?:了|啦)?|我先(?:去)?吃饭(?:了|啦)?|我先忙(?:一会儿|一下)?|回头再聊)$/;
 const REDIRECT_TURN_RE = /(?:换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个)/;
+const FAST_SOCIAL_TURN_RE = /^(?:你好|嗨|哈喽|早上好|早安|晚上好|晚安|拜拜|再见|回头聊|下次聊)[啊呀哈啦～~！!。.]*$/;
+const REASONING_ANAPHORA_RE = /(?:这件事|这个|这点|刚才|前面|还有|确实|顾虑|慢慢(?:看|想)|先看看|那(?:个|件|种)?)/;
 const RESUME_TURN_RE = /^(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)$/;
 const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|嗯呐|嗯哪|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
 const AMUSED_TURN_RE = /^(?:哈{2,}|嘿{2,}|呵{2,}|笑死(?:我了)?|太逗了|有意思|真好笑)$/;
@@ -153,6 +159,10 @@ export function classifyRealtimeConversationDepth(text, softIntent = "none", top
     return 1;
   }
   return 0;
+}
+
+export function classifyRealtimeReasoningSignal(text, softIntent = "none") {
+  return classifyReasoningSignal(text, { explicitDepth: softIntent === "deepen" });
 }
 
 export function isRealtimeLateralShiftSafe(text) {
@@ -364,6 +374,7 @@ export class RealtimeSession {
     onError,
     provider = "unknown",
     conversationMode = "follow-user",
+    reasoningPreference = "off",
     proactiveGreetingDelayMs,
     proactiveFollowupDelayMs,
     proactiveIdleDelayMs,
@@ -444,6 +455,7 @@ export class RealtimeSession {
     this._freshTopicMode = "none";
     this._startupFreshTopics = [];
     this._memoryContextRequestedAt = 0;
+    this._pendingMemoryContextReason = "turn";
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
     this._vadShadowSummary = sanitizeVadShadowSummary();
@@ -475,10 +487,28 @@ export class RealtimeSession {
       reasoningPolicies: { fast: 0, deliberate: 0 },
       responseCues: { none: 0, lowBurden: 0, question: 0 },
       depths: { zero: 0, one: 0, two: 0, three: 0 },
+      sources: {
+        preferenceOff: 0,
+        preferenceAlways: 0,
+        automaticSignal: 0,
+        automaticCarry: 0,
+        automaticFast: 0,
+        fastControl: 0,
+      },
     };
     this._conversationMode = ["balanced", "ai-leads"].includes(conversationMode)
       ? conversationMode
       : "follow-user";
+    this._reasoningPreference = normalizeReasoningPreference(reasoningPreference);
+    this._reasoningController = createReasoningPolicyController({
+      preference: this._reasoningPreference,
+    });
+    this._pendingReasoningDecision = this._reasoningController.select({
+      turnCategory: "substantive",
+      signal: "none",
+    });
+    this._reasoningTopicKey = "";
+    this._reasoningPolicyGenerations = new Set();
     this._proactiveTurnMode = "none";
     this._proactiveTriggerId = 0;
     this._proactiveWelcomeSent = false;
@@ -720,6 +750,9 @@ export class RealtimeSession {
           type: "start",
           systemRole: startMsg.systemRole || "",
           botName: startMsg.botName || "元元",
+          ...(usesManagedCascade(this.trace.provider)
+            ? { reasoningPreference: this._reasoningPreference }
+            : {}),
           ...cascadeCapabilities,
         };
         ws.send(JSON.stringify(startPayload));
@@ -849,7 +882,12 @@ export class RealtimeSession {
       this.ws?.readyState === WebSocket.OPEN &&
       this._sessionStarted
     ) {
-      this.ws.send(JSON.stringify({ type: "resume_pending_turn" }));
+      const reasoningPolicy = ["fast", "deliberate"].includes(
+        this._pendingReasoningDecision?.policy,
+      ) ? this._pendingReasoningDecision.policy : "fast";
+      this.ws.send(JSON.stringify({ type: "resume_pending_turn", reasoningPolicy }));
+      this._noteReasoningPolicy(reasoningPolicy);
+      this._noteReasoningSource(this._pendingReasoningDecision?.source);
     }
   }
 
@@ -921,6 +959,7 @@ export class RealtimeSession {
     this._activeProactiveGeneration = null;
     this._missedProactiveWindowPending = false;
     this._turnStrategies.clear();
+    this._reasoningPolicyGenerations.clear();
     this._proactiveTurnStrategies.clear();
     this._pendingTurnStrategyGeneration = null;
     this._resetInterruptionCandidate();
@@ -1148,8 +1187,31 @@ export class RealtimeSession {
             this._proactiveSummary.topicActivity[topicActivity] + 1,
           );
           this._applyUserTurnPolicy(policy);
+          const softIntent = classifyRealtimeSoftIntent(this._latestFinalAsr);
+          const reasoningTopicKey = deriveRealtimeTopicKey(this._latestFinalAsr);
+          const topicChanged = Boolean(
+            this._reasoningTopicKey &&
+            reasoningTopicKey &&
+            !REASONING_ANAPHORA_RE.test(this._latestFinalAsr) &&
+            !relatedTopicKeys(this._reasoningTopicKey, reasoningTopicKey),
+          );
+          this._pendingReasoningDecision = this._reasoningController.select({
+            turnCategory: FAST_SOCIAL_TURN_RE.test(this._latestFinalAsr.trim())
+              ? "greeting"
+              : policy,
+            signal: classifyRealtimeReasoningSignal(this._latestFinalAsr, softIntent),
+            topicChanged: policy === "redirect" || topicChanged,
+          });
+          if (this._pendingReasoningDecision.source?.startsWith("automatic-") &&
+              this._pendingReasoningDecision.source !== "automatic-carry" &&
+              this._pendingReasoningDecision.source !== "automatic-fast") {
+            this._reasoningTopicKey = reasoningTopicKey;
+          } else if (policy === "redirect" || topicChanged ||
+                     this._pendingReasoningDecision.source === "fast-control") {
+            this._reasoningTopicKey = "";
+          }
+          this._sendReasoningPolicy(this._backendGeneration);
           if (this._conversationDirector) {
-            const softIntent = classifyRealtimeSoftIntent(this._latestFinalAsr);
             const actions = this._conversationDirector.dispatch({
               type: "user-turn-final",
               policy,
@@ -1163,7 +1225,13 @@ export class RealtimeSession {
               ),
             });
             const request = actions.find((action) => action.type === "request-reply");
-            this._pendingTurnStrategy = sanitizeTurnStrategy(request?.strategy);
+            const strategy = sanitizeTurnStrategy(request?.strategy);
+            this._pendingTurnStrategy = strategy
+              ? sanitizeTurnStrategy({
+                  ...strategy,
+                  reasoningPolicy: this._pendingReasoningDecision.policy,
+                })
+              : null;
             this._proactiveSummary.conversationMoves ||= {
               respond: 0, expand: 0, deepen: 0, associate: 0, recover: 0,
             };
@@ -1214,6 +1282,8 @@ export class RealtimeSession {
             this._pendingTurnStrategyGeneration = msg.generation;
           }
           this._memoryContextRequestedAt = performance.now();
+          this._pendingMemoryContextReason =
+            msg.reason === "proactive-topic" ? "proactive-topic" : "turn";
           this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_REQUEST);
           const conversationMove = sanitizeTurnStrategy(this._pendingTurnStrategy)?.move || "none";
           this.cb.onMemoryContextRequest?.({
@@ -1416,6 +1486,12 @@ export class RealtimeSession {
         generation === this._pendingTurnStrategyGeneration
         ? sanitizeTurnStrategy(this._pendingTurnStrategy)
         : null;
+      const reasoningDecision = this._pendingMemoryContextReason === "proactive-topic"
+        ? { policy: "fast", source: "fast-control" }
+        : this._pendingReasoningDecision;
+      const reasoningPolicy = ["fast", "deliberate"].includes(
+        reasoningDecision?.policy,
+      ) ? reasoningDecision.policy : "fast";
       if (turnStrategy) {
         this._turnStrategies.set(generation, turnStrategy);
         while (this._turnStrategies.size > 8) {
@@ -1431,10 +1507,20 @@ export class RealtimeSession {
         items: safe,
         ...(temporal ? { temporalContext: temporal } : {}),
         ...(turnStrategy ? { turnStrategy } : {}),
+        reasoningPolicy,
         ...(safeFreshTopics.length ? { freshTopics: safeFreshTopics } : {}),
       }));
-      if (turnStrategy) this._noteTurnStrategy(turnStrategy);
+      if (turnStrategy) {
+        this._noteTurnStrategy(turnStrategy, {
+          includeReasoning: !this._reasoningPolicyGenerations.has(generation),
+        });
+      }
+      if (!this._reasoningPolicyGenerations.has(generation)) {
+        this._noteReasoningSource(reasoningDecision?.source);
+      }
+      this._pendingMemoryContextReason = "turn";
     } catch {
+      this._pendingMemoryContextReason = "turn";
       this.trace.record(TRACE_EVENT.MEMORY_CONTEXT_RESPONSE, {
         metrics: { accepted: false, itemCount: 0, memoryChars: 0 },
       });
@@ -1452,6 +1538,32 @@ export class RealtimeSession {
       },
     });
     this._memoryContextRequestedAt = 0;
+    return true;
+  }
+
+  _sendReasoningPolicy(generation) {
+    if (
+      !usesManagedCascade(this.trace.provider) ||
+      !this._sessionStarted ||
+      !Number.isSafeInteger(generation) ||
+      generation < 0 ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) return false;
+    const policy = ["fast", "deliberate"].includes(this._pendingReasoningDecision?.policy)
+      ? this._pendingReasoningDecision.policy
+      : "fast";
+    this.ws.send(JSON.stringify({ type: "reasoning_policy", generation, policy }));
+    if (!this._reasoningPolicyGenerations.has(generation)) {
+      this._reasoningPolicyGenerations.add(generation);
+      while (this._reasoningPolicyGenerations.size > 8) {
+        this._reasoningPolicyGenerations.delete(
+          this._reasoningPolicyGenerations.values().next().value,
+        );
+      }
+      this._noteReasoningPolicy(policy);
+      this._noteReasoningSource(this._pendingReasoningDecision?.source);
+    }
     return true;
   }
 
@@ -1717,7 +1829,7 @@ export class RealtimeSession {
     this.trace.record(eventType);
   }
 
-  _noteTurnStrategy(value) {
+  _noteTurnStrategy(value, { includeReasoning = true } = {}) {
     const strategy = sanitizeTurnStrategy(value);
     if (!strategy) return false;
     const increment = (bucket, key) => {
@@ -1725,12 +1837,43 @@ export class RealtimeSession {
     };
     increment(this._turnStrategySummary.moves, strategy.move);
     increment(this._turnStrategySummary.stances, strategy.stance);
-    increment(this._turnStrategySummary.reasoningPolicies, strategy.reasoningPolicy);
+    if (includeReasoning) this._noteReasoningPolicy(strategy.reasoningPolicy);
     increment(
       this._turnStrategySummary.responseCues,
       strategy.responseCue === "low-burden" ? "lowBurden" : strategy.responseCue,
     );
     increment(this._turnStrategySummary.depths, ["zero", "one", "two", "three"][strategy.depth]);
+    return true;
+  }
+
+  _noteReasoningPolicy(policy) {
+    if (!["fast", "deliberate"].includes(policy)) return false;
+    this._turnStrategySummary.reasoningPolicies[policy] = Math.min(
+      255,
+      this._turnStrategySummary.reasoningPolicies[policy] + 1,
+    );
+    return true;
+  }
+
+  _noteReasoningSource(source) {
+    const key = source === "preference-off"
+      ? "preferenceOff"
+      : source === "preference-always"
+        ? "preferenceAlways"
+        : source === "automatic-carry"
+          ? "automaticCarry"
+          : source === "automatic-fast"
+            ? "automaticFast"
+            : source === "fast-control"
+              ? "fastControl"
+              : typeof source === "string" && source.startsWith("automatic-")
+                ? "automaticSignal"
+                : null;
+    if (!key) return false;
+    this._turnStrategySummary.sources[key] = Math.min(
+      255,
+      this._turnStrategySummary.sources[key] + 1,
+    );
     return true;
   }
 
@@ -1807,14 +1950,18 @@ export class RealtimeSession {
       return;
     }
     pending.sent = true;
+    const reasoningDecision = this._reasoningController.select({ turnCategory: "recovery" });
+    this._reasoningTopicKey = "";
     const turnStrategy = createRecoveryTurnStrategy();
     this.ws.send(JSON.stringify({
       type: "interruption_recovery",
       requestId: pending.requestId,
       expectedGeneration: pending.expectedGeneration,
+      reasoningPolicy: reasoningDecision.policy,
       turnStrategy,
     }));
     this._noteTurnStrategy(turnStrategy);
+    this._noteReasoningSource(reasoningDecision.source);
   }
 
   _noteInterruptionRecoveryStatus(msg) {
@@ -1865,17 +2012,22 @@ export class RealtimeSession {
       this._proactiveTopicProposals.delete(oldest);
     }
     this._proactiveSummary.candidates += 1;
+    const reasoningDecision = this._reasoningController.select({ turnCategory: "proactive" });
+    this._reasoningTopicKey = "";
     const summaryKind = kind === "revisit" ? "idle" : kind;
     this._proactiveSummary.triggerKinds[summaryKind] += 1;
     const message = {
       type: "proactive_turn",
       triggerId,
       kind,
+      reasoningPolicy: reasoningDecision.policy,
       ...(safeStrategy ? { turnStrategy: safeStrategy } : {}),
       ...(topicRevisit ? { topicRevisit } : {}),
     };
     this.ws.send(JSON.stringify(message));
     if (safeStrategy) this._noteTurnStrategy(safeStrategy);
+    else this._noteReasoningPolicy(reasoningDecision.policy);
+    this._noteReasoningSource(reasoningDecision.source);
     return true;
   }
 
@@ -3066,6 +3218,7 @@ export class RealtimeSession {
         reasoningPolicies: { ...this._turnStrategySummary.reasoningPolicies },
         responseCues: { ...this._turnStrategySummary.responseCues },
         depths: { ...this._turnStrategySummary.depths },
+        sources: { ...this._turnStrategySummary.sources },
       },
       proactiveSummary: {
         mode: this._conversationMode,

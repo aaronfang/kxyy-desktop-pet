@@ -9,7 +9,9 @@ import {
   classifyImportantTopicBranch,
   createRecoveryTurnStrategy,
   createConversationDirector,
+  createReasoningPolicyController,
   createSessionTopicLedger,
+  normalizeReasoningPreference,
   sanitizeTurnStrategy,
 } from "../src/ai/conversation-director.js";
 
@@ -315,6 +317,73 @@ test("turn strategy schema is fixed and depth is semantic rather than mechanical
     { ...valid, depth: -1 },
     { ...valid, depth: true },
   ]) assert.equal(sanitizeTurnStrategy(invalid), null);
+});
+
+test("reasoning preferences normalize to off automatic or always", () => {
+  assert.equal(normalizeReasoningPreference("off"), "off");
+  assert.equal(normalizeReasoningPreference("automatic"), "automatic");
+  assert.equal(normalizeReasoningPreference("always"), "always");
+  assert.equal(normalizeReasoningPreference(true), "always");
+  assert.equal(normalizeReasoningPreference(false), "off");
+  assert.equal(normalizeReasoningPreference("hostile"), "off");
+});
+
+test("automatic reasoning is deliberate only for agreed semantic scenarios", () => {
+  const scenarios = [
+    ["greeting", { turnCategory: "acknowledge", signal: "none" }, "fast"],
+    ["explicit depth", { turnCategory: "substantive", signal: "explicit-depth" }, "deliberate"],
+    ["reasons", { turnCategory: "substantive", signal: "reasons" }, "deliberate"],
+    ["decision", { turnCategory: "substantive", signal: "decision" }, "deliberate"],
+    ["relationship", { turnCategory: "substantive", signal: "relationship" }, "deliberate"],
+    ["emotion", { turnCategory: "substantive", signal: "emotion" }, "deliberate"],
+    ["comparison", { turnCategory: "substantive", signal: "comparison" }, "deliberate"],
+  ];
+  for (const [name, event, expected] of scenarios) {
+    const controller = createReasoningPolicyController({ preference: "automatic" });
+    assert.equal(controller.select(event).policy, expected, name);
+  }
+});
+
+test("automatic deliberate carry is bounded to two eligible followups and resets on control", () => {
+  const controller = createReasoningPolicyController({ preference: "automatic" });
+  assert.deepEqual(controller.select({ turnCategory: "substantive", signal: "decision" }), {
+    policy: "deliberate",
+    source: "automatic-decision",
+  });
+  assert.equal(controller.select({ turnCategory: "substantive", signal: "none" }).source, "automatic-carry");
+  assert.equal(controller.select({ turnCategory: "substantive", signal: "none" }).source, "automatic-carry");
+  assert.deepEqual(controller.select({ turnCategory: "substantive", signal: "none" }), {
+    policy: "fast",
+    source: "automatic-fast",
+  });
+
+  controller.select({ turnCategory: "substantive", signal: "relationship" });
+  assert.deepEqual(controller.select({ turnCategory: "pause", signal: "none" }), {
+    policy: "fast",
+    source: "fast-control",
+  });
+  assert.equal(controller.select({ turnCategory: "substantive", signal: "none" }).policy, "fast");
+});
+
+test("off always and proactive control preferences stay deterministic", () => {
+  const off = createReasoningPolicyController({ preference: "off" });
+  const always = createReasoningPolicyController({ preference: "always" });
+  assert.deepEqual(off.select({ turnCategory: "substantive", signal: "decision" }), {
+    policy: "fast",
+    source: "preference-off",
+  });
+  assert.deepEqual(always.select({ turnCategory: "substantive", signal: "none" }), {
+    policy: "deliberate",
+    source: "preference-always",
+  });
+  assert.deepEqual(always.select({ turnCategory: "proactive", signal: "none" }), {
+    policy: "fast",
+    source: "fast-control",
+  });
+  assert.deepEqual(always.select({ turnCategory: "recovery", signal: "none" }), {
+    policy: "fast",
+    source: "fast-control",
+  });
 });
 
 test("four eligible reactive turns create a lateral opening without waiting for silence", () => {

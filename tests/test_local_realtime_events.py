@@ -390,12 +390,18 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertEqual(payload["provider"], "text")
         self.assertFalse("model" in payload)
         self.assertFalse("apiKey" in payload)
-        self.assertFalse("thinking" in payload)
         self.assertFalse("temperature" in payload)
+        self.assertEqual(payload["thinking"], False)
         self.assertTrue(payload["stream"])
         self.assertGreaterEqual(payload["max_tokens"], 512)
         self.assertNotIn("一两句即可", payload["messages"][0]["content"])
         self.assertEqual(payload["messages"][-1]["content"], "这一轮")
+
+    def test_realtime_proxy_payload_sends_explicit_reasoning_policy_every_time(self):
+        fast = common.build_llm_proxy_payload("角色设定", [], "普通回应", thinking=False)
+        deliberate = common.build_llm_proxy_payload("角色设定", [], "深入回应", thinking=True)
+        self.assertEqual(fast["thinking"], False)
+        self.assertEqual(deliberate["thinking"], True)
 
     def test_proxy_request_preserves_recent_facts_and_message_boundaries(self):
         history = []
@@ -449,6 +455,18 @@ class TextProviderAdapterTests(unittest.TestCase):
         for strategy in invalid_values:
             with self.subTest(strategy=strategy):
                 self.assertIsNone(common.sanitize_turn_strategy(strategy))
+
+    def test_reasoning_policy_sanitizer_fails_closed_to_fast(self):
+        self.assertEqual(common.sanitize_reasoning_policy("fast"), "fast")
+        self.assertEqual(common.sanitize_reasoning_policy("deliberate"), "deliberate")
+        for value in (None, "automatic", "reasoning text", True, 1):
+            self.assertEqual(common.sanitize_reasoning_policy(value), "fast")
+        self.assertEqual(
+            common.sanitize_reasoning_policy(None, "deliberate"),
+            "deliberate",
+        )
+        self.assertEqual(common.reasoning_preference_fallback("always"), "deliberate")
+        self.assertEqual(common.reasoning_preference_fallback("automatic"), "fast")
 
     def test_llm_stream_uses_loopback_proxy_and_parses_deltas_and_usage(self):
         captured = {}
@@ -985,7 +1003,7 @@ class BoundedLlmProducerTests(unittest.TestCase):
         scope = common.GenerationCancelScope(1, "response")
         events = queue.Queue(maxsize=1)
         events.put({"type": "occupied"})
-        common.iter_llm_stream = lambda *_args: iter([{"type": "delta", "text": "late"}])
+        common.iter_llm_stream = lambda *_args, **_kwargs: iter([{"type": "delta", "text": "late"}])
         try:
             thread = common.start_llm_stream_producer("role", [], "user", scope, events)
             self.assertIsNotNone(thread)
@@ -1002,7 +1020,7 @@ class BoundedLlmProducerTests(unittest.TestCase):
         )
         release = threading.Event()
 
-        def blocking_iter(*_args):
+        def blocking_iter(*_args, **_kwargs):
             release.wait(timeout=1)
             return
             yield  # pragma: no cover - keeps this a generator
@@ -1034,7 +1052,7 @@ class BoundedLlmProducerTests(unittest.TestCase):
         common._llm_stream_slots = threading.BoundedSemaphore(
             common.LLM_STREAM_MAX_PRODUCERS
         )
-        common.iter_llm_stream = lambda *_args: (_ for _ in ()).throw(
+        common.iter_llm_stream = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             ValueError("raw upstream secret and full text")
         )
         scope = common.GenerationCancelScope(4, "response")
@@ -3336,7 +3354,8 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         calls = []
         original_once = common._iter_llm_stream_once
 
-        def retrying_stream(_role, history, user_text):
+        def retrying_stream(_role, history, user_text, *, thinking=False):
+            self.assertFalse(thinking)
             calls.append(([dict(message) for message in history], user_text))
             return iter([
                 {"type": "meta", "provider": "Ollama", "thinking": False},
@@ -3423,7 +3442,9 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.session._request_turn_memory = request_memory
         self.session._reply_pipeline = capture_reply
-        self.assertTrue(await self.session.on_resume_pending_turn())
+        self.assertTrue(await self.session.on_resume_pending_turn({
+            "reasoningPolicy": "deliberate",
+        }))
         task = self.session.reply_task
         if task is not None:
             await task
@@ -3443,6 +3464,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                     "responseCue": "none",
                     "depth": 0,
                 },
+                "reasoning_policy": "deliberate",
                 "fresh_topics": [{"title": "本轮话题"}],
             },
         )
@@ -3554,6 +3576,98 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 3)
         self.assertEqual(captured[2][2], common.PROACTIVE_IDLE_PROMPT)
         self.assertEqual(self.session._last_proactive_trigger_id, 3)
+
+    async def test_managed_reasoning_policy_reaches_only_eligible_generations(self):
+        captured = []
+        common._synth_tts = lambda _text: b"\x00\x00"
+
+        def capture_start(_role, _history, _text, scope, out):
+            captured.append(scope.reasoning_policy)
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture_start
+        deliberate = {
+            "move": "deepen",
+            "responseCue": "none",
+            "stance": "support",
+            "reasoningPolicy": "deliberate",
+            "depth": 2,
+        }
+
+        ordinary = self.session._new_scope("response")
+        self.session.response_scope = ordinary
+        await self.session._reply_pipeline(
+            "我在认真考虑这个选择",
+            ordinary,
+            reasoning_policy="deliberate",
+        )
+
+        proactive = self.session._new_scope("response")
+        self.session.response_scope = proactive
+        await self.session._reply_pipeline(
+            "",
+            proactive,
+            proactive_kind="welcome",
+            reasoning_policy="deliberate",
+            turn_strategy=deliberate,
+        )
+
+        recovery = self.session._new_scope("response")
+        self.session.response_scope = recovery
+        await self.session._reply_pipeline(
+            "",
+            recovery,
+            proactive_kind="recovery",
+            reasoning_policy="deliberate",
+            turn_strategy=deliberate,
+        )
+
+        self.assertEqual(captured, ["deliberate", "fast", "fast"])
+
+    async def test_memory_context_sanitizes_the_reactive_reasoning_policy(self):
+        self.session.memory_context = common.TURN_MEMORY_CAPABILITY
+        future = self.session.loop.create_future()
+        self.session._memory_context_waiter = (7, future)
+        self.session.on_memory_context({
+            "generation": 7,
+            "items": [],
+            "reasoningPolicy": "deliberate",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+
+        future = self.session.loop.create_future()
+        self.session._memory_context_waiter = (8, future)
+        self.session.on_memory_context({
+            "generation": 8,
+            "items": [],
+            "reasoningPolicy": "private chain of thought",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "fast")
+
+    async def test_generation_reasoning_policy_uses_persisted_preference_fallback(self):
+        await self.session.on_start({"reasoningPreference": "always"})
+        self.session.gen_id = 7
+        self.session.on_reasoning_policy({
+            "generation": 7,
+            "policy": "deliberate",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+        self.session.on_reasoning_policy({
+            "generation": 7,
+            "policy": "private chain of thought",
+        })
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+        self.session.on_reasoning_policy({"generation": 6, "policy": "fast"})
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
+
+    async def test_generation_policy_releases_no_memory_fallback_barrier(self):
+        self.session.gen_id = 7
+        scope = common.GenerationCancelScope(7, "response")
+        pending = asyncio.create_task(self.session._request_turn_memory(scope))
+        await asyncio.sleep(0)
+        self.session.on_reasoning_policy({"generation": 7, "policy": "deliberate"})
+        self.assertEqual(await pending, "")
+        self.assertEqual(self.session._turn_reasoning_policy, "deliberate")
 
     async def test_speech_candidate_cancels_only_an_active_proactive_generation(self):
         common._synth_tts = lambda _text: b"\x00\x00"
@@ -3966,7 +4080,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         common.is_valid_asr = lambda text, _nsp, _pcm: text
 
-        async def no_reply(_text, _generation):
+        async def no_reply(_text, _generation, **_kwargs):
             return None
 
         self.session._reply_pipeline = no_reply

@@ -620,6 +620,7 @@ def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> f
 
     return max(0.0, samples_sent / OUTPUT_RATE - max(0.0, elapsed_seconds))
 TURN_MEMORY_WAIT_SECONDS = 0.1
+REASONING_POLICY_WAIT_SECONDS = 0.05
 TURN_MEMORY_MAX_ITEMS = 3
 TURN_MEMORY_MAX_CHARS = 300
 FRESH_TOPIC_MAX_ITEMS = 3
@@ -1019,6 +1020,24 @@ def sanitize_turn_strategy(value) -> dict | None:
     }
 
 
+def normalize_reasoning_preference(value) -> str:
+    return value if value in ("off", "automatic", "always") else "off"
+
+
+def reasoning_preference_fallback(value) -> str:
+    return "deliberate" if normalize_reasoning_preference(value) == "always" else "fast"
+
+
+def sanitize_reasoning_policy(value, fallback="fast") -> str:
+    return (
+        value
+        if value in TURN_STRATEGY_REASONING_POLICIES
+        else sanitize_reasoning_policy(fallback)
+        if fallback in TURN_STRATEGY_REASONING_POLICIES
+        else "fast"
+    )
+
+
 TOPIC_REVISIT_CATEGORIES = frozenset(
     ("emotion", "decision", "goal", "relationship", "long-running")
 )
@@ -1250,6 +1269,7 @@ class GenerationCancelScope:
         self.stage = stage
         self.state = "active"
         self.reason = ""
+        self.reasoning_policy = "fast"
         self.inactive = threading.Event()
 
     @property
@@ -1817,6 +1837,8 @@ def build_llm_proxy_payload(
     system_role: str,
     history: list[dict],
     user_text: str,
+    *,
+    thinking: bool = False,
 ) -> dict:
     """构造桌面 `/api/chat` 请求；provider/model 由 Rust 当前设置统一选择。"""
     role = system_role or "你是元元，口语化、像真人闲聊，先贡献具体内容再留回应入口。"
@@ -1869,6 +1891,7 @@ def build_llm_proxy_payload(
         "messages": messages,
         "max_tokens": 512,
         "stream": True,
+        "thinking": thinking is True,
     }
 
 
@@ -2371,9 +2394,20 @@ def is_empty_confirmed_interruption(
     )
 
 
-def _iter_llm_stream_once(system_role: str, history: list[dict], user_text: str):
+def _iter_llm_stream_once(
+    system_role: str,
+    history: list[dict],
+    user_text: str,
+    *,
+    thinking: bool = False,
+):
     """Parse one desktop-proxy SSE attempt without exposing provider credentials."""
-    payload = build_llm_proxy_payload(system_role, history, user_text)
+    payload = build_llm_proxy_payload(
+        system_role,
+        history,
+        user_text,
+        thinking=thinking,
+    )
     body = json.dumps(payload).encode("utf-8")
     secret = os.environ.get("KXYY_TTS_SECRET") or ""
     if not secret:
@@ -2456,7 +2490,13 @@ def _iter_llm_stream_once(system_role: str, history: list[dict], user_text: str)
         raise SafeRealtimeError("本地文字代理连接失败，请稍后重试") from e
 
 
-def iter_llm_stream(system_role: str, history: list[dict], user_text: str):
+def iter_llm_stream(
+    system_role: str,
+    history: list[dict],
+    user_text: str,
+    *,
+    thinking: bool = False,
+):
     """Stream cloud replies, while gating local replies against recent repetition."""
     recent_assistant = [
         str(message.get("content") or "")
@@ -2465,7 +2505,14 @@ def iter_llm_stream(system_role: str, history: list[dict], user_text: str):
     ][-4:]
     attempt_history = [dict(message) for message in history]
     for attempt in range(2):
-        stream = iter(_iter_llm_stream_once(system_role, attempt_history, user_text))
+        stream = iter(
+            _iter_llm_stream_once(
+                system_role,
+                attempt_history,
+                user_text,
+                thinking=thinking,
+            )
+        )
         try:
             first = next(stream)
         except StopIteration:
@@ -2530,7 +2577,12 @@ def start_llm_stream_producer(
 
     def produce() -> None:
         try:
-            for event in iter_llm_stream(system_role, history, user_text):
+            for event in iter_llm_stream(
+                system_role,
+                history,
+                user_text,
+                thinking=scope.reasoning_policy == "deliberate",
+            ):
                 if not _put_llm_event(out, scope, event):
                     return
             _put_llm_event(out, scope, {"type": "done"})
@@ -3048,6 +3100,10 @@ class Session:
         self._send_lock = asyncio.Lock()
         self._memory_context_waiter: tuple[int, asyncio.Future] | None = None
         self._turn_strategy: dict | None = None
+        self._turn_reasoning_policy = "fast"
+        self._turn_reasoning_generation: int | None = None
+        self._reasoning_policy_waiter: tuple[int, asyncio.Future] | None = None
+        self.reasoning_preference = "off"
         self._turn_fresh_topics: list[dict] = []
         self.asr_task: asyncio.Task | None = None
         self.tts_parallelism = _tts_parallelism
@@ -3431,6 +3487,13 @@ class Session:
     async def on_start(self, msg: dict) -> None:
         self.system_role = (msg.get("systemRole") or self.system_role).strip() or self.system_role
         self.bot_name = (msg.get("botName") or "元元").strip() or "元元"
+        self.reasoning_preference = normalize_reasoning_preference(
+            msg.get("reasoningPreference")
+        )
+        self._turn_reasoning_policy = reasoning_preference_fallback(
+            self.reasoning_preference
+        )
+        self._turn_reasoning_generation = None
         self._initial_history = sanitize_initial_history(msg.get("initialHistory"))
         self._short_term_facts = {}
         self._user_affect = UserAffectTracker()
@@ -3545,7 +3608,7 @@ class Session:
         )
         log(f"会话开始 bot={self.bot_name} system_role={len(self.system_role)} chars")
 
-    async def on_resume_pending_turn(self) -> bool:
+    async def on_resume_pending_turn(self, msg: dict | None = None) -> bool:
         if (
             self.pending_turn_resume != PENDING_TURN_RESUME_CAPABILITY
             or self.closed
@@ -3561,6 +3624,11 @@ class Session:
         self._pending_turn_resumed = True
         self._initial_history = base_history
         scope = self._new_scope("response")
+        self._turn_reasoning_policy = sanitize_reasoning_policy(
+            (msg or {}).get("reasoningPolicy"),
+            reasoning_preference_fallback(self.reasoning_preference),
+        )
+        self._turn_reasoning_generation = scope.generation
         self.response_scope = scope
         self._response_generated = False
         self._response_tts_admitted = False
@@ -3586,9 +3654,12 @@ class Session:
             kwargs["temporal_context"] = self._turn_temporal_context
         if self._turn_strategy:
             kwargs["turn_strategy"] = self._turn_strategy
+        kwargs["reasoning_policy"] = self._turn_reasoning_policy
         if self._turn_fresh_topics:
             kwargs["fresh_topics"] = self._turn_fresh_topics
         self._turn_strategy = None
+        self._turn_reasoning_policy = "fast"
+        self._turn_reasoning_generation = None
         self._turn_fresh_topics = []
         turn_policy = classify_realtime_conversation_turn(pending_text)
         if turn_policy != "substantive":
@@ -3854,12 +3925,45 @@ class Session:
         self._turn_strategy = sanitize_turn_strategy(
             msg.get("turnStrategy")
         )
+        self._turn_reasoning_policy = sanitize_reasoning_policy(
+            msg.get("reasoningPolicy"),
+            reasoning_preference_fallback(self.reasoning_preference),
+        )
+        self._turn_reasoning_generation = generation
+        policy_waiter = self._reasoning_policy_waiter
+        if (
+            policy_waiter is not None
+            and policy_waiter[0] == generation
+            and not policy_waiter[1].done()
+        ):
+            policy_waiter[1].set_result(None)
         self._turn_fresh_topics = (
             sanitize_fresh_topics(msg.get("freshTopics"))
             if self.fresh_topic == FRESH_TOPIC_CAPABILITY
             else []
         )
         waiter[1].set_result(format_turn_memory_context(msg.get("items")))
+
+    def on_reasoning_policy(self, msg: dict) -> None:
+        generation = msg.get("generation")
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation != self.gen_id
+        ):
+            return
+        self._turn_reasoning_policy = sanitize_reasoning_policy(
+            msg.get("policy"),
+            reasoning_preference_fallback(self.reasoning_preference),
+        )
+        self._turn_reasoning_generation = generation
+        policy_waiter = self._reasoning_policy_waiter
+        if (
+            policy_waiter is not None
+            and policy_waiter[0] == generation
+            and not policy_waiter[1].done()
+        ):
+            policy_waiter[1].set_result(None)
 
     def on_fresh_topics(self, msg: dict) -> None:
         """Accept startup cache only after the session capability is confirmed."""
@@ -3868,8 +3972,30 @@ class Session:
         self._fresh_topics = sanitize_fresh_topics(msg.get("items"))
 
     async def _request_turn_memory(
-        self, scope: GenerationCancelScope, *, reason: str = "turn"
+        self,
+        scope: GenerationCancelScope,
+        *,
+        reason: str = "turn",
+        await_reasoning_policy: bool = False,
     ) -> str:
+        if await_reasoning_policy and self._turn_reasoning_generation != scope.generation:
+            future = self.loop.create_future()
+            self._reasoning_policy_waiter = (scope.generation, future)
+            try:
+                await asyncio.wait_for(future, timeout=REASONING_POLICY_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                if (
+                    self._reasoning_policy_waiter is not None
+                    and self._reasoning_policy_waiter[1] is future
+                ):
+                    self._reasoning_policy_waiter = None
+        if self._turn_reasoning_generation != scope.generation:
+            self._turn_reasoning_policy = reasoning_preference_fallback(
+                self.reasoning_preference
+            )
+            self._turn_reasoning_generation = scope.generation
         if self.memory_context != TURN_MEMORY_CAPABILITY or not scope.active:
             return ""
         self._turn_temporal_context = ""
@@ -4276,13 +4402,19 @@ class Session:
             continuation_hint = await self.cancel_reply("turn_detected")
             if not scope.active:
                 return
-            turn_memory_context = await self._request_turn_memory(scope)
+            turn_memory_context = await self._request_turn_memory(
+                scope,
+                await_reasoning_policy=True,
+            )
             if not scope.active:
                 return
             turn_temporal_context = self._turn_temporal_context
             turn_strategy = self._turn_strategy
+            turn_reasoning_policy = self._turn_reasoning_policy
             turn_fresh_topics = self._turn_fresh_topics
             self._turn_strategy = None
+            self._turn_reasoning_policy = "fast"
+            self._turn_reasoning_generation = None
             self._turn_fresh_topics = []
             scope.promote("response")
             if self.asr_scope is scope:
@@ -4307,6 +4439,7 @@ class Session:
                 reply_kwargs["short_term_context"] = short_term_context
             if turn_strategy:
                 reply_kwargs["turn_strategy"] = turn_strategy
+            reply_kwargs["reasoning_policy"] = turn_reasoning_policy
             if turn_fresh_topics:
                 reply_kwargs["fresh_topics"] = turn_fresh_topics
             if user_affect:
@@ -4434,6 +4567,7 @@ class Session:
         proactive_kind: str = "",
         turn_policy: str = "substantive",
         turn_strategy: dict | None = None,
+        reasoning_policy: str = "fast",
         topic_revisit: dict | None = None,
         fresh_topics: list[dict] | None = None,
         user_affect: dict | None = None,
@@ -4502,6 +4636,15 @@ class Session:
             if fresh_topic_hint:
                 history_snapshot.append({"role": "system", "content": fresh_topic_hint})
             events: "queue.Queue[dict]" = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
+            strategy = sanitize_turn_strategy(turn_strategy)
+            if proactive_kind:
+                scope.reasoning_policy = "fast"
+            else:
+                scope.reasoning_policy = (
+                    strategy["reasoningPolicy"]
+                    if strategy is not None
+                    else sanitize_reasoning_policy(reasoning_policy)
+                )
             start_llm_stream_producer(
                 self.system_role,
                 history_snapshot,
@@ -5022,10 +5165,12 @@ async def _handler(ws):
                 session.on_playback_interruption(msg)
             elif typ == "memory_context":
                 session.on_memory_context(msg)
+            elif typ == "reasoning_policy":
+                session.on_reasoning_policy(msg)
             elif typ == "fresh_topics":
                 session.on_fresh_topics(msg)
             elif typ == "resume_pending_turn":
-                await session.on_resume_pending_turn()
+                await session.on_resume_pending_turn(msg)
             elif typ == "proactive_turn":
                 await session.on_proactive_turn(msg)
             elif typ == "interruption_recovery":

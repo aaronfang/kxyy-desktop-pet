@@ -86,6 +86,7 @@ import {
 } from "./ai/fresh-idle.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
+import { classifyReasoningSignal } from "./ai/conversation-director.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 import { localVoicePresetById } from "./ai/voice-presets.js";
@@ -589,6 +590,7 @@ const textGenDebug = {
   timer: null,
   chars: 0,
   thinking: false,
+  reasoningMode: "off",
 };
 /** TTS 计费字符（CosyVoice / 火山按字计费，非 LLM token）。 */
 const ttsUsageDebug = {
@@ -1792,6 +1794,16 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
   // 深聊模式：仅普通轮次（非拍一拍 / 非追问等主动开口）按观众用词判定；命中则本轮放开字数与
   // 拆条上限、注入「深聊但保持人设」提示，让元元能展开多聊，但性格口吻不变。
   const deep = !proactiveKind && detectDeepIntent(lastRealUserMessage()?.content || "");
+  const reasoningSignal = classifyReasoningSignal(lastRealUserMessage()?.content || "", {
+    explicitDepth: deep,
+  });
+  const reasoningMode = ["off", "automatic", "always"].includes(settings.reasoningMode)
+    ? settings.reasoningMode
+    : settings.thinking
+      ? "always"
+      : "off";
+  const deliberate = reasoningMode === "always" ||
+    (reasoningMode === "automatic" && !proactiveKind && reasoningSignal !== "none");
   const isLocalText = settings.textProvider === "local";
   let localGenStarted = false;
   try {
@@ -1804,7 +1816,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       }
     }
     if (isLocalText) {
-      beginLocalTextGen({ thinking: !!settings.thinking });
+      beginLocalTextGen({ thinking: deliberate });
       localGenStarted = true;
     }
     const requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
@@ -1816,7 +1828,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         stream: true,
         provider: "text",
         temperature: settings.temperature ?? 0.8,
-        thinking: !!settings.thinking,
+        thinking: deliberate,
         max_tokens: replyMaxTokens({
           proactiveKind,
           lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
@@ -2712,6 +2724,7 @@ async function startCall() {
   session = new RealtimeSession({
     provider: settings.realtimeBackend,
     conversationMode: settings.realtimeConversationMode,
+    reasoningPreference: settings.reasoningMode ?? settings.thinking,
     onState: (state) => {
       if (state === "started") {
         if (!callSessionStarted) appendPatNotice("📞 通话已接通");
