@@ -999,8 +999,6 @@ async function save() {
       throw new Error("请填写 Tavily API Key");
     }
     await invoke("set_ai_settings", { settings: payload });
-    // 通知聊天窗口热更新（人设卡 / 昵称 / 画像 / 头像 / 字号等）
-    emit("apply-settings", payload);
     statusEl.style.color = "#16a34a";
     statusEl.textContent = "已保存";
   } catch (e) {

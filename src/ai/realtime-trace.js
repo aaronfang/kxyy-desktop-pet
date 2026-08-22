@@ -115,9 +115,15 @@ const PROTECTED_EVENT_TYPES = new Set([
 ]);
 const OPAQUE_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_REASONS = new Set([
+  "app_quit",
+  "backend_switch",
   "completed",
   "error",
+  "explicit_conversation_clear",
   "hangup",
+  "persona_switch",
+  "provider_terminal",
+  "recovery_failed",
   "reconnect",
   "session_ended",
   "turn_detected",

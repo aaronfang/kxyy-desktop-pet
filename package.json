@@ -7,7 +7,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/conversation-director.test.js tests/conversation-replay.test.js tests/topic-preferences.test.js tests/topic-preferences-ui.test.js tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/fresh-association.test.js tests/fresh-exposure.test.js tests/fresh-idle.test.js tests/persona-context.test.js tests/persona-realtime.test.js tests/siriwave-modern.test.js",
+    "test": "node --test tests/conversation-director.test.js tests/conversation-replay.test.js tests/topic-preferences.test.js tests/topic-preferences-ui.test.js tests/settings-update-policy.test.js tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/fresh-association.test.js tests/fresh-exposure.test.js tests/fresh-idle.test.js tests/persona-context.test.js tests/persona-realtime.test.js tests/siriwave-modern.test.js",
     "test:conversation": "node --test tests/conversation-replay.test.js",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:resources": "node scripts/verify-vad-resources.mjs",

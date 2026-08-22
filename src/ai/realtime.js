@@ -60,6 +60,14 @@ const TRANSPORT_RECOVERY_DELAYS_MS = [0, 250, 750, 1500, 2500, 4000];
 const VOICE_SERVICE_RECOVERY_POLL_MS = 1000;
 const VOICE_SERVICE_UNKNOWN_MAX_POLLS = 10;
 const SESSION_HANDSHAKE_TIMEOUT_MS = 5000;
+const CALL_END_REASONS = new Set([
+  "app_quit",
+  "backend_switch",
+  "explicit_conversation_clear",
+  "hangup",
+  "persona_switch",
+  "provider_terminal",
+]);
 const MAX_AUDIO_SEGMENTS = 64;
 const MANAGED_AUDIO_CAPABILITY = "managed-v1";
 const MANAGED_AUDIO_MAGIC = 0x4b584155; // ASCII KXAU; not a Volcano protocol constant.
@@ -789,7 +797,7 @@ export class RealtimeSession {
           return;
         }
         this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
-          reason: "session_ended",
+          reason: "provider_terminal",
         });
         this.cb.onState?.("ended");
       };
@@ -1110,7 +1118,7 @@ export class RealtimeSession {
         }
         if (msg.state === "ended") {
           this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, {
-            reason: "session_ended",
+            reason: "provider_terminal",
           });
         }
         this.cb.onState?.(msg.state);
@@ -3117,8 +3125,9 @@ export class RealtimeSession {
   }
 
   /** 挂断并清理所有资源。 */
-  async stop() {
+  async stop(reason = "hangup") {
     if (this.stopped) return;
+    const endReason = CALL_END_REASONS.has(reason) ? reason : "provider_terminal";
     this.stopped = true;
     this._cancelInterruptionRecovery();
     this._conversationDirector?.dispatch({ type: "hangup" });
@@ -3151,10 +3160,10 @@ export class RealtimeSession {
       /* ignore */
     }
     if (this.trace.responseId && this.trace.state.response === "active") {
-      this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "hangup" });
+      this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: endReason });
     }
-    this._flushPlayback("hangup");
-    this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, { reason: "hangup" });
+    this._flushPlayback(endReason);
+    this.trace.recordOnce("session_ended", TRACE_EVENT.SESSION_ENDED, { reason: endReason });
     try {
       this._keepAliveOsc?.stop();
     } catch {

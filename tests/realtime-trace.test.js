@@ -294,6 +294,14 @@ test("runtime collector stays bounded and strips unsafe metadata", () => {
   assert.equal(JSON.stringify(snapshot).includes("forbidden"), false);
 });
 
+test("runtime collector preserves the fixed recovery failure reason", () => {
+  const event = fixtureEvent(TRACE_EVENT.SESSION_ENDED, 20, {
+    reason: "recovery_failed",
+  });
+
+  assert.equal(event.reason, "recovery_failed");
+});
+
 test("long-call playback sampling cannot evict early interruption outcomes", () => {
   let now = 0;
   let id = 0;
@@ -1413,6 +1421,46 @@ test("managed transport reconnects with current history before requesting servic
     1,
   );
   session.stopped = true;
+});
+
+test("provider-originated session endings retain the provider terminal reason", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const sockets = [];
+  globalThis.WebSocket = class {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 1;
+      this.sent = [];
+      sockets.push(this);
+    }
+    send(message) {
+      this.sent.push(JSON.parse(message));
+    }
+    close() {}
+  };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+
+  const socketEnded = new RealtimeSession({ provider: "volc" });
+  socketEnded.trace.startSession();
+  const opening = socketEnded._openSocket("ws://volc", {
+    systemRole: "role",
+    botName: "元元",
+  });
+  sockets[0].onopen();
+  sockets[0].onmessage({
+    data: JSON.stringify({ type: "session", state: "started" }),
+  });
+  await opening;
+  sockets[0].onclose();
+
+  const messageEnded = new RealtimeSession({ provider: "local" });
+  messageEnded.trace.startSession();
+  messageEnded._onMessage({
+    data: JSON.stringify({ type: "session", state: "ended" }),
+  });
+
+  assert.equal(socketEnded.getTraceSnapshot().events.at(-1).reason, "provider_terminal");
+  assert.equal(messageEnded.getTraceSnapshot().events.at(-1).reason, "provider_terminal");
 });
 
 test("transport recovery does not resume an old trailing user message", async () => {
@@ -3792,7 +3840,7 @@ test("old local services time out on one short wait while Volcano never waits", 
   }
 });
 
-test("stop records a final diagnostic snapshot before audio cleanup settles", async () => {
+test("stop records a fixed call-end reason before audio cleanup settles", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
   const session = new RealtimeSession({ provider: "local" });
@@ -3803,17 +3851,29 @@ test("stop records a final diagnostic snapshot before audio cleanup settles", as
     close: () => new Promise(() => {}),
   };
 
-  void session.stop();
+  void session.stop("app_quit");
   const snapshot = session.getTraceSnapshot();
   assert.equal(session.stopped, true);
   assert.equal(snapshot.state.lifecycle, "ended");
   assert.deepEqual(
     snapshot.events.slice(-2).map((event) => [event.eventType, event.reason]),
     [
-      [TRACE_EVENT.RESPONSE_CANCELLED, "hangup"],
-      [TRACE_EVENT.SESSION_ENDED, "hangup"],
+      [TRACE_EVENT.RESPONSE_CANCELLED, "app_quit"],
+      [TRACE_EVENT.SESSION_ENDED, "app_quit"],
     ],
   );
+});
+
+test("unknown call-end reasons fail closed to provider terminal", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "local" });
+  session.trace.startSession();
+  session.ws = { readyState: 1, send() {}, close() {} };
+
+  await session.stop("conversation text must not enter diagnostics");
+
+  assert.equal(session.getTraceSnapshot().events.at(-1).reason, "provider_terminal");
 });
 
 test("desktop session records privacy-safe soft endpoint transitions", async () => {

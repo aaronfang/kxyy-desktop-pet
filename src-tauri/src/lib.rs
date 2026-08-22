@@ -53,7 +53,7 @@ fn roster() -> Roster {
     serde_json::from_str(ROSTER_JSON).expect("invalid roster.json")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TopicPreference {
     topic: String,
@@ -1998,17 +1998,23 @@ fn get_fresh_topics(
 
 #[tauri::command]
 fn merge_topic_preferences(app: AppHandle, entries: Vec<TopicPreference>) -> Vec<TopicPreference> {
-    let mut merged = {
+    let (normalized, changed) = {
         let state = app.state::<AppState>();
-        let current = state.settings.lock().unwrap().topic_preferences.clone();
-        current
+        let mut settings = state.settings.lock().unwrap();
+        let mut merged = settings.topic_preferences.clone();
+        merged.extend(entries.into_iter().take(8));
+        let normalized = normalize_topic_preferences(&merged);
+        let changed = normalized != settings.topic_preferences;
+        if changed {
+            settings.topic_preferences = normalized.clone();
+        }
+        (normalized, changed)
     };
-    merged.extend(entries.into_iter().take(8));
-    let normalized = normalize_topic_preferences(&merged);
-    commit_settings(&app, |settings| {
-        settings.topic_preferences = normalized.clone();
-    });
-    let _ = app.emit("topic-preferences-updated", &normalized);
+    if changed {
+        let snapshot = app.state::<AppState>().settings.lock().unwrap().clone();
+        save_settings(&app, &snapshot);
+        let _ = app.emit("topic-preferences-updated", &normalized);
+    }
     normalized
 }
 

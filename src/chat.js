@@ -87,6 +87,7 @@ import {
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
 import { RealtimeSession } from "./ai/realtime.js";
 import { classifyReasoningSignal } from "./ai/conversation-director.js";
+import { classifySettingsUpdate } from "./ai/settings-update-policy.js";
 import { buildRealtimeDiagnosticReport } from "./ai/realtime-trace.js";
 import { setVoiceVolumePercent } from "./ai/voice-volume.js";
 import { localVoicePresetById } from "./ai/voice-presets.js";
@@ -2735,7 +2736,7 @@ async function startCall() {
         setCallCapsuleStatus("语音恢复中…", false, false, "thinking");
         petSignal("thinking");
       } else if (state === "ended") {
-        endCall({ notice: true });
+        endCall({ notice: true, reason: "provider_terminal" });
       }
     },
     getRecoveryHistory: () => buildRealtimeInitialHistory(),
@@ -2808,7 +2809,7 @@ async function startCall() {
     },
     onError: (e) => {
       appendPatNotice(`📞 通话出错：${e.message || e}`);
-      endCall({ notice: false });
+      endCall({ notice: false, reason: "provider_terminal" });
     },
   });
   callSession = session;
@@ -2832,11 +2833,11 @@ async function startCall() {
     });
   } catch (e) {
     appendPatNotice(`📞 无法开始通话：${e.message || e}`);
-    endCall({ notice: false });
+    endCall({ notice: false, reason: "provider_terminal" });
   }
 }
 
-async function endCall({ notice = true } = {}) {
+async function endCall({ notice = true, reason = "hangup" } = {}) {
   if (!callActive && !callSession) return;
   const s = callSession;
   callSession = null;
@@ -2853,7 +2854,7 @@ async function endCall({ notice = true } = {}) {
     updateRealtimeDiagnosticAction();
     let cleanupSettled = true;
     try {
-      cleanupSettled = await waitForCallCleanup(s.stop());
+      cleanupSettled = await waitForCallCleanup(s.stop(reason));
     } catch {
       // 诊断收尾不能妨碍挂断路径。
     }
@@ -2874,7 +2875,7 @@ async function endCall({ notice = true } = {}) {
 }
 
 function toggleCall() {
-  if (callActive) void endCall({ notice: true });
+  if (callActive) void endCall({ notice: true, reason: "hangup" });
   else startCall();
 }
 
@@ -2944,7 +2945,7 @@ stickersBtn.addEventListener("click", toggleStickerPanel);
 callBtn.addEventListener("click", toggleCall);
 chatCollapseBtn?.addEventListener("click", () => void setChatCompact(true));
 callCapsuleOpenBtn?.addEventListener("click", () => void setChatCompact(false));
-callCapsuleHangupBtn?.addEventListener("click", () => void endCall({ notice: true }));
+callCapsuleHangupBtn?.addEventListener("click", () => void endCall({ notice: true, reason: "hangup" }));
 callCapsuleEl?.addEventListener("mouseenter", () => {
   callCapsuleHovered = true;
   setCallCapsuleCollapsed(false);
@@ -3090,9 +3091,9 @@ function clearChatHistory() {
   resetConversation();
 }
 
-/** 切换人设时静默清空当前会话气泡与上下文（不弹确认）。 */
+/** 用户确认后清空当前会话气泡与上下文。 */
 function resetConversation() {
-  if (callActive) endCall({ notice: false });
+  if (callActive) endCall({ notice: false, reason: "explicit_conversation_clear" });
   history.length = 0;
   messagesEl.innerHTML = "";
   memoryEnqueuedIds.clear();
@@ -3219,41 +3220,30 @@ listen("voice-service-status", ({ payload }) => {
 listen("apply-settings", async ({ payload }) => {
   console.log("[chat] apply-settings 收到:", JSON.stringify({ showChatDebug: payload?.showChatDebug, hasShowChatDebug: "showChatDebug" in (payload || {}) }));
   if (!payload) return;
-  const identityKeys = [
-    "userName",
-    "personaRelationship",
-    "personaFacts",
-    "personaJokes",
-    "personaTreatAs",
-  ];
-  const identityChanged = identityKeys.some(
-    (k) => k in payload && payload[k] !== settings[k]
-  );
+  const { personaChanged, backendChanged, identityChanged } =
+    classifySettingsUpdate(settings, payload);
   const debugWasOn = settings.showChatDebug === true;
   const prevCardId = (settings.personaCardId || "").trim();
   const prevBackend = (settings.realtimeBackend || "").trim().toLowerCase();
-  if (
-    ("personaCardId" in payload && (payload.personaCardId || "").trim() !== prevCardId) ||
-    ("userName" in payload && payload.userName !== settings.userName)
-  ) {
+  if (personaChanged || ("userName" in payload && payload.userName !== settings.userName)) {
     await enqueueMemory();
   }
   settings = { ...settings, ...payload };
   const nextCardId = (settings.personaCardId || "").trim();
   const nextBackend = (settings.realtimeBackend || "").trim().toLowerCase();
-  const cardChanged = "personaCardId" in payload && prevCardId !== nextCardId;
-  const backendChanged = "realtimeBackend" in payload && prevBackend !== nextBackend;
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
   // 切人设 / 换语音后端：重建 Web Audio，避免挂起的 AudioContext 导致「合成成功却静音」。
-  if (cardChanged || backendChanged) {
-    if (callActive) endCall({ notice: false });
+  if (personaChanged || backendChanged) {
+    if (callActive) {
+      const reason = personaChanged ? "persona_switch" : "backend_switch";
+      endCall({ notice: false, reason });
+    }
     console.log("[chat] 重置音频播放管线", { prevCardId, nextCardId, prevBackend, nextBackend });
     resetPlaybackPipeline();
   }
-  // 人设相关保存都刷新资产，避免同 ID 卡内容更新或启动时缓存漂移。
-  if ("personaCardId" in payload) {
-    console.log("[chat] 人设设置已保存，清空会话并重新加载 assets...");
-    resetConversation();
+  // 只有实际切换人设才重载资产；保留当前可见历史，避免保存无关设置清空会话。
+  if (personaChanged) {
+    console.log("[chat] 人设已切换，重新加载 assets...");
     reloadAssetsWithMatchingCard(nextCardId).then((a) => {
       assets = a;
       window.__kxyy_active_card_id = nextCardId || null;
@@ -3294,8 +3284,8 @@ async function prepareAndFlushMemory({ hangup = true } = {}) {
   // 后继续接收文字和音频。此时也不能提前巩固正在增长的可听助手句段，
   // 否则同一消息 ID 被标成已入队后，恢复窗口继续播放的尾段会永久漏记。
   if (!hangup && callActive) return;
-  // 真正退出/设置变更时才释放会话和音频设备，并在定稿后一次性入队。
-  if (hangup && callActive) await endCall({ notice: false });
+  // 真正退出时才释放会话和音频设备，并在定稿后一次性入队。
+  if (hangup && callActive) await endCall({ notice: false, reason: "app_quit" });
   if (!callActive) {
     stopSpeak();
     resetTtsQueue();
