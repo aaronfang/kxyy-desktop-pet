@@ -52,23 +52,28 @@
             </select>
           </label>
 
-          <div id="textFieldsDeepseek" class="text-provider-fields">
+          <div id="deepseekKeyFields" class="text-provider-fields">
             <label>
-              <span>DeepSeek API Key<small>文字聊天必填；本地语音对话也用</small></span>
+              <span>DeepSeek API Key<small>DeepSeek 文字、看图或本地语音对话使用</small></span>
               <div class="pw-field">
                 <input id="deepseekKey" type="password" placeholder="sk-..." />
                 <button type="button" class="pw-toggle" data-target="deepseekKey" aria-label="显示 / 隐藏">👁</button>
               </div>
             </label>
+            <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
+          </div>
+
+          <div id="textFieldsDeepseek" class="text-provider-fields">
             <label>
               <span>文字模型</span>
               <select id="textModel">
-                <option value="">自动（按思考模式）</option>
+                <option value="">自动（Flash，思考独立）</option>
                 <option value="deepseek-v4-flash">deepseek-v4-flash（快）</option>
                 <option value="deepseek-v4-pro">deepseek-v4-pro（强）</option>
+                <option value="deepseek-v4-flash-vision-exp">deepseek-v4-flash-vision-exp（实验多模态）</option>
               </select>
             </label>
-            <p class="hint">Key 仅保存在本机 settings.json，请求经本地代理直连服务商。</p>
+            <p class="hint">选择 Vision 实验模型后，文字与图片都由它直接回复，并跳过下方视觉模型；图片仅在最近 6 轮实时上下文内重发。</p>
           </div>
 
           <div id="textFieldsLocal" class="text-provider-fields" hidden>
@@ -95,7 +100,7 @@
           </div>
 
           <label>
-            <span>推理偏好<small>DeepSeek / 本地 Qwen3 均适用</small></span>
+            <span>推理偏好<small>DeepSeek Flash / Pro 与本地 Qwen3 适用；Vision 实验模型自行管理</small></span>
             <select id="reasoningMode">
               <option value="off">关闭（响应更快）</option>
               <option value="automatic">自动（深话题按需开启）</option>
@@ -122,9 +127,14 @@
             <span>看图服务商<small>发图时用来识别图片内容</small></span>
             <select id="vlProvider">
               <option value="qwen">通义千问（在线）</option>
+              <option value="deepseek">DeepSeek V4 Flash Vision（实验性）</option>
               <option value="local">本地模型（Ollama，离线可用）</option>
             </select>
           </label>
+
+          <div id="vlFieldsDeepseek" class="vl-provider-fields" hidden>
+            <p class="hint">使用 <code>deepseek-v4-flash-vision-exp</code> 和上方同一枚 DeepSeek API Key。该模型目前为实验性版本。</p>
+          </div>
 
           <div id="vlFieldsQwen" class="vl-provider-fields">
             <label>
@@ -157,7 +167,8 @@
             </p>
           </div>
 
-          <p class="hint">看图模型与文字模型独立：可分别选择云端 / 本地。例如文字走 DeepSeek 云端、看图走本地 Ollama，或反过来。</p>
+          <p id="vlBypassedHint" class="hint" hidden>当前文字模型直接处理文字和图片；本组设置不参与请求。</p>
+          <p id="vlRoutingHint" class="hint">Flash / Pro 或本地文字模型发图时，先由这里选择的模型生成图片描述，再交给文字模型回复。</p>
         </section>
       </div>
 

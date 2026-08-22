@@ -51,14 +51,14 @@ VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安
 | 只用桌宠动画 | 不需要 Key 或模型 |
 | 云端文字聊天 | DeepSeek API Key |
 | 本地文字聊天 | 安装 [Ollama](https://ollama.com/download)，再从设置页下载模型 |
-| 发图看图 | DashScope / 通义千问 Key |
+| 发图看图 | DeepSeek Key、DashScope / 通义千问 Key，或本地 Ollama VL |
 | 语音朗读或通话 | 选择下表中的一个语音后端 |
 
 ### 文字和图片
 
-- **DeepSeek**：默认文字服务，支持 `deepseek-v4-flash` / `deepseek-v4-pro` 和独立思考开关。
+- **DeepSeek**：默认文字服务，自动模型默认使用 `deepseek-v4-flash`，思考开关独立控制；`deepseek-v4-pro` 与 `deepseek-v4-flash-vision-exp` 可显式选择。Vision Exp 由它处理全部文字和图片并生成最终回复。
 - **Ollama**：本地文字服务；默认推荐 `qwen3:14b`，也可使用 `qwen3:8b`、`qwen3:32b` 或其它 tag。
-- **通义千问 VL**：发送图片时使用，需要 DashScope Key。
+- **通义千问 VL**：Flash / Pro 或本地文字模型发送图片时可用于生成图片描述，需要 DashScope Key；选择 DeepSeek Vision 文字模型时不使用。
 - **播放音量**：朗读与通话共用 `0–200%` 音量设置，`100%` 为原始音量。
 
 ### 近期互联网话题

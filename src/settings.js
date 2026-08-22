@@ -8,6 +8,7 @@ import {
   TOPIC_PREFERENCE_STATUSES,
 } from "./ai/topic-preferences.js";
 import { memoryHealthState } from "./memory-ui.js";
+import { DEEPSEEK_VISION_MODEL } from "./deepseek-multimodal.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -244,6 +245,7 @@ function currentTextProvider() {
 function syncTextFields() {
   const provider = currentTextProvider();
   el("textFieldsDeepseek").hidden = provider !== "deepseek";
+  el("deepseekKeyFields").hidden = provider !== "deepseek" && currentVlProvider() !== "deepseek";
   el("textFieldsLocal").hidden = provider !== "local";
   const privacy = el("memoryPrivacy");
   if (privacy) {
@@ -473,17 +475,28 @@ async function refreshFreshTopics() {
   }
 }
 
-/** 视觉模型服务商：qwen（在线）/ local（本地 Ollama VL）。 */
+/** 视觉模型服务商：qwen / deepseek（在线）/ local（本地 Ollama VL）。 */
 function currentVlProvider() {
   const v = (el("vlProvider").value || "qwen").toLowerCase();
-  return v === "local" ? "local" : "qwen";
+  return ["deepseek", "local"].includes(v) ? v : "qwen";
+}
+
+function usesDirectVisionTextModel() {
+  return currentTextProvider() === "deepseek"
+    && el("textModel").value === DEEPSEEK_VISION_MODEL;
 }
 
 /** 按所选视觉服务商只展示对应设置项。 */
 function syncVlFields() {
   const provider = currentVlProvider();
-  el("vlFieldsQwen").hidden = provider !== "qwen";
-  el("vlFieldsLocal").hidden = provider !== "local";
+  const bypassed = usesDirectVisionTextModel();
+  el("vlProvider").disabled = bypassed;
+  el("vlFieldsQwen").hidden = bypassed || provider !== "qwen";
+  el("vlFieldsDeepseek").hidden = bypassed || provider !== "deepseek";
+  el("vlFieldsLocal").hidden = bypassed || provider !== "local";
+  el("vlBypassedHint").hidden = !bypassed;
+  el("vlRoutingHint").hidden = bypassed;
+  syncTextFields();
 }
 
 function fill(s) {
@@ -540,7 +553,7 @@ function fill(s) {
   el("textModel").value = s.textModel || "";
   el("localTextModel").value = s.localTextModel || "";
   el("localVlModel").value = s.localVlModel || "";
-  el("vlProvider").value = s.vlProvider === "local" ? "local" : "qwen";
+  el("vlProvider").value = ["deepseek", "local"].includes(s.vlProvider) ? s.vlProvider : "qwen";
   syncTextFields();
   syncVlFields();
   el("reasoningMode").value = ["off", "automatic", "always"].includes(s.reasoningMode)
@@ -1253,9 +1266,10 @@ el("realtimeBackend").addEventListener("change", () => {
 });
 el("asrProvider")?.addEventListener("change", syncVoiceFields);
 el("textProvider").addEventListener("change", () => {
-  syncTextFields();
+  syncVlFields();
   probeLocalTextStatus();
 });
+el("textModel").addEventListener("change", syncVlFields);
 el("webGroundingProvider")?.addEventListener("change", syncWebGroundingFields);
 el("refreshFreshTopicStatus")?.addEventListener("click", () => {
   const status = el("freshTopicRefreshStatus");

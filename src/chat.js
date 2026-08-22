@@ -5,7 +5,13 @@
 // 阶段 2：
 //   A. 情绪驱动桌宠——聊天各阶段通过 Tauri 事件 "pet-chat" 通知 main 窗口驱动桌宠动作。
 //   B. 表情包——回复里的 [表情:情绪] 标记渲染成 gif 贴纸气泡。
-//   C. 看图(VL)——发图先经通义千问识图成文字描述，再让 DeepSeek 以元元口吻回应。
+//   C. 看图(VL)——发图先经所选视觉模型识图成文字描述，再让文字模型以元元口吻回应。
+
+import { renderUnhandledTurnError } from "./chat-turn-error.js";
+import {
+  buildDeepseekMultimodalMessages,
+  usesDeepseekMultimodalModel,
+} from "./deepseek-multimodal.js";
 
 import {
   buildSystemPrompt,
@@ -38,6 +44,7 @@ import {
   parseBilingualReply,
   stripSpeakBlockForDisplay,
   needsBilingualTts,
+  trimHistory,
 } from "./ai/persona.js";
 import {
   loadStickers,
@@ -1719,7 +1726,7 @@ async function buildRequestMessages(opts = {}) {
   });
 }
 
-/** 识图：通义千问 VL 只描述本轮图片（无历史、无人设），返回文字描述。 */
+/** 识图：所选 VL 只描述本轮图片（无历史、无人设），返回文字描述。 */
 async function describeImage(imageDataUrl, userText) {
   if (!apiBase || !apiBase.startsWith("http://")) {
     throw new Error("API 代理未就绪，无法识图");
@@ -1744,7 +1751,11 @@ async function describeImage(imageDataUrl, userText) {
     throw new Error(err);
   }
   const data = await resp.json();
-  const vlProvider = settings.vlProvider === "local" ? "本地看图" : "通义千问";
+  const vlProvider = settings.vlProvider === "local"
+    ? "本地看图"
+    : settings.vlProvider === "deepseek"
+      ? "DeepSeek 看图"
+      : "通义千问";
   noteApiUsage(vlProvider, extractUsage(data));
   const caption = data.choices?.[0]?.message?.content?.trim();
   if (!caption) throw new Error("识图描述为空");
@@ -1820,7 +1831,13 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       beginLocalTextGen({ thinking: deliberate });
       localGenStarted = true;
     }
-    const requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
+    let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
+    if (usesDeepseekMultimodalModel(settings)) {
+      requestMessages = buildDeepseekMultimodalMessages(
+        requestMessages,
+        trimHistory(history, MAX_TURNS),
+      );
+    }
     const resp = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2032,7 +2049,7 @@ async function send(text, opts = {}) {
 
   try {
     let caption = "";
-    if (image) {
+    if (image && !usesDeepseekMultimodalModel(settings)) {
       streamBubble.textContent = "（正在看图…）";
       caption = await describeImage(image.dataUrl, text);
       streamBubble.textContent = "";
@@ -2087,8 +2104,11 @@ async function send(text, opts = {}) {
         }
       }
     }
-  } catch (_) {
-    /* streamAssistantReply 已渲染错误气泡 */
+  } catch (error) {
+    // describeImage 在文字流之前执行，失败时尚没有任何函数负责呈现错误。
+    if (renderUnhandledTurnError(streamBubble, streamRow, error)) {
+      petSignal("abort");
+    }
   } finally {
     currentTurnDoNotRemember = false;
     setBusy(false);

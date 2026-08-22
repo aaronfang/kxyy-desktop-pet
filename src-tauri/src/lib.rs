@@ -210,7 +210,7 @@ struct Settings {
     /// 用户可编辑的话题偏好；仅保存结构化标签，不保存网络正文或聊天原文。
     #[serde(default)]
     topic_preferences: Vec<TopicPreference>,
-    /// 文字模型；空串表示自动（按 thinking 选 deepseek-v4-flash / deepseek-v4-pro）。
+    /// 文字模型；空串表示自动使用 Flash（thinking 独立控制），也可显式选择 Pro 或 Vision 实验模型。
     #[serde(default)]
     text_model: String,
     /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
@@ -233,7 +233,7 @@ struct Settings {
     /// 本地看图 VL 模型 tag（Ollama），空则用推荐默认 `minicpm-v:8b`。
     #[serde(default)]
     local_vl_model: String,
-    /// 视觉模型服务商：`qwen`（在线通义千问）/ `local`（本地 Ollama VL）。
+    /// 视觉模型服务商：`qwen` / `deepseek`（在线）/ `local`（本地 Ollama VL）。
     #[serde(default = "default_vl_provider")]
     vl_provider: String,
     /// 思考模式（DeepSeek thinking.type / 本地 Qwen reasoning_effort）。
@@ -353,6 +353,14 @@ fn default_fresh_topic_participation() -> String {
 
 fn default_vl_provider() -> String {
     "qwen".into()
+}
+
+fn normalize_vl_provider(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "local" => "local",
+        "deepseek" => "deepseek",
+        _ => "qwen",
+    }
 }
 
 fn default_voice_volume() -> u32 {
@@ -570,7 +578,7 @@ pub(crate) struct AiConfig {
     pub local_text_model: String,
     /// 本地看图 VL 模型 tag（Ollama），空则由 api.rs 兜底默认 `minicpm-v:8b`。
     pub local_vl_model: String,
-    /// 视觉模型服务商：`qwen`（在线）/ `local`（本地 Ollama VL）。
+    /// 视觉模型服务商：`qwen` / `deepseek`（在线）/ `local`（本地 Ollama VL）。
     pub vl_provider: String,
     pub thinking_default: bool,
     pub temperature_default: f64,
@@ -2094,15 +2102,9 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.tavily_api_key = settings.tavily_api_key.trim().to_string();
         s.local_text_model = settings.local_text_model.trim().to_string();
         s.local_vl_model = settings.local_vl_model.trim().to_string();
-        s.vl_provider = match settings.vl_provider.trim().to_ascii_lowercase().as_str() {
-            "local" => "local".into(),
-            _ => "qwen".into(),
-        };
-        s.reasoning_mode = normalize_reasoning_mode(
-            &settings.reasoning_mode,
-            settings.thinking,
-        )
-        .into();
+        s.vl_provider = normalize_vl_provider(&settings.vl_provider).into();
+        s.reasoning_mode =
+            normalize_reasoning_mode(&settings.reasoning_mode, settings.thinking).into();
         s.thinking = s.reasoning_mode == "always";
         s.memory_workspace = settings.memory_workspace;
         s.memory_workspace_mode = match settings.memory_workspace_mode.trim() {
@@ -2516,8 +2518,8 @@ mod tests {
         capsule_collapsed_width, capsule_drag_result, capsule_resized_x, normalize_asr_provider,
         normalize_local_voice_preset, normalize_realtime_conversation_mode,
         normalize_reasoning_mode, normalize_topic_preferences, normalize_turn_pause_tolerance,
-        voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT,
-        CAPSULE_WIDTH,
+        normalize_vl_provider, voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference,
+        CAPSULE_HEIGHT, CAPSULE_WIDTH,
     };
 
     #[test]
@@ -2628,6 +2630,15 @@ mod tests {
 
         settings.asr_provider = "unknown".into();
         assert_eq!(whisper, voice_config_fingerprint(&settings));
+    }
+
+    #[test]
+    fn vision_provider_is_allowlisted() {
+        assert_eq!(normalize_vl_provider("deepseek"), "deepseek");
+        assert_eq!(normalize_vl_provider(" LOCAL "), "local");
+        for value in ["", "qwen", "unknown", "deepseek-v4-flash-vision-exp"] {
+            assert_eq!(normalize_vl_provider(value), "qwen");
+        }
     }
 
     #[test]

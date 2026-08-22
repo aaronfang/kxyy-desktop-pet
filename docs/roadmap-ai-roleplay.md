@@ -184,6 +184,17 @@ P1-D 的 connector 权限、认证、scope、审计与撤销原则复用 [Memory
 
 完整诊断、目标指标、事件契约和实施顺序见 [《实时语音与情绪语音优化路线图》](./roadmap-realtime-voice.md)。
 
+#### DeepSeek 自动模型与图片多模态路由
+
+当前实现已将模型档位与 reasoning 开关解耦：文字模型显式选择 `deepseek-v4-flash-vision-exp` 时，Vision Exp 处理纯文字和图片；文字模型选择“自动”时始终使用成本较低的 `deepseek-v4-flash`，本轮是否 reasoning 只由 `thinking.type` 控制，显式 Pro 或旧 `deepseek-reasoner` 设置仍保持 Pro。图片继续由独立的视觉链路先转描述。后续可评估把“自动 + 当前请求含图片”做成请求级临时路由：
+
+- 仅当当前用户轮次实际携带图片，并且文字模型为 DeepSeek 自动模式时，临时切换到 allow-listed `deepseek-v4-flash-vision-exp`；纯文字、拍一拍、续说和历史中残留图片不得触发该切换。
+- 图片轮次仍需沿用同一份 system/persona、bounded history、温度和输出清洗边界；不要把 Vision Exp 选择持久化为全局 `textModel`，下一轮恢复 Flash/Pro 自动策略。
+- 已完成：自动模式不再因为开启 reasoning 而升级到 Pro；后续仍需用真实账户验证 Flash + `thinking.type=enabled` 的思考质量、长度上限、首 token 延迟和失败率，再决定是否增加显式的质量升级策略。
+- Vision Exp 的 reasoning 能力必须单独核验：若 API 无法可靠接受 `thinking.type=disabled`，图片短回复需要独立的 token 预算、正文可用性判定和 `finish_reason=length` 回退，不能复用普通拍一拍的 240-token 上限。
+- 若图片路由失败、模型不支持或账户能力不足，应 fail closed 并给出固定错误，不静默把图片伪装成纯文字，也不改变后续文字轮次的模型选择。
+- 实施前补确定性请求构造测试，至少覆盖：自动+无图→Flash/Pro、自动+当前有图→Vision Exp、历史有图但当前无图→不切换、拍一拍→不切换、显式 Vision Exp→保持现有显式行为；再用真实账户验证模型能力、费用、首 token 延迟和正文产出率。
+
 ### 2.4 生态/可扩展性
 
 | 现状 | 具体缺口 | 影响 |
