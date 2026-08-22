@@ -594,11 +594,17 @@ PROACTIVE_REVISIT_PROMPT = (
     "先承接并补充一个新的具体观察，不要像总结或翻旧账，也不要假装用户已经做出决定。"
     "只说一到两句，留一个容易退出或回应的口，不要连续追问。）"
 )
+INTERRUPTION_RECOVERY_PROMPT = (
+    "（内部控制：用户刚才打断后没有留下可用内容，并且随后保持安静。"
+    "只根据已经实际播完的对话，自然接回你刚才未说完的思路；补充一个具体观点或细节。"
+    "不要声称用户说过任何话，不要提及打断机制，只说一到两句，不要连续追问。）"
+)
 PROACTIVE_PROMPTS = {
     "welcome": PROACTIVE_WELCOME_PROMPT,
     "followup": PROACTIVE_FOLLOWUP_PROMPT,
     "idle": PROACTIVE_IDLE_PROMPT,
     "revisit": PROACTIVE_REVISIT_PROMPT,
+    "recovery": INTERRUPTION_RECOVERY_PROMPT,
 }
 PROACTIVE_KINDS = frozenset(("welcome", "followup", "idle", "revisit", "memory", "commitment"))
 MEMORY_CONTEXT_CAPABILITY = "session-start-v1"
@@ -606,6 +612,7 @@ TURN_MEMORY_CAPABILITY = "turn-final-v1"
 TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1"
 FRESH_TOPIC_CAPABILITY = "fresh-topic-v1"
 PENDING_TURN_RESUME_CAPABILITY = "pending-turn-resume-v1"
+INTERRUPTION_RECOVERY_CAPABILITY = "empty-confirmed-v1"
 
 
 def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> float:
@@ -1452,6 +1459,9 @@ class AudibleHistory:
             and segment_id in turn["segmentIds"]
             and segment_id not in turn["completed"]
         )
+
+    def has_audible_assistant(self) -> bool:
+        return any(message.get("role") == "assistant" for message in self.messages)
 
     def _trim(self) -> None:
         overflow = len(self.messages) - self.max_messages
@@ -2321,6 +2331,35 @@ def is_valid_asr(text: str, no_speech_prob: float | None, pcm: bytes) -> str | N
     return text
 
 
+def is_empty_confirmed_interruption(
+    text: str,
+    no_speech_prob: float | None,
+    pcm: bytes,
+) -> bool:
+    """Keep a voiced filler distinct from silence and unsafe ASR output."""
+    if no_speech_prob is not None and no_speech_prob >= NO_SPEECH_PROB_MAX:
+        return False
+    if pcm16_rms(pcm) < SPEECH_RMS * 0.55:
+        return False
+    text = (text or "").strip()
+    if not text:
+        return True
+    if len(text) > ASR_TEXT_MAX_CHARS:
+        return False
+    if _HALLUCINATION_RE.search(text):
+        return False
+    if _WHISPER_PROMPT_CONTEXT_RE.search(text) and _WHISPER_PROMPT_ROLE_RE.search(text):
+        return False
+    if has_pathological_asr_repetition(text):
+        return False
+    bare = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+    return bool(
+        bare
+        and not _SHORT_SOCIAL_ASR_RE.fullmatch(text)
+        and _FILLER_RE.fullmatch(bare)
+    )
+
+
 def _iter_llm_stream_once(system_role: str, history: list[dict], user_text: str):
     """Parse one desktop-proxy SSE attempt without exposing provider credentials."""
     payload = build_llm_proxy_payload(system_role, history, user_text)
@@ -3009,10 +3048,14 @@ class Session:
         self.temporal_context = "none"
         self.fresh_topic = "none"
         self.pending_turn_resume = "none"
+        self.interruption_recovery = "none"
         self._fresh_topics: list[dict] = []
         self._turn_temporal_context = ""
         self.proactive_turn = "none"
         self._last_proactive_trigger_id = 0
+        self._last_interruption_recovery_request_id = 0
+        self._interruption_recovery_generation: int | None = None
+        self._interruption_recovery_request_id: int | None = None
         self._proactive_response_generation: int | None = None
         self._proactive_response_trigger_id: int | None = None
         self._candidate_sequence = 0
@@ -3271,6 +3314,12 @@ class Session:
     async def cancel_reply(self, reason: str = "superseded") -> bool:
         scope = self.response_scope
         self.response_scope = None
+        recovery_request_id = (
+            self._interruption_recovery_request_id
+            if scope is not None
+            and scope.generation == self._interruption_recovery_generation
+            else None
+        )
         continuation = bool(
             reason == "turn_detected"
             and scope is not None
@@ -3304,6 +3353,15 @@ class Session:
                             "generation": scope.generation,
                         }
                     )
+            if recovery_request_id is not None:
+                self._interruption_recovery_generation = None
+                self._interruption_recovery_request_id = None
+                await self.send_json({
+                    "type": "interruption_recovery_status",
+                    "requestId": recovery_request_id,
+                    "state": "cancelled",
+                    "generation": scope.generation,
+                })
         self._response_generated = False
         self._response_tts_admitted = False
         self._response_audio_started = False
@@ -3432,6 +3490,14 @@ class Session:
             and PENDING_TURN_RESUME_CAPABILITY in offered_pending_turn_resume
             else "none"
         )
+        offered_interruption_recovery = msg.get("interruptionRecovery")
+        self.interruption_recovery = (
+            INTERRUPTION_RECOVERY_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and isinstance(offered_interruption_recovery, list)
+            and INTERRUPTION_RECOVERY_CAPABILITY in offered_interruption_recovery
+            else "none"
+        )
         # Startup cache arrives in a second message after this acknowledgement;
         # old clients therefore never receive or retain it from `start`.
         self._fresh_topics = []
@@ -3444,6 +3510,9 @@ class Session:
             else "none"
         )
         self._clear_interruption_candidate()
+        self._last_interruption_recovery_request_id = 0
+        self._interruption_recovery_generation = None
+        self._interruption_recovery_request_id = None
         vad_shadow = await self._start_or_reset_vad_shadow()
         await self.send_json(
             {
@@ -3456,6 +3525,7 @@ class Session:
                 "temporalContext": self.temporal_context,
                 "freshTopic": self.fresh_topic,
                 "pendingTurnResume": self.pending_turn_resume,
+                "interruptionRecovery": self.interruption_recovery,
                 "proactiveTurn": self.proactive_turn,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
@@ -3611,6 +3681,93 @@ class Session:
             conversation_plan=conversation_plan,
             topic_revisit=topic_revisit,
         )
+
+    async def on_interruption_recovery(self, msg: dict) -> None:
+        request_id = msg.get("requestId")
+        expected_generation = msg.get("expectedGeneration")
+        valid_request = (
+            isinstance(request_id, int)
+            and not isinstance(request_id, bool)
+            and 1 <= request_id <= 0xFFFFFFFF
+            and request_id > self._last_interruption_recovery_request_id
+        )
+        if not valid_request:
+            return
+        if (
+            self.interruption_recovery != INTERRUPTION_RECOVERY_CAPABILITY
+            or self.closed
+            or not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation != self.gen_id
+            or not self._audible_history.has_audible_assistant()
+        ):
+            self._last_interruption_recovery_request_id = request_id
+            await self.send_json({
+                "type": "interruption_recovery_status",
+                "requestId": request_id,
+                "state": "cancelled",
+            })
+            return
+        if (
+            self.in_speech
+            or self.candidate_emitted
+            or self.asr_scope is not None
+            or (self.asr_task is not None and not self.asr_task.done())
+            or self._busy()
+            or self.playing
+            or self._pending_playback_segments
+        ):
+            await self.send_json({
+                "type": "interruption_recovery_status",
+                "requestId": request_id,
+                "state": "deferred",
+            })
+            return
+
+        self._last_interruption_recovery_request_id = request_id
+        scope = self._new_scope("response")
+        self.response_scope = scope
+        self._response_generated = False
+        self._response_tts_admitted = False
+        self._response_audio_started = False
+        self._response_started_at = time.perf_counter()
+        self._interruption_recovery_generation = scope.generation
+        self._interruption_recovery_request_id = request_id
+        await self.send_json({
+            "type": "interruption_recovery_status",
+            "requestId": request_id,
+            "state": "started",
+            "generation": scope.generation,
+        })
+        self.reply_task = asyncio.create_task(
+            self._interruption_recovery_pipeline(scope, request_id)
+        )
+
+    async def _interruption_recovery_pipeline(
+        self,
+        scope: GenerationCancelScope,
+        request_id: int,
+    ) -> None:
+        try:
+            await self._reply_pipeline("", scope, proactive_kind="recovery")
+            if scope.state == "completed":
+                await self.send_json({
+                    "type": "interruption_recovery_status",
+                    "requestId": request_id,
+                    "state": "completed",
+                    "generation": scope.generation,
+                })
+        finally:
+            if self._interruption_recovery_generation == scope.generation:
+                if scope.state != "completed":
+                    await self.send_json({
+                        "type": "interruption_recovery_status",
+                        "requestId": request_id,
+                        "state": "cancelled",
+                        "generation": scope.generation,
+                    })
+                self._interruption_recovery_generation = None
+                self._interruption_recovery_request_id = None
 
     async def send_vad_shadow_summary(self, *, final: bool) -> bool:
         """Send one bounded, text-free aggregate outside the per-frame path."""
@@ -3837,11 +3994,11 @@ class Session:
         # the 3-second ring and drop already identified managed audio.
         if self.playing and self.play_enabled:
             self.play_enabled = False
-        if (
-            self.response_scope is not None
-            and self.response_scope.generation == self._proactive_response_generation
-        ):
-            await self.cancel_reply("proactive_speech_candidate")
+        if self.response_scope is not None:
+            if self.response_scope.generation == self._proactive_response_generation:
+                await self.cancel_reply("proactive_speech_candidate")
+            elif self.response_scope.generation == self._interruption_recovery_generation:
+                await self.cancel_reply("recovery_speech_candidate")
         payload = {"type": "speech_candidate"}
         if self.interruption_hint == INTERRUPTION_HINT_CAPABILITY:
             self._candidate_sequence = (self._candidate_sequence % 0xFFFFFFFF) + 1
@@ -4045,6 +4202,27 @@ class Session:
             )
             cleaned = is_valid_asr(result.text, nsp, pcm)
             if not cleaned:
+                if (
+                    from_play_barge
+                    and self.interruption_recovery == INTERRUPTION_RECOVERY_CAPABILITY
+                    and self.candidate_emitted
+                    and is_empty_confirmed_interruption(result.text, nsp, pcm)
+                ):
+                    log("确认空打断，等待前端恢复")
+                    if self.playing:
+                        self._invalidate_play()
+                    candidate_id = await self._emit_speech_confirmed(scope)
+                    await self._emit_asr_start(scope)
+                    await self.send_json(self._asr_end_payload(), scope=scope)
+                    self.asr_started = False
+                    if not scope.active:
+                        return
+                    await self._consume_interruption_hint(candidate_id)
+                    if not scope.active:
+                        return
+                    await self.cancel_reply("turn_detected")
+                    scope.complete()
+                    return
                 log("无效人声，忽略" + ("（播报未中断）" if from_play_barge else ""))
                 await self._emit_asr_end_only(scope)
                 await self._emit_speech_rejected(scope)
@@ -4256,7 +4434,11 @@ class Session:
                 if proactive_kind
                 else self._audible_history.begin_turn(scope.generation, text)
             )
-            history_snapshot = [*self._initial_history, *audible_snapshot]
+            history_snapshot = (
+                audible_snapshot
+                if proactive_kind == "recovery"
+                else [*self._initial_history, *audible_snapshot]
+            )
             request_text = PROACTIVE_PROMPTS.get(proactive_kind, text)
             if continuation_hint and not proactive_kind:
                 history_snapshot, request_text = merge_continuation_request(
@@ -4828,6 +5010,8 @@ async def _handler(ws):
                 await session.on_resume_pending_turn()
             elif typ == "proactive_turn":
                 await session.on_proactive_turn(msg)
+            elif typ == "interruption_recovery":
+                await session.on_interruption_recovery(msg)
     except Exception as e:
         log(f"连接结束: {e}")
     finally:

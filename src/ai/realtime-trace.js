@@ -759,6 +759,11 @@ function sanitizeRuntimeSummary(runtime) {
       ["candidate-snapshot-v1", "none"],
       "none",
     ),
+    interruptionRecovery: safeEnum(
+      value.interruptionRecovery,
+      ["empty-confirmed-v1", "none"],
+      "none",
+    ),
     memoryContext: safeEnum(
       value.memoryContext,
       ["session-start-v1", "turn-final-v1", "none"],
@@ -839,6 +844,20 @@ function sanitizeProactiveSummary(raw) {
       stops: count("rhythmStops"),
       stopped: value.rhythmStopped === true,
     },
+  });
+}
+
+function sanitizeRecoverySummary(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const count = (name) =>
+    Number.isSafeInteger(value[name]) && value[name] >= 0 && value[name] <= 255
+      ? value[name]
+      : 0;
+  return Object.freeze({
+    scheduled: count("scheduled"),
+    started: count("started"),
+    cancelled: count("cancelled"),
+    completed: count("completed"),
   });
 }
 
@@ -935,6 +954,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
       segmentContinuity: summarizeSegmentContinuity(events),
       memoryContext: summarizeMemoryContext(events),
       proactive: sanitizeProactiveSummary(source.proactiveSummary),
+      recovery: sanitizeRecoverySummary(source.recoverySummary),
       vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),
       playback: {
         maxSampledQueuedMs:

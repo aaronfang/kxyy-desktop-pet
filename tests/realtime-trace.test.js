@@ -525,6 +525,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       downlinkAudio: "managed-v1",
       ttsStream: "provider-pcm-v1",
       interruptionHint: "candidate-snapshot-v1",
+      interruptionRecovery: "empty-confirmed-v1",
       memoryContext: "turn-final-v1",
       vadShadow: "silero-onnx-shadow-v1",
       asr: {
@@ -588,6 +589,13 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       rhythmStopped: true,
       topicText: "forbidden-topic",
     },
+    recoverySummary: {
+      scheduled: 255,
+      started: 3,
+      cancelled: -1,
+      completed: 256,
+      rawReason: "forbidden-recovery-reason",
+    },
     events,
     latencies: [summarizeTraceLatency(events, 0)],
     persona: "forbidden-persona",
@@ -601,6 +609,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    interruptionRecovery: "empty-confirmed-v1",
     memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
     asr: {
@@ -673,6 +682,12 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     },
     rhythm: { backoffs: 1, stops: 1, stopped: true },
   });
+  assert.deepEqual(report.aggregate.recovery, {
+    scheduled: 255,
+    started: 3,
+    cancelled: 0,
+    completed: 0,
+  });
   assert.equal(report.appVersion, "0.2.23");
   assert.equal(report.events.length, 255);
   assert.equal(report.events.at(-1).metrics.audioBytes, 259);
@@ -702,6 +717,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "rawProbability",
     "forbidden-model-path",
     "forbidden-topic",
+    "forbidden-recovery-reason",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -765,6 +781,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
       downlinkAudio: "future-envelope",
       ttsStream: "future-stream",
       interruptionHint: "future-hint",
+      interruptionRecovery: "future-recovery",
       vadShadow: "future-shadow",
       asr: {
         requested: "future-asr",
@@ -779,6 +796,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     downlinkAudio: "raw",
     ttsStream: "none",
     interruptionHint: "none",
+    interruptionRecovery: "none",
     memoryContext: "none",
     vadShadow: "disabled",
     asr: {
@@ -1099,6 +1117,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
       downlinkAudio: "managed-v1",
       memoryContext: "turn-final-v1",
       interruptionHint: "candidate-snapshot-v1",
+      interruptionRecovery: "empty-confirmed-v1",
       ttsStream: "provider-pcm-v1",
       proactiveTurn: "local-v1",
       freshTopic: "fresh-topic-v1",
@@ -1108,6 +1127,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[0].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[0].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[0].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+  assert.deepEqual(sockets[0].sent[0].interruptionRecovery, ["empty-confirmed-v1"]);
   assert.deepEqual(sockets[0].sent[0].ttsStream, ["provider-pcm-v1"]);
   assert.deepEqual(sockets[0].sent[0].proactiveTurn, ["local-v1"]);
   assert.equal("freshTopics" in sockets[0].sent[0], false);
@@ -1170,6 +1190,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     downlinkAudio: "managed-v1",
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
+    interruptionRecovery: "empty-confirmed-v1",
     memoryContext: "turn-final-v1",
     vadShadow: "disabled",
     asr: {
@@ -1215,6 +1236,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[1].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[1].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.deepEqual(sockets[1].sent[0].interruptionHint, ["candidate-snapshot-v1"]);
+  assert.deepEqual(sockets[1].sent[0].interruptionRecovery, ["empty-confirmed-v1"]);
   assert.deepEqual(sockets[1].sent[0].ttsStream, ["provider-pcm-v1"]);
   assert.deepEqual(sockets[1].sent[0].proactiveTurn, ["local-v1"]);
 
@@ -1239,6 +1261,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   assert.deepEqual(sockets[2].sent[0].downlinkAudio, ["managed-v1"]);
   assert.deepEqual(sockets[2].sent[0].memoryContext, ["session-start-v1", "turn-final-v1"]);
   assert.equal("interruptionHint" in sockets[2].sent[0], false);
+  assert.deepEqual(sockets[2].sent[0].interruptionRecovery, ["empty-confirmed-v1"]);
   assert.equal("ttsStream" in sockets[2].sent[0], false);
   assert.equal("proactiveTurn" in sockets[2].sent[0], false);
   assert.equal("freshTopics" in sockets[2].sent[0], false);
@@ -1263,6 +1286,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
   await volcanoOpen;
   assert.equal("downlinkAudio" in sockets[3].sent[0], false);
   assert.equal("interruptionHint" in sockets[3].sent[0], false);
+  assert.equal("interruptionRecovery" in sockets[3].sent[0], false);
   assert.equal("ttsStream" in sockets[3].sent[0], false);
   assert.equal("proactiveTurn" in sockets[3].sent[0], false);
   assert.equal("initialHistory" in sockets[3].sent[0], false);
@@ -1705,6 +1729,165 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   const oldServer = await open({ provider: "local", conversationMode: "ai-leads" });
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(oldServer.socket.sent.filter((message) => message.type === "proactive_turn").length, 0);
+});
+
+test("empty confirmed interruption requests one recovery and records fixed lifecycle counts", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = class { static OPEN = 1; };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    interruptionRecoveryGraceMs: 0,
+    interruptionRecoveryDeferMs: 0,
+  });
+  session.trace.startSession();
+  session.ws = { readyState: 1, send: (value) => sent.push(JSON.parse(value)) };
+  session._sessionStarted = true;
+  session._interruptionRecoveryMode = "empty-confirmed-v1";
+  session._backendGeneration = 7;
+  session._candidateInterruptsResponse = true;
+  assert.equal(session._confirmSpeech(), true);
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 7 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(
+    sent.filter((message) => message.type === "interruption_recovery"),
+    [{ type: "interruption_recovery", requestId: 1, expectedGeneration: 7 }],
+  );
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "started",
+      generation: 8,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "started",
+      generation: 8,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "completed",
+      generation: 8,
+    }),
+  });
+  const snapshot = session.getTraceSnapshot();
+  assert.deepEqual(snapshot.recoverySummary, {
+    scheduled: 1,
+    started: 1,
+    cancelled: 0,
+    completed: 1,
+  });
+  assert.equal(JSON.stringify(snapshot).includes("userText"), false);
+});
+
+test("valid speech cancels recovery while temporary occupancy only defers it", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = class { static OPEN = 1; };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const makeSession = () => {
+    const sent = [];
+    const session = new RealtimeSession({
+      provider: "local",
+      interruptionRecoveryGraceMs: 0,
+      interruptionRecoveryDeferMs: 1,
+    });
+    session.trace.startSession();
+    session.ws = { readyState: 1, send: (value) => sent.push(JSON.parse(value)) };
+    session._sessionStarted = true;
+    session._interruptionRecoveryMode = "empty-confirmed-v1";
+    session._backendGeneration = 3;
+    session._candidateInterruptsResponse = true;
+    session._confirmSpeech();
+    return { session, sent };
+  };
+
+  const valid = makeSession();
+  valid.session._onMessage({
+    data: JSON.stringify({ type: "asr", text: "我还想继续说", interim: false, generation: 3 }),
+  });
+  valid.session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 3 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(valid.sent.some((message) => message.type === "interruption_recovery"), false);
+
+  const deferred = makeSession();
+  deferred.session._backendAudioPending = true;
+  deferred.session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 3 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(deferred.sent.some((message) => message.type === "interruption_recovery"), false);
+  deferred.session._backendAudioPending = false;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(
+    deferred.sent.filter((message) => message.type === "interruption_recovery").length,
+    1,
+  );
+
+  const cancelled = makeSession();
+  cancelled.session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 3 }) });
+  cancelled.session._beginSpeechCandidate();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(cancelled.sent.some((message) => message.type === "interruption_recovery"), false);
+  assert.equal(cancelled.session.getTraceSnapshot().recoverySummary.cancelled, 1);
+});
+
+test("hard controls, stale generations and hangup cancel pending recovery timers", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const makePending = () => {
+    const sent = [];
+    const session = new RealtimeSession({
+      provider: "local",
+      interruptionRecoveryGraceMs: 20,
+      interruptionRecoveryDeferMs: 1,
+    });
+    session.trace.startSession();
+    session.ws = {
+      readyState: 1,
+      send: (value) => sent.push(JSON.parse(value)),
+      close() {},
+    };
+    session._sessionStarted = true;
+    session._interruptionRecoveryMode = "empty-confirmed-v1";
+    session._backendGeneration = 3;
+    assert.equal(session._scheduleInterruptionRecovery(), true);
+    return { session, sent };
+  };
+
+  for (const control of ["先别说话", "换个话题吧"]) {
+    const current = makePending();
+    current.session._onMessage({
+      data: JSON.stringify({ type: "asr", text: control, interim: false, generation: 3 }),
+    });
+    current.session._onMessage({
+      data: JSON.stringify({ type: "asr_end", generation: 3 }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(
+      current.sent.some((message) => message.type === "interruption_recovery"),
+      false,
+    );
+  }
+
+  const stale = makePending();
+  stale.session._backendGeneration = 4;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(stale.sent.some((message) => message.type === "interruption_recovery"), false);
+  assert.equal(stale.session.getTraceSnapshot().recoverySummary.cancelled, 1);
+
+  const hungUp = makePending();
+  await hungUp.session.stop();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(hungUp.sent.some((message) => message.type === "interruption_recovery"), false);
+  assert.equal(hungUp.session.getTraceSnapshot().recoverySummary.cancelled, 1);
 });
 
 test("realtime proactive policy classifies explicit controls without model inference", async () => {

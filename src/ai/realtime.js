@@ -65,6 +65,9 @@ const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const STREAMING_PLAYBACK_STARTUP_MS = 240;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
+const INTERRUPTION_RECOVERY_CAPABILITY = "empty-confirmed-v1";
+const INTERRUPTION_RECOVERY_GRACE_MS = 4500;
+const INTERRUPTION_RECOVERY_DEFER_MS = 250;
 const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
 const TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1";
@@ -367,6 +370,8 @@ export class RealtimeSession {
     proactiveGreetingDelayMs,
     proactiveFollowupDelayMs,
     proactiveIdleDelayMs,
+    interruptionRecoveryGraceMs,
+    interruptionRecoveryDeferMs,
     thinkingFeedbackDelayMs,
     maxTraceEvents = 256,
     onTrace,
@@ -436,6 +441,7 @@ export class RealtimeSession {
     this._downlinkAudioMode = "raw";
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
+    this._interruptionRecoveryMode = "none";
     this._memoryContextMode = "none";
     this._temporalContextMode = "none";
     this._freshTopicMode = "none";
@@ -450,6 +456,22 @@ export class RealtimeSession {
     this._candidateSegmentKeys = null;
     this._pendingConfirmedCandidate = null;
     this._candidateSnapshotTimer = 0;
+    this._confirmedInterruptionEligible = false;
+    this._interruptionRecoveryTimer = 0;
+    this._interruptionRecoveryRequestId = 0;
+    this._pendingInterruptionRecovery = null;
+    this._interruptionRecoveryGraceMs = Number.isFinite(interruptionRecoveryGraceMs)
+      ? Math.max(0, interruptionRecoveryGraceMs)
+      : INTERRUPTION_RECOVERY_GRACE_MS;
+    this._interruptionRecoveryDeferMs = Number.isFinite(interruptionRecoveryDeferMs)
+      ? Math.max(0, interruptionRecoveryDeferMs)
+      : INTERRUPTION_RECOVERY_DEFER_MS;
+    this._interruptionRecoverySummary = {
+      scheduled: 0,
+      started: 0,
+      cancelled: 0,
+      completed: 0,
+    };
     this._conversationMode = ["balanced", "ai-leads"].includes(conversationMode)
       ? conversationMode
       : "follow-user";
@@ -674,6 +696,7 @@ export class RealtimeSession {
           );
           cascadeCapabilities.freshTopic = [FRESH_TOPIC_CAPABILITY];
           cascadeCapabilities.pendingTurnResume = [PENDING_TURN_RESUME_CAPABILITY];
+          cascadeCapabilities.interruptionRecovery = [INTERRUPTION_RECOVERY_CAPABILITY];
         }
         if (
           usesManagedCascade(this.trace.provider) &&
@@ -870,6 +893,7 @@ export class RealtimeSession {
   }
 
   _prepareTransportRecovery() {
+    this._cancelInterruptionRecovery();
     const staleSocket = this.ws;
     this.ws = null;
     try {
@@ -1015,6 +1039,11 @@ export class RealtimeSession {
             msg.interruptionHint === INTERRUPTION_HINT_CAPABILITY
               ? INTERRUPTION_HINT_CAPABILITY
               : "none";
+          this._interruptionRecoveryMode =
+            this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
+            msg.interruptionRecovery === INTERRUPTION_RECOVERY_CAPABILITY
+              ? INTERRUPTION_RECOVERY_CAPABILITY
+              : "none";
           this._vadShadowMode =
             msg.vadShadow === undefined
               ? "disabled"
@@ -1055,6 +1084,7 @@ export class RealtimeSession {
         if (this._confirmSpeech()) this.cb.onAsrStart?.();
         break;
       case "speech_candidate":
+        this._cancelInterruptionRecovery();
         this._beginSpeechCandidate(msg);
         break;
       case "speech_confirmed":
@@ -1095,6 +1125,10 @@ export class RealtimeSession {
           this._pendingUserTurn = true;
           this._traceAsrFinalSeen = true;
           this._latestFinalAsr = msg.text || "";
+          if (this._latestFinalAsr.trim()) {
+            this._confirmedInterruptionEligible = false;
+            this._cancelInterruptionRecovery();
+          }
           const policy = classifyRealtimeConversationTurn(this._latestFinalAsr);
           const lateralAllowed = isRealtimeLateralShiftSafe(this._latestFinalAsr);
           const topicActivity = classifyRealtimeTopicActivity(
@@ -1154,10 +1188,15 @@ export class RealtimeSession {
         this._userTurnOpen = false;
         if (hadUserTurn) {
           this.cb.onAsrEnd?.();
-          this._beginThinkingFeedback("reasoning");
-          this.trace.startResponse();
-          this.trace.recordOnce("llm_request", TRACE_EVENT.LLM_REQUEST);
+          if (this._confirmedInterruptionEligible && !this._latestFinalAsr.trim()) {
+            this._scheduleInterruptionRecovery();
+          } else {
+            this._beginThinkingFeedback("reasoning");
+            this.trace.startResponse();
+            this.trace.recordOnce("llm_request", TRACE_EVENT.LLM_REQUEST);
+          }
         }
+        this._confirmedInterruptionEligible = false;
         break;
       }
       case "memory_context_request":
@@ -1254,6 +1293,11 @@ export class RealtimeSession {
           this._backendAudioPending = false;
           this._assistantActive = false;
           this._flushPlayback("speech_candidate");
+        }
+        break;
+      case "interruption_recovery_status":
+        if (this._interruptionRecoveryMode === INTERRUPTION_RECOVERY_CAPABILITY) {
+          this._noteInterruptionRecoveryStatus(msg);
         }
         break;
       case "tts_start":
@@ -1574,6 +1618,7 @@ export class RealtimeSession {
 
   _beginSpeechCandidate(msg = {}) {
     this._endThinkingFeedback();
+    this._cancelInterruptionRecovery();
     if (this._speechCandidate || this._userTurnOpen) return false;
     this._resetInterruptionCandidate();
     if (this._proactiveGreetingTimer || this._proactiveLeadTimer) {
@@ -1656,6 +1701,121 @@ export class RealtimeSession {
     this._cancelProactiveWelcome();
     if (this._proactiveLeadTimer) clearTimeout(this._proactiveLeadTimer);
     this._proactiveLeadTimer = 0;
+  }
+
+  _noteInterruptionRecovery(field, eventType) {
+    this._interruptionRecoverySummary[field] = Math.min(
+      255,
+      this._interruptionRecoverySummary[field] + 1,
+    );
+    this.trace.record(eventType);
+  }
+
+  _cancelInterruptionRecovery() {
+    if (this._interruptionRecoveryTimer) clearTimeout(this._interruptionRecoveryTimer);
+    this._interruptionRecoveryTimer = 0;
+    if (!this._pendingInterruptionRecovery) return false;
+    this._pendingInterruptionRecovery = null;
+    this._noteInterruptionRecovery(
+      "cancelled",
+      TRACE_EVENT.INTERRUPTION_RECOVERY_CANCELLED,
+    );
+    return true;
+  }
+
+  _hasInterruptionRecoveryOccupancy() {
+    return this._assistantActive ||
+      this._backendAudioPending ||
+      this._hasPlayback() ||
+      this._currentAudioSegment !== null ||
+      this._audioSegments.size > 0 ||
+      this._legacySegments.size > 0;
+  }
+
+  _armInterruptionRecovery(delayMs) {
+    if (!this._pendingInterruptionRecovery || this._interruptionRecoveryTimer) return;
+    this._interruptionRecoveryTimer = setTimeout(() => {
+      this._interruptionRecoveryTimer = 0;
+      this._tryInterruptionRecovery();
+    }, delayMs);
+  }
+
+  _scheduleInterruptionRecovery() {
+    if (
+      this._interruptionRecoveryMode !== INTERRUPTION_RECOVERY_CAPABILITY ||
+      this.stopped ||
+      this._pendingInterruptionRecovery
+    ) return false;
+    this._interruptionRecoveryRequestId =
+      (this._interruptionRecoveryRequestId % 0xffffffff) + 1;
+    this._pendingInterruptionRecovery = {
+      requestId: this._interruptionRecoveryRequestId,
+      expectedGeneration: this._backendGeneration,
+      sent: false,
+      started: false,
+    };
+    this._noteInterruptionRecovery(
+      "scheduled",
+      TRACE_EVENT.INTERRUPTION_RECOVERY_SCHEDULED,
+    );
+    this._armInterruptionRecovery(this._interruptionRecoveryGraceMs);
+    return true;
+  }
+
+  _tryInterruptionRecovery() {
+    const pending = this._pendingInterruptionRecovery;
+    if (!pending || pending.sent) return;
+    if (
+      this.stopped ||
+      this._interruptionRecoveryMode !== INTERRUPTION_RECOVERY_CAPABILITY ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN ||
+      this._backendGeneration !== pending.expectedGeneration
+    ) {
+      this._cancelInterruptionRecovery();
+      return;
+    }
+    if (this._speechCandidate || this._userTurnOpen) {
+      this._cancelInterruptionRecovery();
+      return;
+    }
+    if (this._hasInterruptionRecoveryOccupancy()) {
+      this._armInterruptionRecovery(this._interruptionRecoveryDeferMs);
+      return;
+    }
+    pending.sent = true;
+    this.ws.send(JSON.stringify({
+      type: "interruption_recovery",
+      requestId: pending.requestId,
+      expectedGeneration: pending.expectedGeneration,
+    }));
+  }
+
+  _noteInterruptionRecoveryStatus(msg) {
+    const pending = this._pendingInterruptionRecovery;
+    if (!pending || msg.requestId !== pending.requestId) return;
+    if (msg.state === "deferred" && pending.sent && !pending.started) {
+      pending.sent = false;
+      this._armInterruptionRecovery(this._interruptionRecoveryDeferMs);
+      return;
+    }
+    if (msg.state === "started" && pending.sent && !pending.started) {
+      pending.started = true;
+      this._noteInterruptionRecovery(
+        "started",
+        TRACE_EVENT.INTERRUPTION_RECOVERY_STARTED,
+      );
+      return;
+    }
+    if (msg.state === "completed" && pending.started) {
+      this._noteInterruptionRecovery(
+        "completed",
+        TRACE_EVENT.INTERRUPTION_RECOVERY_COMPLETED,
+      );
+      this._pendingInterruptionRecovery = null;
+      return;
+    }
+    if (msg.state === "cancelled") this._cancelInterruptionRecovery();
   }
 
   _sendProactiveTurn(kind, conversationPlan = null, topicRevisit = null, topicProposal = null) {
@@ -2077,6 +2237,14 @@ export class RealtimeSession {
     const generation = msg.generation;
     if (!Number.isSafeInteger(generation) || generation < 0) return false;
     if (generation < this._backendGeneration) return false;
+    if (
+      this._pendingInterruptionRecovery &&
+      !this._pendingInterruptionRecovery.started &&
+      generation > this._pendingInterruptionRecovery.expectedGeneration &&
+      msg.type !== "interruption_recovery_status"
+    ) {
+      this._cancelInterruptionRecovery();
+    }
     this._backendGeneration = generation;
     return true;
   }
@@ -2411,10 +2579,13 @@ export class RealtimeSession {
   }
 
   _beginUserTurn(candidateInterruptedResponse = false) {
+    this._cancelInterruptionRecovery();
     // 仅在「新开一轮」时打断播报；同一轮内的重复 asr_start/asr 不再 flush。
     const alreadyOpen = this._userTurnOpen;
     const assistantWasActive = this._assistantActive;
     this._userTurnOpen = true;
+    this._latestFinalAsr = "";
+    this._pendingUserTurn = false;
     this._assistantActive = false;
     this._backendAudioPending = false;
     if (alreadyOpen) return false;
@@ -2431,6 +2602,7 @@ export class RealtimeSession {
     this.trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
     this._traceAsrFinalSeen = false;
     this._bargeInTurn = true;
+    this._confirmedInterruptionEligible = interruptsResponse;
     return true;
   }
 
@@ -2769,6 +2941,7 @@ export class RealtimeSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this._cancelInterruptionRecovery();
     this._conversationDirector?.dispatch({ type: "hangup" });
     this._endThinkingFeedback();
     this._cancelProactiveTimers();
@@ -2853,11 +3026,13 @@ export class RealtimeSession {
         downlinkAudio: this._downlinkAudioMode,
         ttsStream: this._ttsStreamingMode,
         interruptionHint: this._interruptionHintMode,
+        interruptionRecovery: this._interruptionRecoveryMode,
         memoryContext: this._memoryContextMode,
         vadShadow: this._vadShadowMode,
         asr: { ...this._asrRuntime },
       },
       vadShadowSummary: { ...this._vadShadowSummary },
+      recoverySummary: { ...this._interruptionRecoverySummary },
       proactiveSummary: {
         mode: this._conversationMode,
         capability: this._proactiveTurnMode,

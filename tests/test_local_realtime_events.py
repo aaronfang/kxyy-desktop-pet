@@ -1618,6 +1618,27 @@ class InMemoryAsrTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(common.is_valid_asr(text, 0.1, voiced))
 
+    def test_empty_confirmed_interruption_accepts_only_voiced_empty_or_filler_asr(self):
+        voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
+        quiet = struct.pack("<h", 1) * common.FRAME_SAMPLES
+        for text, no_speech_prob in (("", 0.1), ("呃", 0.1), ("那个", None)):
+            with self.subTest(text=text, no_speech_prob=no_speech_prob):
+                self.assertTrue(
+                    common.is_empty_confirmed_interruption(text, no_speech_prob, voiced)
+                )
+        for text, no_speech_prob, pcm in (
+            ("嗯", 0.1, voiced),
+            ("字幕由某某提供", 0.1, voiced),
+            ("这是一段中文对话，角色名字叫元元", 0.1, voiced),
+            ("啊" * 40, 0.1, voiced),
+            ("", 0.9, voiced),
+            ("呃", 0.1, quiet),
+        ):
+            with self.subTest(text=text, no_speech_prob=no_speech_prob):
+                self.assertFalse(
+                    common.is_empty_confirmed_interruption(text, no_speech_prob, pcm)
+                )
+
 
 class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
     def test_vad_shadow_summary_schema_bounds_and_privacy_are_fixed(self):
@@ -2944,6 +2965,139 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             "reason": "speech",
         })
 
+    async def test_empty_interruption_recovery_uses_only_audible_history(self):
+        captured = []
+        common._synth_tts = lambda _text: b"unused"
+
+        def capture(_role, history, text, _scope, out):
+            captured.append(([dict(message) for message in history], text))
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+            "initialHistory": [
+                {"role": "user", "content": "不可用的启动历史"},
+                {"role": "assistant", "content": "也没有在这次通话播放"},
+            ],
+        })
+        self.session._audible_history.begin_proactive_turn(1)
+        self.assertTrue(self.session._audible_history.add_segment(1, 1, "已经实际播完的内容"))
+        self.assertTrue(self.session._audible_history.acknowledge(1, 1, "completed"))
+        self.session.gen_id = 3
+
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 3,
+            "userText": "forbidden fake user",
+        })
+        await self.session.reply_task
+
+        statuses = [
+            message for message in self.ws.json_messages()
+            if message.get("type") == "interruption_recovery_status"
+        ]
+        self.assertEqual([message["state"] for message in statuses], ["started", "completed"])
+        history, request_text = captured[0]
+        self.assertEqual(request_text, common.INTERRUPTION_RECOVERY_PROMPT)
+        self.assertEqual(history, [{"role": "assistant", "content": "已经实际播完的内容"}])
+        self.assertNotIn("forbidden fake user", json.dumps(captured, ensure_ascii=False))
+        self.assertNotIn("forbidden fake user", json.dumps(self.session.history, ensure_ascii=False))
+
+    async def test_interruption_recovery_failure_emits_one_cancelled_terminal_status(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session._audible_history.begin_proactive_turn(1)
+        self.session._audible_history.add_segment(1, 1, "可听内容")
+        self.session._audible_history.acknowledge(1, 1, "completed")
+        self.session.gen_id = 2
+
+        async def fail_reply(_text, scope, **_kwargs):
+            scope.cancel("response_error")
+
+        self.session._reply_pipeline = fail_reply
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 2,
+        })
+        await self.session.reply_task
+
+        statuses = [
+            message["state"]
+            for message in self.ws.json_messages()
+            if message.get("type") == "interruption_recovery_status"
+        ]
+        self.assertEqual(statuses, ["started", "cancelled"])
+
+    async def test_interruption_recovery_defers_receipts_and_rejects_stale_or_empty_history(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session.gen_id = 4
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 4,
+        })
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "cancelled")
+
+        self.session._audible_history.begin_proactive_turn(1)
+        self.session._audible_history.add_segment(1, 1, "可听内容")
+        self.session._audible_history.acknowledge(1, 1, "completed")
+        self.session._pending_playback_segments.add((2, 1))
+        await self.session.on_interruption_recovery({
+            "requestId": 2,
+            "expectedGeneration": 4,
+        })
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "deferred")
+        self.session._pending_playback_segments.clear()
+
+        async def no_reply(_scope, _request_id):
+            return None
+
+        self.session._interruption_recovery_pipeline = no_reply
+        await self.session.on_interruption_recovery({
+            "requestId": 2,
+            "expectedGeneration": 4,
+        })
+        await self.session.reply_task
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "started")
+
+        await self.session.on_interruption_recovery({
+            "requestId": 3,
+            "expectedGeneration": 1,
+        })
+        self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "cancelled")
+
+    async def test_speech_candidate_cancels_active_interruption_recovery(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session._audible_history.begin_proactive_turn(1)
+        self.session._audible_history.add_segment(1, 1, "可听内容")
+        self.session._audible_history.acknowledge(1, 1, "completed")
+        self.session.gen_id = 5
+        blocker = asyncio.Event()
+
+        async def blocked_reply(_scope, _request_id):
+            await blocker.wait()
+
+        self.session._interruption_recovery_pipeline = blocked_reply
+        await self.session.on_interruption_recovery({
+            "requestId": 1,
+            "expectedGeneration": 5,
+        })
+        await self.session._emit_speech_candidate()
+        statuses = [
+            message for message in self.ws.json_messages()
+            if message.get("type") == "interruption_recovery_status"
+        ]
+        self.assertEqual([message["state"] for message in statuses], ["started", "cancelled"])
+
     async def asyncTearDown(self):
         if self.session.reply_task:
             await self.session.reply_task
@@ -3840,6 +3994,70 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertNotIn("幻觉文本", json.dumps(messages, ensure_ascii=False))
+
+    async def test_playback_filler_takes_the_floor_without_creating_user_text(self):
+        original_transcribe = common.transcribe
+        original_cancel_reply = self.session.cancel_reply
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "呃", 0.1, language="zh"
+        )
+        cancelled = []
+
+        async def capture_cancel(reason="superseded"):
+            cancelled.append(reason)
+            return await original_cancel_reply(reason)
+
+        self.session.cancel_reply = capture_cancel
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "interruptionRecovery": [common.INTERRUPTION_RECOVERY_CAPABILITY],
+        })
+        self.session.candidate_emitted = True
+        self.session.playing = True
+        self.session.play_enabled = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        try:
+            await self.session._asr_then_maybe_reply(
+                b"\x88\x13" * 1000,
+                scope,
+                from_play_barge=True,
+            )
+        finally:
+            common.transcribe = original_transcribe
+
+        messages = self.ws.json_messages()
+        self.assertEqual(
+            [message["type"] for message in messages if message["type"] != "session"],
+            ["speech_confirmed", "asr_start", "asr_end"],
+        )
+        self.assertEqual(cancelled, ["turn_detected"])
+        self.assertFalse(any(message.get("type") == "asr" for message in messages))
+        self.assertFalse(any(message.get("role") == "user" for message in self.session.history))
+
+    async def test_playback_filler_stays_rejected_without_recovery_negotiation(self):
+        original_transcribe = common.transcribe
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "呃", 0.1, language="zh"
+        )
+        self.session.candidate_emitted = True
+        self.session.playing = True
+        self.session.play_enabled = True
+        scope = self.session._new_scope("asr")
+        self.session.asr_scope = scope
+        try:
+            await self.session._asr_then_maybe_reply(
+                b"\x88\x13" * 1000,
+                scope,
+                from_play_barge=True,
+            )
+        finally:
+            common.transcribe = original_transcribe
+
+        self.assertEqual(
+            [message["type"] for message in self.ws.json_messages()],
+            ["speech_rejected"],
+        )
 
     async def test_cancelled_asr_scope_drops_late_result(self):
         future = asyncio.get_running_loop().create_future()
