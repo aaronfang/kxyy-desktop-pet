@@ -1,8 +1,21 @@
 export const CONVERSATION_MOVE = Object.freeze({
+  RESPOND: "respond",
   EXPAND: "expand",
-  OFFER_ENTRY: "offer-entry",
   DEEPEN: "deepen",
   ASSOCIATE: "associate",
+  RECOVER: "recover",
+});
+
+export const PERSONA_STANCE = Object.freeze({
+  SUPPORT: "support",
+  OPINE: "opine",
+  CONTRAST: "contrast",
+  LEAD: "lead",
+});
+
+export const REASONING_POLICY = Object.freeze({
+  FAST: "fast",
+  DELIBERATE: "deliberate",
 });
 
 export const RESPONSE_CUE = Object.freeze({
@@ -39,6 +52,10 @@ const SOFT_INTENTS = new Set([
   "lighten",
   "concretize",
 ]);
+const CONVERSATION_MOVES = new Set(Object.values(CONVERSATION_MOVE));
+const PERSONA_STANCES = new Set(Object.values(PERSONA_STANCE));
+const REASONING_POLICIES = new Set(Object.values(REASONING_POLICY));
+const RESPONSE_CUES = new Set(Object.values(RESPONSE_CUE));
 const IMPORTANT_TOPIC_CATEGORIES = new Set([
   "emotion",
   "decision",
@@ -67,10 +84,40 @@ function normalizeDelays(value) {
   return result;
 }
 
-function responseDelay(plan, delays) {
-  if (plan?.responseCue === RESPONSE_CUE.QUESTION) return delays.question;
-  if (plan?.responseCue === RESPONSE_CUE.LOW_BURDEN) return delays.lowBurden;
+function responseDelay(strategy, delays) {
+  if (strategy?.responseCue === RESPONSE_CUE.QUESTION) return delays.question;
+  if (strategy?.responseCue === RESPONSE_CUE.LOW_BURDEN) return delays.lowBurden;
   return delays.statement;
+}
+
+export function sanitizeTurnStrategy(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (
+    !CONVERSATION_MOVES.has(value.move) ||
+    !PERSONA_STANCES.has(value.stance) ||
+    !REASONING_POLICIES.has(value.reasoningPolicy) ||
+    !RESPONSE_CUES.has(value.responseCue) ||
+    !Number.isSafeInteger(value.depth) ||
+    value.depth < 0 ||
+    value.depth > 3
+  ) return null;
+  return {
+    move: value.move,
+    stance: value.stance,
+    reasoningPolicy: value.reasoningPolicy,
+    responseCue: value.responseCue,
+    depth: value.depth,
+  };
+}
+
+export function createRecoveryTurnStrategy() {
+  return Object.freeze({
+    move: CONVERSATION_MOVE.RECOVER,
+    stance: PERSONA_STANCE.SUPPORT,
+    reasoningPolicy: REASONING_POLICY.FAST,
+    responseCue: RESPONSE_CUE.NONE,
+    depth: 0,
+  });
 }
 
 function topicBigrams(value) {
@@ -227,7 +274,7 @@ class ConversationDirector {
     this.lateralRecoveryTurns = 0;
     this.lateralCooldownTurns = 0;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
-    this._nextQuestionMove = CONVERSATION_MOVE.OFFER_ENTRY;
+    this._nextQuestionMove = CONVERSATION_MOVE.RESPOND;
   }
 
   dispatch(event) {
@@ -252,7 +299,7 @@ class ConversationDirector {
         }
         return [];
       case "playback-completed":
-        return this._afterPlayback(event.plan);
+        return this._afterPlayback(event.strategy);
       case "silence-deadline":
         return this._onSilenceDeadline(event.kind);
       case "proactive-accepted":
@@ -346,14 +393,20 @@ class ConversationDirector {
         this.initiativeDebt >= MISSED_WINDOW_THRESHOLD ||
         this.topicTurns >= LATERAL_TURN_INTERVAL
       );
-    const plan = shouldAssociate
-      ? this._plan(
+    const semanticDepth = Number.isSafeInteger(event.conversationDepth) &&
+      event.conversationDepth >= 0 && event.conversationDepth <= 3
+      ? event.conversationDepth
+      : softIntent === "deepen" ? 2 : topicActivity === "sensitive" ? 1 : 0;
+    this.depth = semanticDepth;
+    const strategy = shouldAssociate
+      ? this._strategy(
           CONVERSATION_MOVE.ASSOCIATE,
           RESPONSE_CUE.LOW_BURDEN,
-          "companion",
-          Math.min(2, this.depth),
+          PERSONA_STANCE.LEAD,
+          REASONING_POLICY.FAST,
+          Math.min(2, semanticDepth),
         )
-      : this._nextPlan(softIntent);
+      : this._nextStrategy(softIntent, semanticDepth);
     if (shouldAssociate) {
       this.initiativeDebt = 0;
       this.topicTurns = 0;
@@ -361,52 +414,98 @@ class ConversationDirector {
       this.lateralCooldownTurns = LATERAL_COOLDOWN_TURNS;
       this.lateralMoves = Math.min(255, this.lateralMoves + 1);
     }
-    this._recordPlan(plan);
-    if (policy === "substantive") this.depth = Math.min(5, this.depth + 1);
-    return [{ type: "request-reply", kind: "response", plan }];
+    this._recordStrategy(strategy);
+    return [{ type: "request-reply", kind: "response", strategy }];
   }
 
-  _nextPlan(softIntent = "none") {
-    const depth = this.depth;
+  _nextStrategy(softIntent = "none", depth = this.depth) {
     if (softIntent === "invite-opinion") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "opinion", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.EXPAND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.OPINE,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "invite-advice") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "advice", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.RESPOND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "deepen") {
-      return this._plan(CONVERSATION_MOVE.DEEPEN, RESPONSE_CUE.NONE, "companion", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.DEEPEN,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "concretize") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "concrete", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.EXPAND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     if (softIntent === "lighten") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "light", Math.max(0, depth - 1));
+      return this._strategy(
+        CONVERSATION_MOVE.RESPOND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        0,
+      );
     }
 
     if (this.lastResponseCue !== RESPONSE_CUE.NONE || this.lastMove === "none") {
-      return this._plan(CONVERSATION_MOVE.EXPAND, RESPONSE_CUE.NONE, "companion", depth);
+      return this._strategy(
+        CONVERSATION_MOVE.EXPAND,
+        RESPONSE_CUE.NONE,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
     const questionMove = this._nextQuestionMove;
-    this._nextQuestionMove = questionMove === CONVERSATION_MOVE.OFFER_ENTRY
+    this._nextQuestionMove = questionMove === CONVERSATION_MOVE.RESPOND
       ? CONVERSATION_MOVE.DEEPEN
-      : CONVERSATION_MOVE.OFFER_ENTRY;
-    if (questionMove === CONVERSATION_MOVE.OFFER_ENTRY) {
-      return this._plan(questionMove, RESPONSE_CUE.LOW_BURDEN, "companion", depth);
+      : CONVERSATION_MOVE.RESPOND;
+    if (questionMove === CONVERSATION_MOVE.RESPOND) {
+      return this._strategy(
+        questionMove,
+        RESPONSE_CUE.LOW_BURDEN,
+        PERSONA_STANCE.SUPPORT,
+        REASONING_POLICY.FAST,
+        depth,
+      );
     }
-    return this._plan(questionMove, RESPONSE_CUE.QUESTION, "companion", depth);
+    return this._strategy(
+      questionMove,
+      RESPONSE_CUE.QUESTION,
+      PERSONA_STANCE.SUPPORT,
+      REASONING_POLICY.FAST,
+      depth,
+    );
   }
 
-  _plan(move, responseCue, stance, depth) {
-    return { move, responseCue, stance, depth };
+  _strategy(move, responseCue, stance, reasoningPolicy, depth) {
+    return sanitizeTurnStrategy({ move, responseCue, stance, reasoningPolicy, depth });
   }
 
-  _recordPlan(plan) {
-    this.lastMove = plan?.move || "none";
-    this.lastResponseCue = plan?.responseCue || RESPONSE_CUE.NONE;
+  _recordStrategy(strategy) {
+    this.lastMove = strategy?.move || "none";
+    this.lastResponseCue = strategy?.responseCue || RESPONSE_CUE.NONE;
   }
 
-  _afterPlayback(plan) {
+  _afterPlayback(strategy) {
     if (
       this.lifecycle !== "active" ||
       this.paused ||
@@ -422,7 +521,7 @@ class ConversationDirector {
     return [{
       type: "schedule-proactive",
       kind: switchTopic ? "idle" : "followup",
-      delayMs: switchTopic ? this.delays.topicSwitch : responseDelay(plan, this.delays),
+      delayMs: switchTopic ? this.delays.topicSwitch : responseDelay(strategy, this.delays),
     }];
   }
 
@@ -436,9 +535,9 @@ class ConversationDirector {
       return [];
     }
     const proactiveKind = kind === "idle" ? "idle" : "followup";
-    const plan = this._nextPlan();
-    this._recordPlan(plan);
-    return [{ type: "request-reply", kind: proactiveKind, plan }];
+    const strategy = this._nextStrategy();
+    this._recordStrategy(strategy);
+    return [{ type: "request-reply", kind: proactiveKind, strategy }];
   }
 
   _onHardControl(control) {

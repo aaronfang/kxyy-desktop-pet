@@ -8,44 +8,44 @@ import {
 } from "./support/conversation-behavior-replay.js";
 import { createConversationDirector } from "../src/ai/conversation-director.js";
 
-function rotatedPlans() {
+function rotatedStrategies() {
   const director = createConversationDirector({ mode: "ai-leads" });
   director.dispatch({ type: "session-started" });
-  const plans = ["substantive", "acknowledge", "agree", "substantive"].map(
+  const strategies = ["substantive", "acknowledge", "agree", "substantive"].map(
     (policy) => director.dispatch({
       type: "user-turn-final",
       policy,
       softIntent: policy === "substantive" ? "invite-opinion" : "none",
-    }).find((action) => action.type === "request-reply")?.plan || null,
+    }).find((action) => action.type === "request-reply")?.strategy || null,
   );
   director.dispatch({ type: "user-turn-final", policy: "redirect" });
-  plans.push(
+  strategies.push(
     director.dispatch({ type: "user-turn-final", policy: "substantive" })
-      .find((action) => action.type === "request-reply")?.plan || null,
+      .find((action) => action.type === "request-reply")?.strategy || null,
   );
-  return plans;
+  return strategies;
 }
 
 function replayThreeRounds() {
   const director = createConversationDirector({ mode: "ai-leads" });
   director.dispatch({ type: "session-started" });
-  const plans = [];
-  const userPlans = [];
+  const strategies = [];
+  const userStrategies = [];
   for (const policy of ["substantive", "substantive", "substantive"]) {
     const response = director.dispatch({ type: "user-turn-final", policy, softIntent: "none" })
       .find((action) => action.type === "request-reply");
-    plans.push(response.plan);
-    userPlans.push(response.plan);
-    const schedule = director.dispatch({ type: "playback-completed", plan: response.plan })
+    strategies.push(response.strategy);
+    userStrategies.push(response.strategy);
+    const schedule = director.dispatch({ type: "playback-completed", strategy: response.strategy })
       .find((action) => action.type === "schedule-proactive");
     assert.ok(schedule);
     const proactive = director.dispatch({ type: "silence-deadline", kind: schedule.kind })
       .find((action) => action.type === "request-reply");
-    plans.push(proactive.plan);
+    strategies.push(proactive.strategy);
     director.dispatch({ type: "proactive-accepted", kind: proactive.kind });
-    director.dispatch({ type: "playback-completed", plan: proactive.plan });
+    director.dispatch({ type: "playback-completed", strategy: proactive.strategy });
   }
-  return { plans, userPlans };
+  return { strategies, userStrategies };
 }
 
 function percentile(values, p) {
@@ -104,43 +104,45 @@ test("bounded behavior replay reports fixed user-visible outcomes", () => {
   assert.equal(JSON.stringify(report).includes("工作日去那家店"), false);
 });
 
-test("plan rotation alone cannot pass the user-visible behavior gate", () => {
-  const plans = rotatedPlans();
-  const planOnly = evaluateConversationBehaviorReplay(plans.map((plan) => ({ plan })));
-  assert.equal(planOnly.pass, false);
-  assert.equal(planOnly.counts.turns, 0);
-  assert.equal(planOnly.counts.rejected, 5);
+test("strategy rotation alone cannot pass the user-visible behavior gate", () => {
+  const strategies = rotatedStrategies();
+  const strategyOnly = evaluateConversationBehaviorReplay(
+    strategies.map((strategy) => ({ strategy })),
+  );
+  assert.equal(strategyOnly.pass, false);
+  assert.equal(strategyOnly.counts.turns, 0);
+  assert.equal(strategyOnly.counts.rejected, 5);
 
   const report = evaluateConversationBehaviorReplay([
     {
       scenario: BEHAVIOR_SCENARIO.SHORT_ACKNOWLEDGEMENT,
-      plan: plans[0],
+      strategy: strategies[0],
       reply: "哈哈对啊。你平时也这样吗？",
     },
     {
       scenario: BEHAVIOR_SCENARIO.OPINION_REQUEST,
-      plan: plans[1],
+      strategy: strategies[1],
       reply: "确实挺有意思的。你一般喜欢什么类型？",
     },
     {
       scenario: BEHAVIOR_SCENARIO.VULNERABLE_DISCLOSURE,
-      plan: plans[2],
+      strategy: strategies[2],
       reply: "嗯嗯我明白。你为什么会这样？以后准备怎么办？",
     },
     {
       scenario: BEHAVIOR_SCENARIO.REPEATED_AGREEMENT,
-      plan: plans[3],
+      strategy: strategies[3],
       reply: "哈哈对，确实是这样。那你还想聊点什么？",
     },
     {
       scenario: BEHAVIOR_SCENARIO.LED_TOPIC_REJECTION,
-      plan: plans[4],
+      strategy: strategies[4],
       reply: "电影其实还可以继续聊，你最喜欢哪个导演？",
       userTopicTerms: ["睡觉", "生物钟"],
     },
   ]);
 
-  assert.equal(plans.every(Boolean), true);
+  assert.equal(strategies.every(Boolean), true);
   assert.equal(report.pass, false);
   assert.equal(report.counts.contribution, 0);
   assert.equal(report.counts.question, 6);
@@ -169,15 +171,15 @@ test("behavior replay is deterministic, bounded, and rejects unknown observation
   assert.equal(JSON.stringify(first).includes("private-production-text"), false);
 });
 
-test("deterministic three-round replay progressively deepens without consecutive pure questions", () => {
-  const { plans, userPlans } = replayThreeRounds();
-  assert.equal(plans.length, 6);
-  assert.deepEqual(plans.filter((plan) => plan.responseCue === "question").length, 1);
-  assert.deepEqual(userPlans.map((plan) => plan.move), ["expand", "expand", "expand"]);
-  assert.deepEqual(userPlans.map((plan) => plan.depth), [0, 1, 2]);
-  for (let index = 1; index < plans.length; index += 1) {
+test("deterministic three-round replay keeps ordinary depth semantic without consecutive pure questions", () => {
+  const { strategies, userStrategies } = replayThreeRounds();
+  assert.equal(strategies.length, 6);
+  assert.deepEqual(strategies.filter((strategy) => strategy.responseCue === "question").length, 1);
+  assert.deepEqual(userStrategies.map((strategy) => strategy.move), ["expand", "expand", "expand"]);
+  assert.deepEqual(userStrategies.map((strategy) => strategy.depth), [0, 0, 0]);
+  for (let index = 1; index < strategies.length; index += 1) {
     assert.equal(
-      plans[index - 1].responseCue === "question" && plans[index].responseCue === "question",
+      strategies[index - 1].responseCue === "question" && strategies[index].responseCue === "question",
       false,
     );
   }
@@ -186,19 +188,19 @@ test("deterministic three-round replay progressively deepens without consecutive
 test("short-response fixtures keep contribution plus an easy entry in at least 80 percent", () => {
   const fixtures = [
     ["expand", "我先说个具体细节，这个角度其实挺有意思。"],
-    ["offer-entry", "我先补一个例子；你更像是 A，还是 B？"],
+    ["respond", "我先补一个例子；你更像是 A，还是 B？"],
     ["expand", "我想到一个新看法，先把它说清楚。"],
-    ["offer-entry", "这里有个小区别；你更偏哪一种？"],
+    ["respond", "这里有个小区别；你更偏哪一种？"],
     ["deepen", "我觉得关键在于原因，不只是表面结果。"],
     ["expand", "我再补一个具体场景，可能更好理解。"],
-    ["offer-entry", "我先贡献一个判断；你更认同哪边？"],
+    ["respond", "我先贡献一个判断；你更认同哪边？"],
     ["deepen", "沿着刚才的感受再往里一层，可能是因为选择成本。"],
     ["expand", "这个说法还能换一个角度看。"],
-    ["offer-entry", "我先把细节补上；更像前一种还是后一种？"],
+    ["respond", "我先把细节补上；更像前一种还是后一种？"],
   ];
   const successful = fixtures.filter(([move, reply]) => {
     const hasContribution = /具体|细节|例子|看法|角度|判断|场景|原因|说清楚/.test(reply);
-    const hasEntry = move === "offer-entry" ? /[？?；;]/.test(reply) : true;
+    const hasEntry = move === "respond" ? /[？?；;]/.test(reply) : true;
     return hasContribution && hasEntry;
   }).length;
   assert.ok(successful / fixtures.length >= 0.8);

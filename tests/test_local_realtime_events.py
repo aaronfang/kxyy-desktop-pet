@@ -416,6 +416,40 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertIn("牛肉饭", str(payload["messages"]))
         self.assertNotEqual(payload["messages"][2]["role"], "assistant")
 
+    def test_turn_strategy_sanitizer_accepts_only_the_v2_fixed_schema(self):
+        base = {
+            "move": "respond",
+            "responseCue": "none",
+            "stance": "support",
+            "reasoningPolicy": "fast",
+            "depth": 0,
+        }
+        dimensions = {
+            "move": ("respond", "expand", "deepen", "associate", "recover"),
+            "responseCue": ("none", "low-burden", "question"),
+            "stance": ("support", "opine", "contrast", "lead"),
+            "reasoningPolicy": ("fast", "deliberate"),
+            "depth": (0, 1, 2, 3),
+        }
+        for field, values in dimensions.items():
+            for value in values:
+                strategy = {**base, field: value}
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(common.sanitize_turn_strategy(strategy), strategy)
+
+        invalid_values = (
+            {**base, "move": "offer-entry"},
+            {**base, "stance": "companion"},
+            {**base, "reasoningPolicy": "automatic"},
+            {**base, "responseCue": "open-ended"},
+            {**base, "depth": -1},
+            {**base, "depth": 4},
+            {**base, "depth": True},
+        )
+        for strategy in invalid_values:
+            with self.subTest(strategy=strategy):
+                self.assertIsNone(common.sanitize_turn_strategy(strategy))
+
     def test_llm_stream_uses_loopback_proxy_and_parses_deltas_and_usage(self):
         captured = {}
 
@@ -517,13 +551,14 @@ class TextProviderAdapterTests(unittest.TestCase):
             return FakeResponse()
 
         common.urllib.request.urlopen = fake_urlopen
-        plan = {
+        strategy = {
             "move": "expand",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 1,
         }
-        hint = common.format_conversation_plan_hint(plan)
+        hint = common.format_turn_strategy_hint(strategy)
         events = list(
             common.iter_llm_stream(
                 "角色设定",
@@ -2610,7 +2645,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured, [[{"role": "system", "content": expected_hint}]])
             self.assertFalse(any(message.get("content") == expected_hint for message in session.history))
 
-    async def test_conversation_plan_hint_is_fixed_and_ephemeral(self):
+    async def test_turn_strategy_hint_is_fixed_and_ephemeral(self):
         captured = []
         common._synth_tts = lambda _text: b"unused"
 
@@ -2622,13 +2657,14 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         session = common.Session(FakeWebSocket())
         scope = session._new_scope("response")
         session.response_scope = scope
-        plan = {
-            "move": "offer-entry",
+        strategy = {
+            "move": "respond",
             "responseCue": "low-burden",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 2,
         }
-        await session._reply_pipeline("简短回应", scope, conversation_plan=plan)
+        await session._reply_pipeline("简短回应", scope, turn_strategy=strategy)
 
         system_contents = [
             message["content"] for message in captured[0] if message["role"] == "system"
@@ -2636,9 +2672,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         rendered = next(
             content for content in system_contents if content.startswith("本轮对话节奏")
         )
-        self.assertEqual(rendered, common.format_conversation_plan_hint(plan))
-        self.assertIn("先贡献具体内容", rendered)
+        self.assertEqual(rendered, common.format_turn_strategy_hint(strategy))
+        self.assertIn("贡献具体内容", rendered)
         self.assertIn("低负担", rendered)
+        self.assertIn("当前语义深度", rendered)
+        self.assertNotIn("渐进深度", rendered)
         self.assertNotIn("简短回应", rendered)
         self.assertFalse(any(message.get("content") == rendered for message in session.history))
 
@@ -2814,7 +2852,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         finally:
             common.THINKING_FILLER_DELAY_SECONDS = original_delay
 
-    async def test_proactive_conversation_plan_crosses_only_as_fixed_enums(self):
+    async def test_proactive_turn_strategy_crosses_only_as_fixed_enums(self):
         captured = []
         common._synth_tts = lambda _text: b"unused"
 
@@ -2830,10 +2868,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         await self.session.on_proactive_turn({
             "triggerId": 1,
             "kind": "followup",
-            "conversationPlan": {
+            "turnStrategy": {
                 "move": "expand",
                 "responseCue": "none",
-                "stance": "companion",
+                "stance": "support",
+                "reasoningPolicy": "fast",
                 "depth": 1,
                 "injected": "forbidden",
             },
@@ -2841,22 +2880,24 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         await self.session.reply_task
 
         rendered = captured[0][-1]["content"]
-        self.assertEqual(rendered, common.format_conversation_plan_hint({
+        self.assertEqual(rendered, common.format_turn_strategy_hint({
             "move": "expand",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 1,
         }))
         self.assertNotIn("forbidden", rendered)
 
-    def test_associate_plan_is_fixed_and_asks_for_one_bounded_lateral_thread(self):
-        plan = {
+    def test_associate_strategy_is_fixed_and_asks_for_one_bounded_lateral_thread(self):
+        strategy = {
             "move": "associate",
             "responseCue": "low-burden",
-            "stance": "companion",
+            "stance": "lead",
+            "reasoningPolicy": "fast",
             "depth": 2,
         }
-        rendered = common.format_conversation_plan_hint(plan)
+        rendered = common.format_turn_strategy_hint(strategy)
         self.assertIn("语义状态", rendered)
         self.assertIn("只带出一个", rendered)
         self.assertIn("新的具体名词", rendered)
@@ -2864,16 +2905,17 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("普通生活联想", rendered)
         self.assertNotIn("突然硬切", rendered)
 
-    def test_associate_plan_suppresses_conflicting_short_agreement_hint(self):
-        plan = {
+    def test_associate_strategy_suppresses_conflicting_short_agreement_hint(self):
+        strategy = {
             "move": "associate",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "lead",
+            "reasoningPolicy": "fast",
             "depth": 1,
         }
-        self.assertEqual(common.select_turn_policy_hint("agree", plan), "")
+        self.assertEqual(common.select_turn_policy_hint("agree", strategy), "")
         self.assertEqual(
-            common.select_turn_policy_hint("agree", {**plan, "move": "expand"}),
+            common.select_turn_policy_hint("agree", {**strategy, "move": "expand"}),
             common.AGREE_HINT_TEXT,
         )
 
@@ -2892,11 +2934,12 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不可兑现", common.CONTINUE_CONVERSATION_SUFFIX)
         self.assertIn("现实中正在", common.CONTINUE_CONVERSATION_SUFFIX)
 
-    def test_default_companion_plan_contributes_without_parroting_or_closing(self):
-        rendered = common.format_conversation_plan_hint({
+    def test_default_support_strategy_contributes_without_parroting_or_closing(self):
+        rendered = common.format_turn_strategy_hint({
             "move": "expand",
             "responseCue": "none",
-            "stance": "companion",
+            "stance": "support",
+            "reasoningPolicy": "fast",
             "depth": 1,
         })
         self.assertIn("不要同义复述", rendered)
@@ -3055,7 +3098,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(last_json_of_type(self.ws, "interruption_recovery_status")["state"], "deferred")
         self.session._pending_playback_segments.clear()
 
-        async def no_reply(_scope, _request_id):
+        async def no_reply(_scope, _request_id, _turn_strategy=None):
             return None
 
         self.session._interruption_recovery_pipeline = no_reply
@@ -3083,7 +3126,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.session.gen_id = 5
         blocker = asyncio.Event()
 
-        async def blocked_reply(_scope, _request_id):
+        async def blocked_reply(_scope, _request_id, _turn_strategy=None):
             await blocker.wait()
 
         self.session._interruption_recovery_pipeline = blocked_reply
@@ -3351,7 +3394,13 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(scope.active)
             self.assertEqual(reason, "turn")
             self.session._turn_temporal_context = "当前时间上下文"
-            self.session._turn_conversation_plan = {"mode": "follow-up"}
+            self.session._turn_strategy = {
+                "move": "respond",
+                "stance": "support",
+                "reasoningPolicy": "fast",
+                "responseCue": "none",
+                "depth": 0,
+            }
             self.session._turn_fresh_topics = [{"title": "本轮话题"}]
             return "本轮记忆上下文"
 
@@ -3373,7 +3422,13 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 "short_term_context": "",
                 "memory_context": "本轮记忆上下文",
                 "temporal_context": "当前时间上下文",
-                "conversation_plan": {"mode": "follow-up"},
+                "turn_strategy": {
+                    "move": "respond",
+                    "stance": "support",
+                    "reasoningPolicy": "fast",
+                    "responseCue": "none",
+                    "depth": 0,
+                },
                 "fresh_topics": [{"title": "本轮话题"}],
             },
         )

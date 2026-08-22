@@ -555,10 +555,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       topicSwitches: 1,
       replyCancelTimeouts: 2,
       conversationMoves: {
+        respond: 2,
         expand: 3,
-        offerEntry: 2,
         deepen: 1,
         associate: 1,
+        recover: 0,
       },
       topicActivity: {
         active: 5,
@@ -595,6 +596,27 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       cancelled: -1,
       completed: 256,
       rawReason: "forbidden-recovery-reason",
+    },
+    turnStrategySummary: {
+      moves: {
+        respond: 1,
+        expand: 255,
+        deepen: -1,
+        associate: 256,
+        recover: 2.5,
+        "offer-entry": 9,
+      },
+      stances: {
+        support: 2,
+        opine: 3,
+        contrast: Number.MAX_SAFE_INTEGER + 1,
+        lead: 4,
+        companion: 8,
+      },
+      reasoningPolicies: { fast: 5, deliberate: 6, automatic: 7 },
+      responseCues: { none: 7, lowBurden: 8, question: 9, transcript: "forbidden-strategy-text" },
+      depths: { zero: 10, one: 11, two: 12, three: 13, four: 14 },
+      reason: "forbidden-strategy-reason",
     },
     events,
     latencies: [summarizeTraceLatency(events, 0)],
@@ -642,10 +664,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     topicSwitches: 1,
     replyCancelTimeouts: 2,
     conversationMoves: {
+      respond: 2,
       expand: 3,
-      offerEntry: 2,
       deepen: 1,
       associate: 1,
+      recover: 0,
     },
     topicActivity: {
       active: 5,
@@ -688,6 +711,13 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     cancelled: 0,
     completed: 0,
   });
+  assert.deepEqual(report.aggregate.turnStrategy, {
+    moves: { respond: 1, expand: 255, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 2, opine: 3, contrast: 0, lead: 4 },
+    reasoningPolicies: { fast: 5, deliberate: 6 },
+    responseCues: { none: 7, lowBurden: 8, question: 9 },
+    depths: { zero: 10, one: 11, two: 12, three: 13 },
+  });
   assert.equal(report.appVersion, "0.2.23");
   assert.equal(report.events.length, 255);
   assert.equal(report.events.at(-1).metrics.audioBytes, 259);
@@ -718,6 +748,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     "forbidden-model-path",
     "forbidden-topic",
     "forbidden-recovery-reason",
+    "forbidden-strategy-text",
+    "forbidden-strategy-reason",
+    "offer-entry",
+    "companion",
+    "automatic",
   ]) {
     assert.equal(json.includes(forbidden), false);
   }
@@ -1753,7 +1788,18 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
 
   assert.deepEqual(
     sent.filter((message) => message.type === "interruption_recovery"),
-    [{ type: "interruption_recovery", requestId: 1, expectedGeneration: 7 }],
+    [{
+      type: "interruption_recovery",
+      requestId: 1,
+      expectedGeneration: 7,
+      turnStrategy: {
+        move: "recover",
+        stance: "support",
+        reasoningPolicy: "fast",
+        responseCue: "none",
+        depth: 0,
+      },
+    }],
   );
   session._onMessage({
     data: JSON.stringify({
@@ -1785,6 +1831,13 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
     started: 1,
     cancelled: 0,
     completed: 1,
+  });
+  assert.deepEqual(snapshot.turnStrategySummary, {
+    moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 1 },
+    stances: { support: 1, opine: 0, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 1, deliberate: 0 },
+    responseCues: { none: 1, lowBurden: 0, question: 0 },
+    depths: { zero: 1, one: 0, two: 0, three: 0 },
   });
   assert.equal(JSON.stringify(snapshot).includes("userText"), false);
 });
@@ -1951,7 +2004,7 @@ test("realtime proactive policy classifies explicit controls without model infer
   assert.equal(classifyRealtimeTopicActivity("我现在肚子疼", "substantive", false), "sensitive");
 });
 
-test("ai-leads schedules bounded plan-aware followups from audible playback", async () => {
+test("ai-leads schedules bounded strategy-aware followups from audible playback", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -1972,10 +2025,11 @@ test("ai-leads schedules bounded plan-aware followups from audible playback", as
   session._scheduleTopicLeadAfterPlayback(1);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.at(-1).kind, "followup");
-  assert.deepEqual(sent.at(-1).conversationPlan, {
+  assert.deepEqual(sent.at(-1).turnStrategy, {
     move: "expand",
     responseCue: "none",
-    stance: "companion",
+    stance: "support",
+    reasoningPolicy: "fast",
     depth: 0,
   });
 
@@ -1988,11 +2042,19 @@ test("ai-leads schedules bounded plan-aware followups from audible playback", as
   session._scheduleTopicLeadAfterPlayback(2);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.at(-1).kind, "followup");
-  assert.deepEqual(sent.at(-1).conversationPlan, {
-    move: "offer-entry",
+  assert.deepEqual(sent.at(-1).turnStrategy, {
+    move: "respond",
     responseCue: "low-burden",
-    stance: "companion",
+    stance: "support",
+    reasoningPolicy: "fast",
     depth: 0,
+  });
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
+    moves: { respond: 1, expand: 1, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 2, opine: 0, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 2, deliberate: 0 },
+    responseCues: { none: 1, lowBurden: 1, question: 0 },
+    depths: { zero: 2, one: 0, two: 0, three: 0 },
   });
 
   session._noteProactiveStatus({
@@ -2080,7 +2142,34 @@ test("balanced allows one proactive turn after user engagement", async () => {
   assert.equal(sent[0].kind, "followup");
 });
 
-test("ai-leads sends a fixed conversation plan with negotiated turn context", async () => {
+test("malformed proactive strategy is omitted from wire and diagnostics", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._proactiveTurnMode = "local-v1";
+
+  assert.equal(session._sendProactiveTurn("followup", {
+    move: "offer-entry",
+    responseCue: "none",
+    stance: "companion",
+    reasoningPolicy: "automatic",
+    depth: 4,
+  }), true);
+
+  assert.equal(Object.hasOwn(sent[0], "turnStrategy"), false);
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
+    moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 0, opine: 0, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 0, deliberate: 0 },
+    responseCues: { none: 0, lowBurden: 0, question: 0 },
+    depths: { zero: 0, one: 0, two: 0, three: 0 },
+  });
+});
+
+test("ai-leads sends a fixed turn strategy with negotiated turn context", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
   const { RealtimeSession } = await import("../src/ai/realtime.js");
@@ -2100,11 +2189,19 @@ test("ai-leads sends a fixed conversation plan with negotiated turn context", as
   });
 
   assert.equal(session.sendMemoryContext({ generation: 7, items: [] }), true);
-  assert.deepEqual(sent.at(-1).conversationPlan, {
+  assert.deepEqual(sent.at(-1).turnStrategy, {
     move: "expand",
     responseCue: "none",
-    stance: "opinion",
+    stance: "opine",
+    reasoningPolicy: "fast",
     depth: 0,
+  });
+  assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
+    moves: { respond: 0, expand: 1, deepen: 0, associate: 0, recover: 0 },
+    stances: { support: 0, opine: 1, contrast: 0, lead: 0 },
+    reasoningPolicies: { fast: 1, deliberate: 0 },
+    responseCues: { none: 1, lowBurden: 0, question: 0 },
+    depths: { zero: 1, one: 0, two: 0, three: 0 },
   });
   assert.equal(JSON.stringify(sent.at(-1)).includes("我想听听"), false);
   session._onMessage({
@@ -2201,7 +2298,8 @@ test("important topic revisit is a bounded accepted transition and stays out of 
     session._sendTopicTransition({
       move: "expand",
       responseCue: "none",
-      stance: "companion",
+      stance: "support",
+      reasoningPolicy: "fast",
       depth: 1,
     });
     const message = sent.at(-1);
@@ -2217,7 +2315,8 @@ test("important topic revisit is a bounded accepted transition and stays out of 
   session._sendTopicTransition({
     move: "deepen",
     responseCue: "low-burden",
-    stance: "companion",
+    stance: "support",
+    reasoningPolicy: "fast",
     depth: 2,
   });
   const revisit = sent.at(-1);

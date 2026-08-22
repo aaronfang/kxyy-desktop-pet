@@ -824,7 +824,7 @@ function sanitizeProactiveSummary(raw) {
     topicSwitches: count("topicSwitches"),
     replyCancelTimeouts: count("replyCancelTimeouts"),
     conversationMoves: fixedCounts(value.conversationMoves, [
-      "expand", "offerEntry", "deepen", "associate",
+      "respond", "expand", "deepen", "associate", "recover",
     ]),
     topicActivity: fixedCounts(value.topicActivity, [
       "active", "neutral", "settling", "sensitive",
@@ -844,6 +844,24 @@ function sanitizeProactiveSummary(raw) {
       stops: count("rhythmStops"),
       stopped: value.rhythmStopped === true,
     },
+  });
+}
+
+function sanitizeTurnStrategySummary(raw) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const fixedCounts = (source, names) => {
+    const input = source && typeof source === "object" ? source : {};
+    return Object.fromEntries(names.map((name) => {
+      const count = input[name];
+      return [name, Number.isSafeInteger(count) && count >= 0 && count <= 255 ? count : 0];
+    }));
+  };
+  return Object.freeze({
+    moves: fixedCounts(value.moves, ["respond", "expand", "deepen", "associate", "recover"]),
+    stances: fixedCounts(value.stances, ["support", "opine", "contrast", "lead"]),
+    reasoningPolicies: fixedCounts(value.reasoningPolicies, ["fast", "deliberate"]),
+    responseCues: fixedCounts(value.responseCues, ["none", "lowBurden", "question"]),
+    depths: fixedCounts(value.depths, ["zero", "one", "two", "three"]),
   });
 }
 
@@ -955,6 +973,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
       memoryContext: summarizeMemoryContext(events),
       proactive: sanitizeProactiveSummary(source.proactiveSummary),
       recovery: sanitizeRecoverySummary(source.recoverySummary),
+      turnStrategy: sanitizeTurnStrategySummary(source.turnStrategySummary),
       vadShadow: sanitizeVadShadowSummary(source.vadShadowSummary),
       playback: {
         maxSampledQueuedMs:

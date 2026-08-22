@@ -911,12 +911,13 @@ def format_user_affect_hint(value) -> str:
         "优先相信用户实际说出的内容；不要断言用户处于某种情绪，不要替用户解释原因，"
         "也不要镜像愤怒或刻意模仿哭笑。只在措辞、节奏和共情程度上做轻微调整，并允许用户纠正。"
     )
-CONVERSATION_PLAN_MOVES = frozenset(("expand", "offer-entry", "deepen", "associate"))
-CONVERSATION_PLAN_CUES = frozenset(("none", "low-burden", "question"))
-CONVERSATION_PLAN_STANCES = frozenset(("companion", "opinion", "advice", "concrete", "light"))
+TURN_STRATEGY_MOVES = frozenset(("respond", "expand", "deepen", "associate", "recover"))
+TURN_STRATEGY_CUES = frozenset(("none", "low-burden", "question"))
+TURN_STRATEGY_STANCES = frozenset(("support", "opine", "contrast", "lead"))
+TURN_STRATEGY_REASONING_POLICIES = frozenset(("fast", "deliberate"))
 CONVERSATION_MOVE_HINTS = {
+    "respond": "先直接回应用户当前表达并贡献具体内容，不要只做同义复述或把问题原样抛回去。",
     "expand": "用一句接住用户刚才的具体表达，不要同义复述；随后主动补充一个新观点、细节、例子或有依据的小故事。",
-    "offer-entry": "先贡献具体内容，再留一个低负担、容易回应的入口；不要只把问题抛回用户。",
     "deepen": "沿当前话题自然深入一层，优先触及感受、原因、价值判断或个人选择，不要突然换题。",
     "associate": (
         "先用一句准确接住用户，再根据最近对话的语义状态决定是否只带出一个新方向。"
@@ -925,6 +926,7 @@ CONVERSATION_MOVE_HINTS = {
         "不能只是换句话继续安慰或认同。先把这个新方向讲出一点实际内容，不要反问用户提供素材。"
         "也不要为了显得有生活而虚构亲身经历。用户不接这个方向时，下一轮立刻跟回用户。"
     ),
+    "recover": "自然接回刚才中断的思路，只依据实际可听历史补充一小步，不要提及内部恢复机制。",
 }
 CONVERSATION_CUE_HINTS = {
     "none": "本轮不必提问，不要总结收口；用户没有明确道别时，不要替双方结束对话，给后续交流保留空间。",
@@ -932,11 +934,14 @@ CONVERSATION_CUE_HINTS = {
     "question": "本轮最多问一个具体问题；前一部分必须先贡献内容，不能连续盘问。",
 }
 CONVERSATION_STANCE_HINTS = {
-    "companion": "默认陪聊：先理解和展开，除非用户明确求助，否则不要急着给建议。",
-    "opinion": "用户明确想听你的想法：给出有理由的具体观点，减少反问，可以温和不同意。",
-    "advice": "用户已明确邀请建议：结合处境给出具体看法，但不要用总结人生道理收尾。",
-    "concrete": "用户要求更具体：补一个清楚的例子、细节或可观察区别。",
-    "light": "用户要求轻松一点：降低深度和沉重感，保持具体自然，不要追问敏感内容。",
+    "support": "先准确理解并支持用户当前表达；支持不等于机械附和，仍要贡献一个具体观察或细节。",
+    "opine": "给出有理由的具体立场，减少反问；只使用稳定人设偏好和当前上下文，不虚构亲身经历。",
+    "contrast": "在安全话题上提出一个温和、有理由的不同角度；先承接再对比，不为了反对而反对。",
+    "lead": "主动带出一个明确方向并先讲出实际内容；用户不接时立刻合作地跟回用户。",
+}
+TURN_STRATEGY_REASONING_HINTS = {
+    "fast": "本轮采用快速策略，直接、自然地作答，不展开冗长分析。",
+    "deliberate": "本轮采用审慎策略，在内部比较原因和取舍后再给出清楚结论，不展示推理过程。",
 }
 CONTINUATION_WINDOW_SECONDS = 8.0
 LLM_REPLY_MAX_CHARS = 4096
@@ -986,26 +991,31 @@ def classify_realtime_soft_intent(text: str) -> str:
     return "none"
 
 
-def sanitize_conversation_plan(value) -> dict | None:
+def sanitize_turn_strategy(value) -> dict | None:
     if not isinstance(value, dict):
         return None
     move = value.get("move")
     cue = value.get("responseCue")
     stance = value.get("stance")
+    reasoning_policy = value.get("reasoningPolicy")
     depth = value.get("depth")
     if (
-        move not in CONVERSATION_PLAN_MOVES
-        or cue not in CONVERSATION_PLAN_CUES
-        or stance not in CONVERSATION_PLAN_STANCES
+        move not in TURN_STRATEGY_MOVES
+        or cue not in TURN_STRATEGY_CUES
+        or stance not in TURN_STRATEGY_STANCES
+        or reasoning_policy not in TURN_STRATEGY_REASONING_POLICIES
         or not isinstance(depth, int)
         or isinstance(depth, bool)
+        or depth < 0
+        or depth > 3
     ):
         return None
     return {
         "move": move,
         "responseCue": cue,
         "stance": stance,
-        "depth": max(0, min(5, depth)),
+        "reasoningPolicy": reasoning_policy,
+        "depth": depth,
     }
 
 
@@ -1041,16 +1051,17 @@ def format_topic_revisit_hint(value) -> str:
     )
 
 
-def format_conversation_plan_hint(value) -> str:
-    plan = sanitize_conversation_plan(value)
-    if plan is None:
+def format_turn_strategy_hint(value) -> str:
+    strategy = sanitize_turn_strategy(value)
+    if strategy is None:
         return ""
     return (
         "本轮对话节奏（内部固定策略，不要复述）："
-        + CONVERSATION_MOVE_HINTS[plan["move"]]
-        + CONVERSATION_CUE_HINTS[plan["responseCue"]]
-        + CONVERSATION_STANCE_HINTS[plan["stance"]]
-        + f"当前渐进深度为 {plan['depth']}；它只控制本轮表达，不是用户事实。"
+        + CONVERSATION_MOVE_HINTS[strategy["move"]]
+        + CONVERSATION_CUE_HINTS[strategy["responseCue"]]
+        + CONVERSATION_STANCE_HINTS[strategy["stance"]]
+        + TURN_STRATEGY_REASONING_HINTS[strategy["reasoningPolicy"]]
+        + f"当前语义深度为 {strategy['depth']}；它只控制本轮表达，不是用户事实。"
     )
 
 
@@ -1065,9 +1076,9 @@ SEMANTIC_TOPIC_AUTONOMY_HINT = (
 )
 
 
-def select_turn_policy_hint(turn_policy: str, conversation_plan) -> str:
-    plan = sanitize_conversation_plan(conversation_plan)
-    if plan is not None and plan["move"] == "associate":
+def select_turn_policy_hint(turn_policy: str, turn_strategy) -> str:
+    strategy = sanitize_turn_strategy(turn_strategy)
+    if strategy is not None and strategy["move"] == "associate":
         return ""
     return {
         "acknowledge": ACKNOWLEDGE_HINT_TEXT,
@@ -3036,7 +3047,7 @@ class Session:
         # LLM delta 与有序音频 sender 可并行推进，但同一 WebSocket 只允许一个 send 在途。
         self._send_lock = asyncio.Lock()
         self._memory_context_waiter: tuple[int, asyncio.Future] | None = None
-        self._turn_conversation_plan: dict | None = None
+        self._turn_strategy: dict | None = None
         self._turn_fresh_topics: list[dict] = []
         self.asr_task: asyncio.Task | None = None
         self.tts_parallelism = _tts_parallelism
@@ -3573,11 +3584,11 @@ class Session:
             kwargs["memory_context"] = memory_context
         if self._turn_temporal_context:
             kwargs["temporal_context"] = self._turn_temporal_context
-        if self._turn_conversation_plan:
-            kwargs["conversation_plan"] = self._turn_conversation_plan
+        if self._turn_strategy:
+            kwargs["turn_strategy"] = self._turn_strategy
         if self._turn_fresh_topics:
             kwargs["fresh_topics"] = self._turn_fresh_topics
-        self._turn_conversation_plan = None
+        self._turn_strategy = None
         self._turn_fresh_topics = []
         turn_policy = classify_realtime_conversation_turn(pending_text)
         if turn_policy != "substantive":
@@ -3644,7 +3655,7 @@ class Session:
         self._response_started_at = time.perf_counter()
         self._proactive_response_generation = scope.generation
         self._proactive_response_trigger_id = trigger_id
-        conversation_plan = sanitize_conversation_plan(msg.get("conversationPlan"))
+        turn_strategy = sanitize_turn_strategy(msg.get("turnStrategy"))
         await self.send_json(
             {
                 "type": "proactive_turn_status",
@@ -3654,14 +3665,14 @@ class Session:
             }
         )
         self.reply_task = asyncio.create_task(
-            self._proactive_reply_pipeline(scope, kind, conversation_plan, topic_revisit)
+            self._proactive_reply_pipeline(scope, kind, turn_strategy, topic_revisit)
         )
 
     async def _proactive_reply_pipeline(
         self,
         scope: GenerationCancelScope,
         kind: str,
-        conversation_plan: dict | None = None,
+        turn_strategy: dict | None = None,
         topic_revisit: dict | None = None,
     ) -> None:
         memory_context = await self._request_turn_memory(
@@ -3678,13 +3689,14 @@ class Session:
             temporal_context=self._turn_temporal_context,
             short_term_context=format_short_term_facts(self._short_term_facts),
             fresh_topics=self._fresh_topics or self._turn_fresh_topics,
-            conversation_plan=conversation_plan,
+            turn_strategy=turn_strategy,
             topic_revisit=topic_revisit,
         )
 
     async def on_interruption_recovery(self, msg: dict) -> None:
         request_id = msg.get("requestId")
         expected_generation = msg.get("expectedGeneration")
+        turn_strategy = sanitize_turn_strategy(msg.get("turnStrategy"))
         valid_request = (
             isinstance(request_id, int)
             and not isinstance(request_id, bool)
@@ -3740,16 +3752,22 @@ class Session:
             "generation": scope.generation,
         })
         self.reply_task = asyncio.create_task(
-            self._interruption_recovery_pipeline(scope, request_id)
+            self._interruption_recovery_pipeline(scope, request_id, turn_strategy)
         )
 
     async def _interruption_recovery_pipeline(
         self,
         scope: GenerationCancelScope,
         request_id: int,
+        turn_strategy: dict | None = None,
     ) -> None:
         try:
-            await self._reply_pipeline("", scope, proactive_kind="recovery")
+            await self._reply_pipeline(
+                "",
+                scope,
+                proactive_kind="recovery",
+                turn_strategy=turn_strategy,
+            )
             if scope.state == "completed":
                 await self.send_json({
                     "type": "interruption_recovery_status",
@@ -3833,8 +3851,8 @@ class Session:
             if self.temporal_context == TEMPORAL_CONTEXT_CAPABILITY
             else ""
         )
-        self._turn_conversation_plan = sanitize_conversation_plan(
-            msg.get("conversationPlan")
+        self._turn_strategy = sanitize_turn_strategy(
+            msg.get("turnStrategy")
         )
         self._turn_fresh_topics = (
             sanitize_fresh_topics(msg.get("freshTopics"))
@@ -3855,7 +3873,7 @@ class Session:
         if self.memory_context != TURN_MEMORY_CAPABILITY or not scope.active:
             return ""
         self._turn_temporal_context = ""
-        self._turn_conversation_plan = None
+        self._turn_strategy = None
         self._turn_fresh_topics = []
         future = self.loop.create_future()
         self._memory_context_waiter = (scope.generation, future)
@@ -4262,9 +4280,9 @@ class Session:
             if not scope.active:
                 return
             turn_temporal_context = self._turn_temporal_context
-            turn_conversation_plan = self._turn_conversation_plan
+            turn_strategy = self._turn_strategy
             turn_fresh_topics = self._turn_fresh_topics
-            self._turn_conversation_plan = None
+            self._turn_strategy = None
             self._turn_fresh_topics = []
             scope.promote("response")
             if self.asr_scope is scope:
@@ -4287,8 +4305,8 @@ class Session:
             short_term_context = format_short_term_facts(self._short_term_facts)
             if short_term_context:
                 reply_kwargs["short_term_context"] = short_term_context
-            if turn_conversation_plan:
-                reply_kwargs["conversation_plan"] = turn_conversation_plan
+            if turn_strategy:
+                reply_kwargs["turn_strategy"] = turn_strategy
             if turn_fresh_topics:
                 reply_kwargs["fresh_topics"] = turn_fresh_topics
             if user_affect:
@@ -4415,7 +4433,7 @@ class Session:
         short_term_context: str = "",
         proactive_kind: str = "",
         turn_policy: str = "substantive",
-        conversation_plan: dict | None = None,
+        turn_strategy: dict | None = None,
         topic_revisit: dict | None = None,
         fresh_topics: list[dict] | None = None,
         user_affect: dict | None = None,
@@ -4464,10 +4482,10 @@ class Session:
                 history_snapshot.append(
                     {"role": "system", "content": CONTINUATION_HINT_TEXT}
                 )
-            policy_hint = select_turn_policy_hint(turn_policy, conversation_plan)
+            policy_hint = select_turn_policy_hint(turn_policy, turn_strategy)
             if policy_hint:
                 history_snapshot.append({"role": "system", "content": policy_hint})
-            conversation_hint = format_conversation_plan_hint(conversation_plan)
+            conversation_hint = format_turn_strategy_hint(turn_strategy)
             if conversation_hint:
                 history_snapshot.append(
                     {"role": "system", "content": conversation_hint}
