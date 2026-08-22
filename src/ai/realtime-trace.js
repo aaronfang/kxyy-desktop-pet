@@ -84,6 +84,16 @@ export const TRACE_EVENT = Object.freeze({
 });
 
 const EVENT_TYPES = new Set(Object.values(TRACE_EVENT));
+const SAMPLED_EVENT_TYPES = new Set([
+  TRACE_EVENT.MIC_AUDIO_INPUT,
+  TRACE_EVENT.PLAYBACK_QUEUED,
+  TRACE_EVENT.PLAYBACK_STATS,
+]);
+const PROTECTED_EVENT_TYPES = new Set([
+  TRACE_EVENT.SPEECH_CANDIDATE,
+  TRACE_EVENT.SPEECH_CONFIRMED,
+  TRACE_EVENT.SPEECH_REJECTED,
+]);
 const SAFE_REASONS = new Set([
   "completed",
   "error",
@@ -164,6 +174,25 @@ function safeIdentifier(value, name, required = false) {
     throw new Error(`${name} must be an opaque identifier of at most 128 characters`);
   }
   return text;
+}
+
+function selectBoundedEvents(source, maximum) {
+  const events = Array.isArray(source) ? source : [];
+  if (events.length <= maximum) return events.slice();
+  const protectedEvents = [];
+  const remaining = [];
+  events.forEach((event, index) => {
+    (PROTECTED_EVENT_TYPES.has(event?.eventType) ? protectedEvents : remaining).push({
+      event,
+      index,
+    });
+  });
+  const selected = protectedEvents.length >= maximum
+    ? protectedEvents.slice(-maximum)
+    : protectedEvents.concat(remaining.slice(-(maximum - protectedEvents.length)));
+  return selected
+    .sort((left, right) => left.index - right.index)
+    .map(({ event }) => event);
 }
 
 /** Build one immutable v1 trace event. Primarily useful for deterministic tests. */
@@ -781,7 +810,7 @@ function sanitizeLatencySummary(summary) {
 export function buildRealtimeDiagnosticReport(snapshot) {
   const source = snapshot && typeof snapshot === "object" ? snapshot : {};
   const sourceEvents = Array.isArray(source.events) ? source.events : [];
-  const candidateEvents = sourceEvents.slice(-MAX_DIAGNOSTIC_EVENTS);
+  const candidateEvents = selectBoundedEvents(sourceEvents, MAX_DIAGNOSTIC_EVENTS);
   const events = [];
   const sessionIds = new Map();
   const turnIds = new Map();
@@ -982,8 +1011,26 @@ export class RealtimeTrace {
       this.coalescedPlaybackStats += 1;
     } else {
       if (this.events.length >= this.maxEvents) {
-        this.events.shift();
         this.droppedEvents += 1;
+        const sampledIndex = this.events.findIndex((candidate) =>
+          SAMPLED_EVENT_TYPES.has(candidate.eventType),
+        );
+        const ordinaryIndex = this.events.findIndex((candidate) =>
+          !PROTECTED_EVENT_TYPES.has(candidate.eventType),
+        );
+        const evictIndex = sampledIndex >= 0 ? sampledIndex : ordinaryIndex;
+        if (evictIndex >= 0) {
+          this.events.splice(evictIndex, 1);
+        } else if (!PROTECTED_EVENT_TYPES.has(event.eventType)) {
+          try {
+            this.onEvent?.(event, this.state.lastDecision);
+          } catch {
+            // Observability callbacks must never change the live conversation path.
+          }
+          return event;
+        } else {
+          this.events.shift();
+        }
       }
       this.events.push(event);
     }

@@ -294,6 +294,52 @@ test("runtime collector stays bounded and strips unsafe metadata", () => {
   assert.equal(JSON.stringify(snapshot).includes("forbidden"), false);
 });
 
+test("long-call playback sampling cannot evict early interruption outcomes", () => {
+  let now = 0;
+  let id = 0;
+  const trace = new RealtimeTrace({
+    provider: "local",
+    maxEvents: 16,
+    clock: () => now++,
+    idFactory: (prefix) => `${prefix}-${++id}`,
+  });
+  trace.startSession();
+  trace.record(TRACE_EVENT.SPEECH_CANDIDATE);
+  trace.openTurn(TRACE_EVENT.SPEECH_CONFIRMED);
+  trace.record(TRACE_EVENT.ASR_FINAL);
+  for (let index = 0; index < 40; index += 1) {
+    trace.record(TRACE_EVENT.PLAYBACK_STATS, {
+      metrics: { queuedMs: index, playedSamples: index * 128 },
+    });
+    trace.record(TRACE_EVENT.MIC_AUDIO_INPUT, { metrics: { audioBytes: 640 } });
+  }
+
+  const snapshot = trace.snapshot();
+  const eventTypes = snapshot.events.map((event) => event.eventType);
+  assert.ok(snapshot.events.length <= 16);
+  assert.ok(eventTypes.includes(TRACE_EVENT.SPEECH_CANDIDATE));
+  assert.ok(eventTypes.includes(TRACE_EVENT.SPEECH_CONFIRMED));
+  assert.ok(eventTypes.includes(TRACE_EVENT.ASR_FINAL));
+
+  const report = buildRealtimeDiagnosticReport({
+    events: [
+      fixtureEvent(TRACE_EVENT.SPEECH_CANDIDATE, 1),
+      fixtureEvent(TRACE_EVENT.SPEECH_REJECTED, 2),
+      ...Array.from({ length: 300 }, (_, index) =>
+        fixtureEvent(TRACE_EVENT.PLAYBACK_STATS, index + 3, {
+          metrics: { queuedMs: index },
+        }),
+      ),
+    ],
+  });
+  assert.equal(report.events.length, 256);
+  assert.deepEqual(
+    report.events.slice(0, 2).map((event) => event.eventType),
+    [TRACE_EVENT.SPEECH_CANDIDATE, TRACE_EVENT.SPEECH_REJECTED],
+  );
+  assert.equal(report.exportStats.truncatedEvents, 46);
+});
+
 test("keeps eight generation latency summaries outside the rolling event queue", () => {
   let now = 0;
   let id = 0;
