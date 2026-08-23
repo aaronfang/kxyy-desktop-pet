@@ -216,6 +216,9 @@ struct Settings {
     /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
     #[serde(default = "default_text_provider")]
     text_provider: String,
+    /// 在线人格提示词：`original`（完整原始卡）/ `abstract`（去直播流程的抽象版）。
+    #[serde(default = "default_online_prompt_mode")]
+    online_prompt_mode: String,
     /// 时下信息网页观察；默认关闭，仅在用户明确选择 provider 后生效。
     #[serde(default)]
     web_grounding_enabled: bool,
@@ -347,6 +350,10 @@ fn default_text_provider() -> String {
     "deepseek".into()
 }
 
+fn default_online_prompt_mode() -> String {
+    "original".into()
+}
+
 fn default_fresh_topic_participation() -> String {
     "relevant".into()
 }
@@ -450,6 +457,7 @@ impl Settings {
             topic_preferences: Vec::new(),
             text_model: String::new(),
             text_provider: default_text_provider(),
+            online_prompt_mode: default_online_prompt_mode(),
             web_grounding_enabled: false,
             fresh_topic_participation: default_fresh_topic_participation(),
             web_grounding_provider: String::new(),
@@ -628,7 +636,7 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
     let mut hasher = DefaultHasher::new();
     // Bump whenever bundled local realtime behavior changes in a way that
     // requires a running Python child to reload its modules.
-    "local-realtime-policy-v3".hash(&mut hasher);
+    "local-realtime-policy-v7".hash(&mut hasher);
     backend.hash(&mut hasher);
     settings.vad_shadow_enabled.hash(&mut hasher);
     normalize_asr_provider(&settings.asr_provider).hash(&mut hasher);
@@ -1860,6 +1868,8 @@ struct AiSettingsInput {
     text_model: String,
     #[serde(default = "default_text_provider")]
     text_provider: String,
+    #[serde(default = "default_online_prompt_mode")]
+    online_prompt_mode: String,
     #[serde(default)]
     web_grounding_enabled: bool,
     #[serde(default = "default_fresh_topic_participation")]
@@ -2086,6 +2096,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.text_provider = match settings.text_provider.trim().to_ascii_lowercase().as_str() {
             "local" => "local".into(),
             _ => "deepseek".into(),
+        };
+        s.online_prompt_mode = if settings.online_prompt_mode.trim().eq_ignore_ascii_case("abstract") {
+            "abstract".into()
+        } else {
+            default_online_prompt_mode()
         };
         s.web_grounding_enabled = settings.web_grounding_enabled;
         s.fresh_topic_participation =
@@ -2370,9 +2385,35 @@ pub fn run() {
                 apply_monitor_to_window(&handle, &settings.monitor_id);
                 // 尺寸异步落地后再次通知前端刷新边界（与 apply_monitor 内的即时 emit 互补）。
                 let resized_handle = handle.clone();
+                let reconcile_in_progress = std::sync::Arc::new(AtomicBool::new(false));
+                let reconcile_guard = reconcile_in_progress.clone();
                 win.on_window_event(move |event| {
-                    if let WindowEvent::Resized(_) = event {
-                        let _ = resized_handle.emit("stage-resized", ());
+                    match event {
+                        // 系统显示器分辨率、缩放比例或任务栏工作区改变时，Tauri
+                        // 只保证通知窗口事件，不会替我们重新铺满目标工作区。
+                        // 重新应用目标 monitor 可以把活动范围同步到新的 CSS viewport。
+                        WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                            let _ = resized_handle.emit("stage-resized", ());
+                            if !reconcile_guard.swap(true, Ordering::AcqRel) {
+                                let monitor_id = resized_handle
+                                    .state::<AppState>()
+                                    .settings
+                                    .lock()
+                                    .ok()
+                                    .map(|current| current.monitor_id.clone())
+                                    .unwrap_or_default();
+                                apply_monitor_to_window(&resized_handle, &monitor_id);
+                                // set_size/set_position may synchronously or asynchronously
+                                // produce another resize event. Keep the guard through that
+                                // settling window so monitor reconciliation cannot recurse.
+                                let guard = reconcile_guard.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_millis(120));
+                                    guard.store(false, Ordering::Release);
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 });
                 win.set_always_on_top(true)?;

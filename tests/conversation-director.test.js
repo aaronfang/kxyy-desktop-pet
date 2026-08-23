@@ -50,18 +50,36 @@ test("ai-leads rotates contribution and response entry without consecutive quest
   assert.equal(second.strategy.move, CONVERSATION_MOVE.RESPOND);
   assert.equal(second.strategy.responseCue, RESPONSE_CUE.LOW_BURDEN);
   director.dispatch({ type: "proactive-accepted", kind: "followup" });
-  assert.equal(
-    onlyAction(director, { type: "playback-completed", strategy: second.strategy }).delayMs,
-    6000,
+  assert.deepEqual(
+    onlyAction(director, { type: "playback-completed", strategy: second.strategy }),
+    { type: "schedule-proactive", kind: "idle", delayMs: 9000 },
   );
-
-  const third = onlyAction(director, { type: "silence-deadline", kind: "followup" });
+  const third = onlyAction(director, { type: "silence-deadline", kind: "idle" });
   assert.equal(third.strategy.move, CONVERSATION_MOVE.EXPAND);
   assert.equal(third.strategy.responseCue, RESPONSE_CUE.NONE);
+  director.dispatch({ type: "proactive-accepted", kind: "idle" });
+  assert.deepEqual(
+    director.dispatch({ type: "playback-completed", strategy: third.strategy }),
+    [],
+  );
+});
+
+test("an answered turn resets the silent escalation ladder", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+  director.dispatch({ type: "user-turn-final", policy: "substantive", softIntent: "none" });
+  director.dispatch({ type: "silence-deadline", kind: "followup" });
   director.dispatch({ type: "proactive-accepted", kind: "followup" });
-  const fourth = onlyAction(director, { type: "silence-deadline", kind: "followup" });
-  assert.equal(fourth.strategy.move, CONVERSATION_MOVE.DEEPEN);
-  assert.equal(fourth.strategy.responseCue, RESPONSE_CUE.QUESTION);
+  director.dispatch({ type: "user-turn-final", policy: "substantive", softIntent: "none" });
+
+  assert.deepEqual(
+    onlyAction(director, {
+      type: "playback-completed",
+      strategy: { move: "expand", responseCue: "none", stance: "support", depth: 0 },
+    }),
+    { type: "schedule-proactive", kind: "followup", delayMs: 4000 },
+  );
+  assert.equal(director.snapshot().silentProactiveTurns, 0);
 });
 
 test("two low-interest turns require a same-topic continuation before topic switch", () => {
@@ -141,6 +159,41 @@ test("soft intents change only the current turn strategy", () => {
     softIntent: "none",
   });
   assert.equal(normal.strategy.stance, "support");
+});
+
+test("ai-leads treats a user handoff as an immediate invitation to lead", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+
+  const action = onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "handoff",
+    topicActivity: "active",
+  });
+
+  assert.deepEqual(action.strategy, {
+    move: CONVERSATION_MOVE.ASSOCIATE,
+    responseCue: RESPONSE_CUE.LOW_BURDEN,
+    stance: PERSONA_STANCE.LEAD,
+    reasoningPolicy: REASONING_POLICY.FAST,
+    depth: 0,
+  });
+});
+
+test("ai-leads rotates out of repeated support on safe ordinary turns", () => {
+  const director = createConversationDirector({ mode: "ai-leads" });
+  director.dispatch({ type: "session-started" });
+
+  const stances = Array.from({ length: 3 }, () => onlyAction(director, {
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "none",
+    topicActivity: "neutral",
+    lateralAllowed: true,
+  }).strategy.stance);
+
+  assert.deepEqual(stances, ["support", "support", "opine"]);
 });
 
 test("explicit opinion requests opine without turning the reply into an interview", () => {
@@ -520,6 +573,8 @@ test("hard controls and hangup cancel leading without retaining text", () => {
     proactiveTurns: 0,
     lowInterestTurns: 0,
     sameTopicContinuations: 0,
+    silentProactiveTurns: 0,
+    lastProactiveKind: "none",
     lastMove: "none",
     lastResponseCue: "none",
     depth: 0,

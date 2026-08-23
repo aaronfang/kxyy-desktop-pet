@@ -52,6 +52,14 @@
             </select>
           </label>
 
+          <label>
+            <span>在线人格提示词<small>仅影响 DeepSeek 等在线文字聊天；本地模型固定使用快速版</small></span>
+            <select id="onlinePromptMode">
+              <option value="original">原始完整版本（默认）</option>
+              <option value="abstract">抽象人格版本（减少直播流程资料）</option>
+            </select>
+          </label>
+
           <div id="deepseekKeyFields" class="text-provider-fields">
             <label>
               <span>DeepSeek API Key<small>DeepSeek 文字、看图或本地语音对话使用</small></span>
@@ -85,6 +93,7 @@
                 <option value="qwen3:8b">qwen3:8b（更快，低配优先）</option>
                 <option value="qwen3:4b">qwen3:4b（极速，可能 hold 不住复杂人设）</option>
                 <option value="qwen3:32b">qwen3:32b（更强，需更大显存/内存）</option>
+                <option value="ornith-1.5:9b">ornith-1.5:9b（默认开启思考）</option>
               </select>
             </label>
             <div class="model-actions">
@@ -100,7 +109,7 @@
           </div>
 
           <label>
-            <span>推理偏好<small>DeepSeek Flash / Pro 与本地 Qwen3 适用；Vision 实验模型自行管理</small></span>
+            <span>推理偏好<small>DeepSeek 与本地文字模型适用；切换 Ornith 时默认开启，可手动关闭测试</small></span>
             <select id="reasoningMode">
               <option value="off">关闭（响应更快）</option>
               <option value="automatic">自动（深话题按需开启）</option>

@@ -223,7 +223,15 @@ async function boot() {
   for (const ms of [50, 200, 500]) {
     setTimeout(refreshPetBounds, ms);
   }
-  listen("stage-resized", () => refreshPetBounds());
+  // 分辨率/缩放变化时，Tauri 端和 WebView CSS viewport 的更新可能不在同一帧；
+  // 同时监听 viewport resize，并在下一帧再校准一次，避免活动范围停留在旧尺寸。
+  const refreshViewportBounds = () => {
+    refreshPetBounds();
+    requestAnimationFrame(refreshPetBounds);
+  };
+  window.addEventListener("resize", refreshViewportBounds);
+  window.visualViewport?.addEventListener("resize", refreshViewportBounds);
+  listen("stage-resized", refreshViewportBounds);
 
   hidden = !!settings.hidden;
   applyHidden(hidden);

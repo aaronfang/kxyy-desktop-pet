@@ -866,3 +866,5 @@ A: 将 `scripts/persona-distill/` 目录整体复制即可——它不依赖项�
 - 2026-07-24 / 0.2.21：CosyVoice + Worklet 新增双向 `provider-pcm-v1`，按官方字段请求 24k raw PCM 并单路有界下发；stream end 精确校验 samples/chunks，失败/取消不进入可听历史。Qwen/legacy/旧端/火山降级不变；真实账号字节序、TTFA 与听感仍待实验。
 - 2026-07-24 / 0.2.20：Worklet-only 本地/CosyVoice 新增双向 `candidate-snapshot-v1`、candidate-bound 精确播放样本快照与 >=1 秒 one-shot 临时打断提示；提示不持久化、不恢复部分文本，legacy/旧端/火山无提示降级。
 - 2026-07-23 / 0.2.19：本地/CosyVoice 实时通话新增可降级的 managed 下行音频身份与严格顺序/样本校验；火山协议、隐藏打断提示、字/音素恢复和真正 TTS streaming 均未改变。
+- 2026-08-23：本地文字聊天改用较短人格提示词和有界 few-shot，在线文字聊天新增可选抽象人格版本；Ornith 1.5 9B 作为 Ollama 可选模型并记录 M4 48GB 可行性边界。关系阶段仍不得由隐藏轮次计数推进，后续只能从可查看、可纠正、有来源的 Memory 事件投影。
+- 2026-08-23：`ai-leads` 增加显式/语义交棒、连续 support 后的有界贡献姿态轮换、静默接话到一次换题的停止阶梯，并协商无文本 `response-finish-v1` 恢复卡住的收尾；状态不进入历史、Memory 或诊断正文。

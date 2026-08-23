@@ -15,6 +15,9 @@ import {
 
 import {
   buildSystemPrompt,
+  buildLocalTextSystemPrompt,
+  buildOnlineAbstractSystemPrompt,
+  buildCompactSystemPrompt,
   buildMessages,
   splitReply,
   sanitizeReply,
@@ -126,6 +129,9 @@ const emit = window.__TAURI__.event.emit;
 const MAX_TURNS = 6; // DeepSeek 等在线：送给模型的最近对话轮数
 /** 本地 Ollama：人设已占 ~5k tokens，轮数再多容易顶穿上下文 → 400；比在线收紧一点。 */
 const LOCAL_MAX_TURNS = 4;
+// 本地 Ollama 的预填充速度明显慢于在线服务；保留 8 组代表性示例即可维持口吻，
+// 避免把完整 50 条 few-shot 与 7k+ 字符人设一起重复送入每轮请求。
+const LOCAL_FEW_SHOT_MESSAGES = 16;
 const STICKER_FREQUENCY = "medium"; // 适中：情绪到位时较常配表情
 const IMAGE_DESCRIBE_MAX_TOKENS = 512;
 const PAT_COOLDOWN_MS = 2500;
@@ -1547,12 +1553,17 @@ async function buildRequestMessages(opts = {}) {
   const profile = activeProfile
     || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings), settings.personaCardId);
   const useUserProfile = settings.loadPersona !== false;
-  const systemPrompt = buildSystemPrompt(assets, {
+  const promptArgs = {
     name: name || null,
     useUserProfile,
     memory: null,
     profile,
-  });
+  };
+  const systemPrompt = settings.textProvider === "local"
+    ? buildLocalTextSystemPrompt(assets, promptArgs)
+    : settings.onlinePromptMode === "abstract"
+      ? buildOnlineAbstractSystemPrompt(assets, promptArgs)
+      : buildSystemPrompt(assets, promptArgs);
   const relationshipMoodPrompt = buildRelationshipMoodHint(
     profile,
     detectShortTermConversationMood(lastRealUserMessage()?.content || ""),
@@ -1703,13 +1714,16 @@ async function buildRequestMessages(opts = {}) {
     if (chatDebugEnabled()) console.log("[web-observations]", { count: observations.length });
   }
   const maxTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
+  const fewShot = settings.textProvider === "local"
+    ? assets.fewShot.slice(0, LOCAL_FEW_SHOT_MESSAGES)
+    : assets.fewShot;
   const stickerFreq = isKxyyPersona(settings.personaCardId) ? STICKER_FREQUENCY : "off";
   const reqDebug = `cardId=${settings.personaCardId} sticker=${stickerFreq} sys=${(systemPrompt || "").substring(0,60)}`;
   console.log("[buildRequestMessages]", reqDebug);
   if (apiDebugMetaEl) { apiDebugMetaEl.textContent = "REQ " + reqDebug; apiDebugMetaEl.title = reqDebug; }
   return buildMessages({
     systemPrompt: systemPrompt + relationshipMoodPrompt + memoryPrompt + webPrompt,
-    fewShot: assets.fewShot,
+    fewShot,
     history,
     maxTurns,
     useLive: true,
@@ -2278,7 +2292,7 @@ async function inferAndPersistTopicPreferences(text) {
   }
 }
 
-/** 组装实时通话用的人设 system_role：复用文字聊天的 buildSystemPrompt + 实时状态，
+/** 组装实时通话用的人设 system_role：复用精简人格层 + 实时状态，
  *  再叠加「语音口语化」提示（说人话、简短、不要括号/表情/贴纸标记）。 */
 function buildRealtimeSystemRoleBase() {
   if (!assets) return "";
@@ -2286,12 +2300,22 @@ function buildRealtimeSystemRoleBase() {
   const profile = activeProfile
     || resolveUserProfile(assets.userProfile, name, buildStoredProfileFromSettings(settings), settings.personaCardId);
   const useUserProfile = settings.loadPersona !== false;
-  let sys = buildSystemPrompt(assets, {
+  let sys = settings.textProvider === "local"
+    ? buildLocalTextSystemPrompt(assets, {
+      name: name || null,
+      profile,
+    })
+    : settings.onlinePromptMode === "abstract"
+      ? buildOnlineAbstractSystemPrompt(assets, {
+        name: name || null,
+        profile,
+      })
+      : buildSystemPrompt(assets, {
     name: name || null,
     useUserProfile,
     memory: null,
     profile,
-  });
+      });
   try {
     const live = computeLiveContext(new Date(), assets.lore, settings.personaCardId);
     if (live) sys += "\n\n" + live;

@@ -770,6 +770,11 @@ function sanitizeRuntimeSummary(runtime) {
       ["empty-confirmed-v1", "none"],
       "none",
     ),
+    responseFinish: safeEnum(
+      value.responseFinish,
+      ["response-finish-v1", "none"],
+      "none",
+    ),
     memoryContext: safeEnum(
       value.memoryContext,
       ["session-start-v1", "turn-final-v1", "none"],
@@ -890,6 +895,8 @@ function sanitizeRecoverySummary(raw) {
     started: count("started"),
     cancelled: count("cancelled"),
     completed: count("completed"),
+    finishStalls: count("finishStalls"),
+    finishRecoveries: count("finishRecoveries"),
   });
 }
 

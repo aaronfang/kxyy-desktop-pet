@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
@@ -25,6 +26,10 @@ const HEALTH_TIMEOUT_MS: u64 = 800;
 /// 拉起 `ollama serve` 后等待端口就绪的上限（秒）；本地首次加载模型可能较久，
 /// 但 serve 本身通常几秒内就会监听端口，这里只等「进程起来」，不等模型加载。
 const START_TIMEOUT_SECS: u64 = 20;
+
+// `ensure()` is called both during setup and on the Tauri run event. Avoid
+// launching two concurrent native warmups for the same model.
+static SCHEDULED_WARMUP_MODEL: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,7 +175,7 @@ pub fn ensure(app: &AppHandle, provider: &str, preferred_model: &str) {
                 models,
             },
         );
-        spawn_warmup(app.clone(), model);
+        schedule_warmup(app.clone(), model);
         return;
     }
 
@@ -242,7 +247,7 @@ pub fn ensure(app: &AppHandle, provider: &str, preferred_model: &str) {
                         models,
                     },
                 );
-                spawn_warmup(app2, model2);
+                schedule_warmup(app2, model2);
                 return;
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -286,6 +291,24 @@ fn warmup_system_prompt() -> String {
 
 /// 后台把模型 + 人设 system prompt 预热进 GPU，避免首条聊天卡在 30s+ 冷预填。
 /// 走 native `/api/chat`：才能真正设置 `keep_alive` / `num_ctx`（`/v1` 会忽略）。
+fn schedule_warmup(app: AppHandle, model: String) {
+    let should_schedule = SCHEDULED_WARMUP_MODEL
+        .lock()
+        .map(|mut scheduled| {
+            if scheduled.as_deref() == Some(model.as_str()) {
+                false
+            } else {
+                *scheduled = Some(model.clone());
+                true
+            }
+        })
+        .unwrap_or(true);
+    if !should_schedule {
+        return;
+    }
+    spawn_warmup(app, model);
+}
+
 fn spawn_warmup(app: AppHandle, model: String) {
     std::thread::spawn(move || {
         let system = warmup_system_prompt();
