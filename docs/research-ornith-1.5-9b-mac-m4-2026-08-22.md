@@ -42,4 +42,3 @@ ollama run ornith-1.5:9b
 - 这是**文本模型**路径的可行替换，不等于已验证 persona 质量、中文风格或 thinking 行为与当前 `qwen3:14b` 一致。
 - Ollama 页面标注支持图片，但本项目的文字模型与本地 VL 模型设置是分开的；要做看图仍应走项目现有 `localVlModel` 路由，不要仅因模型页的 Text/Image 标签就假定所有聊天路径自动支持图片。
 - 官方模型卡的 vLLM/SGLang 推荐启动参数包含 reasoning/tool-call parser；本项目直接依赖 Ollama `/v1` 兼容层，工具调用不是本项目日常文字聊天的必要条件，仍应以本项目实际请求/响应字段为准。
-
