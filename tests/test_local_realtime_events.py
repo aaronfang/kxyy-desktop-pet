@@ -2585,6 +2585,26 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         common.start_llm_stream_producer = fake_start
         common._tts_stream_slots = threading.BoundedSemaphore(common.TTS_STREAM_MAX_TASKS)
 
+    async def test_response_finish_recover_cancels_only_when_all_audio_receipts_arrived(self):
+        await self.session.on_start({
+            "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
+            "responseFinish": [common.RESPONSE_FINISH_CAPABILITY],
+        })
+        self.assertEqual(self.session.response_finish, common.RESPONSE_FINISH_CAPABILITY)
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+        self.session._pending_playback_segments.add((scope.generation, 1))
+        await self.session.on_response_finish_recover({"generation": scope.generation})
+        self.assertTrue(scope.active)
+
+        self.session._pending_playback_segments.clear()
+        await self.session.on_response_finish_recover({"generation": scope.generation})
+        self.assertFalse(scope.active)
+        self.assertEqual(
+            self.ws.json_messages()[-1]["type"],
+            "response_finish_recovered",
+        )
+
     def test_realtime_stream_pacer_uses_the_source_audio_clock(self):
         one_second = common.OUTPUT_RATE
         self.assertAlmostEqual(common.realtime_stream_pacing_delay(one_second, 0.25), 0.75)
@@ -2620,6 +2640,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(common.classify_realtime_conversation_turn(text), expected)
 
         soft_cases = [
+            ("倒也没啥安排，还不知道干嘛呢", "handoff"),
+            ("你今天有啥新鲜事啊", "handoff"),
+            ("今天你来当主持人", "none"),
+            ("我负责听，你负责说", "none"),
+            ("你随便挑个话头", "none"),
             ("我想听听你是怎么想的", "invite-opinion"),
             ("你怎么看？", "invite-opinion"),
             ("我也不知道，你觉得我该怎么办", "invite-advice"),
@@ -2690,13 +2715,57 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         rendered = next(
             content for content in system_contents if content.startswith("本轮对话节奏")
         )
-        self.assertEqual(rendered, common.format_turn_strategy_hint(strategy))
+        self.assertEqual(
+            rendered,
+            common.format_turn_strategy_hint(strategy, semantic_handoff=True),
+        )
         self.assertIn("贡献具体内容", rendered)
         self.assertIn("低负担", rendered)
         self.assertIn("当前语义深度", rendered)
         self.assertNotIn("渐进深度", rendered)
         self.assertNotIn("简短回应", rendered)
         self.assertFalse(any(message.get("content") == rendered for message in session.history))
+
+    async def test_semantic_handoff_fallback_is_only_on_directed_reactive_turn(self):
+        captured = []
+        common._synth_tts = lambda _text: b"unused"
+
+        def capture(_role, history, _text, _scope, out):
+            captured.append([dict(message) for message in history])
+            out.put_nowait({"type": "done"})
+
+        common.start_llm_stream_producer = capture
+        session = common.Session(FakeWebSocket())
+        session.proactive_turn = common.PROACTIVE_TURN_CAPABILITY
+        scope = session._new_scope("response")
+        session.response_scope = scope
+        strategy = {
+            "move": "respond",
+            "responseCue": "none",
+            "stance": "support",
+            "reasoningPolicy": "fast",
+            "depth": 0,
+        }
+        await session._reply_pipeline("今天你来当主持人", scope, turn_strategy=strategy)
+        rendered = "\n".join(
+            message["content"] for message in captured[0] if message["role"] == "system"
+        )
+        self.assertIn("不要依赖固定关键词", rendered)
+        self.assertIn("连续贡献至少两个", rendered)
+
+        captured.clear()
+        scope = session._new_scope("response")
+        session.response_scope = scope
+        await session._reply_pipeline(
+            "",
+            scope,
+            proactive_kind="followup",
+            turn_strategy=strategy,
+        )
+        proactive_rendered = "\n".join(
+            message["content"] for message in captured[0] if message["role"] == "system"
+        )
+        self.assertNotIn("不要依赖固定关键词", proactive_rendered)
 
     async def test_runtime_thinking_filler_is_bounded_ephemeral_and_skips_when_content_starts(self):
         original_delay = common.THINKING_FILLER_DELAY_SECONDS
@@ -2951,6 +3020,15 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("你先忙", common.CONTINUE_CONVERSATION_SUFFIX)
         self.assertIn("不可兑现", common.CONTINUE_CONVERSATION_SUFFIX)
         self.assertIn("现实中正在", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("3~5 句", common.CONTINUE_CONVERSATION_SUFFIX)
+        self.assertIn("不要在首句复述", common.CONTINUE_CONVERSATION_SUFFIX)
+
+    def test_opening_style_is_allowlisted_and_avoids_one_fixed_call_check(self):
+        rendered = common.format_opening_style_hint("topic-first")
+        self.assertIn("马上由你先抛出", rendered)
+        self.assertIn("能否听见", rendered)
+        self.assertEqual(common.format_opening_style_hint("injected-private-style"), "")
+        self.assertEqual(common.format_opening_style_hint(["topic-first"]), "")
 
     def test_default_support_strategy_contributes_without_parroting_or_closing(self):
         rendered = common.format_turn_strategy_hint({
@@ -2962,6 +3040,20 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertIn("不要同义复述", rendered)
         self.assertIn("不要替双方结束", rendered)
+
+    def test_semantic_handoff_fallback_is_same_request_and_excludes_proactive_turns(self):
+        strategy = {
+            "move": "expand",
+            "responseCue": "none",
+            "stance": "support",
+            "reasoningPolicy": "fast",
+            "depth": 0,
+        }
+        rendered = common.format_turn_strategy_hint(strategy, semantic_handoff=True)
+        self.assertIn("不要依赖固定关键词", rendered)
+        self.assertIn("连续贡献至少两个", rendered)
+        self.assertIn("不要反问用户想聊什么", rendered)
+        self.assertNotIn(common.SEMANTIC_HANDOFF_HINT, common.format_turn_strategy_hint(strategy))
 
     def test_agency_stance_hints_preserve_persona_facts_and_forbid_fake_experience(self):
         for stance in ("opine", "contrast", "lead"):

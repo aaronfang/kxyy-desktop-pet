@@ -649,6 +649,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
     interruptionRecovery: "empty-confirmed-v1",
+    responseFinish: "none",
     memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
     asr: {
@@ -727,6 +728,8 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     started: 3,
     cancelled: 0,
     completed: 0,
+    finishStalls: 0,
+    finishRecoveries: 0,
   });
   assert.deepEqual(report.aggregate.turnStrategy, {
     moves: { respond: 1, expand: 255, deepen: 0, associate: 0, recover: 0 },
@@ -857,6 +860,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     ttsStream: "none",
     interruptionHint: "none",
     interruptionRecovery: "none",
+    responseFinish: "none",
     memoryContext: "none",
     vadShadow: "disabled",
     asr: {
@@ -1251,6 +1255,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     ttsStream: "provider-pcm-v1",
     interruptionHint: "candidate-snapshot-v1",
     interruptionRecovery: "empty-confirmed-v1",
+    responseFinish: "none",
     memoryContext: "turn-final-v1",
     vadShadow: "disabled",
     asr: {
@@ -1773,8 +1778,19 @@ test("proactive welcome is one-shot, negotiated and cancelled by user speech", a
   );
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual(
-    active.socket.sent.filter((message) => message.type === "proactive_turn"),
-    [{ type: "proactive_turn", triggerId: 1, kind: "welcome", reasoningPolicy: "fast" }],
+    active.socket.sent.filter((message) => message.type === "proactive_turn")
+      .map(({ openingStyle, ...message }) => ({
+        ...message,
+        openingStyleAllowed: ["warm-direct", "context-first", "playful", "topic-first"]
+          .includes(openingStyle),
+      })),
+    [{
+      type: "proactive_turn",
+      triggerId: 1,
+      kind: "welcome",
+      reasoningPolicy: "fast",
+      openingStyleAllowed: true,
+    }],
   );
   active.session._scheduleProactiveWelcome();
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1909,6 +1925,8 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
     started: 1,
     cancelled: 0,
     completed: 1,
+    finishStalls: 0,
+    finishRecoveries: 0,
   });
   assert.deepEqual(snapshot.turnStrategySummary, {
     moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 1 },
@@ -2065,6 +2083,13 @@ test("realtime proactive policy classifies explicit controls without model infer
   }
 
   const softCases = [
+    ["倒也没啥安排，还不知道干嘛呢", "handoff"],
+    ["你今天有啥新鲜事啊", "handoff"],
+    ["给我推荐几个", "handoff"],
+    ["随便聊点什么都行", "handoff"],
+    ["今天你来当主持人", "none"],
+    ["我负责听，你负责说", "none"],
+    ["你随便挑个话头", "none"],
     ["我想听听你是怎么想的", "invite-opinion"],
     ["你怎么看？", "invite-opinion"],
     ["我也不知道，你觉得我该怎么办", "invite-advice"],
@@ -2090,6 +2115,33 @@ test("realtime proactive policy classifies explicit controls without model infer
   assert.equal(classifyRealtimeTopicActivity("我现在肚子疼", "substantive", false), "sensitive");
 });
 
+test("first call-check turn sends one allow-listed opening style", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({ provider: "local", conversationMode: "ai-leads" });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._memoryContextMode = "turn-final-v1";
+
+  for (const [generation, text] of [[1, "喂，能听见吗？"], [2, "今天没什么安排"]]) {
+    session._backendGeneration = generation;
+    session._userTurnOpen = true;
+    session._onMessage({
+      data: JSON.stringify({ type: "asr", text, interim: false, generation }),
+    });
+    assert.equal(session.sendMemoryContext({ generation, items: [] }), true);
+  }
+
+  const contexts = sent.filter((message) => message.type === "memory_context");
+  assert.equal(
+    ["warm-direct", "context-first", "playful", "topic-first"]
+      .includes(contexts[0].openingStyle),
+    true,
+  );
+  assert.equal("openingStyle" in contexts[1], false);
+});
+
 test("ai-leads schedules bounded strategy-aware followups from audible playback", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   globalThis.WebSocket = { OPEN: 1 };
@@ -2105,15 +2157,20 @@ test("ai-leads schedules bounded strategy-aware followups from audible playback"
   session._proactiveTurnMode = "local-v1";
   session._proactiveWelcomeSent = true;
 
-  session._proactivePending.set(1, "welcome");
-  session._noteProactiveStatus({ triggerId: 1, state: "accepted", generation: 1 });
+  session._conversationDirector.dispatch({
+    type: "user-turn-final",
+    policy: "substantive",
+    softIntent: "none",
+  });
+  session._proactivePending.set(1, "followup");
+  session._conversationDirector.delays.silentTopicSwitch = 0;
   session._assistantActive = false;
   session._scheduleTopicLeadAfterPlayback(1);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.at(-1).kind, "followup");
   assert.deepEqual(sent.at(-1).turnStrategy, {
-    move: "expand",
-    responseCue: "none",
+    move: "respond",
+    responseCue: "low-burden",
     stance: "support",
     reasoningPolicy: "fast",
     depth: 0,
@@ -2127,13 +2184,37 @@ test("ai-leads schedules bounded strategy-aware followups from audible playback"
   session._assistantActive = false;
   session._scheduleTopicLeadAfterPlayback(2);
   await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(sent.at(-1).kind, "followup");
+  assert.equal(sent.at(-1).kind, "idle");
   assert.deepEqual(sent.at(-1).turnStrategy, {
-    move: "respond",
-    responseCue: "low-burden",
+    move: "expand",
+    responseCue: "none",
     stance: "support",
     reasoningPolicy: "fast",
     depth: 0,
+  });
+  session._noteProactiveStatus({
+    triggerId: sent.at(-1).triggerId,
+    state: "accepted",
+    generation: 3,
+  });
+  assert.deepEqual(session._conversationDirector.snapshot(), {
+    mode: "ai-leads",
+    lifecycle: "active",
+    paused: false,
+    proactiveTurns: 2,
+    lowInterestTurns: 0,
+    sameTopicContinuations: 0,
+    silentProactiveTurns: 2,
+    lastProactiveKind: "idle",
+    lastMove: "expand",
+    lastResponseCue: "none",
+    depth: 0,
+    initiativeDebt: 0,
+    topicTurns: 0,
+    lateralMoves: 0,
+    lateralRecoveryTurns: 0,
+    lateralCooldownTurns: 0,
+    topicActivity: { active: 0, neutral: 1, settling: 0, sensitive: 0 },
   });
   assert.deepEqual(session.getTraceSnapshot().turnStrategySummary, {
     moves: { respond: 1, expand: 1, deepen: 0, associate: 0, recover: 0 },
@@ -2151,16 +2232,11 @@ test("ai-leads schedules bounded strategy-aware followups from audible playback"
     },
   });
 
-  session._noteProactiveStatus({
-    triggerId: sent.at(-1).triggerId,
-    state: "accepted",
-    generation: 3,
-  });
   session._assistantActive = false;
   session._scheduleTopicLeadAfterPlayback(3);
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(sent.filter((message) => message.type === "proactive_turn").length, 2);
-  assert.equal(session.getTraceSnapshot().proactiveSummary.topicSwitches, 0);
+  assert.equal(session.getTraceSnapshot().proactiveSummary.topicSwitches, 1);
 
   session._applyUserTurnPolicy("pause");
   session._scheduleTopicLeadAfterPlayback(4);
@@ -2208,6 +2284,35 @@ test("managed playback schedules proactive speech once from final audible drain"
   session._schedulePlaybackCompletion();
   await new Promise((resolve) => setTimeout(resolve, 750));
   assert.equal(schedules, 1, "duplicate drained notices must not restart the silence window");
+});
+
+test("managed response finish watchdog recovers a missing tts_end after playback drain", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    conversationMode: "ai-leads",
+    responseFinishWatchdogMs: 0,
+  });
+  session.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  session._downlinkAudioMode = "managed-v1";
+  session._responseFinishMode = "response-finish-v1";
+  session._backendGeneration = 2;
+  session._backendAudioPending = true;
+  session._assistantActive = false;
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant_end", generation: 2 }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(sent.at(-1), { type: "response_finish_recover", generation: 2 });
+
+  session._onMessage({
+    data: JSON.stringify({ type: "response_finish_recovered", state: "recovered", generation: 2 }),
+  });
+  assert.equal(session._backendAudioPending, false);
+  assert.equal(session.getTraceSnapshot().recoverySummary.finishRecoveries, 1);
 });
 
 test("balanced allows one proactive turn after user engagement", async () => {
@@ -3079,6 +3184,114 @@ test("managed audio completes a receipt and a later generation recovers after in
     { text: "恢复后完整播完。", generation: 2, segmentId: 1 },
   ]);
   assert.equal(JSON.stringify(sent).includes("恢复后"), false);
+});
+
+test("an open user turn rejects late response output until the backend generation advances", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const commands = [];
+  const assistant = [];
+  const session = new RealtimeSession({
+    provider: "voxcpm",
+    onAssistant: (text) => assistant.push(text),
+  });
+  session.audioCtx = { state: "running" };
+  session.playbackNode = { port: { postMessage: (message) => commands.push(message) } };
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      downlinkAudio: "managed-v1",
+      ttsStream: "provider-pcm-v1",
+    }),
+  });
+  session.trace.startSession();
+  session._backendGeneration = 4;
+  session.trace.openTurn();
+  session.trace.startResponse();
+
+  // The backend reports speech onset before final ASR allocates generation 5.
+  session._onMessage({ data: JSON.stringify({ type: "asr_start" }) });
+  assert.equal(session.trace.state.response, "cancelled");
+
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant", generation: 4, text: "用户开口后迟到的旧回复。" }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "tts_start", generation: 4 }) });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 4,
+      segmentId: 1,
+      text: "被打断后没有发出音频的旧回复。",
+      streaming: true,
+    }),
+  });
+
+  assert.deepEqual(assistant, []);
+  assert.equal(commands.some((message) => message.type === "segment_start"), false);
+
+  session._onMessage({
+    data: JSON.stringify({ type: "asr", text: "新的用户输入", interim: false, generation: 5 }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 5 }) });
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant", generation: 5, text: "新回复应当正常显示。" }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 5,
+      segmentId: 1,
+      text: "新回复应当正常播放。",
+      streaming: true,
+    }),
+  });
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 5,
+      segmentId: 1,
+      chunkSequence: 0,
+      payloadSamples: 3,
+      pcm: new Int16Array([1, 2, 3]),
+    }),
+  });
+
+  assert.deepEqual(
+    commands.filter((message) => message.type === "segment_start").map((message) => [
+      message.generation,
+      message.segmentId,
+    ]),
+    [[5, 1]],
+  );
+  assert.deepEqual(assistant, ["新回复应当正常显示。"]);
+  assert.equal(commands.some((message) => message.type === "audio"), true);
+});
+
+test("a rejected user turn reopens late output from the interrupted generation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const assistant = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    onAssistant: (text) => assistant.push(text),
+  });
+  session._downlinkAudioMode = "managed-v1";
+  session._backendGeneration = 7;
+  session.trace.startSession();
+  session.trace.openTurn();
+  session.trace.startResponse();
+
+  session._onMessage({ data: JSON.stringify({ type: "asr_start" }) });
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant", generation: 7, text: "暂时屏蔽。" }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "speech_rejected" }) });
+  session._onMessage({
+    data: JSON.stringify({ type: "assistant", generation: 7, text: "误判后继续。" }),
+  });
+
+  assert.deepEqual(assistant, ["误判后继续。"]);
 });
 
 test("managed suspended-queue overflow never delivers partial segment audio", async () => {

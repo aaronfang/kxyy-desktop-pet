@@ -57,8 +57,10 @@ VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安
 ### 文字和图片
 
 - **DeepSeek**：默认文字服务，自动模型默认使用 `deepseek-v4-flash`，思考开关独立控制；`deepseek-v4-pro` 与 `deepseek-v4-flash-vision-exp` 可显式选择。Vision Exp 由它处理全部文字和图片并生成最终回复。
-- **Ollama**：本地文字服务；默认推荐 `qwen3:14b`，也可使用 `qwen3:8b`、`qwen3:32b` 或其它 tag。
+- **Ollama**：本地文字服务；默认推荐 `qwen3:14b`，也可使用 `qwen3:8b`、`qwen3:32b`、`ornith-1.5:9b` 或其它 tag。Ornith 默认开启思考，M4 48GB 的容量与接口核对见 [Ornith 可行性调查](docs/research-ornith-1.5-9b-mac-m4-2026-08-22.md)。
 - **通义千问 VL**：Flash / Pro 或本地文字模型发送图片时可用于生成图片描述，需要 DashScope Key；选择 DeepSeek Vision 文字模型时不使用。
+
+在线文字聊天可在设置中选择原始完整人格提示词，或选择去掉直播流程资料的抽象人格版本；本地文字模型固定使用较短提示词和有界 few-shot，以减少每轮预填充延迟。
 - **播放音量**：朗读与通话共用 `0–200%` 音量设置，`100%` 为原始音量。
 
 ### 近期互联网话题

@@ -199,6 +199,7 @@ pub fn load_card_from_file(card_id: &str, resource_dir: &PathBuf) -> Result<(), 
 
     // 转为前端 loadAssets() 期望的格式
     let assets = serde_json::json!({
+        "identity": card.get("identity").cloned().unwrap_or(serde_json::json!({})),
         "systemPrompt": card.get("system_prompt").and_then(|v| v.as_str()).unwrap_or(""),
         "fewShot": card.get("few_shot").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
         "userProfile": user_profile,

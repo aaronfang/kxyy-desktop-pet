@@ -77,8 +77,21 @@ const MANAGED_AUDIO_CHUNK_MAX_SAMPLES = (OUTPUT_RATE * 80) / 1000;
 const MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750;
 const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
+const RESPONSE_FINISH_CAPABILITY = "response-finish-v1";
+const RESPONSE_FINISH_WATCHDOG_MS = 12000;
 const STREAMING_PLAYBACK_STARTUP_MS = 240;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
+const RESPONSE_OUTPUT_TYPES = new Set([
+  "assistant",
+  "assistant_end",
+  "thinking_filler",
+  "tts_start",
+  "tts_end",
+  "audio_segment_start",
+  "audio_segment_end",
+  "speaking",
+  "error",
+]);
 const INTERRUPTION_RECOVERY_CAPABILITY = "empty-confirmed-v1";
 const INTERRUPTION_RECOVERY_GRACE_MS = 4500;
 const INTERRUPTION_RECOVERY_DEFER_MS = 250;
@@ -101,10 +114,24 @@ const VAD_SHADOW_FINAL_WAIT_MS = 50;
 const MAX_TOPIC_KEY_CHARS = 64;
 const MAX_TOPICS_USED = 8;
 const PROACTIVE_KINDS = new Set(["welcome", "followup", "idle", "revisit", "memory", "commitment"]);
+const OPENING_STYLES = Object.freeze([
+  "warm-direct",
+  "context-first",
+  "playful",
+  "topic-first",
+]);
+let openingStyleCursor = Math.floor(Math.random() * OPENING_STYLES.length);
+
+function nextOpeningStyle() {
+  const style = OPENING_STYLES[openingStyleCursor % OPENING_STYLES.length];
+  openingStyleCursor = (openingStyleCursor + 1) % OPENING_STYLES.length;
+  return style;
+}
 
 const PAUSE_TURN_RE = /^(?:安静(?:一会儿|一下|会儿)?|先别说(?:话)?|不要说(?:话)?|暂停(?:一下)?|停一下|先停一下|让我想想|让我静静|我想静静|等一下|稍等(?:一下)?|你先听我说|先听我说|让我先(?:说|讲)(?:完)?|等我(?:说|讲)完|先不跟你聊(?:了|啦)?(?:[，,、\s]+我先吃了?(?:啊|呀)?)?|不跟你聊(?:了|啦)?|先吃饭(?:了|啦)?|我先(?:去)?吃饭(?:了|啦)?|我先忙(?:一会儿|一下)?|回头再聊)$/;
 const REDIRECT_TURN_RE = /(?:换个?话题|换一个话题|聊点别的|聊别的|别聊这个|不聊这个|说点别的|跳过这个|不说这个)/;
 const FAST_SOCIAL_TURN_RE = /^(?:你好|嗨|哈喽|早上好|早安|晚上好|晚安|拜拜|再见|回头聊|下次聊)[啊呀哈啦～~！!。.]*$/;
+const CALL_OPENING_RE = /^(?:喂[，,、\s]*)?(?:在吗|能听见吗|听得见吗|能听到吗|听得到吗|听见了吗|听到了吗)[啊呀呢嘛～~！!？?。.]*$/;
 const REASONING_ANAPHORA_RE = /(?:这件事|这个|这点|刚才|前面|还有|确实|顾虑|慢慢(?:看|想)|先看看|那(?:个|件|种)?)/;
 const RESUME_TURN_RE = /^(?:继续(?:说|讲|聊)?(?:吧)?|你继续(?:说|讲|聊)?(?:吧)?|接着(?:说|讲|聊)?(?:吧)?|你说吧|可以继续了|好了继续)$/;
 const ACKNOWLEDGE_TURN_RE = /^(?:嗯+|嗯呐|嗯哪|哦+|啊+|好+|好的|行+|明白了?|知道了|原来如此|收到)$/;
@@ -118,6 +145,7 @@ const INVITE_OPINION_RE = /你(?:是)?怎么(?:看|想)(?:的)?|你有(?:什么|
 const DEEPEN_RE = /深入(?:点|一点)?.{0,6}(?:聊|说|讲)|聊深(?:点|一点)|多(?:说|讲|聊)(?:点|一点|一些)|展开(?:说|讲|聊)|详细(?:说|讲|聊)/;
 const LIGHTEN_RE = /轻松(?:点|一点)|别(?:聊|说)得?这么沉重|聊点轻松的/;
 const CONCRETIZE_RE = /(?:说|讲)具体(?:点|一点)|举个例子|比如呢|说清楚(?:点|一点)?/;
+const HANDOFF_RE = /(?:不知道(?:聊|说|干|做)什么|不知道(?:该)?干嘛|没啥安排|没什么安排|你(?:来|说|讲|推荐|挑|选)(?:一个|几个|点|点儿|点什么|吧)|给我推荐(?:一个|几个|点|点儿)|随便聊(?:点|点儿|什么)?|聊什么都行|你.{0,6}(?:有啥|有什么)新鲜事)/;
 const SETTLING_TOPIC_RE = /就是这个道理|反正|总归|就这样|先这样|不说这个|先不说|准备(?:准备)?(?:去|开播|开始)|那就(?:这么|这样)|行了行了|大不了/;
 const ACTIVE_TOPIC_RE = /[?？]|为什么|怎么(?:办|样|说)|会不会|能不能|要不要|该不该|如果|万一|紧张|担心|拿不准|没底|不知道/;
 
@@ -140,6 +168,7 @@ export function classifyRealtimeConversationTurn(text) {
 export function classifyRealtimeSoftIntent(text) {
   const value = String(text || "").trim();
   if (!value || classifyRealtimeConversationTurn(value) !== "substantive") return "none";
+  if (HANDOFF_RE.test(value)) return "handoff";
   if (INVITE_ADVICE_RE.test(value)) return "invite-advice";
   if (INVITE_OPINION_RE.test(value)) return "invite-opinion";
   if (DEEPEN_RE.test(value)) return "deepen";
@@ -388,6 +417,7 @@ export class RealtimeSession {
     proactiveIdleDelayMs,
     interruptionRecoveryGraceMs,
     interruptionRecoveryDeferMs,
+    responseFinishWatchdogMs,
     thinkingFeedbackDelayMs,
     maxTraceEvents = 256,
     onTrace,
@@ -447,8 +477,12 @@ export class RealtimeSession {
     this._speechCandidate = false;
     this._candidateInterruptsResponse = false;
     this._playbackDrainTimer = 0;
+    this._responseFinishTimer = 0;
+    this._responseFinishGeneration = null;
+    this._responseFinishRecoveryPending = false;
     this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
     this._backendGeneration = 0;
+    this._interruptedResponseGeneration = null;
     this._lastDurableAudibleGeneration = null;
     this._traceAsrFinalSeen = false;
     this._currentAudioSegment = null;
@@ -458,6 +492,10 @@ export class RealtimeSession {
     this._ttsStreamingMode = "none";
     this._interruptionHintMode = "none";
     this._interruptionRecoveryMode = "none";
+    this._responseFinishMode = "none";
+    this._responseFinishWatchdogMs = Number.isFinite(responseFinishWatchdogMs)
+      ? Math.max(0, responseFinishWatchdogMs)
+      : RESPONSE_FINISH_WATCHDOG_MS;
     this._memoryContextMode = "none";
     this._temporalContextMode = "none";
     this._freshTopicMode = "none";
@@ -488,6 +526,8 @@ export class RealtimeSession {
       started: 0,
       cancelled: 0,
       completed: 0,
+      finishStalls: 0,
+      finishRecoveries: 0,
     };
     this._turnStrategySummary = {
       moves: { respond: 0, expand: 0, deepen: 0, associate: 0, recover: 0 },
@@ -591,6 +631,9 @@ export class RealtimeSession {
       rhythmStops: 0,
     };
     this._sessionStarted = false;
+    this._openingStyle = nextOpeningStyle();
+    this._openingStyleGeneration = null;
+    this._userFinalTurns = 0;
     this._startMessage = null;
     this._recoveryInFlight = false;
     this._recoveryAttempt = 0;
@@ -739,6 +782,7 @@ export class RealtimeSession {
           cascadeCapabilities.freshTopic = [FRESH_TOPIC_CAPABILITY];
           cascadeCapabilities.pendingTurnResume = [PENDING_TURN_RESUME_CAPABILITY];
           cascadeCapabilities.interruptionRecovery = [INTERRUPTION_RECOVERY_CAPABILITY];
+          cascadeCapabilities.responseFinish = [RESPONSE_FINISH_CAPABILITY];
         }
         if (
           usesManagedCascade(this.trace.provider) &&
@@ -944,6 +988,7 @@ export class RealtimeSession {
 
   _prepareTransportRecovery() {
     this._cancelInterruptionRecovery();
+    this._clearResponseFinishWatchdog();
     const staleSocket = this.ws;
     this.ws = null;
     try {
@@ -960,6 +1005,7 @@ export class RealtimeSession {
     }
     this._sessionStarted = false;
     this._backendGeneration = 0;
+    this._interruptedResponseGeneration = null;
     this._backendAudioPending = false;
     this._assistantActive = false;
     this._lastAudibleGeneration = null;
@@ -1038,6 +1084,7 @@ export class RealtimeSession {
       case "session":
         if (msg.state === "started") {
           this._sessionStarted = true;
+          this._interruptedResponseGeneration = null;
           this._memoryContextMode =
             [SESSION_MEMORY_CAPABILITY, TURN_MEMORY_CAPABILITY].includes(msg.memoryContext)
               ? msg.memoryContext
@@ -1095,6 +1142,11 @@ export class RealtimeSession {
             msg.interruptionRecovery === INTERRUPTION_RECOVERY_CAPABILITY
               ? INTERRUPTION_RECOVERY_CAPABILITY
               : "none";
+          this._responseFinishMode =
+            this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY &&
+            msg.responseFinish === RESPONSE_FINISH_CAPABILITY
+              ? RESPONSE_FINISH_CAPABILITY
+              : "none";
           this._vadShadowMode =
             msg.vadShadow === undefined
               ? "disabled"
@@ -1142,6 +1194,7 @@ export class RealtimeSession {
         if (this._confirmSpeech(msg)) this.cb.onAsrStart?.();
         break;
       case "speech_rejected":
+        this._interruptedResponseGeneration = null;
         this._rejectSpeech(msg.reason || "voice_rejected");
         break;
       case "endpoint_soft_end":
@@ -1176,6 +1229,15 @@ export class RealtimeSession {
           this._pendingUserTurn = true;
           this._traceAsrFinalSeen = true;
           this._latestFinalAsr = msg.text || "";
+          const finalAsrText = this._latestFinalAsr.trim();
+          if (
+            this._userFinalTurns === 0 &&
+            finalAsrText &&
+            (FAST_SOCIAL_TURN_RE.test(finalAsrText) || CALL_OPENING_RE.test(finalAsrText))
+          ) {
+            this._openingStyleGeneration = this._backendGeneration;
+          }
+          if (finalAsrText) this._userFinalTurns += 1;
           if (this._latestFinalAsr.trim()) {
             this._confirmedInterruptionEligible = false;
             this._cancelInterruptionRecovery();
@@ -1343,11 +1405,15 @@ export class RealtimeSession {
       }
       case "assistant_end":
         this._assistantActive = false;
+        this._armResponseFinishWatchdog(msg.generation);
         this.trace.recordOnce("llm_response", TRACE_EVENT.LLM_RESPONSE);
         if (this.trace.mode === "end_to_end") {
           this.trace.recordOnce("tts_request", TRACE_EVENT.TTS_REQUEST);
         }
         this.cb.onAssistantEnd?.();
+        break;
+      case "response_finish_recovered":
+        this._onResponseFinishRecovered(msg);
         break;
       case "assistant_discarded":
         if (!usesManagedCascade(this.trace.provider)) break;
@@ -1389,6 +1455,7 @@ export class RealtimeSession {
         break;
       case "tts_end":
         this._backendAudioPending = false;
+        this._clearResponseFinishWatchdog();
         if (!this._hasPlayback()) this._schedulePlaybackCompletion();
         break;
       case "audio_segment_start":
@@ -1410,6 +1477,7 @@ export class RealtimeSession {
         break;
       case "error":
         this._endThinkingFeedback();
+        this._clearResponseFinishWatchdog();
         this._backendAudioPending = false;
         if (this.trace.responseId && this.trace.state.response === "active") {
           this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "error" });
@@ -1494,6 +1562,9 @@ export class RealtimeSession {
         generation === this._pendingTurnStrategyGeneration
         ? sanitizeTurnStrategy(this._pendingTurnStrategy)
         : null;
+      const openingStyle = generation === this._openingStyleGeneration
+        ? this._openingStyle
+        : null;
       const reasoningDecision = this._pendingMemoryContextReason === "proactive-topic"
         ? { policy: "fast", source: "fast-control" }
         : this._pendingReasoningDecision;
@@ -1515,6 +1586,7 @@ export class RealtimeSession {
         items: safe,
         ...(temporal ? { temporalContext: temporal } : {}),
         ...(turnStrategy ? { turnStrategy } : {}),
+        ...(openingStyle ? { openingStyle } : {}),
         reasoningPolicy,
         ...(safeFreshTopics.length ? { freshTopics: safeFreshTopics } : {}),
       }));
@@ -1523,6 +1595,7 @@ export class RealtimeSession {
           includeReasoning: !this._reasoningPolicyGenerations.has(generation),
         });
       }
+      if (openingStyle) this._openingStyleGeneration = null;
       if (!this._reasoningPolicyGenerations.has(generation)) {
         this._noteReasoningSource(reasoningDecision?.source);
       }
@@ -2028,6 +2101,7 @@ export class RealtimeSession {
       type: "proactive_turn",
       triggerId,
       kind,
+      ...(kind === "welcome" ? { openingStyle: this._openingStyle } : {}),
       reasoningPolicy: reasoningDecision.policy,
       ...(safeStrategy ? { turnStrategy: safeStrategy } : {}),
       ...(topicRevisit ? { topicRevisit } : {}),
@@ -2350,6 +2424,66 @@ export class RealtimeSession {
     this._scheduleTopicLeadAfterPlayback(generation);
   }
 
+  _clearResponseFinishWatchdog() {
+    if (this._responseFinishTimer) clearTimeout(this._responseFinishTimer);
+    this._responseFinishTimer = 0;
+    this._responseFinishGeneration = null;
+    this._responseFinishRecoveryPending = false;
+  }
+
+  _armResponseFinishWatchdog(generation) {
+    if (
+      this._responseFinishMode !== RESPONSE_FINISH_CAPABILITY ||
+      !Number.isSafeInteger(generation) ||
+      generation !== this._backendGeneration
+    ) return;
+    this._clearResponseFinishWatchdog();
+    this._responseFinishGeneration = generation;
+    this._responseFinishTimer = setTimeout(() => {
+      this._responseFinishTimer = 0;
+      if (
+        this.stopped ||
+        this._responseFinishRecoveryPending ||
+        !this._backendAudioPending ||
+        this._assistantActive ||
+        this._hasPlayback() ||
+        this._currentAudioSegment !== null ||
+        [...this._audioSegments.values()].some(
+          (segment) => segment.generation === generation && !segment.dropped && !segment.completed,
+        ) ||
+        generation !== this._backendGeneration ||
+        !this.ws ||
+        this.ws.readyState !== WebSocket.OPEN
+      ) return;
+      this._responseFinishRecoveryPending = true;
+      this._interruptionRecoverySummary.finishStalls = Math.min(
+        255,
+        this._interruptionRecoverySummary.finishStalls + 1,
+      );
+      this.ws.send(JSON.stringify({
+        type: "response_finish_recover",
+        generation,
+      }));
+    }, this._responseFinishWatchdogMs);
+  }
+
+  _onResponseFinishRecovered(msg) {
+    if (
+      this._responseFinishMode !== RESPONSE_FINISH_CAPABILITY ||
+      msg.state !== "recovered" ||
+      msg.generation !== this._responseFinishGeneration ||
+      msg.generation !== this._backendGeneration
+    ) return;
+    this._clearResponseFinishWatchdog();
+    this._interruptionRecoverySummary.finishRecoveries = Math.min(
+      255,
+      this._interruptionRecoverySummary.finishRecoveries + 1,
+    );
+    this._backendAudioPending = false;
+    this._assistantActive = false;
+    if (!this._hasPlayback()) this._schedulePlaybackCompletion();
+  }
+
   _acceptCandidateSnapshot(message) {
     if (
       this._interruptionHintMode !== INTERRUPTION_HINT_CAPABILITY ||
@@ -2424,6 +2558,19 @@ export class RealtimeSession {
     const generation = msg.generation;
     if (!Number.isSafeInteger(generation) || generation < 0) return false;
     if (generation < this._backendGeneration) return false;
+    if (
+      this._interruptedResponseGeneration !== null &&
+      generation > this._interruptedResponseGeneration
+    ) {
+      this._interruptedResponseGeneration = null;
+    }
+    if (
+      this._interruptedResponseGeneration !== null &&
+      generation <= this._interruptedResponseGeneration &&
+      RESPONSE_OUTPUT_TYPES.has(msg.type)
+    ) {
+      return false;
+    }
     if (
       this._pendingInterruptionRecovery &&
       !this._pendingInterruptionRecovery.started &&
@@ -2500,6 +2647,9 @@ export class RealtimeSession {
       managed &&
       this._ttsStreamingMode === TTS_STREAMING_CAPABILITY &&
       msg.streaming === true;
+    if (generation === this._responseFinishGeneration) {
+      this._armResponseFinishWatchdog(generation);
+    }
     if (
       !Number.isSafeInteger(generation) ||
       generation < 0 ||
@@ -2662,6 +2812,9 @@ export class RealtimeSession {
     this._pendingUserTurn = false;
     this._noteAudibleTopic(segment.text);
     this._lastAudibleGeneration = generation;
+    if (generation === this._responseFinishGeneration) {
+      this._armResponseFinishWatchdog(generation);
+    }
   }
 
   _commitDeferredAudioSegments() {
@@ -2767,9 +2920,17 @@ export class RealtimeSession {
 
   _beginUserTurn(candidateInterruptedResponse = false) {
     this._cancelInterruptionRecovery();
+    this._clearResponseFinishWatchdog();
     // 仅在「新开一轮」时打断播报；同一轮内的重复 asr_start/asr 不再 flush。
     const alreadyOpen = this._userTurnOpen;
     const assistantWasActive = this._assistantActive;
+    const responseWasPending = this.trace.state.response === "active";
+    if (
+      responseWasPending &&
+      this._downlinkAudioMode === MANAGED_AUDIO_CAPABILITY
+    ) {
+      this._interruptedResponseGeneration = this._backendGeneration;
+    }
     this._userTurnOpen = true;
     this._latestFinalAsr = "";
     this._pendingUserTurn = false;
@@ -2778,7 +2939,7 @@ export class RealtimeSession {
     if (alreadyOpen) return false;
     const interruptsResponse =
       candidateInterruptedResponse || assistantWasActive || this._hasPlayback();
-    if (interruptsResponse && this.trace.responseId) {
+    if ((interruptsResponse || responseWasPending) && this.trace.responseId) {
       this.trace.record(TRACE_EVENT.RESPONSE_CANCELLED, { reason: "turn_detected" });
     }
     if (interruptsResponse) this._audioGate = true;
@@ -3130,6 +3291,7 @@ export class RealtimeSession {
     const endReason = CALL_END_REASONS.has(reason) ? reason : "provider_terminal";
     this.stopped = true;
     this._cancelInterruptionRecovery();
+    this._clearResponseFinishWatchdog();
     this._conversationDirector?.dispatch({ type: "hangup" });
     this._endThinkingFeedback();
     this._cancelProactiveTimers();
@@ -3215,6 +3377,7 @@ export class RealtimeSession {
         ttsStream: this._ttsStreamingMode,
         interruptionHint: this._interruptionHintMode,
         interruptionRecovery: this._interruptionRecoveryMode,
+        responseFinish: this._responseFinishMode,
         memoryContext: this._memoryContextMode,
         vadShadow: this._vadShadowMode,
         asr: { ...this._asrRuntime },

@@ -34,6 +34,7 @@ const FIELDS = [
   "topicPreferences",
   "voiceVolume",
   "textProvider",
+  "onlinePromptMode",
   "freshTopicParticipation",
   "webGroundingProvider",
   "tavilyApiKey",
@@ -106,6 +107,10 @@ function currentRealtimeConversationMode() {
 function currentReasoningMode() {
   const value = (el("reasoningMode")?.value || "off").toLowerCase();
   return value === "automatic" || value === "always" ? value : "off";
+}
+
+function isOrnithTextModel(value) {
+  return (value || "").trim().toLowerCase() === "ornith-1.5:9b";
 }
 
 function topicPreferenceStatusSelect(status) {
@@ -543,6 +548,7 @@ function fill(s) {
   el("personaCardId").value = s.personaCardId || "";
   if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
   el("textProvider").value = s.textProvider === "local" ? "local" : "deepseek";
+  el("onlinePromptMode").value = s.onlinePromptMode === "abstract" ? "abstract" : "original";
   el("webGroundingEnabled").checked = s.webGroundingEnabled === true;
   el("freshTopicParticipation").value = ["relevant", "occasional", "active"].includes(s.freshTopicParticipation)
     ? s.freshTopicParticipation
@@ -556,11 +562,14 @@ function fill(s) {
   el("vlProvider").value = ["deepseek", "local"].includes(s.vlProvider) ? s.vlProvider : "qwen";
   syncTextFields();
   syncVlFields();
-  el("reasoningMode").value = ["off", "automatic", "always"].includes(s.reasoningMode)
+  const savedReasoningMode = ["off", "automatic", "always"].includes(s.reasoningMode)
     ? s.reasoningMode
     : s.thinking
       ? "always"
-      : "off";
+      : isOrnithTextModel(s.localTextModel) && !Object.prototype.hasOwnProperty.call(s, "reasoningMode")
+        ? "always"
+        : "off";
+  el("reasoningMode").value = savedReasoningMode;
   if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
   if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
@@ -949,6 +958,7 @@ function collect() {
     showChatDebug: el("showChatDebug").checked,
     vadShadowEnabled: el("vadShadowEnabled").checked,
     textProvider: currentTextProvider(),
+    onlinePromptMode: el("onlinePromptMode").value === "abstract" ? "abstract" : "original",
     webGroundingEnabled: el("webGroundingEnabled").checked,
     freshTopicParticipation: el("freshTopicParticipation").value || "relevant",
     webGroundingProvider: currentWebGroundingProvider(),
@@ -1268,6 +1278,12 @@ el("asrProvider")?.addEventListener("change", syncVoiceFields);
 el("textProvider").addEventListener("change", () => {
   syncVlFields();
   probeLocalTextStatus();
+});
+el("localTextModel")?.addEventListener("change", () => {
+  // Ornith is shipped as a reasoning model; make the compatible default explicit.
+  if (isOrnithTextModel(el("localTextModel").value) && currentReasoningMode() === "off") {
+    el("reasoningMode").value = "always";
+  }
 });
 el("textModel").addEventListener("change", syncVlFields);
 el("webGroundingProvider")?.addEventListener("change", syncWebGroundingFields);

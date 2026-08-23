@@ -59,6 +59,7 @@ const DEFAULT_DELAYS = Object.freeze({
   lowBurden: 6000,
   question: 8000,
   topicSwitch: 14000,
+  silentTopicSwitch: 9000,
 });
 
 const LOW_INTEREST_POLICIES = new Set(["acknowledge"]);
@@ -76,6 +77,7 @@ const LATERAL_COOLDOWN_TURNS = 5;
 const TOPIC_ACTIVITY = new Set(["active", "neutral", "settling", "sensitive"]);
 const SOFT_INTENTS = new Set([
   "none",
+  "handoff",
   "invite-opinion",
   "invite-advice",
   "deepen",
@@ -351,6 +353,8 @@ class ConversationDirector {
     this.proactiveTurns = 0;
     this.lowInterestTurns = 0;
     this.sameTopicContinuations = 0;
+    this.silentProactiveTurns = 0;
+    this.lastProactiveKind = "none";
     this.lastMove = "none";
     this.lastResponseCue = RESPONSE_CUE.NONE;
     this.depth = 0;
@@ -360,6 +364,8 @@ class ConversationDirector {
     this.lateralRecoveryTurns = 0;
     this.lateralCooldownTurns = 0;
     this.agreementStreak = 0;
+    this.supportStreak = 0;
+    this._nextContributionStance = PERSONA_STANCE.OPINE;
     this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
     this._nextQuestionMove = CONVERSATION_MOVE.RESPOND;
@@ -394,6 +400,8 @@ class ConversationDirector {
         this.proactiveTurns = Math.min(3, this.proactiveTurns + 1);
         if (event.kind === "followup") {
           this.sameTopicContinuations = Math.min(3, this.sameTopicContinuations + 1);
+          this.silentProactiveTurns = Math.min(2, this.silentProactiveTurns + 1);
+          this.lastProactiveKind = "followup";
         } else if (event.kind === "idle") {
           this.lowInterestTurns = 0;
           this.sameTopicContinuations = 0;
@@ -401,6 +409,8 @@ class ConversationDirector {
           this.topicTurns = 0;
           this.agreementStreak = 0;
           this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
+          this.silentProactiveTurns = Math.min(2, this.silentProactiveTurns + 1);
+          this.lastProactiveKind = "idle";
         }
         this.initiativeDebt = 0;
         return [];
@@ -424,6 +434,8 @@ class ConversationDirector {
       proactiveTurns: this.proactiveTurns,
       lowInterestTurns: this.lowInterestTurns,
       sameTopicContinuations: this.sameTopicContinuations,
+      silentProactiveTurns: this.silentProactiveTurns,
+      lastProactiveKind: this.lastProactiveKind,
       lastMove: this.lastMove,
       lastResponseCue: this.lastResponseCue,
       depth: this.depth,
@@ -445,6 +457,8 @@ class ConversationDirector {
       : event.lateralAllowed === false ? "sensitive" : "neutral";
     this.topicActivity[topicActivity] = Math.min(255, this.topicActivity[topicActivity] + 1);
     this.proactiveTurns = 0;
+    this.silentProactiveTurns = 0;
+    this.lastProactiveKind = "none";
 
     if (LOW_INTEREST_POLICIES.has(policy)) {
       this.lowInterestTurns = Math.min(2, this.lowInterestTurns + 1);
@@ -530,8 +544,32 @@ class ConversationDirector {
       : this._nextStrategy(softIntent, semanticDepth);
     if (!shouldAssociate && sensitive) {
       strategy = sanitizeTurnStrategy({ ...strategy, stance: PERSONA_STANCE.SUPPORT });
+      this.supportStreak = 0;
     } else if (!shouldAssociate && agencyStance) {
       strategy = sanitizeTurnStrategy({ ...strategy, stance: agencyStance });
+      this.supportStreak = 0;
+    } else if (
+      this.mode === "ai-leads" &&
+      softIntent === "none" &&
+      policy === "substantive" &&
+      ["neutral", "settling"].includes(topicActivity) &&
+      strategy?.stance === PERSONA_STANCE.SUPPORT &&
+      this.supportStreak >= 2
+    ) {
+      strategy = sanitizeTurnStrategy({
+        ...strategy,
+        stance: this._nextContributionStance,
+      });
+      this._nextContributionStance = this._nextContributionStance === PERSONA_STANCE.OPINE
+        ? PERSONA_STANCE.CONTRAST
+        : this._nextContributionStance === PERSONA_STANCE.CONTRAST
+          ? PERSONA_STANCE.LEAD
+          : PERSONA_STANCE.OPINE;
+      this.supportStreak = 0;
+    } else if (strategy?.stance === PERSONA_STANCE.SUPPORT) {
+      this.supportStreak = Math.min(2, this.supportStreak + 1);
+    } else {
+      this.supportStreak = 0;
     }
     if (shouldAssociate) {
       this.initiativeDebt = 0;
@@ -545,6 +583,15 @@ class ConversationDirector {
   }
 
   _nextStrategy(softIntent = "none", depth = this.depth) {
+    if (softIntent === "handoff") {
+      return this._strategy(
+        CONVERSATION_MOVE.ASSOCIATE,
+        RESPONSE_CUE.LOW_BURDEN,
+        PERSONA_STANCE.LEAD,
+        REASONING_POLICY.FAST,
+        Math.min(1, depth),
+      );
+    }
     if (softIntent === "invite-opinion") {
       return this._strategy(
         CONVERSATION_MOVE.EXPAND,
@@ -640,14 +687,26 @@ class ConversationDirector {
     ) {
       return [];
     }
+    if (
+      this.mode === "ai-leads" &&
+      this.silentProactiveTurns >= 2 &&
+      this.lastProactiveKind === "idle"
+    ) {
+      return [];
+    }
     const switchTopic =
       this.mode === "ai-leads" &&
-      this.lowInterestTurns >= 2 &&
-      this.sameTopicContinuations >= 1;
+      this.sameTopicContinuations >= 1 &&
+      (this.lowInterestTurns >= 2 || this.silentProactiveTurns >= 1);
+    const delayMs = switchTopic
+      ? this.lowInterestTurns >= 2
+        ? this.delays.topicSwitch
+        : this.delays.silentTopicSwitch
+      : responseDelay(strategy, this.delays);
     return [{
       type: "schedule-proactive",
       kind: switchTopic ? "idle" : "followup",
-      delayMs: switchTopic ? this.delays.topicSwitch : responseDelay(strategy, this.delays),
+      delayMs,
     }];
   }
 
@@ -668,6 +727,10 @@ class ConversationDirector {
 
   _onHardControl(control) {
     this.agreementStreak = 0;
+    this.silentProactiveTurns = 0;
+    this.lastProactiveKind = "none";
+    this.supportStreak = 0;
+    this._nextContributionStance = PERSONA_STANCE.OPINE;
     this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
     if (control === "resume") {
       this.paused = false;
@@ -693,6 +756,8 @@ class ConversationDirector {
     this.proactiveTurns = 0;
     this.lowInterestTurns = 0;
     this.sameTopicContinuations = 0;
+    this.silentProactiveTurns = 0;
+    this.lastProactiveKind = "none";
     this.lastMove = "none";
     this.lastResponseCue = RESPONSE_CUE.NONE;
     this.depth = 0;
@@ -703,6 +768,8 @@ class ConversationDirector {
     this.lateralCooldownTurns = 0;
     this.agreementStreak = 0;
     this._nextAgencyStance = PERSONA_STANCE.CONTRAST;
+    this.supportStreak = 0;
+    this._nextContributionStance = PERSONA_STANCE.OPINE;
     this.topicActivity = { active: 0, neutral: 0, settling: 0, sensitive: 0 };
   }
 }

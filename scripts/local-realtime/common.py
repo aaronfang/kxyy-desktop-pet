@@ -574,30 +574,45 @@ MANAGED_AUDIO_CHUNKS_PER_SEGMENT_MAX = 750
 TTS_STREAMING_CAPABILITY = "provider-pcm-v1"
 INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1"
 PROACTIVE_TURN_CAPABILITY = "local-v1"
+OPENING_STYLE_HINTS = {
+    "warm-direct": (
+        "简短确认彼此接通后自然展开，语气亲近但不要固定套用“我在呢、能听见”一类口头禅。"
+    ),
+    "context-first": (
+        "从已有聊天上下文或当前时间场景里的一个具体细节开口，不要先做冗长寒暄。"
+    ),
+    "playful": (
+        "用一句轻松、有角色感的小反应开口，再自然接入话题；不要夸张营业或编造刚发生的事。"
+    ),
+    "topic-first": (
+        "寒暄最多半句，马上由你先抛出一个具体、容易接的小话题，不要让用户负责找素材。"
+    ),
+}
 PROACTIVE_WELCOME_PROMPT = (
     "（内部控制：实时通话刚接通，用户还没开口。如果上方已有文字聊天上下文，"
     "请直接自然承接最后一个话题，不要重新寒暄或换成无关新话题；只有没有上下文时才先打招呼，"
-    "再抛一个轻松、很容易回应的小话题。只说一到两句，不要解释任务，不要催促用户。）"
+    "再抛一个轻松、很容易回应的小话题。说两到三句，不要解释任务，不要催促用户，"
+    "不要默认使用‘在吗、听得到吗、我在呢’这类固定开场。）"
 )
 PROACTIVE_FOLLOWUP_PROMPT = (
     "（内部控制：用户暂时没有接话。沿着上一段实际播完的话题自然续说一小步，"
-    "先补充一个具体观点或细节，再留一个低负担回应口。只说一到两句，不要复述任务，"
+    "先补充一个具体观点或细节，再留一个低负担回应口。说两到三句，不要复述任务，"
     "不要连续追问，也不要假装用户说过任何话。）"
 )
 PROACTIVE_IDLE_PROMPT = (
     "（内部控制：当前话题已自然停顿较久。结合已有可听对话和系统提供的记忆线索，"
     "换到一个轻松、安全且尚未重复的小话题；自己先分享观点或细节，再留一个容易回应的口。"
-    "只说一到两句，不要展示档案，不要把不确定记忆说成事实，不要假装用户说过任何话。）"
+    "说两到三句，不要展示档案，不要把不确定记忆说成事实，不要假装用户说过任何话。）"
 )
 PROACTIVE_REVISIT_PROMPT = (
     "（内部控制：这是一次低频回溯。只在已有可听对话中自然接回一个有个人意义、尚未说完的分支；"
     "先承接并补充一个新的具体观察，不要像总结或翻旧账，也不要假装用户已经做出决定。"
-    "只说一到两句，留一个容易退出或回应的口，不要连续追问。）"
+    "说两到三句，留一个容易退出或回应的口，不要连续追问。）"
 )
 INTERRUPTION_RECOVERY_PROMPT = (
     "（内部控制：用户刚才打断后没有留下可用内容，并且随后保持安静。"
     "只根据已经实际播完的对话，自然接回你刚才未说完的思路；补充一个具体观点或细节。"
-    "不要声称用户说过任何话，不要提及打断机制，只说一到两句，不要连续追问。）"
+    "不要声称用户说过任何话，不要提及打断机制，说两到三句，不要连续追问。）"
 )
 PROACTIVE_PROMPTS = {
     "welcome": PROACTIVE_WELCOME_PROMPT,
@@ -613,6 +628,7 @@ TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1"
 FRESH_TOPIC_CAPABILITY = "fresh-topic-v1"
 PENDING_TURN_RESUME_CAPABILITY = "pending-turn-resume-v1"
 INTERRUPTION_RECOVERY_CAPABILITY = "empty-confirmed-v1"
+RESPONSE_FINISH_CAPABILITY = "response-finish-v1"
 
 
 def realtime_stream_pacing_delay(samples_sent: int, elapsed_seconds: float) -> float:
@@ -973,12 +989,22 @@ def classify_realtime_conversation_turn(text: str) -> str:
     return "substantive"
 
 
+HANDOFF_RE = re.compile(
+    r"(?:不知道(?:聊|说|干|做)什么|不知道(?:该)?干嘛|没啥安排|没什么安排|"
+    r"你(?:来|说|讲|推荐|挑|选)(?:一个|几个|点|点儿|点什么|吧)|"
+    r"给我推荐(?:一个|几个|点|点儿)|随便聊(?:点|点儿|什么)?|聊什么都行|"
+    r"你.{0,6}(?:有啥|有什么)新鲜事)"
+)
+
+
 def classify_realtime_soft_intent(text: str) -> str:
     """Classify one-turn guidance without changing persistent conversation control."""
 
     value = str(text or "").strip()
     if not value or classify_realtime_conversation_turn(value) != "substantive":
         return "none"
+    if HANDOFF_RE.search(value):
+        return "handoff"
     if re.search(r"你觉得我?(?:该|应该)?怎么办|我(?:该|应该)怎么办|换成你(?:会)?怎么做|你会怎么做|给我.{0,12}(?:建议|主意)", value):
         return "invite-advice"
     if re.search(r"你(?:是)?怎么(?:看|想)(?:的)?|你有(?:什么|啥)看法|想听听你(?:是)?怎么(?:想|看)|换成你(?:会)?怎么(?:想|看待)", value):
@@ -1070,17 +1096,45 @@ def format_topic_revisit_hint(value) -> str:
     )
 
 
-def format_turn_strategy_hint(value) -> str:
+SEMANTIC_HANDOFF_HINT = (
+    "同时只在本轮内部按语义判断：用户是否正把选题或推进谈话的责任交给你，例如表达自己没思路、"
+    "愿意主要倾听、请你自行选方向或让你负责继续展开；不要依赖固定关键词，也不要输出判断或分类标签。"
+    "如果是，即使措辞没有命中固定示例，也由你直接接管：自己选一个具体方向，连续贡献至少两个相关的"
+    "信息点、观察或推进步骤，再留一个低负担回应入口；不要反问用户想聊什么、喜欢什么或让用户替你选题。"
+    "普通具体问答、明确建议或观点请求、用户正在补充新事实或追问，以及健康、安全、强情绪和严肃话题"
+    "都不算交棒，继续准确回应当前内容。"
+)
+
+
+def format_turn_strategy_hint(value, *, semantic_handoff: bool = False) -> str:
     strategy = sanitize_turn_strategy(value)
     if strategy is None:
         return ""
-    return (
+    rendered = (
         "本轮对话节奏（内部固定策略，不要复述）："
         + CONVERSATION_MOVE_HINTS[strategy["move"]]
         + CONVERSATION_CUE_HINTS[strategy["responseCue"]]
         + CONVERSATION_STANCE_HINTS[strategy["stance"]]
         + TURN_STRATEGY_REASONING_HINTS[strategy["reasoningPolicy"]]
         + f"当前语义深度为 {strategy['depth']}；它只控制本轮表达，不是用户事实。"
+    )
+    if semantic_handoff:
+        rendered += SEMANTIC_HANDOFF_HINT
+    return rendered
+
+
+def sanitize_opening_style(value) -> str:
+    return value if isinstance(value, str) and value in OPENING_STYLE_HINTS else ""
+
+
+def format_opening_style_hint(value) -> str:
+    guidance = OPENING_STYLE_HINTS.get(sanitize_opening_style(value))
+    if not guidance:
+        return ""
+    return (
+        "本次通话开场方式（内部固定风格，不要复述标签）："
+        + guidance
+        + "如果用户明确询问能否听见，可以自然确认，但仍要换一种措辞和后续切入方式。"
     )
 
 
@@ -1587,6 +1641,9 @@ class VoiceServiceRestartRequired(SafeRealtimeError):
 
 # 各本地后端都必须遵守的对话持续性约束；其余风格后缀目前仅 CosyVoice 使用。
 CONTINUE_CONVERSATION_SUFFIX = (
+    "\n普通实时回复通常说 3~5 句；先直接贡献判断、细节或例子，再留一个容易回应的入口。"
+    "除非需要澄清歧义或纠正事实，不要在首句复述用户刚说的数字、名词和结论；"
+    "不要用同义改写证明自己听见了，也不要为了凑长度重复、总结或连续提问。"
     "\n用户没有明确说要睡、道别、离开或挂断时，不要主动用先这样、你先忙、我先去忙、"
     "回头再聊、早点休息、明天见等任何措辞替双方结束对话，也不要擅自安排用户接下来做什么。"
     "不要承诺稍后发照片、主动联系、线下见面或共同活动等系统不可兑现的未来行为；"
@@ -1597,7 +1654,7 @@ CONTINUE_CONVERSATION_SUFFIX = (
 
 # CosyVoice 共用的完整 LLM 输出约束（下沉自 tts_*.py，避免多处漂移）。
 SYSTEM_SUFFIX = (
-    "\n口语化、像真人闲聊；普通一轮通常说 2~5 句，先贡献具体内容再留回应入口；"
+    "\n口语化、像真人闲聊；普通一轮通常说 3~5 句，先贡献具体内容再留回应入口；"
     "用户明确想深入时可以自然说得更完整，但不要为了凑长度重复或总结收口；"
     "需要停顿时用逗号或……；"
     "可带神态括号如（开心）（小声）（生气）（难过），括号不会被念出。"
@@ -3060,7 +3117,7 @@ class Session:
         vad_shadow_config_revision="none",
     ):
         self.ws = ws
-        self.system_role = "你是元元，口语化、像真人闲聊，普通一轮说 2~5 句；用户明确想深入时可以更完整。"
+        self.system_role = "你是元元，口语化、像真人闲聊，普通一轮说 3~5 句；用户明确想深入时可以更完整。"
         self.bot_name = "元元"
         self._audible_history = AudibleHistory()
         self._initial_history: list[dict] = []
@@ -3100,6 +3157,7 @@ class Session:
         self._send_lock = asyncio.Lock()
         self._memory_context_waiter: tuple[int, asyncio.Future] | None = None
         self._turn_strategy: dict | None = None
+        self._turn_opening_style = ""
         self._turn_reasoning_policy = "fast"
         self._turn_reasoning_generation: int | None = None
         self._reasoning_policy_waiter: tuple[int, asyncio.Future] | None = None
@@ -3116,6 +3174,7 @@ class Session:
         self.fresh_topic = "none"
         self.pending_turn_resume = "none"
         self.interruption_recovery = "none"
+        self.response_finish = "none"
         self._fresh_topics: list[dict] = []
         self._turn_temporal_context = ""
         self.proactive_turn = "none"
@@ -3572,6 +3631,14 @@ class Session:
             and INTERRUPTION_RECOVERY_CAPABILITY in offered_interruption_recovery
             else "none"
         )
+        offered_response_finish = msg.get("responseFinish")
+        self.response_finish = (
+            RESPONSE_FINISH_CAPABILITY
+            if self.downlink_audio == MANAGED_AUDIO_CAPABILITY
+            and isinstance(offered_response_finish, list)
+            and RESPONSE_FINISH_CAPABILITY in offered_response_finish
+            else "none"
+        )
         # Startup cache arrives in a second message after this acknowledgement;
         # old clients therefore never receive or retain it from `start`.
         self._fresh_topics = []
@@ -3600,6 +3667,7 @@ class Session:
                 "freshTopic": self.fresh_topic,
                 "pendingTurnResume": self.pending_turn_resume,
                 "interruptionRecovery": self.interruption_recovery,
+                "responseFinish": self.response_finish,
                 "proactiveTurn": self.proactive_turn,
                 "vadShadow": vad_shadow,
                 "vadShadowSummary": self.vad_shadow_summary(),
@@ -3654,10 +3722,13 @@ class Session:
             kwargs["temporal_context"] = self._turn_temporal_context
         if self._turn_strategy:
             kwargs["turn_strategy"] = self._turn_strategy
+        if self._turn_opening_style:
+            kwargs["opening_style"] = self._turn_opening_style
         kwargs["reasoning_policy"] = self._turn_reasoning_policy
         if self._turn_fresh_topics:
             kwargs["fresh_topics"] = self._turn_fresh_topics
         self._turn_strategy = None
+        self._turn_opening_style = ""
         self._turn_reasoning_policy = "fast"
         self._turn_reasoning_generation = None
         self._turn_fresh_topics = []
@@ -3670,6 +3741,7 @@ class Session:
         trigger_id = msg.get("triggerId")
         kind = msg.get("kind")
         topic_revisit = sanitize_topic_revisit(msg.get("topicRevisit"))
+        opening_style = sanitize_opening_style(msg.get("openingStyle"))
         valid_id = (
             isinstance(trigger_id, int)
             and not isinstance(trigger_id, bool)
@@ -3736,7 +3808,9 @@ class Session:
             }
         )
         self.reply_task = asyncio.create_task(
-            self._proactive_reply_pipeline(scope, kind, turn_strategy, topic_revisit)
+            self._proactive_reply_pipeline(
+                scope, kind, turn_strategy, topic_revisit, opening_style
+            )
         )
 
     async def _proactive_reply_pipeline(
@@ -3745,6 +3819,7 @@ class Session:
         kind: str,
         turn_strategy: dict | None = None,
         topic_revisit: dict | None = None,
+        opening_style: str = "",
     ) -> None:
         memory_context = await self._request_turn_memory(
             scope,
@@ -3762,6 +3837,7 @@ class Session:
             fresh_topics=self._fresh_topics or self._turn_fresh_topics,
             turn_strategy=turn_strategy,
             topic_revisit=topic_revisit,
+            opening_style=opening_style,
         )
 
     async def on_interruption_recovery(self, msg: dict) -> None:
@@ -3903,6 +3979,28 @@ class Session:
             self.playing = False
             self.play_enabled = False
 
+    async def on_response_finish_recover(self, msg: dict) -> None:
+        """Invalidate a producer that outlived its audible playback boundary."""
+        if self.response_finish != RESPONSE_FINISH_CAPABILITY:
+            return
+        generation = msg.get("generation")
+        scope = self.response_scope
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or scope is None
+            or scope.generation != generation
+            or not self._pending_playback_segments == set()
+        ):
+            return
+        await self.cancel_reply("finish_recovery")
+        await self.send_json({
+            "type": "response_finish_recovered",
+            "state": "recovered",
+            "generation": generation,
+        })
+
     def on_memory_context(self, msg: dict) -> None:
         """接收当前 final turn 的有界记忆卡片；旧 generation 一律丢弃。"""
         if self.memory_context != TURN_MEMORY_CAPABILITY:
@@ -3925,6 +4023,7 @@ class Session:
         self._turn_strategy = sanitize_turn_strategy(
             msg.get("turnStrategy")
         )
+        self._turn_opening_style = sanitize_opening_style(msg.get("openingStyle"))
         self._turn_reasoning_policy = sanitize_reasoning_policy(
             msg.get("reasoningPolicy"),
             reasoning_preference_fallback(self.reasoning_preference),
@@ -4000,6 +4099,7 @@ class Session:
             return ""
         self._turn_temporal_context = ""
         self._turn_strategy = None
+        self._turn_opening_style = ""
         self._turn_fresh_topics = []
         future = self.loop.create_future()
         self._memory_context_waiter = (scope.generation, future)
@@ -4410,9 +4510,11 @@ class Session:
                 return
             turn_temporal_context = self._turn_temporal_context
             turn_strategy = self._turn_strategy
+            turn_opening_style = self._turn_opening_style
             turn_reasoning_policy = self._turn_reasoning_policy
             turn_fresh_topics = self._turn_fresh_topics
             self._turn_strategy = None
+            self._turn_opening_style = ""
             self._turn_reasoning_policy = "fast"
             self._turn_reasoning_generation = None
             self._turn_fresh_topics = []
@@ -4439,6 +4541,8 @@ class Session:
                 reply_kwargs["short_term_context"] = short_term_context
             if turn_strategy:
                 reply_kwargs["turn_strategy"] = turn_strategy
+            if turn_opening_style:
+                reply_kwargs["opening_style"] = turn_opening_style
             reply_kwargs["reasoning_policy"] = turn_reasoning_policy
             if turn_fresh_topics:
                 reply_kwargs["fresh_topics"] = turn_fresh_topics
@@ -4567,6 +4671,7 @@ class Session:
         proactive_kind: str = "",
         turn_policy: str = "substantive",
         turn_strategy: dict | None = None,
+        opening_style: str = "",
         reasoning_policy: str = "fast",
         topic_revisit: dict | None = None,
         fresh_topics: list[dict] | None = None,
@@ -4619,10 +4724,22 @@ class Session:
             policy_hint = select_turn_policy_hint(turn_policy, turn_strategy)
             if policy_hint:
                 history_snapshot.append({"role": "system", "content": policy_hint})
-            conversation_hint = format_turn_strategy_hint(turn_strategy)
+            conversation_hint = format_turn_strategy_hint(
+                turn_strategy,
+                semantic_handoff=(
+                    bool(text)
+                    and not proactive_kind
+                    and turn_strategy is not None
+                ),
+            )
             if conversation_hint:
                 history_snapshot.append(
                     {"role": "system", "content": conversation_hint}
+                )
+            opening_hint = format_opening_style_hint(opening_style)
+            if opening_hint:
+                history_snapshot.append(
+                    {"role": "system", "content": opening_hint}
                 )
             topic_revisit_hint = format_topic_revisit_hint(topic_revisit)
             if topic_revisit_hint:
@@ -5161,6 +5278,8 @@ async def _handler(ws):
                 session.on_playback_segment(msg)
             elif typ == "playback_reset":
                 session.on_playback_reset(msg)
+            elif typ == "response_finish_recover":
+                await session.on_response_finish_recover(msg)
             elif typ == "playback_interruption":
                 session.on_playback_interruption(msg)
             elif typ == "memory_context":
