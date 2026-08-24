@@ -2286,7 +2286,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
 
         loud_frame = struct.pack("<h", 10000) * common.FRAME_SAMPLES
         await session.on_pcm(loud_frame)
-        self.assertTrue(session.in_speech)
+        self.assertFalse(session.in_speech)
 
         await session.on_start({})
         self.assertEqual(last_json_of_type(ws, "session")["vadShadow"], "unavailable")
@@ -2584,6 +2584,38 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
         common.start_llm_stream_producer = fake_start
         common._tts_stream_slots = threading.BoundedSemaphore(common.TTS_STREAM_MAX_TASKS)
+
+    async def test_idle_single_frame_noise_does_not_open_a_user_turn(self):
+        noise = struct.pack("<h", 6000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+        await self.session._on_frame(noise)
+        await self.session._on_frame(quiet)
+        await self.session._on_frame(noise)
+        self.assertFalse(self.session.in_speech)
+        self.assertEqual(self.ws.json_messages(), [])
+
+    async def test_idle_speech_confirmation_keeps_the_three_frame_preroll(self):
+        speech = struct.pack("<h", 6000) * common.FRAME_SAMPLES
+        for _ in range(3):
+            await self.session._on_frame(speech)
+        self.assertTrue(self.session.in_speech)
+        self.assertEqual(len(self.session.speech_pcm), len(speech) * 3)
+
+    async def test_llm_first_event_timeout_releases_response(self):
+        original_timeout = common.LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        original_synth = common._synth_tts
+        common.LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
+        common._synth_tts = lambda _text: b"\x00\x00"
+        try:
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            await self.session._reply_pipeline("用户输入", scope)
+            self.assertFalse(scope.active)
+            self.assertEqual(self.ws.json_messages()[-1]["type"], "error")
+            self.assertIn("首个响应超时", self.ws.json_messages()[-1]["message"])
+        finally:
+            common.LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_timeout
+            common._synth_tts = original_synth
 
     async def test_response_finish_recover_cancels_only_when_all_audio_receipts_arrived(self):
         await self.session.on_start({

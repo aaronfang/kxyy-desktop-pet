@@ -26,9 +26,22 @@ npm run test:python      # local realtime pure-state / replay tests
 npm run test:resources   # fixed VAD bundle mappings, file set, hashes; add -- --stripped-frontend at bundle time
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 cargo check --manifest-path src-tauri/Cargo.toml
+npm run test:gate     # full deterministic JS/Python/resource/Rust verification gate
 ```
 
 There is no linter configured. Realtime voice has deterministic JS/Python/Rust tests that do not require an account, microphone, or model. Build artifacts land in `src-tauri/target/release/bundle/`.
+
+## Development testing rule
+
+All feature work and bug fixes must follow [`docs/testing-development-loop.md`](docs/testing-development-loop.md). In short:
+
+1. Define the user-visible acceptance scenarios and the public seams under test before implementation. Cover the normal path, boundaries, invalid input, failures, cancellation/retry, and state recovery when relevant.
+2. Work in vertical Red -> Green slices: add one failing behavior test, confirm it fails for the expected reason, implement the smallest change that passes it, then repeat. A regression fix must first reproduce the reported failure in an automated test whenever technically feasible.
+3. Run the narrow test during development, then the affected integration suites, then `npm run test:gate` before declaring the code complete. Static inspection, `cargo check`, or a build alone never counts as functional verification.
+4. Changes involving Tauri windows, tray behavior, global shortcuts, microphone/permissions, native process lifecycle, WebView differences, audio timing, or packaged resources require real-app end-to-end acceptance on every affected OS. Record which scenarios and platforms were actually exercised; never report unrun E2E checks as passing.
+5. If any test fails, diagnose and fix the product or the test fixture, rerun the failing test, and repeat the complete affected gate. Do not weaken assertions or delete coverage merely to make the gate green.
+
+Skill guidance can help choose test seams and cases, but it does not replace executing and reporting the tests.
 
 ## Architecture
 
@@ -38,9 +51,11 @@ There is no linter configured. Realtime voice has deterministic JS/Python/Rust t
 
 **Click-through** is not OS event forwarding (Tauri lacks Electron's). Instead `src/app.js` polls the cursor at low frequency via `cursor_pos`, does pixel-level hit-testing against the pet, and toggles `set_ignore_cursor` only when the pointer is near the pet. Transparent regions always pass through.
 
-**macOS Dock / tray**: the app must not occupy the Dock — only the menu-bar tray icon. Two layers enforce this:
+**macOS Dock / tray**: packaged builds are menu-bar-only and must not occupy the Dock. Two layers enforce this:
 - `src-tauri/Info.plist` sets `LSUIElement=true` (applies to packaged builds).
-- `lib.rs` `setup` also calls `app.set_activation_policy(ActivationPolicy::Accessory)` so **dev mode** (`tauri dev`) hides the Dock too (plist alone does not cover that).
+- `lib.rs` `setup` uses `app.set_activation_policy(ActivationPolicy::Accessory)` for packaged builds because plist metadata does not cover every launch path.
+
+Debug/dev mode intentionally keeps `ActivationPolicy::Regular`: macOS 26+ may fail to render a tray icon for a bare dev binary, so the Dock entry is the reliable development fallback. If a packaged app has no visible tray icon and the pet is hidden, the process may still be alive; use the macOS recovery steps in [README.md](README.md#macos-菜单栏图标消失或桌宠隐藏) instead of assuming the app exited.
 
 **Local AI proxy** (`src-tauri/src/api.rs`): a `tiny_http` loopback server started at runtime on a random port. The frontend calls `invoke("get_api_base")` → `http://127.0.0.1:<port>`. Routes replicate the upstream `/api/chat` (SSE streaming) contract so synced logic modules work unchanged:
 - `GET/POST /api/chat` — proxies text to the selected DeepSeek model (`deepseek-v4-flash`/`deepseek-v4-pro`, with explicit `thinking.type`, or the direct multimodal `deepseek-v4-flash-vision-exp`). When the selected text model is not multimodal, images first go to the configured DeepSeek experimental vision model, Qwen-VL (DashScope compatible-mode), or local Ollama VL for a caption. Old/unknown DeepSeek text model settings and unknown vision-provider settings are normalized locally and never forwarded verbatim.

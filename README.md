@@ -42,6 +42,43 @@ VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安
 
 桌宠以透明置顶窗口运行。透明区域保持鼠标穿透，只有指针接近桌宠可见像素时才切回可交互状态。
 
+### macOS 菜单栏图标消失或桌宠隐藏
+
+macOS **安装包**是菜单栏应用，不显示 Dock 图标；桌宠窗口被隐藏时，后台进程仍可能继续运行。若菜单栏图标暂时没有出现，可以按下面顺序结束进程：
+
+1. 如果是通过 `npm run dev` 启动，先回到启动它的终端按 `Ctrl+C`。
+2. 在终端查找进程：
+
+   ```bash
+   pgrep -af 'kxyy-desktop-pet|元元桌宠'
+   ```
+
+3. 记录输出中的 PID 后先尝试正常退出：
+
+   ```bash
+   kill <PID>
+   ```
+
+4. 等待几秒仍未退出，再使用强制结束：
+
+   ```bash
+   kill -9 <PID>
+   ```
+
+   也可以按已安装应用的可执行文件路径结束：
+
+   ```bash
+   pkill -f '/Contents/MacOS/kxyy-desktop-pet'
+   ```
+
+5. 用下面的命令确认没有残留：
+
+   ```bash
+   pgrep -af 'kxyy-desktop-pet|元元桌宠'
+   ```
+
+不想使用终端时，可打开 **活动监视器**，搜索 `kxyy-desktop-pet` 或“元元桌宠”，选中进程后点击停止按钮；普通退出无效时再选“强制退出”。重新启动前，确认菜单栏没有同名残留进程，避免把旧实例误认为新实例。
+
 ## 配置 AI
 
 打开托盘菜单的 **设置…**。先选择你想走的路径：
@@ -173,6 +210,9 @@ npm run dev
 | VAD 资源合同检查 | `npm run test:resources` |
 | Rust 测试 | `cargo test --manifest-path src-tauri/Cargo.toml --lib` |
 | Rust 检查 | `cargo check --manifest-path src-tauri/Cargo.toml` |
+| 完整自动化测试门禁 | `npm run test:gate` |
+
+功能开发和缺陷修复采用“先写失败测试 -> 最小实现 -> 分层回归 -> 实机验收”的闭环，具体规则和场景清单见 [开发测试闭环](docs/testing-development-loop.md)。
 
 ### 打包
 
@@ -239,8 +279,11 @@ CI 与发布职责：
 |---|---|
 | [AI 角色体验路线图](docs/roadmap-ai-roleplay.md) | 当前完成度、角色体验和优先级 |
 | [实时语音路线图](docs/roadmap-realtime-voice.md) | 打断、ASR/TTS、流式能力和验证边界 |
+| [后台陪伴通话规格](docs/spec-background-companion-call.md) | 独立的按住说话、低频主动性和长会话边界 |
 | [Memory Brain 路线图](docs/roadmap-memory-brain.md) | Memory v3/v3.1、关系图和外部接入计划 |
 | [Memory M0 验收清单](docs/qa-memory-v3-m0.md) | Memory 的人工验收入口 |
+| [开发测试闭环](docs/testing-development-loop.md) | 功能、缺陷修复和实机验收的 Red → Green 规则 |
+| [2026-08-24 全项目测试与审查报告](docs/qa-full-project-audit-2026-08-24.md) | 当前自动化门禁、实机验收记录和后续问题清单 |
 
 ## 致谢
 

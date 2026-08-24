@@ -4,6 +4,22 @@ This context describes the user-visible conversation concepts shared by text cha
 
 ## Realtime Conversation
 
+**Background Companion Call**:
+An explicitly started, long-running voice session for sparse conversation while the user focuses on another activity. It uses deliberate Talk Holds and bounded, low-frequency character initiative without observing the user's screen or ambient media.
+_Avoid_: Realtime call mode, Shared Experience Session, always-on call
+
+**Talk Hold**:
+A deliberate request for the conversational floor that begins when the configured push-to-talk control is pressed and ends when it is released or reaches its safety limit. It is not an acoustically inferred Speech Candidate.
+_Avoid_: Speech Candidate, wake word, interruption
+
+**Continuation Window**:
+A bounded interval after a safety-ended Talk Hold during which another Talk Hold can extend the same user turn before it is submitted.
+_Avoid_: ASR timeout, response delay
+
+**Quiet Companionship**:
+A Background Companion Call state in which user-initiated Talk Holds remain available but the character schedules no proactive speech. It may result from an unanswered initiative or an explicit request for silence, with different resume rules.
+_Avoid_: Muted call, paused session, disconnected
+
 **Speech Candidate**:
 A bounded interval in which microphone audio may be user speech while the character is speaking. It has not yet taken the conversational floor.
 _Avoid_: Interruption, barge-in

@@ -547,6 +547,7 @@ MAX_PENDING_HISTORY_TURNS = 4
 LLM_HISTORY_MAX_MESSAGES = 20
 LLM_HISTORY_MAX_CHARS = 12000
 LLM_CONTEXT_SYSTEM_MAX_CHARS = 4000
+LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
 MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
 LLM_STREAM_QUEUE_MAX = 32
@@ -592,7 +593,8 @@ PROACTIVE_WELCOME_PROMPT = (
     "（内部控制：实时通话刚接通，用户还没开口。如果上方已有文字聊天上下文，"
     "请直接自然承接最后一个话题，不要重新寒暄或换成无关新话题；只有没有上下文时才先打招呼，"
     "再抛一个轻松、很容易回应的小话题。说两到三句，不要解释任务，不要催促用户，"
-    "不要默认使用‘在吗、听得到吗、我在呢’这类固定开场。）"
+    "不要默认使用‘在吗、听得到吗、我在呢’这类固定开场。只有文字历史或系统记忆线索明确写过的"
+    "用户事实，才能说‘你上次说过/之前提过’；没有证据时禁止编造过去对话、计划或偏好。）"
 )
 PROACTIVE_FOLLOWUP_PROMPT = (
     "（内部控制：用户暂时没有接话。沿着上一段实际播完的话题自然续说一小步，"
@@ -3134,6 +3136,8 @@ class Session:
         self.endpoint = SoftEndpoint()
         self.asr_started = False
         self.barge_loud_frames = 0
+        self.idle_loud_frames = 0
+        self.idle_loud_pcm = bytearray()
         self.gen_id = 0
         self.asr_scope: GenerationCancelScope | None = None
         self.response_scope: GenerationCancelScope | None = None
@@ -4298,6 +4302,9 @@ class Session:
         while_playing = self.playing and self.play_enabled
 
         if busy:
+            if not self.in_speech:
+                self.idle_loud_frames = 0
+                self.idle_loud_pcm.clear()
             loud_thr = BARGE_IN_RMS_PLAY if while_playing else BARGE_IN_RMS
             need_frames = BARGE_IN_FRAMES_PLAY if while_playing else BARGE_IN_FRAMES
             if rms >= loud_thr:
@@ -4329,11 +4336,19 @@ class Session:
 
         if not self.in_speech:
             if rms >= SPEECH_RMS:
+                self.idle_loud_frames += 1
+                self.idle_loud_pcm.extend(frame)
+            else:
+                self.idle_loud_frames = 0
+                self.idle_loud_pcm.clear()
+            if self.idle_loud_frames >= 3:
                 self.in_speech = True
-                self.speech_pcm = bytearray(frame)
-                self.speech_ms = FRAME_MS
+                self.speech_pcm = bytearray(self.idle_loud_pcm)
+                self.speech_ms = FRAME_MS * self.idle_loud_frames
                 self.silence_ms = 0
                 self.endpoint.reset()
+                self.idle_loud_frames = 0
+                self.idle_loud_pcm.clear()
             return
 
         self.speech_pcm.extend(frame)
@@ -4376,6 +4391,8 @@ class Session:
             self.speech_ms = 0
             self.endpoint.reset()
             self.barge_loud_frames = 0
+            self.idle_loud_frames = 0
+            self.idle_loud_pcm.clear()
             self.play_barge_pending = False
             if self._vad_shadow is not None:
                 try:
@@ -5119,12 +5136,16 @@ class Session:
             )
 
             stream_done = False
+            first_event_deadline = time.perf_counter() + LLM_FIRST_EVENT_TIMEOUT_SECONDS
             while scope.active and not stream_done:
                 try:
                     event = events.get_nowait()
                 except queue.Empty:
+                    if time.perf_counter() >= first_event_deadline:
+                        raise SafeRealtimeError("文字模型首个响应超时，请稍后重试")
                     await asyncio.sleep(0.01)
                     continue
+                first_event_deadline = float("inf")
                 event_type = event.get("type")
                 if event_type == "meta":
                     llm_provider = str(event.get("provider") or "文字模型")

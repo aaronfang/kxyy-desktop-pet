@@ -5,6 +5,8 @@
 > 适用场景：看片、短剧、游戏、音乐、阅读
 > 相关能力：[实时语音路线图](./roadmap-realtime-voice.md)、[Memory Brain 路线图](./roadmap-memory-brain.md)、[AI 角色扮演路线图](./roadmap-ai-roleplay.md)
 
+> 术语边界：本文的 **Shared Experience Session（共同体验会话）** 会在用户授权后观察指定内容。长时间挂着、默认按住说话且不观察屏幕/系统音频的功能是独立的 [Background Companion Call（后台陪伴通话）](./spec-background-companion-call.md)。未来可以显式组合两者，但启动任一会话都不能静默开启另一个。
+
 ## 结论
 
 本项目可以从“随时可聊天的桌宠”扩展为“与用户共同经历内容的 AI 角色”：在用户明确开启后，角色理解指定窗口、应用音频、用户语音和必要的媒体元数据，在合适的时机讨论剧情、玩法、歌词或书中内容。
