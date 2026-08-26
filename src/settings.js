@@ -562,13 +562,18 @@ function fill(s) {
   el("vlProvider").value = ["deepseek", "local"].includes(s.vlProvider) ? s.vlProvider : "qwen";
   syncTextFields();
   syncVlFields();
+  // Ornith ships as a reasoning model, so default it on until the user decides.
+  // Scoped to the local provider: `reasoningMode` is shared with DeepSeek, and a
+  // local model choice must never change what an online turn sends.
+  const ornithDefaultsToReasoning =
+    s.textProvider === "local" &&
+    isOrnithTextModel(s.localTextModel) &&
+    !Object.prototype.hasOwnProperty.call(s, "reasoningMode");
   const savedReasoningMode = ["off", "automatic", "always"].includes(s.reasoningMode)
     ? s.reasoningMode
-    : s.thinking
+    : s.thinking || ornithDefaultsToReasoning
       ? "always"
-      : isOrnithTextModel(s.localTextModel) && !Object.prototype.hasOwnProperty.call(s, "reasoningMode")
-        ? "always"
-        : "off";
+      : "off";
   el("reasoningMode").value = savedReasoningMode;
   if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
   if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
@@ -1280,8 +1285,14 @@ el("textProvider").addEventListener("change", () => {
   probeLocalTextStatus();
 });
 el("localTextModel")?.addEventListener("change", () => {
-  // Ornith is shipped as a reasoning model; make the compatible default explicit.
-  if (isOrnithTextModel(el("localTextModel").value) && currentReasoningMode() === "off") {
+  // Ornith is shipped as a reasoning model; surface that default when the user
+  // picks it. Only while the local provider is selected, so switching local
+  // models never rewrites the mode an online DeepSeek turn would use.
+  if (
+    currentTextProvider() === "local" &&
+    isOrnithTextModel(el("localTextModel").value) &&
+    currentReasoningMode() === "off"
+  ) {
     el("reasoningMode").value = "always";
   }
 });
