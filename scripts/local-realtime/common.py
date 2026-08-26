@@ -2034,6 +2034,8 @@ def load_llm_settings() -> None:
 _asr_backend = "none"  # compatibility/debug enum: mlx | openai | sensevoice | none
 _openai_whisper_model = None
 _asr_adapter_instance = None
+_asr_fallback_adapter = None
+_asr_fallback_backend = "none"
 _asr_runtime = {
     "requested": "whisper",
     "active": "none",
@@ -2051,55 +2053,51 @@ ASR_FAILURE_MESSAGE = "语音识别失败，请稍后重试"
 def load_whisper_on_mlx_thread() -> None:
     """Load one process-lifetime final-ASR adapter; name kept for old entrypoints."""
     global _asr_backend, _openai_whisper_model, _asr_adapter_instance, _asr_runtime
-    whisper = None
-    whisper_backend = "none"
+    global _asr_fallback_adapter, _asr_fallback_backend
     requested = (os.environ.get("KXYY_ASR_PROVIDER") or "whisper").strip().lower()
     selection = None
+    selected_sensevoice = None
     if requested == "sensevoice":
         selection = asr_adapter.select_asr_adapter(asr_adapter.UnavailableAdapter())
         if selection.active_provider == "sensevoice":
-            _asr_adapter_instance = selection.adapter
-            _asr_backend = "sensevoice"
-            _asr_runtime = {
-                "requested": "sensevoice",
-                "active": "sensevoice-sherpa-onnx",
-                "status": "active",
-            }
-            log("ASR 就绪 active=sensevoice-sherpa-onnx status=active")
-            return
-    try:
-        import mlx_whisper
+            selected_sensevoice = selection.adapter
 
-        whisper = asr_adapter.WhisperAdapter("mlx", mlx_module=mlx_whisper)
-        whisper_backend = "mlx"
-    except ImportError:
-        pass
-    if whisper is None:
-        try:
-            import whisper as openai_whisper
+    if selected_sensevoice is not None:
+        _asr_adapter_instance = selected_sensevoice
+        _asr_backend = "sensevoice"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "deferred"
+        _asr_runtime = {
+            "requested": "sensevoice",
+            "active": "sensevoice-sherpa-onnx",
+            "status": "active",
+        }
+        log("ASR 就绪 active=sensevoice-sherpa-onnx status=active")
+        return
 
-            _openai_whisper_model = openai_whisper.load_model("small")
-            whisper = asr_adapter.WhisperAdapter(
-                "openai", openai_model=_openai_whisper_model
-            )
-            whisper_backend = "openai"
-        except (ImportError, RuntimeError):
-            whisper = asr_adapter.UnavailableAdapter()
-
+    whisper, whisper_backend = _load_whisper_fallback()
     selection = asr_adapter.select_asr_adapter(whisper)
     _asr_adapter_instance = selection.adapter
     if selection.active_provider == "sensevoice":
         _asr_backend = "sensevoice"
         active = "sensevoice-sherpa-onnx"
+        _asr_fallback_adapter = whisper if whisper_backend != "none" else None
+        _asr_fallback_backend = whisper_backend
     elif whisper_backend == "mlx":
         _asr_backend = "mlx"
         active = "whisper-mlx"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "none"
     elif whisper_backend == "openai":
         _asr_backend = "openai"
         active = "whisper-openai"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "none"
     else:
         _asr_backend = "none"
         active = "none"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "none"
     status = "active"
     if active == "none":
         status = "unavailable"
@@ -2115,6 +2113,28 @@ def load_whisper_on_mlx_thread() -> None:
     if status == "fallback":
         log(f"ASR 回退 Whisper reason={selection.fallback_reason}")
     log(f"ASR 就绪 active={active} status={status}")
+
+
+def _load_whisper_fallback():
+    global _openai_whisper_model
+    try:
+        import mlx_whisper
+
+        return asr_adapter.WhisperAdapter("mlx", mlx_module=mlx_whisper), "mlx"
+    except ImportError:
+        pass
+    try:
+        import whisper as openai_whisper
+
+        _openai_whisper_model = openai_whisper.load_model("small")
+        return (
+            asr_adapter.WhisperAdapter(
+                "openai", openai_model=_openai_whisper_model
+            ),
+            "openai",
+        )
+    except (ImportError, RuntimeError):
+        return asr_adapter.UnavailableAdapter(), "none"
 
 
 def asr_runtime_summary() -> dict:
@@ -2404,7 +2424,54 @@ def warmup_asr() -> None:
         log(f"ASR 预热完成 ({time.perf_counter()-t0:.1f}s, backend={_asr_backend})")
     except Exception as e:
         reason = e.reason if isinstance(e, asr_adapter.AsrAdapterError) else "unknown"
-        log(f"ASR 预热跳过 reason={reason}")
+        if _asr_backend != "sensevoice":
+            log(f"ASR 预热跳过 reason={reason}")
+            return
+        _activate_whisper_after_sensevoice_warmup_failure(silence, reason)
+
+
+def _activate_whisper_after_sensevoice_warmup_failure(
+    silence: bytes, sensevoice_reason: str
+) -> None:
+    global _asr_backend, _asr_adapter_instance, _asr_runtime
+    global _asr_fallback_adapter, _asr_fallback_backend
+    fallback = _asr_fallback_adapter
+    backend = _asr_fallback_backend
+    if fallback is None and backend == "deferred":
+        fallback, backend = _load_whisper_fallback()
+        _asr_fallback_adapter = fallback if backend != "none" else None
+        _asr_fallback_backend = backend
+    active = {"mlx": "whisper-mlx", "openai": "whisper-openai"}.get(backend)
+    if fallback is None or active is None:
+        _asr_backend = "none"
+        _asr_adapter_instance = asr_adapter.UnavailableAdapter()
+        _asr_runtime = {
+            "requested": "sensevoice",
+            "active": "none",
+            "status": "unavailable",
+        }
+        log(f"SenseVoice 预热失败且 Whisper 不可用 reason={sensevoice_reason}")
+        return
+    _asr_adapter_instance = fallback
+    _asr_backend = backend
+    try:
+        fallback.transcribe(silence)
+    except Exception:
+        _asr_backend = "none"
+        _asr_adapter_instance = asr_adapter.UnavailableAdapter()
+        _asr_runtime = {
+            "requested": "sensevoice",
+            "active": "none",
+            "status": "unavailable",
+        }
+        log("SenseVoice 与 Whisper 预热均失败")
+        return
+    _asr_runtime = {
+        "requested": "sensevoice",
+        "active": active,
+        "status": "fallback",
+    }
+    log(f"SenseVoice 预热失败，固定回退 {active} reason={sensevoice_reason}")
 
 
 def submit_asr(loop, pcm: bytes, *, slots=None):
@@ -2564,6 +2631,7 @@ def _iter_llm_stream_once(
             yield {"type": "meta", "provider": provider, "thinking": thinking}
             content_chars = 0
             reasoning_fallback = ""
+            saw_done = False
             for raw_line in resp:
                 try:
                     line = raw_line.decode("utf-8").rstrip("\r\n")
@@ -2575,6 +2643,7 @@ def _iter_llm_stream_once(
                 if not raw_data:
                     continue
                 if raw_data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     data = json.loads(raw_data)
@@ -2629,6 +2698,8 @@ def _iter_llm_stream_once(
                     # close an Ollama stream even while the model emits only
                     # hidden reasoning. Never crosses the frontend wire.
                     yield {"type": "provider_progress"}
+            if not saw_done:
+                raise SafeRealtimeError(f"{provider} 响应意外中断，请重试")
             if content_chars == 0 and reasoning_fallback:
                 yield {"type": "delta", "text": reasoning_fallback}
     except urllib.error.HTTPError as e:

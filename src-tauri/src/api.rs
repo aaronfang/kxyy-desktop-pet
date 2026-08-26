@@ -25,6 +25,7 @@ const WEB_QUERY_MAX_CHARS: usize = 300;
 const WEB_RESPONSE_MAX_BYTES: u64 = 256 * 1024;
 const WEB_RESULT_MAX_ITEMS: usize = 4;
 const WEB_RESULT_TEXT_MAX_CHARS: usize = 700;
+const CHAT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
 fn normalize_deepseek_model(configured: &str) -> &'static str {
@@ -121,13 +122,8 @@ pub fn start(app: AppHandle) -> std::io::Result<u16> {
         // 该连接会以「半损坏」状态回到连接池；下一次请求复用它就会报
         // "error sending request for url ..."。每次都用全新连接可彻底规避。
         // 同时加连接超时，避免冷启动握手偶发卡死表现为"回复为空"。
-        let client = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(0)
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .timeout(std::time::Duration::from_secs(600))
-            .tcp_nodelay(true)
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let client = build_isolated_chat_client(CHAT_REQUEST_TIMEOUT)
+            .expect("validated reqwest client configuration");
         for request in server.incoming_requests() {
             let app = app.clone();
             let client = client.clone();
@@ -144,6 +140,17 @@ pub fn start(app: AppHandle) -> std::io::Result<u16> {
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes())
         .unwrap_or_else(|_| Header::from_bytes(&b"X-Ignore"[..], &b"1"[..]).unwrap())
+}
+
+fn build_isolated_chat_client(
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(0)
+        .connect_timeout(std::time::Duration::from_secs(20).min(timeout))
+        .timeout(timeout)
+        .tcp_nodelay(true)
+        .build()
 }
 
 /// 跨域头：聊天窗口来源是 tauri://localhost，请求本地 127.0.0.1 属跨域，需放行。
@@ -668,12 +675,13 @@ fn proxy_chat(
         let cli: &reqwest::blocking::Client = if attempt == 0 {
             client
         } else {
-            this_client = reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(0)
-                .connect_timeout(std::time::Duration::from_secs(20))
-                .tcp_nodelay(true)
-                .build()
-                .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            this_client = match build_isolated_chat_client(CHAT_REQUEST_TIMEOUT) {
+                Ok(client) => client,
+                Err(error) => {
+                    last_err = error.to_string();
+                    continue;
+                }
+            };
             &this_client
         };
         match cli
@@ -777,6 +785,13 @@ fn proxy_chat(
         Ok(t) => t,
         Err(e) => return error_json(request, 502, &format!("读取{provider_name}响应失败：{e}")),
     };
+    if !buffered_sse_is_complete(&body) {
+        return error_json(
+            request,
+            502,
+            &format!("{provider_name}响应意外中断，请重试"),
+        );
+    }
     // The buffered WebView path has fully consumed the model response here;
     // refresh Ollama residency only now, never concurrently with generation.
     if is_local_text || is_local_vl {
@@ -888,6 +903,12 @@ fn should_passthrough_internal_sse(
     trusted: bool,
 ) -> bool {
     stream && force == Some("text") && !use_vision && trusted
+}
+
+fn buffered_sse_is_complete(body: &str) -> bool {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .any(|payload| payload.trim() == "[DONE]")
 }
 
 fn should_use_native_ollama_realtime(
@@ -1287,14 +1308,17 @@ fn proxy_web_observations(
 mod tests {
     use super::{
         adapt_ollama_native_stream, apply_deepseek_generation_options,
-        apply_selected_deepseek_generation_options, build_native_ollama_realtime_payload, header,
-        internal_secret_matches, normalize_deepseek_model, normalize_tavily_items,
-        memory_completion_content, online_vision_route, req_header, safe_web_source_url,
-        should_passthrough_internal_sse,
-        should_use_native_ollama_realtime, web_observation_status, DEEPSEEK_FLASH_MODEL,
-        DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL, QWEN_VL_BASE_URL, QWEN_VL_MODEL, TEXT_BASE_URL,
+        apply_selected_deepseek_generation_options, buffered_sse_is_complete,
+        build_isolated_chat_client, build_native_ollama_realtime_payload, header,
+        internal_secret_matches, memory_completion_content, normalize_deepseek_model,
+        normalize_tavily_items, online_vision_route, req_header, safe_web_source_url,
+        should_passthrough_internal_sse, should_use_native_ollama_realtime, web_observation_status,
+        DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL, QWEN_VL_BASE_URL,
+        QWEN_VL_MODEL, TEXT_BASE_URL,
     };
     use std::io::{Cursor, Read};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
     use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
 
     #[test]
@@ -1306,6 +1330,37 @@ mod tests {
         assert!(!internal_secret_matches(Some("wrong"), "managed-secret"));
         assert!(!internal_secret_matches(None, "managed-secret"));
         assert!(!internal_secret_matches(Some(""), ""));
+    }
+
+    #[test]
+    fn isolated_chat_client_enforces_total_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let client = build_isolated_chat_client(Duration::from_millis(40)).unwrap();
+
+        let started = Instant::now();
+        let error = client
+            .get(format!("http://{address}/stall"))
+            .send()
+            .unwrap_err();
+
+        assert!(error.is_timeout());
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn buffered_webview_sse_requires_done_frame() {
+        assert!(buffered_sse_is_complete(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+        ));
+        assert!(!buffered_sse_is_complete(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+        ));
     }
 
     #[test]
@@ -1376,7 +1431,8 @@ mod tests {
             "{\"message\":{\"role\":\"assistant\",\"content\":\"呀\"},\"done\":false}\n",
             "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":41,\"eval_count\":3}\n"
         );
-        let mut adapted = adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
         let mut sse = String::new();
         adapted.read_to_string(&mut sse).unwrap();
 
@@ -1425,7 +1481,8 @@ mod tests {
             "\"prompt_eval_duration\":2820000000,\"eval_count\":47,",
             "\"eval_duration\":1420000000}\n"
         );
-        let mut adapted = adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
         let mut sse = String::new();
         adapted.read_to_string(&mut sse).unwrap();
 
@@ -1442,7 +1499,8 @@ mod tests {
             "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,",
             "\"prompt_eval_count\":41,\"eval_count\":3}\n"
         );
-        let mut adapted = adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
         let mut sse = String::new();
         adapted.read_to_string(&mut sse).unwrap();
 
@@ -1457,7 +1515,8 @@ mod tests {
             "{\"message\":{\"role\":\"assistant\",\"content\":\"第一块\"},\"done\":false}\n",
             "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"eval_count\":2}\n"
         );
-        let mut adapted = adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
         let mut output = vec![0_u8; 9000];
         let first_len = adapted.read(&mut output).unwrap();
         let first = String::from_utf8_lossy(&output[..first_len]);

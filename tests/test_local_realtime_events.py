@@ -752,12 +752,35 @@ class TextProviderAdapterTests(unittest.TestCase):
                     [
                         b'data: {"choices":[{"delta":{"reasoning_content":"fallback "}}]}\n',
                         b'data: {"choices":[{"delta":{"reasoning":"reply"}}]}\n',
+                        b"data: [DONE]\n",
                     ]
                 )
 
         common.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
         events = list(common.iter_llm_stream("role", [], "user"))
         self.assertEqual(events[-1], {"type": "delta", "text": "fallback reply"})
+
+    def test_llm_stream_rejects_clean_eof_without_done_frame(self):
+        class FakeResponse:
+            headers = {"X-Kxyy-Text-Provider": "DeepSeek", "X-Kxyy-Thinking": "0"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"content":"partial"}}]}\n',
+                    ]
+                )
+
+        common.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
+
+        with self.assertRaisesRegex(common.SafeRealtimeError, "响应意外中断"):
+            list(common.iter_llm_stream("role", [], "user"))
 
     def test_disabled_thinking_discards_buffered_reasoning_when_content_arrives(self):
         class FakeResponse:
@@ -774,6 +797,7 @@ class TextProviderAdapterTests(unittest.TestCase):
                     [
                         b'data: {"choices":[{"delta":{"reasoning_content":"private"}}]}\n',
                         b'data: {"choices":[{"delta":{"content":"public"}}]}\n',
+                        b"data: [DONE]\n",
                     ]
                 )
 
@@ -1668,6 +1692,9 @@ class InMemoryAsrTests(unittest.TestCase):
         self.original_backend = common._asr_backend
         self.original_openai_model = common._openai_whisper_model
         self.original_adapter = common._asr_adapter_instance
+        self.original_fallback_adapter = getattr(common, "_asr_fallback_adapter", None)
+        self.original_fallback_backend = getattr(common, "_asr_fallback_backend", "none")
+        self.original_runtime = common._asr_runtime
         common._asr_adapter_instance = None
 
         fake_numpy = types.SimpleNamespace(
@@ -1690,6 +1717,9 @@ class InMemoryAsrTests(unittest.TestCase):
         common._asr_backend = self.original_backend
         common._openai_whisper_model = self.original_openai_model
         common._asr_adapter_instance = self.original_adapter
+        common._asr_fallback_adapter = self.original_fallback_adapter
+        common._asr_fallback_backend = self.original_fallback_backend
+        common._asr_runtime = self.original_runtime
 
     def test_mlx_receives_normalized_memory_audio_without_path(self):
         captured = {}
@@ -1775,6 +1805,37 @@ class InMemoryAsrTests(unittest.TestCase):
             )
         finally:
             common._asr_runtime = original
+
+    def test_sensevoice_warmup_failure_activates_process_lifetime_whisper_fallback(self):
+        class FailingSenseVoice:
+            def transcribe(self, _pcm):
+                raise common.asr_adapter.AsrAdapterError("sensevoice_inference_failed")
+
+        class WorkingWhisper:
+            def transcribe(self, _pcm):
+                return common.asr_adapter.AsrResult("回退成功", language="zh")
+
+        common._asr_backend = "sensevoice"
+        common._asr_adapter_instance = FailingSenseVoice()
+        common._asr_fallback_adapter = WorkingWhisper()
+        common._asr_fallback_backend = "mlx"
+        common._asr_runtime = {
+            "requested": "sensevoice",
+            "active": "sensevoice-sherpa-onnx",
+            "status": "active",
+        }
+
+        common.warmup_asr()
+
+        self.assertEqual(common.transcribe(b"\x00\x00").text, "回退成功")
+        self.assertEqual(
+            common.asr_runtime_summary(),
+            {
+                "requested": "sensevoice",
+                "active": "whisper-mlx",
+                "status": "fallback",
+            },
+        )
 
     def test_long_repetition_hallucinations_are_rejected_without_harming_short_emphasis(self):
         voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES

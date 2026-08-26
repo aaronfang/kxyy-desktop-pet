@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 
 SERVER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -65,6 +67,40 @@ def _load_server():
 
 
 class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_audio_limits_apply_before_pcm_conversion(self):
+        server = _load_server()
+        stream_limit = server.OUTPUT_RATE * 2
+        sentence_limit = server.OUTPUT_RATE * 60
+
+        with self.assertRaisesRegex(RuntimeError, "输出块过长"):
+            server._to_pcm24(
+                np.zeros(stream_limit + 1, dtype=np.float32),
+                max_input_samples=stream_limit,
+            )
+        with self.assertRaisesRegex(RuntimeError, "输出时长异常"):
+            server._to_pcm24(
+                np.zeros(sentence_limit + 1, dtype=np.float32),
+                max_input_samples=sentence_limit,
+            )
+
+    def test_stateful_resampler_suppresses_aliasing_and_matches_chunked_output(self):
+        server = _load_server()
+        source = np.tile(np.array([1.0, -1.0], dtype=np.float32), 2048)
+
+        one_shot = server._Pcm48To24Resampler()
+        expected = np.frombuffer(
+            server._to_pcm24(source, resampler=one_shot), dtype="<i2"
+        )
+
+        chunked = server._Pcm48To24Resampler()
+        parts = []
+        for start, end in ((0, 513), (513, 1554), (1554, len(source))):
+            parts.append(server._to_pcm24(source[start:end], resampler=chunked))
+        actual = np.frombuffer(b"".join(parts), dtype="<i2")
+
+        np.testing.assert_array_equal(actual, expected)
+        self.assertLess(np.max(np.abs(actual[64:])), 1000)
+
     def test_windows_uses_realtime_streaming_steps_without_changing_macos_quality(self):
         server = _load_server()
         server._reference = lambda: (Path("/fake/ref.wav"), "reference")
@@ -183,7 +219,7 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-voxcpm")
         server._model = FakeModel()
         server._kwargs = lambda _text: {}
-        server._to_pcm24 = lambda chunk: chunk
+        server._to_pcm24 = lambda chunk, **_kwargs: chunk
         server._gate = threading.BoundedSemaphore(1)
         server._pool = pool
         try:
