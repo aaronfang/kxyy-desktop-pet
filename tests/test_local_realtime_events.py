@@ -7,6 +7,7 @@ import os
 import queue
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -362,47 +363,47 @@ class GenerationCancelScopeTests(unittest.IsolatedAsyncioTestCase):
 class TextProviderAdapterTests(unittest.TestCase):
     def test_llm_first_event_timeout_allows_bounded_local_cold_start(self):
         original_settings = common.SETTINGS
-        settings_path = Path("/tmp/kxyy-local-text-settings.json")
-        try:
-            common.SETTINGS = settings_path
-            settings_path.write_text('{"textProvider":"local"}', encoding="utf-8")
-            self.assertEqual(
-                common.llm_first_event_timeout_seconds(),
-                common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS,
-            )
-            self.assertEqual(
-                common.llm_first_event_retry_count(),
-                common.LOCAL_LLM_FIRST_EVENT_RETRIES,
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            try:
+                common.SETTINGS = settings_path
+                settings_path.write_text('{"textProvider":"local"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_first_event_timeout_seconds(),
+                    common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(
+                    common.llm_first_event_retry_count(),
+                    common.LOCAL_LLM_FIRST_EVENT_RETRIES,
+                )
 
-            settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
-            self.assertEqual(
-                common.llm_first_event_timeout_seconds(),
-                common.LLM_FIRST_EVENT_TIMEOUT_SECONDS,
-            )
-            self.assertEqual(common.llm_first_event_retry_count(), 0)
-        finally:
-            settings_path.unlink(missing_ok=True)
-            common.SETTINGS = original_settings
+                settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_first_event_timeout_seconds(),
+                    common.LLM_FIRST_EVENT_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(common.llm_first_event_retry_count(), 0)
+            finally:
+                common.SETTINGS = original_settings
 
     def test_llm_poll_interval_is_tight_only_for_local_provider(self):
         original_settings = common.SETTINGS
-        settings_path = Path("/tmp/kxyy-local-text-poll-settings.json")
-        try:
-            common.SETTINGS = settings_path
-            settings_path.write_text('{"textProvider":"local"}', encoding="utf-8")
-            self.assertEqual(
-                common.llm_poll_interval_seconds(),
-                common.LOCAL_LLM_POLL_INTERVAL_SECONDS,
-            )
-            settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
-            self.assertEqual(
-                common.llm_poll_interval_seconds(),
-                common.LLM_POLL_INTERVAL_SECONDS,
-            )
-        finally:
-            settings_path.unlink(missing_ok=True)
-            common.SETTINGS = original_settings
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            try:
+                common.SETTINGS = settings_path
+                settings_path.write_text('{"textProvider":"local"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_poll_interval_seconds(),
+                    common.LOCAL_LLM_POLL_INTERVAL_SECONDS,
+                )
+                settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_poll_interval_seconds(),
+                    common.LLM_POLL_INTERVAL_SECONDS,
+                )
+            finally:
+                common.SETTINGS = original_settings
 
     def test_local_ornith_realtime_generation_forces_fast_path(self):
         original = os.environ.get("KXYY_LOCAL_LLM_REALTIME_FAST")
