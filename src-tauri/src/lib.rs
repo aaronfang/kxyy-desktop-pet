@@ -636,8 +636,24 @@ fn voice_config_fingerprint(settings: &Settings) -> String {
     let mut hasher = DefaultHasher::new();
     // Bump whenever bundled local realtime behavior changes in a way that
     // requires a running Python child to reload its modules.
-    "local-realtime-policy-v7".hash(&mut hasher);
+    "local-realtime-policy-v8".hash(&mut hasher);
     backend.hash(&mut hasher);
+    // The fully local cascade has latency-specific endpoint and generation
+    // policy, so switching text providers must restart the managed child.
+    if matches!(backend.as_str(), "local" | "voxcpm" | "cosyvoice" | "cosy") {
+        settings
+            .text_provider
+            .trim()
+            .to_ascii_lowercase()
+            .hash(&mut hasher);
+        if settings.text_provider.trim().eq_ignore_ascii_case("local") {
+            settings
+                .local_text_model
+                .trim()
+                .to_ascii_lowercase()
+                .hash(&mut hasher);
+        }
+    }
     settings.vad_shadow_enabled.hash(&mut hasher);
     normalize_asr_provider(&settings.asr_provider).hash(&mut hasher);
     normalize_turn_pause_tolerance(&settings.turn_pause_tolerance).hash(&mut hasher);
@@ -2097,7 +2113,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             "local" => "local".into(),
             _ => "deepseek".into(),
         };
-        s.online_prompt_mode = if settings.online_prompt_mode.trim().eq_ignore_ascii_case("abstract") {
+        s.online_prompt_mode = if settings
+            .online_prompt_mode
+            .trim()
+            .eq_ignore_ascii_case("abstract")
+        {
             "abstract".into()
         } else {
             default_online_prompt_mode()

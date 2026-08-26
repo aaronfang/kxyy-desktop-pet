@@ -79,7 +79,10 @@ const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const RESPONSE_FINISH_CAPABILITY = "response-finish-v1";
 const RESPONSE_FINISH_WATCHDOG_MS = 12000;
-const STREAMING_PLAYBACK_STARTUP_MS = 240;
+// Local managed PCM is paced at the source clock. A 200ms reservoir keeps a
+// short scheduling cushion while shaving a measurable part of first playback;
+// unnegotiated/legacy paths remain unchanged.
+const STREAMING_PLAYBACK_STARTUP_MS = 200;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const RESPONSE_OUTPUT_TYPES = new Set([
   "assistant",
@@ -1473,6 +1476,7 @@ export class RealtimeSession {
         this.cb.onSpeaking?.();
         break;
       case "usage":
+        this._recordPrefillSample(msg.llm);
         this.cb.onUsage?.(msg);
         break;
       case "error":
@@ -2422,6 +2426,33 @@ export class RealtimeSession {
       return;
     }
     this._scheduleTopicLeadAfterPlayback(generation);
+  }
+
+  // Prefill timings only reach the trace for providers that report them
+  // (local Ollama); cloud turns omit the fields and record nothing.
+  _recordPrefillSample(usage) {
+    if (!usage || typeof usage !== "object") return;
+    const promptEvalMs = usage.promptEvalMs;
+    if (!Number.isFinite(promptEvalMs) || promptEvalMs < 0) return;
+    const metrics = { promptEvalMs };
+    for (const name of ["prompt", "evalMs", "loadMs", "firstTokenWallMs"]) {
+      const value = usage[name];
+      if (!Number.isFinite(value) || value < 0) continue;
+      metrics[name === "prompt" ? "promptTokens" : name] = value;
+    }
+    // Time the request spent waiting for the shared model before any compute:
+    // the proxy's wall clock to first token minus the work the provider admits
+    // to. Ollama serialises requests and excludes that wait from its own
+    // timings, so without this subtraction the delay is invisible.
+    if (Number.isFinite(metrics.firstTokenWallMs)) {
+      metrics.queueWaitMs = Math.max(
+        0,
+        Math.round(
+          metrics.firstTokenWallMs - promptEvalMs - (metrics.loadMs || 0),
+        ),
+      );
+    }
+    this.trace.record(TRACE_EVENT.LLM_PREFILL, { metrics });
   }
 
   _clearResponseFinishWatchdog() {

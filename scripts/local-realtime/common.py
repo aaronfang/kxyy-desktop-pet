@@ -531,6 +531,7 @@ TURN_PAUSE_TOLERANCE = normalize_turn_pause_tolerance(
 SOFT_REOPEN_MS = TURN_PAUSE_REOPEN_MS[TURN_PAUSE_TOLERANCE]
 ENDPOINT_COMMIT_MS = SOFT_END_MS + SOFT_REOPEN_MS
 MIN_SPEECH_MS = 500
+ENDPOINT_TAIL_PAD_MS = 150
 # 单句最长录音（安全阀，防异常一直录）。日常聊天够用；真要长独白可再加大。
 MAX_SPEECH_MS = 60000
 # 空闲态打断门槛
@@ -548,6 +549,16 @@ LLM_HISTORY_MAX_MESSAGES = 20
 LLM_HISTORY_MAX_CHARS = 12000
 LLM_CONTEXT_SYSTEM_MAX_CHARS = 4000
 LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
+# Ollama may need to load a several-GB model after the user switches providers.
+# Keep the cloud failure budget short, but give a local cold start a bounded window.
+LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
+LOCAL_LLM_POLL_INTERVAL_SECONDS = 0.002
+LLM_POLL_INTERVAL_SECONDS = 0.01
+# A local first-event timeout usually means the model was evicted and is loading,
+# or the previous generation still occupies it. One silent retry recovers the turn
+# instead of surfacing an error the user has to answer again; only the local
+# cascade retries, because a cloud timeout is far more likely to be a real fault.
+LOCAL_LLM_FIRST_EVENT_RETRIES = 1
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
 MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
 LLM_STREAM_QUEUE_MAX = 32
@@ -1764,6 +1775,66 @@ def load_settings() -> dict:
     return json.loads(SETTINGS.read_text(encoding="utf-8"))
 
 
+def local_realtime_fast_generation() -> bool:
+    """Keep local voice turns latency-first without changing text-chat policy.
+
+    Ornith's deliberate/reasoning path can spend several seconds before its
+    first visible token. Realtime speech already has a bounded conversational
+    policy, so local Ollama voice requests stay on the fast generation path;
+    online providers and ordinary chat retain their configured reasoning mode.
+    """
+    return os.environ.get("KXYY_LOCAL_LLM_REALTIME_FAST") == "ornith-v1"
+
+
+def thinking_filler_enabled() -> bool:
+    """Avoid spending a TTS slot masking local Ollama first-token latency.
+
+    Cloud/Volcano-compatible calls retain the historical filler behavior. Local
+    text generation is already on-device, so the filler only adds another
+    serialized synthesis request before the real answer.
+    """
+    try:
+        settings = load_settings()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return True
+    provider = str(settings.get("textProvider") or "").strip().lower()
+    if provider == "local":
+        return settings.get("thinkingFillerEnabled") is True
+    return True
+
+
+def local_text_provider_selected() -> bool:
+    """Read the app-owned provider choice without inferring it from timings."""
+    try:
+        provider = str(load_settings().get("textProvider") or "").strip().lower()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        provider = ""
+    return provider == "local"
+
+
+def llm_first_event_timeout_seconds() -> float:
+    """Return the first-output budget for the provider selected by the app."""
+    return (
+        LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        if local_text_provider_selected()
+        else LLM_FIRST_EVENT_TIMEOUT_SECONDS
+    )
+
+
+def llm_first_event_retry_count() -> int:
+    """Retry only local first-output timeouts; cloud failures stay fail-fast."""
+    return LOCAL_LLM_FIRST_EVENT_RETRIES if local_text_provider_selected() else 0
+
+
+def llm_poll_interval_seconds() -> float:
+    """Use a tighter event handoff loop only for local Ollama realtime turns."""
+    return (
+        LOCAL_LLM_POLL_INTERVAL_SECONDS
+        if local_text_provider_selected()
+        else LLM_POLL_INTERVAL_SECONDS
+    )
+
+
 def _user_ref_from_settings() -> "tuple[Path | None, str]":
     """读取用户在设置里填写的参考音路径 / 文案（localRefWav / localRefText）。
 
@@ -2461,11 +2532,15 @@ def _iter_llm_stream_once(
     thinking: bool = False,
 ):
     """Parse one desktop-proxy SSE attempt without exposing provider credentials."""
+    # Local Ornith realtime calls are deliberately fast-path even when the
+    # general reasoning preference is automatic/always. This does not affect
+    # browser text chat or any online provider request.
+    effective_thinking = False if local_realtime_fast_generation() else thinking
     payload = build_llm_proxy_payload(
         system_role,
         history,
         user_text,
-        thinking=thinking,
+        thinking=effective_thinking,
     )
     body = json.dumps(payload).encode("utf-8")
     secret = os.environ.get("KXYY_TTS_SECRET") or ""
@@ -2509,12 +2584,24 @@ def _iter_llm_stream_once(
                 if usage:
                     prompt = int(usage.get("prompt_tokens") or 0)
                     completion = int(usage.get("completion_tokens") or 0)
-                    yield {
+                    event = {
                         "type": "usage",
                         "prompt": prompt,
                         "completion": completion,
                         "total": int(usage.get("total_tokens") or (prompt + completion)),
                     }
+                    # Only local Ollama reports prefill/decode timings; cloud providers
+                    # omit them and the keys simply stay absent.
+                    for source, name in (
+                        ("prompt_eval_ms", "promptEvalMs"),
+                        ("eval_ms", "evalMs"),
+                        ("load_ms", "loadMs"),
+                        ("first_token_wall_ms", "firstTokenWallMs"),
+                    ):
+                        value = usage.get(source)
+                        if isinstance(value, (int, float)) and value >= 0:
+                            event[name] = int(value)
+                    yield event
                 choices = data.get("choices") or []
                 if not choices:
                     continue
@@ -2532,11 +2619,16 @@ def _iter_llm_stream_once(
                 # 只有明确关闭思考且整条流始终没有 content 时，才把 reasoning 当兼容正文。
                 # 不能逐 chunk 回退，否则显式 reasoner 可能先播出思维链、随后又播正文。
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                if not thinking and isinstance(reasoning, str) and reasoning:
-                    remaining = LLM_REPLY_MAX_CHARS - len(reasoning_fallback)
-                    if remaining <= 0 or len(reasoning) > remaining:
-                        raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
-                    reasoning_fallback += reasoning
+                if isinstance(reasoning, str) and reasoning:
+                    if not thinking:
+                        remaining = LLM_REPLY_MAX_CHARS - len(reasoning_fallback)
+                        if remaining <= 0 or len(reasoning) > remaining:
+                            raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
+                        reasoning_fallback += reasoning
+                    # Text-free internal heartbeat: lets a cancelled producer
+                    # close an Ollama stream even while the model emits only
+                    # hidden reasoning. Never crosses the frontend wire.
+                    yield {"type": "provider_progress"}
             if content_chars == 0 and reasoning_fallback:
                 yield {"type": "delta", "text": reasoning_fallback}
     except urllib.error.HTTPError as e:
@@ -2577,6 +2669,15 @@ def iter_llm_stream(
         except StopIteration:
             return
         if first.get("type") != "meta" or first.get("provider") != "Ollama":
+            yield first
+            yield from stream
+            return
+
+        # The duplicate guard below necessarily buffers the complete local
+        # response before yielding any token. Realtime Ornith prioritizes true
+        # token-to-sentence streaming; retaining the guard here would turn SSE
+        # into a non-streaming 6-11 second wait before TTS can start.
+        if local_realtime_fast_generation():
             yield first
             yield from stream
             return
@@ -2642,6 +2743,10 @@ def start_llm_stream_producer(
                 user_text,
                 thinking=scope.reasoning_policy == "deliberate",
             ):
+                if event.get("type") == "provider_progress":
+                    if not scope.active:
+                        return
+                    continue
                 if not _put_llm_event(out, scope, event):
                     return
             _put_llm_event(out, scope, {"type": "done"})
@@ -4385,6 +4490,15 @@ class Session:
         if self.speech_ms >= MAX_SPEECH_MS or endpoint_event == "committed":
             pcm = bytes(self.speech_pcm)
             was_play_barge = self.play_barge_pending
+            if endpoint_event == "committed":
+                min_ms = MIN_SPEECH_MS_PLAY if was_play_barge else MIN_SPEECH_MS
+                removable_ms = max(0, self.endpoint.silence_ms - ENDPOINT_TAIL_PAD_MS)
+                removable_bytes = INPUT_RATE * 2 * removable_ms // 1000
+                min_bytes = INPUT_RATE * 2 * min_ms // 1000
+                trim_bytes = min(removable_bytes, max(0, len(pcm) - min_bytes))
+                trim_bytes -= trim_bytes % 2
+                if trim_bytes:
+                    pcm = pcm[:-trim_bytes]
             self.in_speech = False
             self.speech_pcm.clear()
             self.silence_ms = 0
@@ -4797,13 +4911,15 @@ class Session:
             speaking_sent = False
             segment_seq = 0
             filler_started = asyncio.Event()
-            filler_task = asyncio.create_task(
-                self._maybe_send_thinking_filler(
-                    scope,
-                    lambda: bool(proactive_kind) or llm_output_started or tts_started,
-                    started_event=filler_started,
+            filler_task = None
+            if thinking_filler_enabled():
+                filler_task = asyncio.create_task(
+                    self._maybe_send_thinking_filler(
+                        scope,
+                        lambda: bool(proactive_kind) or llm_output_started or tts_started,
+                        started_event=filler_started,
+                    )
                 )
-            )
 
             async def synthesize_sentence(_sequence: int, sentence: str) -> dict:
                 if not sentence or not scope.active:
@@ -5105,7 +5221,7 @@ class Session:
                 if not sentence or not scope.active:
                     return
                 if not tts_started:
-                    if not filler_task.done():
+                    if filler_task is not None and not filler_task.done():
                         if not filler_started.is_set():
                             filler_task.cancel()
                         await asyncio.gather(filler_task, return_exceptions=True)
@@ -5136,14 +5252,44 @@ class Session:
             )
 
             stream_done = False
-            first_event_deadline = time.perf_counter() + LLM_FIRST_EVENT_TIMEOUT_SECONDS
+            first_event_timeout = llm_first_event_timeout_seconds()
+            poll_interval = llm_poll_interval_seconds()
+            first_event_deadline = time.perf_counter() + first_event_timeout
+            local_first_event_retries = llm_first_event_retry_count()
+            is_local_first_event = local_first_event_retries > 0
             while scope.active and not stream_done:
                 try:
                     event = events.get_nowait()
                 except queue.Empty:
                     if time.perf_counter() >= first_event_deadline:
+                        # Nothing has been emitted yet at this point, so restarting is
+                        # free of duplicate text or audio. A fresh queue keeps the
+                        # abandoned producer's late events from mixing into the retry.
+                        if local_first_event_retries > 0:
+                            local_first_event_retries -= 1
+                            log("本地文字模型首个响应超时，自动重试一次")
+                            events = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
+                            if start_llm_stream_producer(
+                                self.system_role,
+                                history_snapshot,
+                                request_text,
+                                scope,
+                                events,
+                            ) is None:
+                                raise SafeRealtimeError(
+                                    "本地文字模型首个响应超时，模型可能仍在加载，请稍后重试"
+                                )
+                            first_event_deadline = (
+                                time.perf_counter() + first_event_timeout
+                            )
+                            await asyncio.sleep(poll_interval)
+                            continue
+                        if is_local_first_event:
+                            raise SafeRealtimeError(
+                                "本地文字模型首个响应超时，模型可能仍在加载，请稍后重试"
+                            )
                         raise SafeRealtimeError("文字模型首个响应超时，请稍后重试")
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(poll_interval)
                     continue
                 first_event_deadline = float("inf")
                 event_type = event.get("type")
@@ -5155,6 +5301,10 @@ class Session:
                         "completion": int(event.get("completion") or 0),
                         "total": int(event.get("total") or 0),
                     }
+                    for key in ("promptEvalMs", "evalMs", "loadMs", "firstTokenWallMs"):
+                        value = event.get(key)
+                        if isinstance(value, int):
+                            llm_usage[key] = value
                 elif event_type == "delta":
                     delta = str(event.get("text") or "")
                     if not delta:

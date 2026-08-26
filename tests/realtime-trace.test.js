@@ -9,6 +9,7 @@ import {
   replayTrace,
   sanitizeVadShadowSummary,
   summarizeMemoryContext,
+  summarizePrefill,
   summarizeTraceLatency,
 } from "../src/ai/realtime-trace.js";
 
@@ -640,7 +641,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 9);
+  assert.equal(report.diagnosticSchemaVersion, 10);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -1004,7 +1005,7 @@ test("diagnostic report measures text-free audible gaps between managed segments
     ],
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 9);
+  assert.equal(report.diagnosticSchemaVersion, 10);
   assert.deepEqual(report.aggregate.segmentContinuity, {
     segmentsStarted: 2,
     segmentsCompleted: 2,
@@ -2786,7 +2787,7 @@ test("streamed managed segments require explicit negotiation and exact final tot
   const { session, commands } = createSession();
   assert.deepEqual(commands[0], {
     type: "startup_buffer",
-    milliseconds: 240,
+    milliseconds: 200,
   });
   session._onMessage({
     data: JSON.stringify({
@@ -4120,4 +4121,205 @@ test("desktop session records privacy-safe soft endpoint transitions", async () 
     endpointEvents.map((event) => event.metrics.silenceMs),
     [480, 900, 480, 1050],
   );
+});
+
+test("prefill summary separates cached prefixes from full recomputes", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "voxcpm", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  // 1010 tokens in 2820ms ~= 358 tok/s: a genuine recompute.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 1010, promptEvalMs: 2820, evalMs: 1500 },
+  });
+  // 1010 tokens in 90ms ~= 11222 tok/s: only possible by reusing the prefix.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 1010, promptEvalMs: 90, evalMs: 1500 },
+  });
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.samples, 2);
+  assert.equal(summary.recomputed, 1);
+  assert.equal(summary.reused, 1);
+  assert.equal(summary.partiallyReused, 0);
+  assert.equal(summary.promptEvalMs.p50, 90);
+  assert.equal(summary.promptTokens.p50, 1010);
+});
+
+test("prefill summary stays empty for providers that report no timings", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "volc", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  trace.record(TRACE_EVENT.LLM_REQUEST);
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.samples, 0);
+  assert.equal(summary.throughputTokensPerSecond.count, 0);
+  assert.equal(summary.reused, 0);
+  assert.equal(summary.partiallyReused, 0);
+  assert.equal(summary.recomputed, 0);
+});
+
+test("prefill trace events carry timings without prompt or reply text", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "Ollama",
+      llm: {
+        prompt: 1010,
+        completion: 47,
+        total: 1057,
+        promptEvalMs: 2820,
+        evalMs: 1420,
+        transcript: "forbidden-prompt-text",
+      },
+    }),
+  });
+
+  const events = session
+    .getTraceSnapshot()
+    .events.filter((event) => event.eventType === TRACE_EVENT.LLM_PREFILL);
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].metrics, {
+    promptTokens: 1010,
+    promptEvalMs: 2820,
+    evalMs: 1420,
+  });
+  assert.equal(JSON.stringify(events[0]).includes("forbidden-prompt-text"), false);
+});
+
+test("usage without prefill timings records no prefill event", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "volc" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "DeepSeek",
+      llm: { prompt: 800, completion: 40, total: 840 },
+    }),
+  });
+
+  assert.equal(
+    session
+      .getTraceSnapshot()
+      .events.filter((event) => event.eventType === TRACE_EVENT.LLM_PREFILL).length,
+    0,
+  );
+});
+
+test("prefill reuse on short prompts is not misread as a recompute", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "voxcpm", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  // Measured warm floor: fixed request overhead dominates short prompts, so a
+  // genuine cache hit reports only ~1660 tok/s (161 tokens in 97ms).
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 161, promptEvalMs: 97 },
+  });
+  // Measured cold ceiling on the same model: ~240 tok/s (161 tokens in 676ms).
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 161, promptEvalMs: 676 },
+  });
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.reused, 1);
+  assert.equal(summary.recomputed, 1);
+});
+
+test("prefill summary exposes queue wait and model load separately", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "voxcpm", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  // Measured contended turn: the provider admits 183ms of prefill while the
+  // proxy clock saw 9969ms, so ~9.8s went to waiting for the shared model.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: {
+      promptTokens: 1048,
+      promptEvalMs: 183,
+      loadMs: 1,
+      firstTokenWallMs: 9969,
+      queueWaitMs: 9785,
+    },
+  });
+  // Measured idle turn dominated by a model swap-in rather than queueing.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: {
+      promptTokens: 1048,
+      promptEvalMs: 1048,
+      loadMs: 3349,
+      firstTokenWallMs: 4426,
+      queueWaitMs: 29,
+    },
+  });
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.samples, 2);
+  assert.equal(summary.queueWaitMs.count, 2);
+  assert.equal(summary.queueWaitMs.p95, 9785);
+  assert.equal(summary.loadMs.p95, 3349);
+});
+
+test("queue wait is derived from the proxy clock minus admitted work", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "Ollama",
+      llm: {
+        prompt: 1048,
+        completion: 20,
+        total: 1068,
+        promptEvalMs: 183,
+        evalMs: 600,
+        loadMs: 1,
+        firstTokenWallMs: 9969,
+      },
+    }),
+  });
+
+  const event = session
+    .getTraceSnapshot()
+    .events.find((item) => item.eventType === TRACE_EVENT.LLM_PREFILL);
+  assert.equal(event.metrics.queueWaitMs, 9785);
+  assert.equal(event.metrics.firstTokenWallMs, 9969);
+});
+
+test("queue wait stays absent when the proxy reports no wall clock", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "Ollama",
+      llm: { prompt: 900, completion: 30, total: 930, promptEvalMs: 2800 },
+    }),
+  });
+
+  const event = session
+    .getTraceSnapshot()
+    .events.find((item) => item.eventType === TRACE_EVENT.LLM_PREFILL);
+  assert.equal(event.metrics.promptEvalMs, 2800);
+  assert.equal("queueWaitMs" in event.metrics, false);
 });

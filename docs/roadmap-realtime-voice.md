@@ -233,7 +233,7 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 ### 2.17 P2 真实设备诊断入口（已实现，0.2.23）
 
-0.2.23 把既有内存 trace 变成用户可取回的验证材料：开启设置中的“显示聊天界面调试信息”后，可在聊天 debug 区复制当前通话或最近一次已挂断通话的诊断 JSON。挂断路径会先等待 `RealtimeSession.stop()` 完成，再保存最终快照；只保留最近一份且不写磁盘。报告重新经过严格白名单构造，而不是直接序列化任意运行时对象。0.2.25 因新增固定枚举 `runtime.vadShadow` 将 `diagnosticSchemaVersion` 升为 2；0.2.26 为区分真实 scorer 的 `warming|busy|unavailable|silero-onnx-shadow-v1` 将其升为 3；0.2.28 因新增固定 `aggregate.vadShadow` 聚合将其升为 4；0.2.30 因新增固定 `runtime.asr` 请求/生效/状态枚举将其升为 5；后续诊断扩展升至 6，2026-07-29 主动陪聊基础计数升为 7，本轮固定 trigger kind、互动类别、veto reason 与节奏退让/停止计数升为 8。事件 schema 仍为 v1；主动诊断不含话题正文、用户/助手文本、Memory 内容或内部候选 ID。
+0.2.23 把既有内存 trace 变成用户可取回的验证材料：开启设置中的“显示聊天界面调试信息”后，可在聊天 debug 区复制当前通话或最近一次已挂断通话的诊断 JSON。挂断路径会先等待 `RealtimeSession.stop()` 完成，再保存最终快照；只保留最近一份且不写磁盘。报告重新经过严格白名单构造，而不是直接序列化任意运行时对象。0.2.25 因新增固定枚举 `runtime.vadShadow` 将 `diagnosticSchemaVersion` 升为 2；0.2.26 为区分真实 scorer 的 `warming|busy|unavailable|silero-onnx-shadow-v1` 将其升为 3；0.2.28 因新增固定 `aggregate.vadShadow` 聚合将其升为 4；0.2.30 因新增固定 `runtime.asr` 请求/生效/状态枚举将其升为 5；后续诊断扩展升至 6，2026-07-29 主动陪聊基础计数升为 7，本轮固定 trigger kind、互动类别、veto reason 与节奏退让/停止计数升为 8。新增 `aggregate.prefill`（本地 provider 的 prompt token 数、prefill/decode 耗时、模型换入耗时、代理侧首 token 墙钟与由此推导的共享模型排队等待，以及 prefix KV 复用判定）将其升为 10。事件 schema 仍为 v1；主动诊断不含话题正文、用户/助手文本、Memory 内容或内部候选 ID。
 
 **已实现**：报告固定枚举实际协商结果：provider、`worklet|legacy|none`、`managed-v1|raw`、`provider-pcm-v1|none`、`candidate-snapshot-v1|none`，以及 `runtime.asr` 的 `requested`、`active`、`status`。事件最多 256 条，独立延迟摘要最多 8 个 generation；连续 playback stats 会合并但保留 500ms 采样点中的 `queuedMs` 最高值及合并计数，避免长会话的统计挤掉 TTFA 生命周期边界。报告同时给出这些轮次的 p50/p95、candidate 到 confirmed/rejected、soft-end 到 reopen/commit、App 可观测 TTFA、采样队列最高值和丢样统计。所有阶段时间继续来自单调相对时钟。
 
