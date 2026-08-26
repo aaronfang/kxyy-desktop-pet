@@ -79,7 +79,10 @@ const MANAGED_AUDIO_SEGMENT_MAX_SAMPLES = OUTPUT_RATE * 60;
 const TTS_STREAMING_CAPABILITY = "provider-pcm-v1";
 const RESPONSE_FINISH_CAPABILITY = "response-finish-v1";
 const RESPONSE_FINISH_WATCHDOG_MS = 12000;
-const STREAMING_PLAYBACK_STARTUP_MS = 240;
+// Local managed PCM is paced at the source clock. A 200ms reservoir keeps a
+// short scheduling cushion while shaving a measurable part of first playback;
+// unnegotiated/legacy paths remain unchanged.
+const STREAMING_PLAYBACK_STARTUP_MS = 200;
 const INTERRUPTION_HINT_CAPABILITY = "candidate-snapshot-v1";
 const RESPONSE_OUTPUT_TYPES = new Set([
   "assistant",
@@ -384,6 +387,21 @@ export function decodeManagedAudioFrame(data) {
   };
 }
 
+export function captureProcessingFromTrackSettings(settings) {
+  const value = settings && typeof settings === "object" ? settings : {};
+  const state = (name) =>
+    value[name] === true
+      ? "enabled"
+      : value[name] === false
+        ? "disabled"
+        : "not-reported";
+  return {
+    echoCancellation: state("echoCancellation"),
+    noiseSuppression: state("noiseSuppression"),
+    autoGainControl: state("autoGainControl"),
+  };
+}
+
 /** 通话会话：封装 WS、麦克风采集、可恢复 Worklet 播放与两阶段打断。 */
 export class RealtimeSession {
   constructor({
@@ -483,6 +501,7 @@ export class RealtimeSession {
     this.trace = new RealtimeTrace({ provider, maxEvents: maxTraceEvents, onEvent: onTrace });
     this._backendGeneration = 0;
     this._interruptedResponseGeneration = null;
+    this._candidateResponseGeneration = null;
     this._lastDurableAudibleGeneration = null;
     this._traceAsrFinalSeen = false;
     this._currentAudioSegment = null;
@@ -504,6 +523,7 @@ export class RealtimeSession {
     this._pendingMemoryContextReason = "turn";
     this._vadShadowMode = "disabled";
     this._asrRuntime = sanitizeAsrRuntime();
+    this._captureProcessing = captureProcessingFromTrackSettings();
     this._vadShadowSummary = sanitizeVadShadowSummary();
     this._resolveVadShadowFinal = null;
     this._candidateId = null;
@@ -1006,6 +1026,7 @@ export class RealtimeSession {
     this._sessionStarted = false;
     this._backendGeneration = 0;
     this._interruptedResponseGeneration = null;
+    this._candidateResponseGeneration = null;
     this._backendAudioPending = false;
     this._assistantActive = false;
     this._lastAudibleGeneration = null;
@@ -1187,13 +1208,21 @@ export class RealtimeSession {
         if (this._confirmSpeech()) this.cb.onAsrStart?.();
         break;
       case "speech_candidate":
-        this._cancelInterruptionRecovery();
         this._beginSpeechCandidate(msg);
         break;
       case "speech_confirmed":
         if (this._confirmSpeech(msg)) this.cb.onAsrStart?.();
         break;
       case "speech_rejected":
+        if (
+          this._speechCandidate &&
+          Number.isSafeInteger(msg.resumedGeneration) &&
+          msg.resumedGeneration >= 0 &&
+          msg.resumedGeneration === this._candidateResponseGeneration &&
+          msg.resumedGeneration <= this._backendGeneration
+        ) {
+          this._backendGeneration = msg.resumedGeneration;
+        }
         this._interruptedResponseGeneration = null;
         this._rejectSpeech(msg.reason || "voice_rejected");
         break;
@@ -1473,6 +1502,7 @@ export class RealtimeSession {
         this.cb.onSpeaking?.();
         break;
       case "usage":
+        this._recordPrefillSample(msg.llm);
         this.cb.onUsage?.(msg);
         break;
       case "error":
@@ -1817,6 +1847,7 @@ export class RealtimeSession {
 
   _beginSpeechCandidate(msg = {}) {
     this._endThinkingFeedback();
+    const recoveryWasActive = this._pendingInterruptionRecovery?.started === true;
     this._cancelInterruptionRecovery();
     if (this._speechCandidate || this._userTurnOpen) return false;
     this._resetInterruptionCandidate();
@@ -1827,7 +1858,12 @@ export class RealtimeSession {
     this._pendingProactiveRhythmSignal = this._captureProactiveRhythmSignal();
     this._cancelProactiveTimers();
     this._speechCandidate = true;
-    this._candidateInterruptsResponse = this._assistantActive || this._hasPlayback();
+    this._candidateResponseGeneration = this._backendGeneration;
+    this._candidateInterruptsResponse =
+      this._assistantActive ||
+      this._backendAudioPending ||
+      recoveryWasActive ||
+      this._hasPlayback();
     const candidateId = msg.candidateId;
     if (
       this._candidateInterruptsResponse &&
@@ -2424,6 +2460,33 @@ export class RealtimeSession {
     this._scheduleTopicLeadAfterPlayback(generation);
   }
 
+  // Prefill timings only reach the trace for providers that report them
+  // (local Ollama); cloud turns omit the fields and record nothing.
+  _recordPrefillSample(usage) {
+    if (!usage || typeof usage !== "object") return;
+    const promptEvalMs = usage.promptEvalMs;
+    if (!Number.isFinite(promptEvalMs) || promptEvalMs < 0) return;
+    const metrics = { promptEvalMs };
+    for (const name of ["prompt", "evalMs", "loadMs", "firstTokenWallMs"]) {
+      const value = usage[name];
+      if (!Number.isFinite(value) || value < 0) continue;
+      metrics[name === "prompt" ? "promptTokens" : name] = value;
+    }
+    // Time the request spent waiting for the shared model before any compute:
+    // the proxy's wall clock to first token minus the work the provider admits
+    // to. Ollama serialises requests and excludes that wait from its own
+    // timings, so without this subtraction the delay is invisible.
+    if (Number.isFinite(metrics.firstTokenWallMs)) {
+      metrics.queueWaitMs = Math.max(
+        0,
+        Math.round(
+          metrics.firstTokenWallMs - promptEvalMs - (metrics.loadMs || 0),
+        ),
+      );
+    }
+    this.trace.record(TRACE_EVENT.LLM_PREFILL, { metrics });
+  }
+
   _clearResponseFinishWatchdog() {
     if (this._responseFinishTimer) clearTimeout(this._responseFinishTimer);
     this._responseFinishTimer = 0;
@@ -2874,6 +2937,7 @@ export class RealtimeSession {
     this._commitProactiveRhythmSignal();
     this._speechCandidate = false;
     this._candidateInterruptsResponse = false;
+    this._candidateResponseGeneration = null;
     this._candidateId = null;
     this._candidateSnapshot = null;
     this._candidateSegmentKeys = null;
@@ -2902,6 +2966,7 @@ export class RealtimeSession {
     this._missedProactiveWindowPending = false;
     this._pendingProactiveRhythmSignal = null;
     this._candidateInterruptsResponse = false;
+    this._candidateResponseGeneration = null;
     this._resetInterruptionCandidate();
     this.trace.record(TRACE_EVENT.SPEECH_REJECTED, { reason });
     // Rejection means the candidate was not a real user turn. Resume both the
@@ -3249,6 +3314,12 @@ export class RealtimeSession {
       throw new Error("麦克风未就绪，请重试并允许访问麦克风");
     }
     this.micStream = stream;
+    try {
+      const track = stream.getAudioTracks?.()[0];
+      this._captureProcessing = captureProcessingFromTrackSettings(track?.getSettings?.());
+    } catch {
+      this._captureProcessing = captureProcessingFromTrackSettings();
+    }
     const ctx = this.audioCtx;
     if (!ctx) throw new Error("音频上下文未初始化");
     if (ctx.state === "suspended") await ctx.resume();
@@ -3380,6 +3451,7 @@ export class RealtimeSession {
         responseFinish: this._responseFinishMode,
         memoryContext: this._memoryContextMode,
         vadShadow: this._vadShadowMode,
+        captureProcessing: { ...this._captureProcessing },
         asr: { ...this._asrRuntime },
       },
       vadShadowSummary: { ...this._vadShadowSummary },

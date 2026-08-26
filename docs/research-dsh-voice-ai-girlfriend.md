@@ -169,3 +169,41 @@ README 对这条链路和目录职责给出了同样的边界（[`README.md` L10
 - 本次克隆并固定检查 `55b6a0a010d73b11120c7d69f754f6f9d92bef99`，阅读了 47 个 tracked files 的源码、配置、README、开发日志、许可证和 4 次提交历史。
 - 没有安装约数 GB 的 CUDA、Whisper、Qwen3-TTS 与 DSH 宿主，也没有运行目标项目。目标仓库没有可直接执行的确定性 test/spec 或 CI 配置，因此 README/开发日志中的 TTFA、RTF 和“用户验证通过”只作为作者一手陈述，不作为本报告独立复现的性能事实。
 - 本次只新增研究文档，没有修改元元桌宠代码、配置或资源，因此没有运行本项目测试套件。
+
+## 2026-08-26 复核：macOS、数字人窗口与 QQ 链路
+
+本节针对用户关心的两个问题，重新检查仓库当前 `main`（`9922b13f5f2fccec394ab0ea497e3fe6599f96c6`）。链接中的行号均指向该提交。
+
+### macOS 支持结论：没有上游支持证据，按不支持处理
+
+- README 的安装章节明确写“全程在 Windows 上操作”，系统要求是 Windows 10/11 64 位，硬件要求 NVIDIA 独立显卡；没有 macOS 安装、启动或验收步骤（[`README.md` L71-L86](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L71-L86)）。
+- 数字人部署只给 Windows Docker Desktop/Windows 路径映射（`d:/duix_avatar_data/face2face`），Compose 声明 NVIDIA GPU reservation，并使用 `guiji2025/duix.avatar-5090:trt10.9` 镜像（[`bridge/docker-compose-5060ti.yml` L1-L50](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/bridge/docker-compose-5060ti.yml#L1-L50)）。这不是 macOS/Apple Silicon 的可运行矩阵。
+- 启动脚本是 `.cmd`，默认调用 `venv-speech\\Scripts\\python.exe`、PowerShell 和 NapCat Windows launcher（[`bridge/start-bridge.cmd`](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/bridge/start-bridge.cmd)、[`README.md` L350-L360](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L350-L360)）。Python/FastAPI 本身跨平台，但这不等于整套依赖（DUIX、CUDA、NapCat）跨平台。
+
+因此，不能把它称为“支持 macOS”。在 macOS 上最多可移植不含 DUIX/NapCat 的 Python 语音桥和浏览器插件，需另行验证 PyTorch/模型与音频设备；数字人和 QQ 部分没有作者提供的 macOS 路径或测试结果。
+
+### 数字人窗口与性能：实现方式及可相信的上限
+
+数字人窗口不是原生桌面窗口或 3D 渲染，而是 DSH 浏览器页面中的右侧 Companion 列：空闲/说话视频用 HTML `<video>` 播放，列宽（约 240 px 至 70vw）和左右位置写入 `localStorage`，只有拖拽手柄接收指针事件（[`dsh-plugin/src/client/voice/companion.tsx` L1-L24](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/dsh-plugin/src/client/voice/companion.tsx#L1-L24)）。媒体目录初次加载后每 30 秒轮询，仅在列表变化时更新，避免无变化时重启当前视频（[`companion.tsx` L76-L123](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/dsh-plugin/src/client/voice/companion.tsx#L76-L123)）。
+
+开启动画时，文本按默认 48 字分段，逐段 TTS 后提交 DUIX `/easy/submit`；当前段生成期间预合成下一段，DUIX 单任务串行，更新回复会抢占未开始段（[`voice_bridge.py` L781-L858](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/bridge/voice_bridge.py#L781-L858)）。视频生成结果落盘并由 `<video>` 播放，音频已混入视频以保持同步（[`README.md` L300-L337](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L300-L337)）。
+
+性能只有作者自报、不可独立复现的数字：7.3 秒音频由 20.1 秒降到 14.1 秒（约 30%），换 15fps 和关闭超分预计再降；README 同时承认等待主要来自 LLM + 整段 TTS，长回复更慢（[`README.md` L335-L337](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L335-L337)、[`README.md` L403-L409](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L403-L409)）。这说明数字人生成通常慢于实时播放（14.1 秒生成 7.3 秒音频，约 1.9x 音频时长），不能据此宣称低延迟或 macOS 性能。
+
+### QQ：手机可互动消息，但不是实时通话
+
+链路是“手机主号发消息 → 电脑 QQ 小号（NapCat 注入）→ OneBot HTTP/WebSocket → 本地桥 → 浏览器插件 DSH → 文本回复 + TTS Silk 语音消息发回主号”。README 要求 NapCat Windows Shell、登录小号、OneBot HTTP `:3000` 和 WebSocket 客户端连 `ws://127.0.0.1:8765/api/qq/onebot`（[`README.md` L363-L400](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L363-L400)）。
+
+源码只处理 OneBot `post_type=message` 且 `message_type=private` 的文本字段，并把 `{type:"qq_message", text}` 推给插件；插件收到后调用 `sendText`。出站则监听已结算 assistant 文本，发送 `{type:"reply"}`，桥接依次调用 `send_private_msg` 发文本和 Silk `record` 语音（[`voice_bridge.py` L1291-L1389](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/bridge/voice_bridge.py#L1291-L1389)、[`qq_bridge.py` L1-L72](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/bridge/qq_bridge.py#L1-L72)、[`qq-bridge.tsx` L1-L75](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/dsh-plugin/src/client/voice/qq-bridge.tsx#L1-L75)）。没有 `get/friend call`、音频 RTP、QQ 通话事件、实时双工音频或入站语音转写；README 还明确说 QQ 语音必须是 Silk，且回复延迟主要来自 LLM + 整段 TTS（[`README.md` L403-L409](https://github.com/beiyege-01/dsh-voice-ai-girlfriend/blob/9922b13f5fccec394ab0ea497e3fe6599f96c6/README.md#L403-L409)）。
+
+所以用户理解中的“手机上和本机 QQ 互动消息”是成立的（文本与语音**消息**），但“实时通话”不成立；它是回合式异步消息，不是 QQ 语音通话桥。
+
+### 接入当前 Tauri 项目的可行性
+
+**可行但应拆成两项，且不应直接移植目标项目运行时：**
+
+1. **数字人窗口（中等可行性，macOS 低可行性）**：当前项目已有 Tauri 透明置顶宠物窗口、语音播放回执和跨平台窗口管理。可把 DUIX 结果作为受信任的、尺寸/格式/hash 限制的短视频资源，在现有 chat/pet 窗口中播放；但必须新增外部数字人服务生命周期、任务取消、磁盘配额和视频解码验收。DUIX 的 CUDA/NVIDIA Docker 依赖不能作为 macOS 功能；macOS 需另一个 Apple Silicon/Core ML/远程 GPU 后端，或仅保留现有 2D 宠物动画。
+2. **QQ 消息桥（Windows 优先，中等可行性）**：可在 Rust loopback proxy 外新增受鉴权的 OneBot/NapCat adapter，把入站私聊文本映射到现有 `chat`/Memory 边界，出站发送文本或已生成的语音消息。必须保留 `KXYY_TTS_SECRET`、严格 loopback、固定大小/频率上限和隐私诊断；不能让 NapCat 事件绕过现有 persona/Memory。该适配器依赖 Windows QQ 注入和小号，macOS 没有上游支持证据。
+3. **QQ 实时通话（不可直接接入）**：目标仓库没有通话协议或可复用实现。若产品确实需要手机 QQ 实时通话，需独立研究 QQ/NapCat 是否公开稳定的通话音频 API，并重新设计鉴权、双工 PCM、回声消除、断线恢复和平台合规；在获得一手协议和可运行原型前，不应把它写入当前项目路线图或声称可行。
+
+总体建议：优先实现“QQ 文本 + 语音消息”受控 adapter（仅 Windows、显式开关），数字人先做本地短视频播放原型并以现有 Worklet/回执为准；不要把 DUIX 的 Windows/NVIDIA 方案当作 macOS 支持，也不要把 QQ 语音消息误称为实时通话。

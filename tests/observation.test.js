@@ -15,6 +15,69 @@ import {
   renderFreshTopicBlock,
   takeFreshTopicsForSession,
 } from "../src/ai/fresh-topics.js";
+import {
+  buildRecommendationLinkPrompt,
+  collectRecommendationLinks,
+  safeRecommendationUrl,
+} from "../src/ai/recommendation-links.js";
+
+test("Bilibili video recommendation is treated as a fresh discovery request", () => {
+  const query = "哎，你给我推荐几条B站上的热门视频呗，有没有什么好玩的视频？";
+  assert.deepEqual(inferFreshTopicCategories(query), ["daily-life"]);
+  assert.equal(needsFreshTopics(query, { participation: "active" }), true);
+});
+
+test("Bilibili requests keep only Bilibili source items", async () => {
+  const items = await fetchFreshTopics({
+    enabled: true,
+    query: "推荐几条B站热门视频",
+    participation: "relevant",
+    invokeImpl: async () => ({
+      status: "ok",
+      items: [
+        { sourceName: "百度热榜", sourceId: "baidu:1", title: "不相关", shortText: "不相关", canonicalUrl: "https://example.com/a", fetchedAt: "2026-08-24T01:00:00Z", category: "daily-life" },
+        { sourceName: "哔哩哔哩热门", sourceId: "bilibili:1", title: "真实视频", shortText: "真实视频", canonicalUrl: "https://www.bilibili.com/video/BV1abc", fetchedAt: "2026-08-24T01:00:00Z", category: "daily-life" },
+      ],
+    }),
+  });
+  assert.deepEqual(items.map((item) => item.sourceName), ["哔哩哔哩热门"]);
+});
+
+test("generic video requests are not silently restricted to Bilibili", async () => {
+  const items = await fetchFreshTopics({
+    enabled: true,
+    query: "推荐几个热门视频",
+    participation: "relevant",
+    invokeImpl: async () => ({
+      status: "ok",
+      items: [
+        { sourceName: "其它视频来源", sourceId: "video:1", title: "真实视频", shortText: "真实视频", canonicalUrl: "https://example.com/video/1", fetchedAt: "2026-08-24T01:00:00Z", category: "daily-life" },
+      ],
+    }),
+  });
+  assert.deepEqual(items.map((item) => item.sourceName), ["其它视频来源"]);
+});
+
+test("confirmed Bilibili topics are the only recommendation links exposed to chat", () => {
+  const links = collectRecommendationLinks("推荐几条B站热门视频", [{
+    freshTopic: {
+      title: "Workspace 选中的真实视频",
+      canonicalUrl: "https://www.bilibili.com/video/BV1workspace#reply",
+    },
+  }, {
+    title: "伪造的外站链接",
+    canonicalUrl: "https://example.com/video/BV1fake",
+  }]);
+
+  assert.deepEqual(links, [{
+    title: "Workspace 选中的真实视频",
+    url: "https://www.bilibili.com/video/BV1workspace",
+  }]);
+  assert.equal(safeRecommendationUrl("https://bilibili.com.evil.example/video/BV1fake"), "");
+  assert.match(buildRecommendationLinkPrompt("你发我链接", links), /BV1workspace/);
+  assert.doesNotMatch(buildRecommendationLinkPrompt("你发我链接", links), /稍后/);
+  assert.match(buildRecommendationLinkPrompt("你发我链接", []), /禁止承诺稍后翻历史或虚构链接/);
+});
 
 test("fresh topic locations prefer explicit user city then persona current and hometown", () => {
   const locations = inferFreshTopicLocations({

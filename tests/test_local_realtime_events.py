@@ -7,6 +7,7 @@ import os
 import queue
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -360,6 +361,63 @@ class GenerationCancelScopeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TextProviderAdapterTests(unittest.TestCase):
+    def test_llm_first_event_timeout_allows_bounded_local_cold_start(self):
+        original_settings = common.SETTINGS
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            try:
+                common.SETTINGS = settings_path
+                settings_path.write_text('{"textProvider":"local"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_first_event_timeout_seconds(),
+                    common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(
+                    common.llm_first_event_retry_count(),
+                    common.LOCAL_LLM_FIRST_EVENT_RETRIES,
+                )
+
+                settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_first_event_timeout_seconds(),
+                    common.LLM_FIRST_EVENT_TIMEOUT_SECONDS,
+                )
+                self.assertEqual(common.llm_first_event_retry_count(), 0)
+            finally:
+                common.SETTINGS = original_settings
+
+    def test_llm_poll_interval_is_tight_only_for_local_provider(self):
+        original_settings = common.SETTINGS
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            try:
+                common.SETTINGS = settings_path
+                settings_path.write_text('{"textProvider":"local"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_poll_interval_seconds(),
+                    common.LOCAL_LLM_POLL_INTERVAL_SECONDS,
+                )
+                settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
+                self.assertEqual(
+                    common.llm_poll_interval_seconds(),
+                    common.LLM_POLL_INTERVAL_SECONDS,
+                )
+            finally:
+                common.SETTINGS = original_settings
+
+    def test_local_ornith_realtime_generation_forces_fast_path(self):
+        original = os.environ.get("KXYY_LOCAL_LLM_REALTIME_FAST")
+        try:
+            os.environ["KXYY_LOCAL_LLM_REALTIME_FAST"] = "ornith-v1"
+            self.assertTrue(common.local_realtime_fast_generation())
+            os.environ["KXYY_LOCAL_LLM_REALTIME_FAST"] = ""
+            self.assertFalse(common.local_realtime_fast_generation())
+        finally:
+            if original is None:
+                os.environ.pop("KXYY_LOCAL_LLM_REALTIME_FAST", None)
+            else:
+                os.environ["KXYY_LOCAL_LLM_REALTIME_FAST"] = original
+
     def setUp(self):
         self.original_proxy_base = os.environ.get("KXYY_AI_PROXY_BASE")
         self.original_tts_secret = os.environ.get("KXYY_TTS_SECRET")
@@ -468,6 +526,51 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertEqual(common.reasoning_preference_fallback("always"), "deliberate")
         self.assertEqual(common.reasoning_preference_fallback("automatic"), "fast")
 
+    def test_llm_usage_carries_prefill_timings_only_when_provider_reports_them(self):
+        def stream_with(usage_json: str):
+            class FakeResponse:
+                headers = {"X-Kxyy-Text-Provider": "Ollama", "X-Kxyy-Thinking": "0"}
+                lines = [
+                    b'data: {"choices":[{"delta":{"content":"\xe5\x97\xaf"}}]}\n',
+                    f'data: {{"choices":[],"usage":{usage_json}}}\n'.encode("utf-8"),
+                    b"data: [DONE]\n",
+                ]
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def __iter__(self):
+                    return iter(self.lines)
+
+            common.urllib.request.urlopen = lambda *_a, **_k: FakeResponse()
+            events = list(common.iter_llm_stream("角色设定", [], "用户内容"))
+            return next(e for e in events if e["type"] == "usage")
+
+        timed = stream_with(
+            '{"prompt_tokens":1010,"completion_tokens":47,"total_tokens":1057,'
+            '"prompt_eval_ms":2820,"eval_ms":1420,"load_ms":3349,'
+            '"first_token_wall_ms":9969}'
+        )
+        self.assertEqual(timed["promptEvalMs"], 2820)
+        self.assertEqual(timed["evalMs"], 1420)
+        self.assertEqual(timed["loadMs"], 3349)
+        self.assertEqual(timed["firstTokenWallMs"], 9969)
+        self.assertEqual(timed["prompt"], 1010)
+
+        # Cloud providers report no timings; the keys must stay absent rather
+        # than surface as a misleading zero.
+        untimed = stream_with(
+            '{"prompt_tokens":800,"completion_tokens":40,"total_tokens":840}'
+        )
+        self.assertNotIn("promptEvalMs", untimed)
+        self.assertNotIn("evalMs", untimed)
+        self.assertNotIn("loadMs", untimed)
+        self.assertNotIn("firstTokenWallMs", untimed)
+        self.assertEqual(untimed["prompt"], 800)
+
     def test_llm_stream_uses_loopback_proxy_and_parses_deltas_and_usage(self):
         captured = {}
 
@@ -515,6 +618,47 @@ class TextProviderAdapterTests(unittest.TestCase):
         self.assertNotIn("Authorization", captured["headers"])
         self.assertEqual(captured["headers"]["X-kxyy-internal-secret"], "managed-test-secret")
         self.assertEqual(captured["timeout"], 120)
+
+    def test_local_ornith_fast_path_yields_before_ollama_stream_finishes(self):
+        consumed = []
+        original = os.environ.get("KXYY_LOCAL_LLM_REALTIME_FAST")
+
+        class FakeResponse:
+            headers = {
+                "X-Kxyy-Text-Provider": "Ollama",
+                "X-Kxyy-Thinking": "0",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                for index, line in enumerate(
+                    [
+                        b'data: {"choices":[{"delta":{"content":"first"}}]}\n',
+                        b'data: {"choices":[{"delta":{"content":"second"}}]}\n',
+                        b"data: [DONE]\n",
+                    ]
+                ):
+                    consumed.append(index)
+                    yield line
+
+        try:
+            os.environ["KXYY_LOCAL_LLM_REALTIME_FAST"] = "ornith-v1"
+            common.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
+            stream = iter(common.iter_llm_stream("role", [], "user"))
+            self.assertEqual(next(stream)["type"], "meta")
+            self.assertEqual(next(stream), {"type": "delta", "text": "first"})
+            self.assertEqual(consumed, [0])
+            self.assertEqual(next(stream), {"type": "delta", "text": "second"})
+        finally:
+            if original is None:
+                os.environ.pop("KXYY_LOCAL_LLM_REALTIME_FAST", None)
+            else:
+                os.environ["KXYY_LOCAL_LLM_REALTIME_FAST"] = original
 
     def test_reasoning_is_never_emitted_when_enabled(self):
         class FakeResponse:
@@ -609,12 +753,35 @@ class TextProviderAdapterTests(unittest.TestCase):
                     [
                         b'data: {"choices":[{"delta":{"reasoning_content":"fallback "}}]}\n',
                         b'data: {"choices":[{"delta":{"reasoning":"reply"}}]}\n',
+                        b"data: [DONE]\n",
                     ]
                 )
 
         common.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
         events = list(common.iter_llm_stream("role", [], "user"))
         self.assertEqual(events[-1], {"type": "delta", "text": "fallback reply"})
+
+    def test_llm_stream_rejects_clean_eof_without_done_frame(self):
+        class FakeResponse:
+            headers = {"X-Kxyy-Text-Provider": "DeepSeek", "X-Kxyy-Thinking": "0"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"choices":[{"delta":{"content":"partial"}}]}\n',
+                    ]
+                )
+
+        common.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
+
+        with self.assertRaisesRegex(common.SafeRealtimeError, "响应意外中断"):
+            list(common.iter_llm_stream("role", [], "user"))
 
     def test_disabled_thinking_discards_buffered_reasoning_when_content_arrives(self):
         class FakeResponse:
@@ -631,6 +798,7 @@ class TextProviderAdapterTests(unittest.TestCase):
                     [
                         b'data: {"choices":[{"delta":{"reasoning_content":"private"}}]}\n',
                         b'data: {"choices":[{"delta":{"content":"public"}}]}\n',
+                        b"data: [DONE]\n",
                     ]
                 )
 
@@ -998,6 +1166,29 @@ class ShortTermFactTests(unittest.TestCase):
 
 
 class BoundedLlmProducerTests(unittest.TestCase):
+    def test_hidden_reasoning_progress_releases_cancelled_producer_without_leaking_event(self):
+        original_iter = common.iter_llm_stream
+        scope = common.GenerationCancelScope(0, "response")
+        events = queue.Queue(maxsize=4)
+        release_progress = threading.Event()
+
+        def progress_iter(*_args, **_kwargs):
+            while True:
+                release_progress.wait(timeout=0.01)
+                yield {"type": "provider_progress"}
+
+        common.iter_llm_stream = progress_iter
+        try:
+            thread = common.start_llm_stream_producer("role", [], "user", scope, events)
+            self.assertIsNotNone(thread)
+            scope.cancel("turn_detected")
+            release_progress.set()
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(events.empty())
+        finally:
+            common.iter_llm_stream = original_iter
+
     def test_cancel_unblocks_full_event_queue(self):
         original_iter = common.iter_llm_stream
         scope = common.GenerationCancelScope(1, "response")
@@ -1502,6 +1693,9 @@ class InMemoryAsrTests(unittest.TestCase):
         self.original_backend = common._asr_backend
         self.original_openai_model = common._openai_whisper_model
         self.original_adapter = common._asr_adapter_instance
+        self.original_fallback_adapter = getattr(common, "_asr_fallback_adapter", None)
+        self.original_fallback_backend = getattr(common, "_asr_fallback_backend", "none")
+        self.original_runtime = common._asr_runtime
         common._asr_adapter_instance = None
 
         fake_numpy = types.SimpleNamespace(
@@ -1524,6 +1718,9 @@ class InMemoryAsrTests(unittest.TestCase):
         common._asr_backend = self.original_backend
         common._openai_whisper_model = self.original_openai_model
         common._asr_adapter_instance = self.original_adapter
+        common._asr_fallback_adapter = self.original_fallback_adapter
+        common._asr_fallback_backend = self.original_fallback_backend
+        common._asr_runtime = self.original_runtime
 
     def test_mlx_receives_normalized_memory_audio_without_path(self):
         captured = {}
@@ -1609,6 +1806,37 @@ class InMemoryAsrTests(unittest.TestCase):
             )
         finally:
             common._asr_runtime = original
+
+    def test_sensevoice_warmup_failure_activates_process_lifetime_whisper_fallback(self):
+        class FailingSenseVoice:
+            def transcribe(self, _pcm):
+                raise common.asr_adapter.AsrAdapterError("sensevoice_inference_failed")
+
+        class WorkingWhisper:
+            def transcribe(self, _pcm):
+                return common.asr_adapter.AsrResult("回退成功", language="zh")
+
+        common._asr_backend = "sensevoice"
+        common._asr_adapter_instance = FailingSenseVoice()
+        common._asr_fallback_adapter = WorkingWhisper()
+        common._asr_fallback_backend = "mlx"
+        common._asr_runtime = {
+            "requested": "sensevoice",
+            "active": "sensevoice-sherpa-onnx",
+            "status": "active",
+        }
+
+        common.warmup_asr()
+
+        self.assertEqual(common.transcribe(b"\x00\x00").text, "回退成功")
+        self.assertEqual(
+            common.asr_runtime_summary(),
+            {
+                "requested": "sensevoice",
+                "active": "whisper-mlx",
+                "status": "fallback",
+            },
+        )
 
     def test_long_repetition_hallucinations_are_rejected_without_harming_short_emphasis(self):
         voiced = struct.pack("<h", 5000) * common.FRAME_SAMPLES
@@ -2286,7 +2514,7 @@ class RealtimePcmReplayTests(unittest.IsolatedAsyncioTestCase):
 
         loud_frame = struct.pack("<h", 10000) * common.FRAME_SAMPLES
         await session.on_pcm(loud_frame)
-        self.assertTrue(session.in_speech)
+        self.assertFalse(session.in_speech)
 
         await session.on_start({})
         self.assertEqual(last_json_of_type(ws, "session")["vadShadow"], "unavailable")
@@ -2585,6 +2813,116 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         common.start_llm_stream_producer = fake_start
         common._tts_stream_slots = threading.BoundedSemaphore(common.TTS_STREAM_MAX_TASKS)
 
+    async def test_idle_single_frame_noise_does_not_open_a_user_turn(self):
+        noise = struct.pack("<h", 6000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+        await self.session._on_frame(noise)
+        await self.session._on_frame(quiet)
+        await self.session._on_frame(noise)
+        self.assertFalse(self.session.in_speech)
+        self.assertEqual(self.ws.json_messages(), [])
+
+    async def test_idle_speech_confirmation_keeps_the_three_frame_preroll(self):
+        speech = struct.pack("<h", 6000) * common.FRAME_SAMPLES
+        for _ in range(3):
+            await self.session._on_frame(speech)
+        self.assertTrue(self.session.in_speech)
+        self.assertEqual(len(self.session.speech_pcm), len(speech) * 3)
+
+    async def test_llm_first_event_timeout_releases_response(self):
+        original_timeout = common.LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        original_timeout_selector = common.llm_first_event_timeout_seconds
+        original_retry_selector = common.llm_first_event_retry_count
+        original_synth = common._synth_tts
+        common.LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
+        common.llm_first_event_timeout_seconds = lambda: common.LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        common.llm_first_event_retry_count = lambda: 0
+        common._synth_tts = lambda _text: b"\x00\x00"
+        try:
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            await self.session._reply_pipeline("用户输入", scope)
+            self.assertFalse(scope.active)
+            self.assertEqual(self.ws.json_messages()[-1]["type"], "error")
+            self.assertIn("首个响应超时", self.ws.json_messages()[-1]["message"])
+        finally:
+            common.LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_timeout
+            common.llm_first_event_timeout_seconds = original_timeout_selector
+            common.llm_first_event_retry_count = original_retry_selector
+            common._synth_tts = original_synth
+
+    async def test_local_first_event_timeout_retries_once_and_recovers(self):
+        original_selector = common.llm_first_event_timeout_seconds
+        original_retry_selector = common.llm_first_event_retry_count
+        original_local = common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        original_synth = common._synth_tts
+        common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
+        common.llm_first_event_timeout_seconds = (
+            lambda: common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        )
+        common.llm_first_event_retry_count = lambda: common.LOCAL_LLM_FIRST_EVENT_RETRIES
+        common._synth_tts = lambda _text: b"\x00\x00"
+        attempts = []
+
+        def flaky_start(_role, _history, _text, _scope, out):
+            attempts.append(out)
+            # First attempt hangs without emitting; the retry answers normally.
+            if len(attempts) > 1:
+                out.put_nowait({"type": "delta", "text": "重试之后的回复，说得具体一点。"})
+                out.put_nowait({"type": "done"})
+            return object()
+
+        common.start_llm_stream_producer = flaky_start
+        try:
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            await self.session._reply_pipeline("用户输入", scope)
+
+            self.assertEqual(len(attempts), 2)
+            # The retry must not reuse the abandoned queue, or the hung producer's
+            # late events could contaminate the recovered turn.
+            self.assertIsNot(attempts[0], attempts[1])
+            kinds = [message["type"] for message in self.ws.json_messages()]
+            self.assertIn("assistant", kinds)
+            self.assertNotIn("error", kinds)
+        finally:
+            common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_local
+            common.llm_first_event_timeout_seconds = original_selector
+            common.llm_first_event_retry_count = original_retry_selector
+            common._synth_tts = original_synth
+
+    async def test_local_first_event_retry_is_bounded_to_one_extra_attempt(self):
+        original_selector = common.llm_first_event_timeout_seconds
+        original_retry_selector = common.llm_first_event_retry_count
+        original_local = common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        original_synth = common._synth_tts
+        common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
+        common.llm_first_event_timeout_seconds = (
+            lambda: common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        )
+        common.llm_first_event_retry_count = lambda: common.LOCAL_LLM_FIRST_EVENT_RETRIES
+        common._synth_tts = lambda _text: b"\x00\x00"
+        attempts = []
+
+        def always_hangs(_role, _history, _text, _scope, out):
+            attempts.append(out)
+            return object()
+
+        common.start_llm_stream_producer = always_hangs
+        try:
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            await self.session._reply_pipeline("用户输入", scope)
+
+            self.assertEqual(len(attempts), 1 + common.LOCAL_LLM_FIRST_EVENT_RETRIES)
+            self.assertEqual(self.ws.json_messages()[-1]["type"], "error")
+            self.assertIn("首个响应超时", self.ws.json_messages()[-1]["message"])
+        finally:
+            common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_local
+            common.llm_first_event_timeout_seconds = original_selector
+            common.llm_first_event_retry_count = original_retry_selector
+            common._synth_tts = original_synth
+
     async def test_response_finish_recover_cancels_only_when_all_audio_receipts_arrived(self):
         await self.session.on_start({
             "downlinkAudio": [common.MANAGED_AUDIO_CAPABILITY],
@@ -2828,6 +3166,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         filler_started = threading.Event()
         release_filler = threading.Event()
         model_busy = threading.Event()
+        original_filler_enabled = common.thinking_filler_enabled
         body_attempted = asyncio.Event()
         captured = {}
 
@@ -2850,6 +3189,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
 
         try:
             common.THINKING_FILLER_DELAY_SECONDS = 0
+            common.thinking_filler_enabled = lambda: True
             common._synth_tts = blocking_filler_synth
             common._synth_tts_stream = guarded_body_stream
             common.start_llm_stream_producer = capture_queue
@@ -2893,6 +3233,7 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release_filler.set()
             common.THINKING_FILLER_DELAY_SECONDS = original_delay
+            common.thinking_filler_enabled = original_filler_enabled
 
     async def test_runtime_thinking_filler_skips_after_llm_output_begins(self):
         original_delay = common.THINKING_FILLER_DELAY_SECONDS
@@ -3277,12 +3618,68 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.session.play_enabled = True
         frame = struct.pack("<h", 10000) * common.FRAME_SAMPLES
 
-        for _ in range(common.BARGE_IN_FRAMES_PLAY + 3):
+        for _ in range(common.BARGE_IN_FRAMES_PLAY):
             await self.session._on_frame(frame)
 
         types = [message["type"] for message in self.ws.json_messages()]
         self.assertEqual(types.count("speech_candidate"), 1)
         self.assertTrue(self.session.play_barge_pending)
+        self.assertEqual(
+            len(self.session.speech_pcm),
+            common.BARGE_IN_FRAMES_PLAY * common.FRAME_SAMPLES * 2,
+        )
+
+    async def test_playback_360ms_transient_does_not_open_speech_candidate(self):
+        self.session.playing = True
+        self.session.play_enabled = True
+        loud = struct.pack("<h", 10000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+
+        await self.session.on_pcm(loud * 12 + quiet * 3)
+
+        self.assertFalse(self.session.in_speech)
+        self.assertNotIn(
+            "speech_candidate",
+            [message["type"] for message in self.ws.json_messages()],
+        )
+
+    async def test_playback_cough_event_cannot_confirm_hallucinated_user_text(self):
+        original_submit = common.submit_asr
+        loud = struct.pack("<h", 7000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+        old_response = self.session._new_scope("response")
+        self.session.response_scope = old_response
+        self.session.playing = True
+        self.session.play_enabled = True
+
+        def cough_result(loop, _pcm, **_kwargs):
+            future = loop.create_future()
+            future.set_result(common.asr_adapter.AsrResult(
+                "我刚才其实没有说话呀",
+                None,
+                language="zh",
+                emotion="neutral",
+                event="cough",
+            ))
+            return future
+
+        common.submit_asr = cough_result
+        try:
+            await self.session.on_pcm(
+                loud * (common.BARGE_IN_FRAMES_PLAY + 15) + quiet * 60
+            )
+            if self.session.asr_task is not None:
+                await self.session.asr_task
+        finally:
+            common.submit_asr = original_submit
+
+        message_types = [message["type"] for message in self.ws.json_messages()]
+        self.assertIn("speech_rejected", message_types)
+        self.assertNotIn("speech_confirmed", message_types)
+        rejected = last_json_of_type(self.ws, "speech_rejected")
+        self.assertEqual(rejected["resumedGeneration"], old_response.generation)
+        self.assertTrue(old_response.active)
+        self.assertTrue(self.session.play_enabled)
 
     async def test_start_negotiates_managed_audio_and_old_client_stays_raw(self):
         async def unused_stream(_text):
@@ -5377,6 +5774,34 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(handled), 1)
         self.assertFalse(self.session.in_speech)
+
+    async def test_idle_short_voice_is_not_diluted_by_long_endpoint_tail(self):
+        original_transcribe = common.transcribe
+        common.transcribe = lambda _pcm: common.asr_adapter.AsrResult(
+            "对", None, language="zh"
+        )
+        captured = []
+
+        async def capture_reply(text, _scope, **_kwargs):
+            captured.append(text)
+
+        self.session._reply_pipeline = capture_reply
+        voice = struct.pack("<h", 700) * common.FRAME_SAMPLES
+        quiet = bytes(common.FRAME_SAMPLES * 2)
+        try:
+            for _ in range(360 // common.FRAME_MS):
+                await self.session._on_frame(voice)
+            for _ in range(common.ENDPOINT_COMMIT_MS // common.FRAME_MS):
+                await self.session._on_frame(quiet)
+            if self.session.asr_task is not None:
+                await self.session.asr_task
+            if self.session.reply_task is not None:
+                await self.session.reply_task
+        finally:
+            common.transcribe = original_transcribe
+
+        self.assertEqual(captured, ["对"])
+        self.assertEqual(last_json_of_type(self.ws, "asr")["text"], "对")
 
 
 if __name__ == "__main__":

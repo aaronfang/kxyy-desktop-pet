@@ -531,6 +531,7 @@ TURN_PAUSE_TOLERANCE = normalize_turn_pause_tolerance(
 SOFT_REOPEN_MS = TURN_PAUSE_REOPEN_MS[TURN_PAUSE_TOLERANCE]
 ENDPOINT_COMMIT_MS = SOFT_END_MS + SOFT_REOPEN_MS
 MIN_SPEECH_MS = 500
+ENDPOINT_TAIL_PAD_MS = 150
 # 单句最长录音（安全阀，防异常一直录）。日常聊天够用；真要长独白可再加大。
 MAX_SPEECH_MS = 60000
 # 空闲态打断门槛
@@ -538,7 +539,7 @@ BARGE_IN_RMS = 0.022
 BARGE_IN_FRAMES = 6
 # AI 播报中：更高更久才采信（防外放漏音/杂音）；确认前不停播、不发 asr_start
 BARGE_IN_RMS_PLAY = 0.04
-BARGE_IN_FRAMES_PLAY = 12  # ~360ms
+BARGE_IN_FRAMES_PLAY = 18  # ~540ms; reject common short impact/keyboard bursts
 MAX_HISTORY_MESSAGES = 24
 INITIAL_HISTORY_MAX_MESSAGES = 12
 INITIAL_HISTORY_MAX_MESSAGE_CHARS = 1024
@@ -547,6 +548,20 @@ MAX_PENDING_HISTORY_TURNS = 4
 LLM_HISTORY_MAX_MESSAGES = 20
 LLM_HISTORY_MAX_CHARS = 12000
 LLM_CONTEXT_SYSTEM_MAX_CHARS = 4000
+LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
+# Ollama may need to load a several-GB model after the user switches providers.
+# Keep the cloud failure budget short, but give a local cold start a bounded window.
+LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
+LOCAL_LLM_POLL_INTERVAL_SECONDS = 0.002
+LLM_POLL_INTERVAL_SECONDS = 0.01
+# A local first-event timeout usually means the model was evicted and is loading,
+# or the previous generation still occupies it. One silent retry recovers the turn
+# instead of surfacing an error the user has to answer again; only the local
+# cascade retries, because a cloud timeout is far more likely to be a real fault.
+LOCAL_LLM_FIRST_EVENT_RETRIES = 1
+PLAYBACK_NON_SPEECH_ASR_EVENTS = frozenset(
+    {"bgm", "applause", "sneeze", "breath", "cough"}
+)
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
 MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
 LLM_STREAM_QUEUE_MAX = 32
@@ -592,7 +607,8 @@ PROACTIVE_WELCOME_PROMPT = (
     "（内部控制：实时通话刚接通，用户还没开口。如果上方已有文字聊天上下文，"
     "请直接自然承接最后一个话题，不要重新寒暄或换成无关新话题；只有没有上下文时才先打招呼，"
     "再抛一个轻松、很容易回应的小话题。说两到三句，不要解释任务，不要催促用户，"
-    "不要默认使用‘在吗、听得到吗、我在呢’这类固定开场。）"
+    "不要默认使用‘在吗、听得到吗、我在呢’这类固定开场。只有文字历史或系统记忆线索明确写过的"
+    "用户事实，才能说‘你上次说过/之前提过’；没有证据时禁止编造过去对话、计划或偏好。）"
 )
 PROACTIVE_FOLLOWUP_PROMPT = (
     "（内部控制：用户暂时没有接话。沿着上一段实际播完的话题自然续说一小步，"
@@ -1762,6 +1778,66 @@ def load_settings() -> dict:
     return json.loads(SETTINGS.read_text(encoding="utf-8"))
 
 
+def local_realtime_fast_generation() -> bool:
+    """Keep local voice turns latency-first without changing text-chat policy.
+
+    Ornith's deliberate/reasoning path can spend several seconds before its
+    first visible token. Realtime speech already has a bounded conversational
+    policy, so local Ollama voice requests stay on the fast generation path;
+    online providers and ordinary chat retain their configured reasoning mode.
+    """
+    return os.environ.get("KXYY_LOCAL_LLM_REALTIME_FAST") == "ornith-v1"
+
+
+def thinking_filler_enabled() -> bool:
+    """Avoid spending a TTS slot masking local Ollama first-token latency.
+
+    Cloud/Volcano-compatible calls retain the historical filler behavior. Local
+    text generation is already on-device, so the filler only adds another
+    serialized synthesis request before the real answer.
+    """
+    try:
+        settings = load_settings()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return True
+    provider = str(settings.get("textProvider") or "").strip().lower()
+    if provider == "local":
+        return settings.get("thinkingFillerEnabled") is True
+    return True
+
+
+def local_text_provider_selected() -> bool:
+    """Read the app-owned provider choice without inferring it from timings."""
+    try:
+        provider = str(load_settings().get("textProvider") or "").strip().lower()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        provider = ""
+    return provider == "local"
+
+
+def llm_first_event_timeout_seconds() -> float:
+    """Return the first-output budget for the provider selected by the app."""
+    return (
+        LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
+        if local_text_provider_selected()
+        else LLM_FIRST_EVENT_TIMEOUT_SECONDS
+    )
+
+
+def llm_first_event_retry_count() -> int:
+    """Retry only local first-output timeouts; cloud failures stay fail-fast."""
+    return LOCAL_LLM_FIRST_EVENT_RETRIES if local_text_provider_selected() else 0
+
+
+def llm_poll_interval_seconds() -> float:
+    """Use a tighter event handoff loop only for local Ollama realtime turns."""
+    return (
+        LOCAL_LLM_POLL_INTERVAL_SECONDS
+        if local_text_provider_selected()
+        else LLM_POLL_INTERVAL_SECONDS
+    )
+
+
 def _user_ref_from_settings() -> "tuple[Path | None, str]":
     """读取用户在设置里填写的参考音路径 / 文案（localRefWav / localRefText）。
 
@@ -1961,6 +2037,8 @@ def load_llm_settings() -> None:
 _asr_backend = "none"  # compatibility/debug enum: mlx | openai | sensevoice | none
 _openai_whisper_model = None
 _asr_adapter_instance = None
+_asr_fallback_adapter = None
+_asr_fallback_backend = "none"
 _asr_runtime = {
     "requested": "whisper",
     "active": "none",
@@ -1978,55 +2056,51 @@ ASR_FAILURE_MESSAGE = "语音识别失败，请稍后重试"
 def load_whisper_on_mlx_thread() -> None:
     """Load one process-lifetime final-ASR adapter; name kept for old entrypoints."""
     global _asr_backend, _openai_whisper_model, _asr_adapter_instance, _asr_runtime
-    whisper = None
-    whisper_backend = "none"
+    global _asr_fallback_adapter, _asr_fallback_backend
     requested = (os.environ.get("KXYY_ASR_PROVIDER") or "whisper").strip().lower()
     selection = None
+    selected_sensevoice = None
     if requested == "sensevoice":
         selection = asr_adapter.select_asr_adapter(asr_adapter.UnavailableAdapter())
         if selection.active_provider == "sensevoice":
-            _asr_adapter_instance = selection.adapter
-            _asr_backend = "sensevoice"
-            _asr_runtime = {
-                "requested": "sensevoice",
-                "active": "sensevoice-sherpa-onnx",
-                "status": "active",
-            }
-            log("ASR 就绪 active=sensevoice-sherpa-onnx status=active")
-            return
-    try:
-        import mlx_whisper
+            selected_sensevoice = selection.adapter
 
-        whisper = asr_adapter.WhisperAdapter("mlx", mlx_module=mlx_whisper)
-        whisper_backend = "mlx"
-    except ImportError:
-        pass
-    if whisper is None:
-        try:
-            import whisper as openai_whisper
+    if selected_sensevoice is not None:
+        _asr_adapter_instance = selected_sensevoice
+        _asr_backend = "sensevoice"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "deferred"
+        _asr_runtime = {
+            "requested": "sensevoice",
+            "active": "sensevoice-sherpa-onnx",
+            "status": "active",
+        }
+        log("ASR 就绪 active=sensevoice-sherpa-onnx status=active")
+        return
 
-            _openai_whisper_model = openai_whisper.load_model("small")
-            whisper = asr_adapter.WhisperAdapter(
-                "openai", openai_model=_openai_whisper_model
-            )
-            whisper_backend = "openai"
-        except (ImportError, RuntimeError):
-            whisper = asr_adapter.UnavailableAdapter()
-
+    whisper, whisper_backend = _load_whisper_fallback()
     selection = asr_adapter.select_asr_adapter(whisper)
     _asr_adapter_instance = selection.adapter
     if selection.active_provider == "sensevoice":
         _asr_backend = "sensevoice"
         active = "sensevoice-sherpa-onnx"
+        _asr_fallback_adapter = whisper if whisper_backend != "none" else None
+        _asr_fallback_backend = whisper_backend
     elif whisper_backend == "mlx":
         _asr_backend = "mlx"
         active = "whisper-mlx"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "none"
     elif whisper_backend == "openai":
         _asr_backend = "openai"
         active = "whisper-openai"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "none"
     else:
         _asr_backend = "none"
         active = "none"
+        _asr_fallback_adapter = None
+        _asr_fallback_backend = "none"
     status = "active"
     if active == "none":
         status = "unavailable"
@@ -2042,6 +2116,28 @@ def load_whisper_on_mlx_thread() -> None:
     if status == "fallback":
         log(f"ASR 回退 Whisper reason={selection.fallback_reason}")
     log(f"ASR 就绪 active={active} status={status}")
+
+
+def _load_whisper_fallback():
+    global _openai_whisper_model
+    try:
+        import mlx_whisper
+
+        return asr_adapter.WhisperAdapter("mlx", mlx_module=mlx_whisper), "mlx"
+    except ImportError:
+        pass
+    try:
+        import whisper as openai_whisper
+
+        _openai_whisper_model = openai_whisper.load_model("small")
+        return (
+            asr_adapter.WhisperAdapter(
+                "openai", openai_model=_openai_whisper_model
+            ),
+            "openai",
+        )
+    except (ImportError, RuntimeError):
+        return asr_adapter.UnavailableAdapter(), "none"
 
 
 def asr_runtime_summary() -> dict:
@@ -2331,7 +2427,54 @@ def warmup_asr() -> None:
         log(f"ASR 预热完成 ({time.perf_counter()-t0:.1f}s, backend={_asr_backend})")
     except Exception as e:
         reason = e.reason if isinstance(e, asr_adapter.AsrAdapterError) else "unknown"
-        log(f"ASR 预热跳过 reason={reason}")
+        if _asr_backend != "sensevoice":
+            log(f"ASR 预热跳过 reason={reason}")
+            return
+        _activate_whisper_after_sensevoice_warmup_failure(silence, reason)
+
+
+def _activate_whisper_after_sensevoice_warmup_failure(
+    silence: bytes, sensevoice_reason: str
+) -> None:
+    global _asr_backend, _asr_adapter_instance, _asr_runtime
+    global _asr_fallback_adapter, _asr_fallback_backend
+    fallback = _asr_fallback_adapter
+    backend = _asr_fallback_backend
+    if fallback is None and backend == "deferred":
+        fallback, backend = _load_whisper_fallback()
+        _asr_fallback_adapter = fallback if backend != "none" else None
+        _asr_fallback_backend = backend
+    active = {"mlx": "whisper-mlx", "openai": "whisper-openai"}.get(backend)
+    if fallback is None or active is None:
+        _asr_backend = "none"
+        _asr_adapter_instance = asr_adapter.UnavailableAdapter()
+        _asr_runtime = {
+            "requested": "sensevoice",
+            "active": "none",
+            "status": "unavailable",
+        }
+        log(f"SenseVoice 预热失败且 Whisper 不可用 reason={sensevoice_reason}")
+        return
+    _asr_adapter_instance = fallback
+    _asr_backend = backend
+    try:
+        fallback.transcribe(silence)
+    except Exception:
+        _asr_backend = "none"
+        _asr_adapter_instance = asr_adapter.UnavailableAdapter()
+        _asr_runtime = {
+            "requested": "sensevoice",
+            "active": "none",
+            "status": "unavailable",
+        }
+        log("SenseVoice 与 Whisper 预热均失败")
+        return
+    _asr_runtime = {
+        "requested": "sensevoice",
+        "active": active,
+        "status": "fallback",
+    }
+    log(f"SenseVoice 预热失败，固定回退 {active} reason={sensevoice_reason}")
 
 
 def submit_asr(loop, pcm: bytes, *, slots=None):
@@ -2459,11 +2602,15 @@ def _iter_llm_stream_once(
     thinking: bool = False,
 ):
     """Parse one desktop-proxy SSE attempt without exposing provider credentials."""
+    # Local Ornith realtime calls are deliberately fast-path even when the
+    # general reasoning preference is automatic/always. This does not affect
+    # browser text chat or any online provider request.
+    effective_thinking = False if local_realtime_fast_generation() else thinking
     payload = build_llm_proxy_payload(
         system_role,
         history,
         user_text,
-        thinking=thinking,
+        thinking=effective_thinking,
     )
     body = json.dumps(payload).encode("utf-8")
     secret = os.environ.get("KXYY_TTS_SECRET") or ""
@@ -2487,6 +2634,7 @@ def _iter_llm_stream_once(
             yield {"type": "meta", "provider": provider, "thinking": thinking}
             content_chars = 0
             reasoning_fallback = ""
+            saw_done = False
             for raw_line in resp:
                 try:
                     line = raw_line.decode("utf-8").rstrip("\r\n")
@@ -2498,6 +2646,7 @@ def _iter_llm_stream_once(
                 if not raw_data:
                     continue
                 if raw_data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     data = json.loads(raw_data)
@@ -2507,12 +2656,24 @@ def _iter_llm_stream_once(
                 if usage:
                     prompt = int(usage.get("prompt_tokens") or 0)
                     completion = int(usage.get("completion_tokens") or 0)
-                    yield {
+                    event = {
                         "type": "usage",
                         "prompt": prompt,
                         "completion": completion,
                         "total": int(usage.get("total_tokens") or (prompt + completion)),
                     }
+                    # Only local Ollama reports prefill/decode timings; cloud providers
+                    # omit them and the keys simply stay absent.
+                    for source, name in (
+                        ("prompt_eval_ms", "promptEvalMs"),
+                        ("eval_ms", "evalMs"),
+                        ("load_ms", "loadMs"),
+                        ("first_token_wall_ms", "firstTokenWallMs"),
+                    ):
+                        value = usage.get(source)
+                        if isinstance(value, (int, float)) and value >= 0:
+                            event[name] = int(value)
+                    yield event
                 choices = data.get("choices") or []
                 if not choices:
                     continue
@@ -2530,11 +2691,18 @@ def _iter_llm_stream_once(
                 # 只有明确关闭思考且整条流始终没有 content 时，才把 reasoning 当兼容正文。
                 # 不能逐 chunk 回退，否则显式 reasoner 可能先播出思维链、随后又播正文。
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                if not thinking and isinstance(reasoning, str) and reasoning:
-                    remaining = LLM_REPLY_MAX_CHARS - len(reasoning_fallback)
-                    if remaining <= 0 or len(reasoning) > remaining:
-                        raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
-                    reasoning_fallback += reasoning
+                if isinstance(reasoning, str) and reasoning:
+                    if not thinking:
+                        remaining = LLM_REPLY_MAX_CHARS - len(reasoning_fallback)
+                        if remaining <= 0 or len(reasoning) > remaining:
+                            raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
+                        reasoning_fallback += reasoning
+                    # Text-free internal heartbeat: lets a cancelled producer
+                    # close an Ollama stream even while the model emits only
+                    # hidden reasoning. Never crosses the frontend wire.
+                    yield {"type": "provider_progress"}
+            if not saw_done:
+                raise SafeRealtimeError(f"{provider} 响应意外中断，请重试")
             if content_chars == 0 and reasoning_fallback:
                 yield {"type": "delta", "text": reasoning_fallback}
     except urllib.error.HTTPError as e:
@@ -2575,6 +2743,15 @@ def iter_llm_stream(
         except StopIteration:
             return
         if first.get("type") != "meta" or first.get("provider") != "Ollama":
+            yield first
+            yield from stream
+            return
+
+        # The duplicate guard below necessarily buffers the complete local
+        # response before yielding any token. Realtime Ornith prioritizes true
+        # token-to-sentence streaming; retaining the guard here would turn SSE
+        # into a non-streaming 6-11 second wait before TTS can start.
+        if local_realtime_fast_generation():
             yield first
             yield from stream
             return
@@ -2640,6 +2817,10 @@ def start_llm_stream_producer(
                 user_text,
                 thinking=scope.reasoning_policy == "deliberate",
             ):
+                if event.get("type") == "provider_progress":
+                    if not scope.active:
+                        return
+                    continue
                 if not _put_llm_event(out, scope, event):
                     return
             _put_llm_event(out, scope, {"type": "done"})
@@ -3134,6 +3315,9 @@ class Session:
         self.endpoint = SoftEndpoint()
         self.asr_started = False
         self.barge_loud_frames = 0
+        self.barge_loud_pcm = bytearray()
+        self.idle_loud_frames = 0
+        self.idle_loud_pcm = bytearray()
         self.gen_id = 0
         self.asr_scope: GenerationCancelScope | None = None
         self.response_scope: GenerationCancelScope | None = None
@@ -4285,6 +4469,9 @@ class Session:
         payload = {"type": "speech_rejected", "reason": "voice_rejected"}
         if candidate_id is not None:
             payload["candidateId"] = candidate_id
+        response_scope = self.response_scope
+        if response_scope is not None and response_scope.active:
+            payload["resumedGeneration"] = response_scope.generation
         await self.send_json(
             payload,
             scope=scope,
@@ -4298,20 +4485,33 @@ class Session:
         while_playing = self.playing and self.play_enabled
 
         if busy:
+            if not self.in_speech:
+                self.idle_loud_frames = 0
+                self.idle_loud_pcm.clear()
             loud_thr = BARGE_IN_RMS_PLAY if while_playing else BARGE_IN_RMS
             need_frames = BARGE_IN_FRAMES_PLAY if while_playing else BARGE_IN_FRAMES
             if rms >= loud_thr:
                 self.barge_loud_frames += 1
+                self.barge_loud_pcm.extend(frame)
+                max_preroll_bytes = need_frames * FRAME_SAMPLES * 2
+                if len(self.barge_loud_pcm) > max_preroll_bytes:
+                    del self.barge_loud_pcm[:-max_preroll_bytes]
             else:
-                self.barge_loud_frames = max(0, self.barge_loud_frames - 1)
+                next_count = max(0, self.barge_loud_frames - 1)
+                if next_count < self.barge_loud_frames and self.barge_loud_pcm:
+                    del self.barge_loud_pcm[: FRAME_SAMPLES * 2]
+                self.barge_loud_frames = next_count
 
             if not self.in_speech:
                 if self.barge_loud_frames >= need_frames or (
                     not while_playing and not self.playing and rms >= SPEECH_RMS
                 ):
                     self.in_speech = True
-                    self.speech_pcm = bytearray(frame)
-                    self.speech_ms = FRAME_MS
+                    self.speech_pcm = bytearray(self.barge_loud_pcm or frame)
+                    self.speech_ms = FRAME_MS * max(
+                        1, len(self.speech_pcm) // (FRAME_SAMPLES * 2)
+                    )
+                    self.barge_loud_pcm.clear()
                     self.silence_ms = 0
                     self.endpoint.reset()
                     # 忙碌期（合成中或播报中）一律走「旁路采集」：只暂停发送，
@@ -4328,12 +4528,22 @@ class Session:
                 return
 
         if not self.in_speech:
+            self.barge_loud_frames = 0
+            self.barge_loud_pcm.clear()
             if rms >= SPEECH_RMS:
+                self.idle_loud_frames += 1
+                self.idle_loud_pcm.extend(frame)
+            else:
+                self.idle_loud_frames = 0
+                self.idle_loud_pcm.clear()
+            if self.idle_loud_frames >= 3:
                 self.in_speech = True
-                self.speech_pcm = bytearray(frame)
-                self.speech_ms = FRAME_MS
+                self.speech_pcm = bytearray(self.idle_loud_pcm)
+                self.speech_ms = FRAME_MS * self.idle_loud_frames
                 self.silence_ms = 0
                 self.endpoint.reset()
+                self.idle_loud_frames = 0
+                self.idle_loud_pcm.clear()
             return
 
         self.speech_pcm.extend(frame)
@@ -4370,12 +4580,24 @@ class Session:
         if self.speech_ms >= MAX_SPEECH_MS or endpoint_event == "committed":
             pcm = bytes(self.speech_pcm)
             was_play_barge = self.play_barge_pending
+            if endpoint_event == "committed":
+                min_ms = MIN_SPEECH_MS_PLAY if was_play_barge else MIN_SPEECH_MS
+                removable_ms = max(0, self.endpoint.silence_ms - ENDPOINT_TAIL_PAD_MS)
+                removable_bytes = INPUT_RATE * 2 * removable_ms // 1000
+                min_bytes = INPUT_RATE * 2 * min_ms // 1000
+                trim_bytes = min(removable_bytes, max(0, len(pcm) - min_bytes))
+                trim_bytes -= trim_bytes % 2
+                if trim_bytes:
+                    pcm = pcm[:-trim_bytes]
             self.in_speech = False
             self.speech_pcm.clear()
             self.silence_ms = 0
             self.speech_ms = 0
             self.endpoint.reset()
             self.barge_loud_frames = 0
+            self.barge_loud_pcm.clear()
+            self.idle_loud_frames = 0
+            self.idle_loud_pcm.clear()
             self.play_barge_pending = False
             if self._vad_shadow is not None:
                 try:
@@ -4444,7 +4666,11 @@ class Session:
                 f"chars={len(result.text)} lang={result.language} "
                 f"emotion={result.emotion} event={result.event}"
             )
-            cleaned = is_valid_asr(result.text, nsp, pcm)
+            if from_play_barge and result.event in PLAYBACK_NON_SPEECH_ASR_EVENTS:
+                log("过滤: 播报期非语音事件")
+                cleaned = None
+            else:
+                cleaned = is_valid_asr(result.text, nsp, pcm)
             if not cleaned:
                 if (
                     from_play_barge
@@ -4780,13 +5006,15 @@ class Session:
             speaking_sent = False
             segment_seq = 0
             filler_started = asyncio.Event()
-            filler_task = asyncio.create_task(
-                self._maybe_send_thinking_filler(
-                    scope,
-                    lambda: bool(proactive_kind) or llm_output_started or tts_started,
-                    started_event=filler_started,
+            filler_task = None
+            if thinking_filler_enabled():
+                filler_task = asyncio.create_task(
+                    self._maybe_send_thinking_filler(
+                        scope,
+                        lambda: bool(proactive_kind) or llm_output_started or tts_started,
+                        started_event=filler_started,
+                    )
                 )
-            )
 
             async def synthesize_sentence(_sequence: int, sentence: str) -> dict:
                 if not sentence or not scope.active:
@@ -5088,7 +5316,7 @@ class Session:
                 if not sentence or not scope.active:
                     return
                 if not tts_started:
-                    if not filler_task.done():
+                    if filler_task is not None and not filler_task.done():
                         if not filler_started.is_set():
                             filler_task.cancel()
                         await asyncio.gather(filler_task, return_exceptions=True)
@@ -5119,12 +5347,46 @@ class Session:
             )
 
             stream_done = False
+            first_event_timeout = llm_first_event_timeout_seconds()
+            poll_interval = llm_poll_interval_seconds()
+            first_event_deadline = time.perf_counter() + first_event_timeout
+            local_first_event_retries = llm_first_event_retry_count()
+            is_local_first_event = local_first_event_retries > 0
             while scope.active and not stream_done:
                 try:
                     event = events.get_nowait()
                 except queue.Empty:
-                    await asyncio.sleep(0.01)
+                    if time.perf_counter() >= first_event_deadline:
+                        # Nothing has been emitted yet at this point, so restarting is
+                        # free of duplicate text or audio. A fresh queue keeps the
+                        # abandoned producer's late events from mixing into the retry.
+                        if local_first_event_retries > 0:
+                            local_first_event_retries -= 1
+                            log("本地文字模型首个响应超时，自动重试一次")
+                            events = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
+                            if start_llm_stream_producer(
+                                self.system_role,
+                                history_snapshot,
+                                request_text,
+                                scope,
+                                events,
+                            ) is None:
+                                raise SafeRealtimeError(
+                                    "本地文字模型首个响应超时，模型可能仍在加载，请稍后重试"
+                                )
+                            first_event_deadline = (
+                                time.perf_counter() + first_event_timeout
+                            )
+                            await asyncio.sleep(poll_interval)
+                            continue
+                        if is_local_first_event:
+                            raise SafeRealtimeError(
+                                "本地文字模型首个响应超时，模型可能仍在加载，请稍后重试"
+                            )
+                        raise SafeRealtimeError("文字模型首个响应超时，请稍后重试")
+                    await asyncio.sleep(poll_interval)
                     continue
+                first_event_deadline = float("inf")
                 event_type = event.get("type")
                 if event_type == "meta":
                     llm_provider = str(event.get("provider") or "文字模型")
@@ -5134,6 +5396,10 @@ class Session:
                         "completion": int(event.get("completion") or 0),
                         "total": int(event.get("total") or 0),
                     }
+                    for key in ("promptEvalMs", "evalMs", "loadMs", "firstTokenWallMs"):
+                        value = event.get(key)
+                        if isinstance(value, int):
+                            llm_usage[key] = value
                 elif event_type == "delta":
                     delta = str(event.get("text") or "")
                     if not delta:

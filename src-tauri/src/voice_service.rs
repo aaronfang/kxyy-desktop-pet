@@ -2312,6 +2312,13 @@ fn ensure_impl(app: &AppHandle, backend: String, fp: String) {
     if let Some(base) = crate::local_api_base(app) {
         cmd.env("KXYY_AI_PROXY_BASE", base);
     }
+    if read_setting_str("textProvider").trim() == "local"
+        && read_setting_str("localTextModel")
+            .trim()
+            .eq_ignore_ascii_case("ornith-1.5:9b")
+    {
+        cmd.env("KXYY_LOCAL_LLM_REALTIME_FAST", "ornith-v1");
+    }
     // macOS 打包运行时：把可写目录传给 Python（参考音 / 缓存路径）
     if let Some(rt) = macos_voice_runtime() {
         cmd.env("KXYY_VOICE_RUNTIME", &rt);

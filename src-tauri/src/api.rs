@@ -4,7 +4,7 @@
 //!
 //! 只做「薄代理」：不落地、不缓存、不改协议——上游改了契约时改这里即可，改动面小。
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 
 use tauri::AppHandle;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
@@ -17,6 +17,7 @@ const QWEN_VL_MODEL: &str = "qwen3-vl-plus";
 const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
 // 本地文字模型：Ollama 的 OpenAI 兼容端点，无需 Key（Authorization 头会被忽略）。
 const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+const OLLAMA_NATIVE_CHAT_URL: &str = "http://127.0.0.1:11434/api/chat";
 // 仅受托管本地语音子进程携带；普通 WebView 请求不得用它绕过 Windows SSE 缓冲路径。
 const INTERNAL_SECRET_HEADER: &str = "X-Kxyy-Internal-Secret";
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
@@ -24,6 +25,7 @@ const WEB_QUERY_MAX_CHARS: usize = 300;
 const WEB_RESPONSE_MAX_BYTES: u64 = 256 * 1024;
 const WEB_RESULT_MAX_ITEMS: usize = 4;
 const WEB_RESULT_TEXT_MAX_CHARS: usize = 700;
+const CHAT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
 fn normalize_deepseek_model(configured: &str) -> &'static str {
@@ -120,13 +122,8 @@ pub fn start(app: AppHandle) -> std::io::Result<u16> {
         // 该连接会以「半损坏」状态回到连接池；下一次请求复用它就会报
         // "error sending request for url ..."。每次都用全新连接可彻底规避。
         // 同时加连接超时，避免冷启动握手偶发卡死表现为"回复为空"。
-        let client = reqwest::blocking::Client::builder()
-            .pool_max_idle_per_host(0)
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .timeout(std::time::Duration::from_secs(600))
-            .tcp_nodelay(true)
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let client = build_isolated_chat_client(CHAT_REQUEST_TIMEOUT)
+            .expect("validated reqwest client configuration");
         for request in server.incoming_requests() {
             let app = app.clone();
             let client = client.clone();
@@ -143,6 +140,17 @@ pub fn start(app: AppHandle) -> std::io::Result<u16> {
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes())
         .unwrap_or_else(|_| Header::from_bytes(&b"X-Ignore"[..], &b"1"[..]).unwrap())
+}
+
+fn build_isolated_chat_client(
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(0)
+        .connect_timeout(std::time::Duration::from_secs(20).min(timeout))
+        .timeout(timeout)
+        .tcp_nodelay(true)
+        .build()
 }
 
 /// 跨域头：聊天窗口来源是 tauri://localhost，请求本地 127.0.0.1 属跨域，需放行。
@@ -321,6 +329,21 @@ fn messages_have_image(messages: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the assistant text from either shape: native `/api/chat` returns
+/// `message.content`, the OpenAI-compatible endpoint returns `choices[0].message.content`.
+fn memory_completion_content(data: &serde_json::Value) -> Option<String> {
+    data.get("message")
+        .or_else(|| {
+            data.get("choices")
+                .and_then(|choices| choices.get(0))
+                .and_then(|choice| choice.get("message"))
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .map(str::to_string)
+        .filter(|text| !text.trim().is_empty())
+}
+
 /// Memory v3 后台巩固使用的非流式文字补全。
 /// 在线复用当前规范化后的 DeepSeek 非思考模型；本地复用当前 Ollama 模型并关闭思考，
 /// 避免维护任务抢占过多 token。该函数不开放新的 HTTP 路由，只供 Rust 内部调用。
@@ -338,7 +361,12 @@ pub(crate) fn complete_memory_json(
             cfg.local_text_model.clone()
         };
         (
-            format!("{OLLAMA_CHAT_BASE_URL}/chat/completions"),
+            // Native, not `/v1`: the OpenAI-compatible endpoint ignores num_ctx, so a
+            // consolidation there runs at the server default while realtime voice runs
+            // at LOCAL_NUM_CTX. Ollama evicts and reloads the model between two context
+            // sizes, which showed up as multi-second load_duration at the start of a
+            // call. Same endpoint and same num_ctx keeps one resident instance.
+            OLLAMA_NATIVE_CHAT_URL.to_string(),
             model,
             "ollama".to_string(),
             "本地模型",
@@ -354,23 +382,38 @@ pub(crate) fn complete_memory_json(
             "DeepSeek",
         )
     };
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role":"system","content":system},
-            {"role":"user","content":user}
-        ],
-        "stream": false,
-        "temperature": 0.1,
-        "max_tokens": if is_local { 1800 } else { 1400 }
-    });
-    if is_local {
-        payload["reasoning_effort"] = serde_json::json!("none");
-        payload["think"] = serde_json::json!(false);
+    let payload = if is_local {
+        serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role":"system","content":system},
+                {"role":"user","content":user}
+            ],
+            "stream": false,
+            "think": false,
+            "format": "json",
+            "keep_alive": crate::local_text::KEEP_ALIVE,
+            "options": {
+                "num_ctx": crate::local_text::LOCAL_NUM_CTX,
+                "num_predict": 1800,
+                "temperature": 0.1,
+            },
+        })
     } else {
+        let mut payload = serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role":"system","content":system},
+                {"role":"user","content":user}
+            ],
+            "stream": false,
+            "temperature": 0.1,
+            "max_tokens": 1400
+        });
         apply_deepseek_generation_options(&mut payload, false, 0.1);
-    }
-    payload["response_format"] = serde_json::json!({"type":"json_object"});
+        payload["response_format"] = serde_json::json!({"type":"json_object"});
+        payload
+    };
     let mut last_error = String::new();
     for attempt in 0..3 {
         let client = reqwest::blocking::Client::builder()
@@ -401,14 +444,7 @@ pub(crate) fn complete_memory_json(
                 }
                 let data: serde_json::Value = serde_json::from_str(&raw)
                     .map_err(|e| format!("{provider} 返回非 JSON：{e}"))?;
-                return data
-                    .get("choices")
-                    .and_then(|v| v.get(0))
-                    .and_then(|v| v.get("message"))
-                    .and_then(|v| v.get("content"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .filter(|s| !s.trim().is_empty())
+                return memory_completion_content(&data)
                     .ok_or_else(|| format!("{provider} 返回了空的记忆整理结果"));
             }
             Err(e) => {
@@ -582,15 +618,21 @@ fn proxy_chat(
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
     let passthrough_internal_sse =
         should_passthrough_internal_sse(stream, force, use_vision, trusted_internal_request);
+    let native_ollama_realtime =
+        should_use_native_ollama_realtime(is_local_text, passthrough_internal_sse, thinking);
 
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "stream": stream,
-    });
+    let mut payload = if native_ollama_realtime {
+        build_native_ollama_realtime_payload(&model, messages, max_tokens, temperature)
+    } else {
+        serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        })
+    };
     // 流式默认不带 usage；打开后最后一帧会带 prompt/completion/total tokens。
-    if stream {
+    if stream && !native_ollama_realtime {
         payload["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     // 思考模式由当前 DeepSeek API 的 thinking.type 显式控制；思考时不下发 temperature。
@@ -609,7 +651,7 @@ fn proxy_chat(
     // 注意：`/v1` 会忽略 keep_alive / num_ctx；常驻与上下文扩容由 warmup + touch_keep_alive
     // 走 native `/api/chat` 完成。
     // 注意：local VL 模型（minicpm-v 等）不支持思考模式，仅 local_text 下发 reasoning 控制。
-    if is_local_text {
+    if is_local_text && !native_ollama_realtime {
         payload["reasoning_effort"] = serde_json::json!(if thinking { "medium" } else { "none" });
         payload["think"] = serde_json::json!(thinking);
     }
@@ -618,20 +660,28 @@ fn proxy_chat(
     // 瞬时网络抖动导致的**发送失败**（非上游业务错误）。此类错误一旦发生，前端会把本轮标记为
     // error 且不会自动重试，用户便看到「连发几条都出错」。这里对纯传输失败最多重试 3 次，
     // 且从第 2 次起改用一次性全新 Client（连接池彻底隔离），规避残留的坏连接。
-    let url = format!("{base_url}/chat/completions");
+    let url = if native_ollama_realtime {
+        OLLAMA_NATIVE_CHAT_URL.to_string()
+    } else {
+        format!("{base_url}/chat/completions")
+    };
     let mut last_err = String::new();
     let mut upstream_opt = None;
+    // Started before the first send so transport retries stay inside the measured
+    // window; a retry that masks a stalled model must not read as a fast turn.
+    let upstream_started = std::time::Instant::now();
     for attempt in 0..3 {
         let this_client: reqwest::blocking::Client;
         let cli: &reqwest::blocking::Client = if attempt == 0 {
             client
         } else {
-            this_client = reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(0)
-                .connect_timeout(std::time::Duration::from_secs(20))
-                .tcp_nodelay(true)
-                .build()
-                .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            this_client = match build_isolated_chat_client(CHAT_REQUEST_TIMEOUT) {
+                Ok(client) => client,
+                Err(error) => {
+                    last_err = error.to_string();
+                    continue;
+                }
+            };
             &this_client
         };
         match cli
@@ -683,17 +733,14 @@ fn proxy_chat(
         return respond_json(request, status.as_u16(), body);
     }
 
-    // 本地聊天成功后走 native 续一次 keep_alive（/v1 本身不续命，闲置约 5 分钟就会卸模型）。
-    if is_local_text {
-        crate::local_text::touch_keep_alive(&model);
-    }
-    // 本地看图后也续命（VL 模型同样不续命）。
-    if is_local_vl {
-        crate::local_text::touch_keep_alive(&model);
-    }
-
     if !stream {
         let text = upstream.text().unwrap_or_default();
+        // Only refresh residency after the real request has drained. Starting a
+        // second Ollama request while generation is still running competes for
+        // the same local model and increases first-token latency.
+        if is_local_text || is_local_vl {
+            crate::local_text::touch_keep_alive(&model);
+        }
         let provider = if is_local_text { "Ollama" } else { "DeepSeek" };
         return respond_json_with_text_provider(request, text, provider);
     }
@@ -712,8 +759,19 @@ fn proxy_chat(
             "X-Kxyy-Thinking",
             if reasoning_enabled { "1" } else { "0" },
         ));
-        let resp = Response::new(StatusCode(200), headers, upstream, None, None);
-        let _ = request.respond(resp);
+        if native_ollama_realtime {
+            let resp = Response::new(
+                StatusCode(200),
+                headers,
+                adapt_ollama_native_stream(upstream, upstream_started),
+                None,
+                None,
+            );
+            let _ = request.respond(resp);
+        } else {
+            let resp = Response::new(StatusCode(200), headers, upstream, None, None);
+            let _ = request.respond(resp);
+        }
         return;
     }
 
@@ -727,6 +785,18 @@ fn proxy_chat(
         Ok(t) => t,
         Err(e) => return error_json(request, 502, &format!("读取{provider_name}响应失败：{e}")),
     };
+    if !buffered_sse_is_complete(&body) {
+        return error_json(
+            request,
+            502,
+            &format!("{provider_name}响应意外中断，请重试"),
+        );
+    }
+    // The buffered WebView path has fully consumed the model response here;
+    // refresh Ollama residency only now, never concurrently with generation.
+    if is_local_text || is_local_vl {
+        crate::local_text::touch_keep_alive(&model);
+    }
     // 本地模型安全网：若模型忽略 think: false 仍把所有内容放入 reasoning_content，
     // 则把 reasoning_content 复制到 content，避免前端收到空内容 → "回复为空"。
     if is_local_text && !thinking && !body.is_empty() {
@@ -833,6 +903,218 @@ fn should_passthrough_internal_sse(
     trusted: bool,
 ) -> bool {
     stream && force == Some("text") && !use_vision && trusted
+}
+
+fn buffered_sse_is_complete(body: &str) -> bool {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .any(|payload| payload.trim() == "[DONE]")
+}
+
+fn should_use_native_ollama_realtime(
+    is_local_text: bool,
+    passthrough_internal_sse: bool,
+    thinking: bool,
+) -> bool {
+    is_local_text && passthrough_internal_sse && !thinking
+}
+
+fn build_native_ollama_realtime_payload(
+    model: &str,
+    messages: serde_json::Value,
+    max_tokens: i64,
+    temperature: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "think": false,
+        "keep_alive": crate::local_text::KEEP_ALIVE,
+        "options": {
+            "num_ctx": crate::local_text::LOCAL_NUM_CTX,
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        },
+    })
+}
+
+struct OllamaNativeSse<R: BufRead> {
+    upstream: R,
+    pending: Vec<u8>,
+    offset: usize,
+    finished: bool,
+    // Wall clock from just before the upstream request was sent. Ollama's own
+    // prompt_eval_duration excludes time spent queued behind another request on
+    // the shared model, so only a proxy-side clock can expose that wait.
+    started: std::time::Instant,
+    first_token_ms: Option<u64>,
+}
+
+const TINY_HTTP_STREAM_FLUSH_BYTES: usize = 8193;
+
+fn pad_local_sse_flush_boundary(bytes: &mut Vec<u8>) {
+    if bytes.len() >= TINY_HTTP_STREAM_FLUSH_BYTES {
+        return;
+    }
+    let spaces = TINY_HTTP_STREAM_FLUSH_BYTES - bytes.len() - 3;
+    bytes.push(b':');
+    bytes.extend(std::iter::repeat_n(b' ', spaces));
+    bytes.extend_from_slice(b"\n\n");
+}
+
+fn adapt_ollama_native_stream<R: Read>(
+    reader: R,
+    started: std::time::Instant,
+) -> OllamaNativeSse<BufReader<R>> {
+    OllamaNativeSse {
+        upstream: BufReader::new(reader),
+        pending: Vec::new(),
+        offset: 0,
+        finished: false,
+        started,
+        first_token_ms: None,
+    }
+}
+
+impl<R: BufRead> OllamaNativeSse<R> {
+    fn fill_pending(&mut self) -> std::io::Result<()> {
+        while self.pending.is_empty() && !self.finished {
+            let mut line = String::new();
+            if self.upstream.read_line(&mut line)? == 0 {
+                self.pending = b"data: [DONE]\n\n".to_vec();
+                self.finished = true;
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Ollama returned invalid NDJSON",
+                )
+            })?;
+            if value.get("error").is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Ollama stream failed",
+                ));
+            }
+
+            let content = value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_str())
+                .unwrap_or_default();
+            if !content.is_empty() {
+                if self.first_token_ms.is_none() {
+                    self.first_token_ms = Some(self.started.elapsed().as_millis() as u64);
+                }
+                let chunk = serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": content},
+                        "finish_reason": serde_json::Value::Null,
+                    }]
+                });
+                self.pending
+                    .extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+                pad_local_sse_flush_boundary(&mut self.pending);
+            } else if value
+                .get("message")
+                .and_then(|message| message.get("thinking"))
+                .and_then(|thinking| thinking.as_str())
+                .is_some_and(|thinking| !thinking.is_empty())
+            {
+                // Keep cancellation observable without forwarding hidden reasoning.
+                self.pending.extend_from_slice(b": kxyy-progress\n\n");
+                pad_local_sse_flush_boundary(&mut self.pending);
+            }
+
+            if value.get("done").and_then(|done| done.as_bool()) == Some(true) {
+                let prompt = value
+                    .get("prompt_eval_count")
+                    .and_then(|count| count.as_u64())
+                    .unwrap_or(0);
+                let completion = value
+                    .get("eval_count")
+                    .and_then(|count| count.as_u64())
+                    .unwrap_or(0);
+                let finish_reason =
+                    match value.get("done_reason").and_then(|reason| reason.as_str()) {
+                        Some("length") => "length",
+                        _ => "stop",
+                    };
+                // Prefill/decode durations are the only signal that distinguishes a
+                // prefix-KV-cache hit from a full recompute; token counts alone cannot.
+                // Nanoseconds are provider-native; convert once here so consumers stay
+                // unit-agnostic. Both are timings, never text.
+                let prompt_ms = value
+                    .get("prompt_eval_duration")
+                    .and_then(|value| value.as_u64())
+                    .map(|nanos| nanos / 1_000_000);
+                let completion_ms = value
+                    .get("eval_duration")
+                    .and_then(|value| value.as_u64())
+                    .map(|nanos| nanos / 1_000_000);
+                // Model swap-in cost, reported separately from prefill by Ollama.
+                let load_ms = value
+                    .get("load_duration")
+                    .and_then(|value| value.as_u64())
+                    .map(|nanos| nanos / 1_000_000);
+                let mut usage = serde_json::json!({
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": prompt.saturating_add(completion),
+                });
+                if let Some(ms) = prompt_ms {
+                    usage["prompt_eval_ms"] = serde_json::json!(ms);
+                }
+                if let Some(ms) = completion_ms {
+                    usage["eval_ms"] = serde_json::json!(ms);
+                }
+                if let Some(ms) = load_ms {
+                    usage["load_ms"] = serde_json::json!(ms);
+                }
+                // Proxy-side wall clock to the first visible token. Subtracting the
+                // provider's own load+prefill leaves the time this request spent
+                // waiting for the shared model, which Ollama never reports.
+                if let Some(ms) = self.first_token_ms {
+                    usage["first_token_wall_ms"] = serde_json::json!(ms);
+                }
+                let final_chunk = serde_json::json!({
+                    "choices": [{"delta": {}, "finish_reason": finish_reason}],
+                    "usage": usage,
+                });
+                self.pending.extend_from_slice(
+                    format!("data: {final_chunk}\n\ndata: [DONE]\n\n").as_bytes(),
+                );
+                self.finished = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: BufRead> Read for OllamaNativeSse<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.offset >= self.pending.len() {
+            self.pending.clear();
+            self.offset = 0;
+            self.fill_pending()?;
+        }
+        if self.pending.is_empty() {
+            return Ok(0);
+        }
+        let count = output.len().min(self.pending.len() - self.offset);
+        output[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
 }
 
 fn web_observation_status(enabled: bool, provider: &str, has_key: bool) -> &'static str {
@@ -1025,13 +1307,18 @@ fn proxy_web_observations(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_deepseek_generation_options, apply_selected_deepseek_generation_options, header,
-        internal_secret_matches, normalize_deepseek_model, normalize_tavily_items,
-        online_vision_route, req_header, safe_web_source_url, should_passthrough_internal_sse,
-        web_observation_status, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL,
-        QWEN_VL_BASE_URL, QWEN_VL_MODEL, TEXT_BASE_URL,
+        adapt_ollama_native_stream, apply_deepseek_generation_options,
+        apply_selected_deepseek_generation_options, buffered_sse_is_complete,
+        build_isolated_chat_client, build_native_ollama_realtime_payload, header,
+        internal_secret_matches, memory_completion_content, normalize_deepseek_model,
+        normalize_tavily_items, online_vision_route, req_header, safe_web_source_url,
+        should_passthrough_internal_sse, should_use_native_ollama_realtime, web_observation_status,
+        DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL, QWEN_VL_BASE_URL,
+        QWEN_VL_MODEL, TEXT_BASE_URL,
     };
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
     use tiny_http::{HTTPVersion, Response, StatusCode, TestRequest};
 
     #[test]
@@ -1043,6 +1330,37 @@ mod tests {
         assert!(!internal_secret_matches(Some("wrong"), "managed-secret"));
         assert!(!internal_secret_matches(None, "managed-secret"));
         assert!(!internal_secret_matches(Some(""), ""));
+    }
+
+    #[test]
+    fn isolated_chat_client_enforces_total_request_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let client = build_isolated_chat_client(Duration::from_millis(40)).unwrap();
+
+        let started = Instant::now();
+        let error = client
+            .get(format!("http://{address}/stall"))
+            .send()
+            .unwrap_err();
+
+        assert!(error.is_timeout());
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn buffered_webview_sse_requires_done_frame() {
+        assert!(buffered_sse_is_complete(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+        ));
+        assert!(!buffered_sse_is_complete(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+        ));
     }
 
     #[test]
@@ -1072,6 +1390,140 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn native_ollama_is_limited_to_trusted_non_thinking_realtime_text() {
+        assert!(should_use_native_ollama_realtime(true, true, false));
+        assert!(!should_use_native_ollama_realtime(false, true, false));
+        assert!(!should_use_native_ollama_realtime(true, false, false));
+        assert!(!should_use_native_ollama_realtime(true, true, true));
+    }
+
+    #[test]
+    fn native_ollama_realtime_payload_disables_thinking_and_bounds_generation() {
+        let messages = serde_json::json!([
+            {"role": "system", "content": "persona"},
+            {"role": "user", "content": "hello"}
+        ]);
+        let payload =
+            build_native_ollama_realtime_payload("ornith-1.5:9b", messages.clone(), 512, 0.7);
+
+        assert_eq!(payload["model"], "ornith-1.5:9b");
+        assert_eq!(payload["messages"], messages);
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["think"], false);
+        assert_eq!(payload["keep_alive"], crate::local_text::KEEP_ALIVE);
+        assert_eq!(
+            payload["options"]["num_ctx"],
+            crate::local_text::LOCAL_NUM_CTX
+        );
+        assert_eq!(payload["options"]["num_predict"], 512);
+        assert_eq!(payload["options"]["temperature"], 0.7);
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn native_ollama_ndjson_adapts_to_content_only_openai_sse() {
+        let native = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"thinking\":\"hidden\",\"content\":\"\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"你好\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"呀\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":41,\"eval_count\":3}\n"
+        );
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut sse = String::new();
+        adapted.read_to_string(&mut sse).unwrap();
+
+        assert!(!sse.contains("hidden"));
+        assert!(!sse.contains("thinking"));
+        assert!(sse.contains("\"content\":\"你好\""));
+        assert!(sse.contains("\"content\":\"呀\""));
+        assert!(sse.contains("\"finish_reason\":\"stop\""));
+        assert!(sse.contains("\"prompt_tokens\":41"));
+        assert!(sse.contains("\"completion_tokens\":3"));
+        assert!(sse.contains("\"total_tokens\":44"));
+        assert!(sse.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn memory_completion_reads_native_and_openai_response_shapes() {
+        let native = serde_json::json!({
+            "message": {"role": "assistant", "content": "{\"facts\":[]}"},
+            "done": true
+        });
+        assert_eq!(
+            memory_completion_content(&native).as_deref(),
+            Some("{\"facts\":[]}")
+        );
+
+        let openai = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "{\"facts\":[1]}"}}]
+        });
+        assert_eq!(
+            memory_completion_content(&openai).as_deref(),
+            Some("{\"facts\":[1]}")
+        );
+
+        // Blank and shapeless replies must not pass as a successful extraction.
+        let blank = serde_json::json!({"message": {"content": "   "}});
+        assert!(memory_completion_content(&blank).is_none());
+        assert!(memory_completion_content(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn native_ollama_done_frame_forwards_prefill_and_decode_timings() {
+        let native = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"嗯\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,",
+            "\"done_reason\":\"stop\",\"prompt_eval_count\":1010,",
+            "\"prompt_eval_duration\":2820000000,\"eval_count\":47,",
+            "\"eval_duration\":1420000000}\n"
+        );
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut sse = String::new();
+        adapted.read_to_string(&mut sse).unwrap();
+
+        // Nanoseconds are converted to milliseconds exactly once, at this boundary.
+        assert!(sse.contains("\"prompt_eval_ms\":2820"));
+        assert!(sse.contains("\"eval_ms\":1420"));
+        assert!(sse.contains("\"prompt_tokens\":1010"));
+    }
+
+    #[test]
+    fn native_ollama_done_frame_omits_timings_when_provider_reports_none() {
+        let native = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"嗯\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,",
+            "\"prompt_eval_count\":41,\"eval_count\":3}\n"
+        );
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut sse = String::new();
+        adapted.read_to_string(&mut sse).unwrap();
+
+        assert!(!sse.contains("prompt_eval_ms"));
+        assert!(!sse.contains("eval_ms"));
+        assert!(sse.contains("\"prompt_tokens\":41"));
+    }
+
+    #[test]
+    fn native_ollama_first_delta_crosses_tiny_http_flush_boundary() {
+        let native = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"第一块\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"eval_count\":2}\n"
+        );
+        let mut adapted =
+            adapt_ollama_native_stream(Cursor::new(native.as_bytes()), std::time::Instant::now());
+        let mut output = vec![0_u8; 9000];
+        let first_len = adapted.read(&mut output).unwrap();
+        let first = String::from_utf8_lossy(&output[..first_len]);
+
+        assert!(first_len > 8192);
+        assert!(first.contains("\"content\":\"第一块\""));
+        assert!(!first.contains("[DONE]"));
     }
 
     #[test]
@@ -1132,14 +1584,8 @@ mod tests {
             DEEPSEEK_VISION_MODEL
         );
         assert_eq!(normalize_deepseek_model(""), DEEPSEEK_FLASH_MODEL);
-        assert_eq!(
-            normalize_deepseek_model("qwen3:8b"),
-            DEEPSEEK_FLASH_MODEL
-        );
-        assert_eq!(
-            normalize_deepseek_model("unreviewed"),
-            DEEPSEEK_FLASH_MODEL
-        );
+        assert_eq!(normalize_deepseek_model("qwen3:8b"), DEEPSEEK_FLASH_MODEL);
+        assert_eq!(normalize_deepseek_model("unreviewed"), DEEPSEEK_FLASH_MODEL);
     }
 
     #[test]

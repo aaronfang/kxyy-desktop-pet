@@ -9,6 +9,7 @@ import {
   replayTrace,
   sanitizeVadShadowSummary,
   summarizeMemoryContext,
+  summarizePrefill,
   summarizeTraceLatency,
 } from "../src/ai/realtime-trace.js";
 
@@ -536,6 +537,12 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       interruptionRecovery: "empty-confirmed-v1",
       memoryContext: "turn-final-v1",
       vadShadow: "silero-onnx-shadow-v1",
+      captureProcessing: {
+        echoCancellation: "enabled",
+        noiseSuppression: "disabled",
+        autoGainControl: "enabled",
+        deviceId: "forbidden-device-id",
+      },
       asr: {
         requested: "sensevoice",
         active: "sensevoice-sherpa-onnx",
@@ -640,7 +647,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 9);
+  assert.equal(report.diagnosticSchemaVersion, 11);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -652,6 +659,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     responseFinish: "none",
     memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
+    captureProcessing: {
+      echoCancellation: "enabled",
+      noiseSuppression: "disabled",
+      autoGainControl: "enabled",
+    },
     asr: {
       requested: "sensevoice",
       active: "sensevoice-sherpa-onnx",
@@ -846,6 +858,11 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
       interruptionHint: "future-hint",
       interruptionRecovery: "future-recovery",
       vadShadow: "future-shadow",
+      captureProcessing: {
+        echoCancellation: "future-echo",
+        noiseSuppression: true,
+        autoGainControl: null,
+      },
       asr: {
         requested: "future-asr",
         active: "future-runtime",
@@ -863,6 +880,11 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     responseFinish: "none",
     memoryContext: "none",
     vadShadow: "disabled",
+    captureProcessing: {
+      echoCancellation: "not-reported",
+      noiseSuppression: "not-reported",
+      autoGainControl: "not-reported",
+    },
     asr: {
       requested: "whisper",
       active: "none",
@@ -1004,7 +1026,7 @@ test("diagnostic report measures text-free audible gaps between managed segments
     ],
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 9);
+  assert.equal(report.diagnosticSchemaVersion, 11);
   assert.deepEqual(report.aggregate.segmentContinuity, {
     segmentsStarted: 2,
     segmentsCompleted: 2,
@@ -1120,6 +1142,42 @@ test("managed audio decoder validates the complete fixed header and payload", as
     managedAudioFrame({ pcm: new Int16Array(1921) }),
   ];
   for (const frame of invalid) assert.equal(decodeManagedAudioFrame(frame), null);
+});
+
+test("capture processing reports only effective boolean track settings", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { captureProcessingFromTrackSettings } = await import("../src/ai/realtime.js");
+
+  assert.deepEqual(
+    captureProcessingFromTrackSettings({
+      echoCancellation: true,
+      noiseSuppression: false,
+      autoGainControl: true,
+      deviceId: "forbidden-device-id",
+      sampleRate: 48000,
+    }),
+    {
+      echoCancellation: "enabled",
+      noiseSuppression: "disabled",
+      autoGainControl: "enabled",
+    },
+  );
+  assert.deepEqual(
+    captureProcessingFromTrackSettings({
+      echoCancellation: "true",
+      noiseSuppression: 1,
+    }),
+    {
+      echoCancellation: "not-reported",
+      noiseSuppression: "not-reported",
+      autoGainControl: "not-reported",
+    },
+  );
+  assert.deepEqual(captureProcessingFromTrackSettings(null), {
+    echoCancellation: "not-reported",
+    noiseSuppression: "not-reported",
+    autoGainControl: "not-reported",
+  });
 });
 
 test("realtime waveform envelope stays finite and bounded for short PCM", async () => {
@@ -1258,6 +1316,11 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     responseFinish: "none",
     memoryContext: "turn-final-v1",
     vadShadow: "disabled",
+    captureProcessing: {
+      echoCancellation: "not-reported",
+      noiseSuppression: "not-reported",
+      autoGainControl: "not-reported",
+    },
     asr: {
       requested: "whisper",
       active: "none",
@@ -1944,6 +2007,72 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
     },
   });
   assert.equal(JSON.stringify(snapshot).includes("userText"), false);
+});
+
+test("empty confirmed candidate during recovery synthesis requests replacement recovery", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = class { static OPEN = 1; };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    interruptionRecoveryGraceMs: 0,
+    interruptionRecoveryDeferMs: 0,
+  });
+  session.trace.startSession();
+  session.ws = { readyState: 1, send: (value) => sent.push(JSON.parse(value)) };
+  session._sessionStarted = true;
+  session._interruptionRecoveryMode = "empty-confirmed-v1";
+  session._backendGeneration = 7;
+  session._candidateInterruptsResponse = true;
+  session._confirmSpeech();
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 7 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "started",
+      generation: 8,
+    }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "tts_start", generation: 8 }) });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 2, generation: 8 }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "cancelled",
+      generation: 8,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_confirmed", candidateId: 2, generation: 9 }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "asr_start", generation: 9 }) });
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 9 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(
+    sent.filter((message) => message.type === "interruption_recovery").map((message) => ({
+      requestId: message.requestId,
+      expectedGeneration: message.expectedGeneration,
+    })),
+    [
+      { requestId: 1, expectedGeneration: 7 },
+      { requestId: 2, expectedGeneration: 9 },
+    ],
+  );
+  const finalTurnEvents = session.getTraceSnapshot().events.filter(
+    (event) => event.generationId === 2,
+  );
+  assert.equal(
+    finalTurnEvents.some((event) => event.eventType === TRACE_EVENT.LLM_REQUEST),
+    false,
+  );
 });
 
 test("valid speech cancels recovery while temporary occupancy only defers it", async () => {
@@ -2786,7 +2915,7 @@ test("streamed managed segments require explicit negotiation and exact final tot
   const { session, commands } = createSession();
   assert.deepEqual(commands[0], {
     type: "startup_buffer",
-    milliseconds: 240,
+    milliseconds: 200,
   });
   session._onMessage({
     data: JSON.stringify({
@@ -3524,6 +3653,54 @@ test("candidate rejection reopens the audio gate for the segment already admitte
   assert.equal(queued.some((message) => message.type === "audio"), true);
 });
 
+test("candidate rejection resumes managed PCM from the interrupted response generation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const queued = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.playbackNode = { port: { postMessage: (message) => queued.push(message) } };
+  session.audioCtx = { state: "running" };
+  session.trace.startSession();
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      generation: 4,
+      downlinkAudio: "managed-v1",
+      ttsStream: "provider-pcm-v1",
+    }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "speech_candidate" }) });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 4,
+      segmentId: 1,
+      text: "候选被拒绝后必须继续播报。",
+      streaming: true,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "speech_rejected",
+      generation: 5,
+      resumedGeneration: 4,
+    }),
+  });
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 4,
+      segmentId: 1,
+      chunkSequence: 0,
+      payloadSamples: 3,
+      pcm: new Int16Array([1, 2, 3]),
+    }),
+  });
+
+  assert.equal(queued.some((message) => message.type === "audio"), true);
+});
+
 test("barge-in attributes cleared playback to the interrupted generation", async () => {
   globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
   const previousWebSocket = globalThis.WebSocket;
@@ -4120,4 +4297,205 @@ test("desktop session records privacy-safe soft endpoint transitions", async () 
     endpointEvents.map((event) => event.metrics.silenceMs),
     [480, 900, 480, 1050],
   );
+});
+
+test("prefill summary separates cached prefixes from full recomputes", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "voxcpm", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  // 1010 tokens in 2820ms ~= 358 tok/s: a genuine recompute.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 1010, promptEvalMs: 2820, evalMs: 1500 },
+  });
+  // 1010 tokens in 90ms ~= 11222 tok/s: only possible by reusing the prefix.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 1010, promptEvalMs: 90, evalMs: 1500 },
+  });
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.samples, 2);
+  assert.equal(summary.recomputed, 1);
+  assert.equal(summary.reused, 1);
+  assert.equal(summary.partiallyReused, 0);
+  assert.equal(summary.promptEvalMs.p50, 90);
+  assert.equal(summary.promptTokens.p50, 1010);
+});
+
+test("prefill summary stays empty for providers that report no timings", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "volc", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  trace.record(TRACE_EVENT.LLM_REQUEST);
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.samples, 0);
+  assert.equal(summary.throughputTokensPerSecond.count, 0);
+  assert.equal(summary.reused, 0);
+  assert.equal(summary.partiallyReused, 0);
+  assert.equal(summary.recomputed, 0);
+});
+
+test("prefill trace events carry timings without prompt or reply text", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "Ollama",
+      llm: {
+        prompt: 1010,
+        completion: 47,
+        total: 1057,
+        promptEvalMs: 2820,
+        evalMs: 1420,
+        transcript: "forbidden-prompt-text",
+      },
+    }),
+  });
+
+  const events = session
+    .getTraceSnapshot()
+    .events.filter((event) => event.eventType === TRACE_EVENT.LLM_PREFILL);
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].metrics, {
+    promptTokens: 1010,
+    promptEvalMs: 2820,
+    evalMs: 1420,
+  });
+  assert.equal(JSON.stringify(events[0]).includes("forbidden-prompt-text"), false);
+});
+
+test("usage without prefill timings records no prefill event", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "volc" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "DeepSeek",
+      llm: { prompt: 800, completion: 40, total: 840 },
+    }),
+  });
+
+  assert.equal(
+    session
+      .getTraceSnapshot()
+      .events.filter((event) => event.eventType === TRACE_EVENT.LLM_PREFILL).length,
+    0,
+  );
+});
+
+test("prefill reuse on short prompts is not misread as a recompute", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "voxcpm", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  // Measured warm floor: fixed request overhead dominates short prompts, so a
+  // genuine cache hit reports only ~1660 tok/s (161 tokens in 97ms).
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 161, promptEvalMs: 97 },
+  });
+  // Measured cold ceiling on the same model: ~240 tok/s (161 tokens in 676ms).
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: { promptTokens: 161, promptEvalMs: 676 },
+  });
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.reused, 1);
+  assert.equal(summary.recomputed, 1);
+});
+
+test("prefill summary exposes queue wait and model load separately", () => {
+  let now = 0;
+  const trace = new RealtimeTrace({ provider: "voxcpm", clock: () => now++ });
+  trace.startSession();
+  trace.openTurn();
+  // Measured contended turn: the provider admits 183ms of prefill while the
+  // proxy clock saw 9969ms, so ~9.8s went to waiting for the shared model.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: {
+      promptTokens: 1048,
+      promptEvalMs: 183,
+      loadMs: 1,
+      firstTokenWallMs: 9969,
+      queueWaitMs: 9785,
+    },
+  });
+  // Measured idle turn dominated by a model swap-in rather than queueing.
+  trace.record(TRACE_EVENT.LLM_PREFILL, {
+    metrics: {
+      promptTokens: 1048,
+      promptEvalMs: 1048,
+      loadMs: 3349,
+      firstTokenWallMs: 4426,
+      queueWaitMs: 29,
+    },
+  });
+
+  const summary = summarizePrefill(trace.snapshot().events);
+
+  assert.equal(summary.samples, 2);
+  assert.equal(summary.queueWaitMs.count, 2);
+  assert.equal(summary.queueWaitMs.p95, 9785);
+  assert.equal(summary.loadMs.p95, 3349);
+});
+
+test("queue wait is derived from the proxy clock minus admitted work", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "Ollama",
+      llm: {
+        prompt: 1048,
+        completion: 20,
+        total: 1068,
+        promptEvalMs: 183,
+        evalMs: 600,
+        loadMs: 1,
+        firstTokenWallMs: 9969,
+      },
+    }),
+  });
+
+  const event = session
+    .getTraceSnapshot()
+    .events.find((item) => item.eventType === TRACE_EVENT.LLM_PREFILL);
+  assert.equal(event.metrics.queueWaitMs, 9785);
+  assert.equal(event.metrics.firstTokenWallMs, 9969);
+});
+
+test("queue wait stays absent when the proxy reports no wall clock", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const session = new RealtimeSession({ provider: "voxcpm" });
+  session.trace.startSession();
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "usage",
+      provider: "Ollama",
+      llm: { prompt: 900, completion: 30, total: 930, promptEvalMs: 2800 },
+    }),
+  });
+
+  const event = session
+    .getTraceSnapshot()
+    .events.find((item) => item.eventType === TRACE_EVENT.LLM_PREFILL);
+  assert.equal(event.metrics.promptEvalMs, 2800);
+  assert.equal("queueWaitMs" in event.metrics, false);
 });

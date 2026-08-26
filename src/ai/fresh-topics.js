@@ -21,8 +21,8 @@ const CATEGORY_PATTERNS = Object.freeze([
   ["daily-life", /日常|生活|家务|天气|健康|作息|养生|通勤|lifestyle/i],
   ["science", /科学|科普|太空|航天|宇宙|science|space/i],
 ]);
-const FRESH_INTENT_RE = /刚刚|最新|近期|最近|新闻|热搜|比赛|比分|赛程|票房|发布|更新|政策|天气|查一下|查查|搜索|搜一下|联网|网上|发生了什么/i;
-const CATEGORY_DISCOVERY_RE = /聊聊|说说|讲讲|介绍|推荐|有什么|有哪些|哪款|哪部|哪本|哪首|哪里|去哪儿?玩|值得|好玩|好看|好听|新作|新品|新游|新片|新书|新歌|榜单|排行|限免|吃什么|玩什么|看什么|听什么/i;
+const FRESH_INTENT_RE = /刚刚|最新|近期|最近|新闻|热搜|比赛|比分|赛程|票房|发布|更新|政策|天气|热门|热榜|查一下|查查|搜索|搜一下|联网|网上|发生了什么/i;
+const CATEGORY_DISCOVERY_RE = /聊聊|说说|讲讲|介绍|推荐|有什么|有哪些|哪款|哪部|哪本|哪首|哪里|去哪儿?玩|值得|好玩|好看|好听|视频|新作|新品|新游|新片|新书|新歌|榜单|排行|限免|吃什么|玩什么|看什么|听什么/i;
 const FIRST_PERSON_RECENT_STATEMENT_RE = /^(?:我|俺|咱)(?:最近|近期|这几天|刚刚|现在).*(?:在|会|刚|已经|一直|偶尔|平时)/i;
 
 function normalizedCity(value) {
@@ -87,9 +87,13 @@ export function inferFreshTopicWorkRoles({ profile, personaText = "", recentMess
 
 export function inferFreshTopicCategories(query) {
   const value = String(query || "");
-  return CATEGORY_PATTERNS
+  const categories = CATEGORY_PATTERNS
     .filter(([, pattern]) => pattern.test(value))
     .map(([category]) => category);
+  if (!categories.length && /B站|哔哩哔哩|视频|短视频|UP主/i.test(value)) {
+    categories.push("daily-life");
+  }
+  return categories;
 }
 
 export function needsFreshTopics(query, { proactive = false, participation = "relevant", ambient = false } = {}) {
@@ -227,7 +231,11 @@ export async function fetchFreshTopics({
       },
     });
     if (response?.status !== "ok" && response?.status !== "partial") return [];
-    return normalizeFreshTopics(response.items);
+    const normalized = normalizeFreshTopics(response.items);
+    if (/B站|哔哩哔哩|bilibili/i.test(String(query || ""))) {
+      return normalized.filter((item) => /哔哩哔哩|B站/i.test(item.sourceName));
+    }
+    return normalized;
   } catch {
     return [];
   }

@@ -65,6 +65,12 @@ import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
 import { fetchWebObservations, renderWebObservationBlock } from "./ai/web-observations.js";
 import {
+  buildRecommendationLinkPrompt,
+  collectRecommendationLinks,
+  isBilibiliRecommendationQuery,
+  safeRecommendationUrl,
+} from "./ai/recommendation-links.js";
+import {
   fetchFreshTopics,
   inferFreshTopicLocations,
   inferFreshTopicWorkRoles,
@@ -169,7 +175,7 @@ function makeBubbleRevealer(parts, firstBubble, firstRow) {
       const i = next++;
       if (i === 0) {
         firstRow?.classList.remove("streaming");
-        firstBubble.textContent = parts[0];
+        renderTextWithSafeLinks(firstBubble, parts[0]);
       } else {
         addBubble("assistant", parts[i]);
       }
@@ -311,6 +317,7 @@ let pendingImage = null; // { dataUrl } —— 待随下条消息发送的图片
 let pendingSticker = null; // { url, emotion, ... } —— 待随下条消息发送的表情
 let stickerGridBuilt = false; // 表情网格是否已懒填充
 const history = []; // { role, content, imageCaption?, images?, sticker?, pat?, id? }
+let recentRecommendationLinks = [];
 let lastPatAt = 0;
 let midDragActive = false;
 let midDragStartY = 0;
@@ -1140,12 +1147,32 @@ function addBubble(role, text, { mid } = {}) {
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   if (mid) bubble.dataset.mid = mid;
-  bubble.textContent = text;
+  renderTextWithSafeLinks(bubble, text);
   row.appendChild(createAvatar(role));
   row.appendChild(bubble);
   messagesEl.appendChild(row);
   scrollBottom();
   return bubble;
+}
+
+function renderTextWithSafeLinks(node, text) {
+  node.textContent = "";
+  const value = String(text || "");
+  const pattern = /https:\/\/www\.bilibili\.com\/video\/[A-Za-z0-9_-]+/gi;
+  let cursor = 0;
+  for (const match of value.matchAll(pattern)) {
+    const url = safeRecommendationUrl(match[0]);
+    if (!url) continue;
+    node.append(document.createTextNode(value.slice(cursor, match.index)));
+    const link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.textContent = url;
+    node.append(link);
+    cursor = match.index + match[0].length;
+  }
+  node.append(document.createTextNode(value.slice(cursor)));
 }
 
 /** 拍一拍居中提示条（类微信系统消息）。 */
@@ -1621,9 +1648,10 @@ async function buildRequestMessages(opts = {}) {
     }
   }
   let webPrompt = "";
+  const query = lastRealUserMessage()?.content || "";
+  if (isBilibiliRecommendationQuery(query)) recentRecommendationLinks = [];
   if (settings.webGroundingEnabled === true) {
     await syncFreshTopicLocations();
-    const query = lastRealUserMessage()?.content || "";
     updateFreshAssociationContext(freshAssociationSessionState, query);
     const feedback = applyFreshAssociationFeedback(freshAssociationSessionState, query);
     if (feedback.rejected && freshAssociationSessionState.lastExposureFingerprint) {
@@ -1669,6 +1697,8 @@ async function buildRequestMessages(opts = {}) {
       if (association) {
         const consumed = takeFreshTopicsForSession([association.freshTopic], textFreshTopicIds);
         if (consumed.length) {
+          const links = collectRecommendationLinks(query, consumed);
+          if (links.length) recentRecommendationLinks = links;
           webPrompt = renderFreshAssociationBlock(association);
           recordFreshAssociationExposure(freshAssociationSessionState, association, { ambient });
           recordFreshExposure(freshExposureLedger, association, { outcome: "shared" });
@@ -1690,6 +1720,8 @@ async function buildRequestMessages(opts = {}) {
       const topicsForPrompt = ambient ? allowedFreshTopics.slice(0, 1) : allowedFreshTopics;
       const unusedFreshTopics = takeFreshTopicsForSession(topicsForPrompt, textFreshTopicIds);
       webPrompt = renderFreshTopicBlock(unusedFreshTopics);
+      const links = collectRecommendationLinks(query, unusedFreshTopics);
+      if (links.length) recentRecommendationLinks = links;
       if (unusedFreshTopics.length) {
         recordFreshAssociationExposure(freshAssociationSessionState, unusedFreshTopics[0], { ambient });
         if (ambient) {
@@ -1702,6 +1734,7 @@ async function buildRequestMessages(opts = {}) {
       }
     }
   }
+  webPrompt += buildRecommendationLinkPrompt(query, recentRecommendationLinks);
   if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
     const query = lastRealUserMessage()?.content || "";
     const observations = await fetchWebObservations({
@@ -1784,7 +1817,7 @@ function renderFinalBubbles(streamBubble, reply) {
     streamBubble.closest(".row")?.remove();
     return;
   }
-  streamBubble.textContent = parts[0];
+  renderTextWithSafeLinks(streamBubble, parts[0]);
   for (let i = 1; i < parts.length; i++) addBubble("assistant", parts[i]);
 }
 
@@ -1919,9 +1952,9 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
             }
             // 会朗读时先不显示文字，等对应句音频开始播放再显示（同步出现）。
             if (!willSync) {
-              streamBubble.textContent = stripStickerForDisplay(
+              renderTextWithSafeLinks(streamBubble, stripStickerForDisplay(
                 stripSpeakBlockForDisplay(normalizeModelNewlines(full))
-              );
+              ));
               scrollBottom();
             }
           }
@@ -2592,7 +2625,7 @@ function appendCallAsstBubble(delta, { generation } = {}) {
     callAsstBubble.closest(".row")?.classList.add("streaming");
     petSignal("reply");
   } else {
-    callAsstBubble.textContent = callAsstText;
+    renderTextWithSafeLinks(callAsstBubble, callAsstText);
     scrollBottom();
   }
 }

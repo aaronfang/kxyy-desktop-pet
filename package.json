@@ -11,6 +11,7 @@
     "test:conversation": "node --test tests/conversation-replay.test.js",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:resources": "node scripts/verify-vad-resources.mjs",
+    "test:gate": "npm test && npm run test:python && npm run test:resources && cargo test --manifest-path src-tauri/Cargo.toml --lib && cargo check --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri",
     "dev": "tauri dev",
     "predev": "node scripts/kill-services.mjs && npm run encrypt-assets",

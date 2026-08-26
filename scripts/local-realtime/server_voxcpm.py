@@ -31,6 +31,9 @@ _gate = threading.BoundedSemaphore(1)
 _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxcpm")
 _DONE = object()
 PROVIDER_CLEANUP_WAIT_SECONDS = 5.0
+PROVIDER_STREAM_CHUNK_MAX_SAMPLES = OUTPUT_RATE * 2
+PROVIDER_SENTENCE_MAX_SAMPLES = OUTPUT_RATE * 60
+RESAMPLE_FILTER_TAPS = 31
 
 
 def _model_path() -> str:
@@ -59,13 +62,53 @@ def _spoken(text: str) -> str:
     return common.clip_speech_text(common.text_for_speech(text) or text)
 
 
-def _to_pcm24(audio):
+class _Pcm48To24Resampler:
+    """Stateful 2:1 FIR resampler so provider chunk boundaries stay inaudible."""
+
+    def __init__(self):
+        import numpy as np
+
+        offsets = np.arange(RESAMPLE_FILTER_TAPS, dtype=np.float64)
+        offsets -= (RESAMPLE_FILTER_TAPS - 1) / 2
+        taps = 0.5 * np.sinc(0.5 * offsets) * np.hamming(RESAMPLE_FILTER_TAPS)
+        self._taps = (taps / np.sum(taps)).astype(np.float32)
+        self._tail = np.zeros(RESAMPLE_FILTER_TAPS - 1, dtype=np.float32)
+        self._processed = 0
+
+    def process(self, values):
+        import numpy as np
+
+        combined = np.concatenate((self._tail, values))
+        filtered = np.convolve(combined, self._taps, mode="valid").astype(
+            np.float32, copy=False
+        )
+        start = self._processed % 2
+        self._processed += values.size
+        self._tail = combined[-(RESAMPLE_FILTER_TAPS - 1) :].copy()
+        return filtered[start::2]
+
+
+def _to_pcm24(
+    audio,
+    *,
+    resampler=None,
+    max_input_samples=PROVIDER_SENTENCE_MAX_SAMPLES,
+):
     import numpy as np
-    values = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+    values = np.asarray(audio).reshape(-1)
+    if values.size > max_input_samples:
+        message = (
+            "VoxCPM2 输出块过长"
+            if max_input_samples <= PROVIDER_STREAM_CHUNK_MAX_SAMPLES
+            else "VoxCPM2 输出时长异常"
+        )
+        raise RuntimeError(message)
+    values = values.astype(np.float32, copy=False)
     if values.size == 0 or not np.isfinite(values).all():
         raise RuntimeError("VoxCPM2 输出为空或包含无效采样")
-    # VoxCPM2 is natively 48 kHz; project playback and envelope are 24 kHz.
-    values = values[: values.size - (values.size % 2) : 2]
+    converter = resampler or _Pcm48To24Resampler()
+    values = converter.process(values)
     return (np.clip(values, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
 
@@ -177,7 +220,10 @@ def _synth(text: str) -> bytes:
     if not _gate.acquire(blocking=False):
         raise RuntimeError("VoxCPM2 正忙，请稍后再试")
     try:
-        return _to_pcm24(_provider_generate(text))
+        return _to_pcm24(
+            _provider_generate(text),
+            max_input_samples=PROVIDER_SENTENCE_MAX_SAMPLES,
+        )
     finally:
         _gate.release()
 
@@ -203,13 +249,18 @@ async def _synth_stream(text: str):
             )
         await asyncio.sleep(0.02)
     generator = None
+    resampler = _Pcm48To24Resampler()
     try:
         generator = _provider_stream(text)
         while True:
             chunk = await loop.run_in_executor(_pool, _pull, generator)
             if chunk is _DONE:
                 break
-            pcm = _to_pcm24(chunk)
+            pcm = _to_pcm24(
+                chunk,
+                resampler=resampler,
+                max_input_samples=PROVIDER_STREAM_CHUNK_MAX_SAMPLES,
+            )
             for part in common.chunk_pcm(pcm, 80):
                 yield {"type": "audio", "pcm": part}
     finally:

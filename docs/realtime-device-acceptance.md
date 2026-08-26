@@ -105,4 +105,4 @@ cargo test --offline --manifest-path src-tauri/Cargo.toml --lib
 - AEC 造成持续自激、确认/拒绝打断状态错误、音频顺序或速度明显异常。
 - filler 超过一轮、正文 admission 后插入、用户开口后仍继续播放，或 filler 污染历史。
 
-交付物：一份每设备一页的计时/主观评分表、脱敏 `diagnosticSchemaVersion:9`（如开启调试）、缓存 provider 状态截图/固定事件、失败步骤和复现条件。当前仓库只完成自动化与实现，真实设备项目在人工执行前保持“待验收”。
+交付物：一份每设备一页的计时/主观评分表、脱敏 `diagnosticSchemaVersion:11`（如开启调试，其中 `runtime.captureProcessing` 记录浏览器音轨实际报告的 AEC、noise suppression 和 AGC 固定状态）、缓存 provider 状态截图/固定事件、失败步骤和复现条件。当前仓库只完成自动化与实现，真实设备项目在人工执行前保持“待验收”。

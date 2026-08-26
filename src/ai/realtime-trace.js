@@ -5,10 +5,17 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 9;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 11;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
+// Effective prefill throughput (tokens/second) band edges. Measured Ornith-1.5:9b
+// on Apple silicon: a full recompute holds 240-395 tok/s regardless of prompt size,
+// a fully reused prefix reports 1700-48000 tok/s, and a partially reused prompt
+// (shared persona/history hit, new tail recomputed) lands in between. Two edges
+// instead of one keep partial reuse from being reported as either extreme.
+const PREFILL_COLD_TOKENS_PER_SECOND = 500;
+const PREFILL_REUSE_TOKENS_PER_SECOND = 1600;
 const VAD_SHADOW_SUMMARY_SCHEMA_VERSION = 1;
 const VAD_SHADOW_COUNTER_MAX = Number.MAX_SAFE_INTEGER;
 const VAD_SHADOW_LATENCY_SAMPLES_MAX = 64;
@@ -81,6 +88,7 @@ export const TRACE_EVENT = Object.freeze({
   RESPONSE_CANCELLED: "response_cancelled",
   MEMORY_CONTEXT_REQUEST: "memory_context_request",
   MEMORY_CONTEXT_RESPONSE: "memory_context_response",
+  LLM_PREFILL: "llm_prefill",
   PROACTIVE_TURN_ACCEPTED: "proactive_turn_accepted",
   PROACTIVE_TURN_VETOED: "proactive_turn_vetoed",
   PROACTIVE_TURN_CANCELLED: "proactive_turn_cancelled",
@@ -147,6 +155,12 @@ const SAFE_METRICS = new Set([
   "timedOut",
   "stale",
   "segmentIndex",
+  "promptTokens",
+  "promptEvalMs",
+  "evalMs",
+  "loadMs",
+  "firstTokenWallMs",
+  "queueWaitMs",
 ]);
 
 let fallbackId = 0;
@@ -588,6 +602,61 @@ export function summarizeMemoryContext(events) {
   };
 }
 
+/**
+ * Prefill cost, model residency, and prefix-KV-cache reuse; timings and counts only.
+ *
+ * Reuse is inferred from effective prefill throughput rather than raw duration, so
+ * the reading stays valid across prompt sizes and hardware: a full recompute is
+ * bounded by the model's real prefill rate while skipped tokens cost near-zero.
+ * Three bands, because reuse is not binary in a running conversation — a turn that
+ * keeps the persona and older history but appends a new tail lands an order of
+ * magnitude between the two extremes, and folding it into either one misreports it.
+ *
+ * `throughputTokensPerSecond` is the raw distribution behind the bands; prefer it
+ * over the counts when judging how well the prefix is actually being reused.
+ */
+export function summarizePrefill(events) {
+  const source = Array.isArray(events) ? events : [];
+  const samples = source.filter((event) => event.eventType === TRACE_EVENT.LLM_PREFILL);
+  const durations = [];
+  const tokens = [];
+  const queueWaits = [];
+  const loads = [];
+  const throughputs = [];
+  let reused = 0;
+  let partiallyReused = 0;
+  let recomputed = 0;
+  for (const event of samples) {
+    const ms = event.metrics?.promptEvalMs;
+    const count = event.metrics?.promptTokens;
+    const queueWaitMs = event.metrics?.queueWaitMs;
+    const loadMs = event.metrics?.loadMs;
+    if (Number.isFinite(queueWaitMs) && queueWaitMs >= 0) queueWaits.push(queueWaitMs);
+    if (Number.isFinite(loadMs) && loadMs >= 0) loads.push(loadMs);
+    if (!Number.isFinite(ms) || ms < 0) continue;
+    durations.push(ms);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    tokens.push(count);
+    // Guard against a zero-duration report making throughput non-finite.
+    const perSecond = ms > 0 ? (count * 1000) / ms : Infinity;
+    if (Number.isFinite(perSecond)) throughputs.push(roundMetric(perSecond));
+    if (perSecond >= PREFILL_REUSE_TOKENS_PER_SECOND) reused += 1;
+    else if (perSecond >= PREFILL_COLD_TOKENS_PER_SECOND) partiallyReused += 1;
+    else recomputed += 1;
+  }
+  return {
+    samples: samples.length,
+    promptEvalMs: summarizeDistribution(durations),
+    promptTokens: summarizeDistribution(tokens),
+    queueWaitMs: summarizeDistribution(queueWaits),
+    loadMs: summarizeDistribution(loads),
+    throughputTokensPerSecond: summarizeDistribution(throughputs),
+    reused,
+    partiallyReused,
+    recomputed,
+  };
+}
+
 function maxMetric(events, name) {
   let max = 0;
   let seen = false;
@@ -755,6 +824,10 @@ export function sanitizeVadShadowSummary(raw) {
 function sanitizeRuntimeSummary(runtime) {
   const value = runtime && typeof runtime === "object" ? runtime : {};
   const asr = value.asr && typeof value.asr === "object" ? value.asr : {};
+  const captureProcessing =
+    value.captureProcessing && typeof value.captureProcessing === "object"
+      ? value.captureProcessing
+      : {};
   return {
     provider: normalizeProvider(value.provider),
     playbackMode: safeEnum(value.playbackMode, ["worklet", "legacy", "none"], "none"),
@@ -792,6 +865,23 @@ function sanitizeRuntimeSummary(runtime) {
       ],
       "disabled",
     ),
+    captureProcessing: {
+      echoCancellation: safeEnum(
+        captureProcessing.echoCancellation,
+        ["enabled", "disabled", "not-reported"],
+        "not-reported",
+      ),
+      noiseSuppression: safeEnum(
+        captureProcessing.noiseSuppression,
+        ["enabled", "disabled", "not-reported"],
+        "not-reported",
+      ),
+      autoGainControl: safeEnum(
+        captureProcessing.autoGainControl,
+        ["enabled", "disabled", "not-reported"],
+        "not-reported",
+      ),
+    },
     asr: {
       requested: safeEnum(asr.requested, ["whisper", "sensevoice"], "whisper"),
       active: safeEnum(
@@ -992,6 +1082,7 @@ export function buildRealtimeDiagnosticReport(snapshot) {
       interruptions: summarizeCandidateOutcomes(events),
       segmentContinuity: summarizeSegmentContinuity(events),
       memoryContext: summarizeMemoryContext(events),
+      prefill: summarizePrefill(events),
       proactive: sanitizeProactiveSummary(source.proactiveSummary),
       recovery: sanitizeRecoverySummary(source.recoverySummary),
       turnStrategy: sanitizeTurnStrategySummary(source.turnStrategySummary),
