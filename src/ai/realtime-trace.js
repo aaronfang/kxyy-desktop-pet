@@ -5,7 +5,7 @@
 // boolean metrics are retained in a bounded in-memory queue.
 
 export const TRACE_SCHEMA_VERSION = 1;
-export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 10;
+export const REALTIME_DIAGNOSTIC_SCHEMA_VERSION = 11;
 
 const MAX_DIAGNOSTIC_EVENTS = 256;
 const MAX_LATENCY_SUMMARIES = 8;
@@ -824,6 +824,10 @@ export function sanitizeVadShadowSummary(raw) {
 function sanitizeRuntimeSummary(runtime) {
   const value = runtime && typeof runtime === "object" ? runtime : {};
   const asr = value.asr && typeof value.asr === "object" ? value.asr : {};
+  const captureProcessing =
+    value.captureProcessing && typeof value.captureProcessing === "object"
+      ? value.captureProcessing
+      : {};
   return {
     provider: normalizeProvider(value.provider),
     playbackMode: safeEnum(value.playbackMode, ["worklet", "legacy", "none"], "none"),
@@ -861,6 +865,23 @@ function sanitizeRuntimeSummary(runtime) {
       ],
       "disabled",
     ),
+    captureProcessing: {
+      echoCancellation: safeEnum(
+        captureProcessing.echoCancellation,
+        ["enabled", "disabled", "not-reported"],
+        "not-reported",
+      ),
+      noiseSuppression: safeEnum(
+        captureProcessing.noiseSuppression,
+        ["enabled", "disabled", "not-reported"],
+        "not-reported",
+      ),
+      autoGainControl: safeEnum(
+        captureProcessing.autoGainControl,
+        ["enabled", "disabled", "not-reported"],
+        "not-reported",
+      ),
+    },
     asr: {
       requested: safeEnum(asr.requested, ["whisper", "sensevoice"], "whisper"),
       active: safeEnum(

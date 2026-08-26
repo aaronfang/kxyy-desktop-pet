@@ -537,6 +537,12 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
       interruptionRecovery: "empty-confirmed-v1",
       memoryContext: "turn-final-v1",
       vadShadow: "silero-onnx-shadow-v1",
+      captureProcessing: {
+        echoCancellation: "enabled",
+        noiseSuppression: "disabled",
+        autoGainControl: "enabled",
+        deviceId: "forbidden-device-id",
+      },
       asr: {
         requested: "sensevoice",
         active: "sensevoice-sherpa-onnx",
@@ -641,7 +647,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     persona: "forbidden-persona",
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 10);
+  assert.equal(report.diagnosticSchemaVersion, 11);
 
   assert.deepEqual(report.runtime, {
     provider: "cosyvoice",
@@ -653,6 +659,11 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     responseFinish: "none",
     memoryContext: "turn-final-v1",
     vadShadow: "silero-onnx-shadow-v1",
+    captureProcessing: {
+      echoCancellation: "enabled",
+      noiseSuppression: "disabled",
+      autoGainControl: "enabled",
+    },
     asr: {
       requested: "sensevoice",
       active: "sensevoice-sherpa-onnx",
@@ -847,6 +858,11 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
       interruptionHint: "future-hint",
       interruptionRecovery: "future-recovery",
       vadShadow: "future-shadow",
+      captureProcessing: {
+        echoCancellation: "future-echo",
+        noiseSuppression: true,
+        autoGainControl: null,
+      },
       asr: {
         requested: "future-asr",
         active: "future-runtime",
@@ -864,6 +880,11 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     responseFinish: "none",
     memoryContext: "none",
     vadShadow: "disabled",
+    captureProcessing: {
+      echoCancellation: "not-reported",
+      noiseSuppression: "not-reported",
+      autoGainControl: "not-reported",
+    },
     asr: {
       requested: "whisper",
       active: "none",
@@ -1005,7 +1026,7 @@ test("diagnostic report measures text-free audible gaps between managed segments
     ],
   });
 
-  assert.equal(report.diagnosticSchemaVersion, 10);
+  assert.equal(report.diagnosticSchemaVersion, 11);
   assert.deepEqual(report.aggregate.segmentContinuity, {
     segmentsStarted: 2,
     segmentsCompleted: 2,
@@ -1121,6 +1142,42 @@ test("managed audio decoder validates the complete fixed header and payload", as
     managedAudioFrame({ pcm: new Int16Array(1921) }),
   ];
   for (const frame of invalid) assert.equal(decodeManagedAudioFrame(frame), null);
+});
+
+test("capture processing reports only effective boolean track settings", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  const { captureProcessingFromTrackSettings } = await import("../src/ai/realtime.js");
+
+  assert.deepEqual(
+    captureProcessingFromTrackSettings({
+      echoCancellation: true,
+      noiseSuppression: false,
+      autoGainControl: true,
+      deviceId: "forbidden-device-id",
+      sampleRate: 48000,
+    }),
+    {
+      echoCancellation: "enabled",
+      noiseSuppression: "disabled",
+      autoGainControl: "enabled",
+    },
+  );
+  assert.deepEqual(
+    captureProcessingFromTrackSettings({
+      echoCancellation: "true",
+      noiseSuppression: 1,
+    }),
+    {
+      echoCancellation: "not-reported",
+      noiseSuppression: "not-reported",
+      autoGainControl: "not-reported",
+    },
+  );
+  assert.deepEqual(captureProcessingFromTrackSettings(null), {
+    echoCancellation: "not-reported",
+    noiseSuppression: "not-reported",
+    autoGainControl: "not-reported",
+  });
 });
 
 test("realtime waveform envelope stays finite and bounded for short PCM", async () => {
@@ -1259,6 +1316,11 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     responseFinish: "none",
     memoryContext: "turn-final-v1",
     vadShadow: "disabled",
+    captureProcessing: {
+      echoCancellation: "not-reported",
+      noiseSuppression: "not-reported",
+      autoGainControl: "not-reported",
+    },
     asr: {
       requested: "whisper",
       active: "none",
@@ -1945,6 +2007,72 @@ test("empty confirmed interruption requests one recovery and records fixed lifec
     },
   });
   assert.equal(JSON.stringify(snapshot).includes("userText"), false);
+});
+
+test("empty confirmed candidate during recovery synthesis requests replacement recovery", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = class { static OPEN = 1; };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const sent = [];
+  const session = new RealtimeSession({
+    provider: "local",
+    interruptionRecoveryGraceMs: 0,
+    interruptionRecoveryDeferMs: 0,
+  });
+  session.trace.startSession();
+  session.ws = { readyState: 1, send: (value) => sent.push(JSON.parse(value)) };
+  session._sessionStarted = true;
+  session._interruptionRecoveryMode = "empty-confirmed-v1";
+  session._backendGeneration = 7;
+  session._candidateInterruptsResponse = true;
+  session._confirmSpeech();
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 7 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "started",
+      generation: 8,
+    }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "tts_start", generation: 8 }) });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_candidate", candidateId: 2, generation: 8 }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "interruption_recovery_status",
+      requestId: 1,
+      state: "cancelled",
+      generation: 8,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({ type: "speech_confirmed", candidateId: 2, generation: 9 }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "asr_start", generation: 9 }) });
+  session._onMessage({ data: JSON.stringify({ type: "asr_end", generation: 9 }) });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.deepEqual(
+    sent.filter((message) => message.type === "interruption_recovery").map((message) => ({
+      requestId: message.requestId,
+      expectedGeneration: message.expectedGeneration,
+    })),
+    [
+      { requestId: 1, expectedGeneration: 7 },
+      { requestId: 2, expectedGeneration: 9 },
+    ],
+  );
+  const finalTurnEvents = session.getTraceSnapshot().events.filter(
+    (event) => event.generationId === 2,
+  );
+  assert.equal(
+    finalTurnEvents.some((event) => event.eventType === TRACE_EVENT.LLM_REQUEST),
+    false,
+  );
 });
 
 test("valid speech cancels recovery while temporary occupancy only defers it", async () => {
@@ -3522,6 +3650,54 @@ test("candidate rejection reopens the audio gate for the segment already admitte
     pcm: new Int16Array([1, 2, 3]),
   }) });
   assert.equal(session._audioGate, false);
+  assert.equal(queued.some((message) => message.type === "audio"), true);
+});
+
+test("candidate rejection resumes managed PCM from the interrupted response generation", async () => {
+  globalThis.window = { __TAURI__: { core: { invoke: async () => "" } } };
+  globalThis.WebSocket = { OPEN: 1 };
+  const { RealtimeSession } = await import("../src/ai/realtime.js");
+  const queued = [];
+  const session = new RealtimeSession({ provider: "local" });
+  session.playbackNode = { port: { postMessage: (message) => queued.push(message) } };
+  session.audioCtx = { state: "running" };
+  session.trace.startSession();
+  session._onMessage({
+    data: JSON.stringify({
+      type: "session",
+      state: "started",
+      generation: 4,
+      downlinkAudio: "managed-v1",
+      ttsStream: "provider-pcm-v1",
+    }),
+  });
+  session._onMessage({ data: JSON.stringify({ type: "speech_candidate" }) });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "audio_segment_start",
+      generation: 4,
+      segmentId: 1,
+      text: "候选被拒绝后必须继续播报。",
+      streaming: true,
+    }),
+  });
+  session._onMessage({
+    data: JSON.stringify({
+      type: "speech_rejected",
+      generation: 5,
+      resumedGeneration: 4,
+    }),
+  });
+  session._onMessage({
+    data: managedAudioFrame({
+      generation: 4,
+      segmentId: 1,
+      chunkSequence: 0,
+      payloadSamples: 3,
+      pcm: new Int16Array([1, 2, 3]),
+    }),
+  });
+
   assert.equal(queued.some((message) => message.type === "audio"), true);
 });
 

@@ -68,7 +68,7 @@ VoxCPM2 零样本后端现可在 Apple Silicon macOS 上由应用首次选择时
 
 ### 2.2 当前打断时序
 
-本地链路在播报中使用较高 RMS 门槛和约 360ms 连续响声建立 candidate；candidate 会立即通知前端 duck/暂停，但不会清空可恢复缓冲。随后继续录到 soft endpoint，整段 final ASR 通过文本长度、幻觉和可用静音概率校验后才 confirmed、清空旧播放并取消旧 generation；无效 ASR 则 rejected 并恢复。0.2.30 的 SenseVoice 只替换这次句尾识别，不改变上述时序。
+本地链路在播报中使用较高 RMS 门槛和约 540ms 连续响声建立 candidate，并保留这段有界 pre-roll；candidate 会立即通知前端 duck/暂停，但不会清空可恢复缓冲。随后继续录到 soft endpoint，整段 final ASR 通过文本长度、幻觉、可用静音概率和播报期非语音事件校验后才 confirmed、清空旧播放并取消旧 generation；无效 ASR 则 rejected，携带仍存活的 response generation 供前端恢复该代播放。0.2.30 的 SenseVoice 只替换这次句尾识别，不改变上述时序。
 
 这已解决“用户开口时助手完全不让声”，但 confirmed 仍受句尾提交和整段 Whisper 延迟约束。后续不能只降低 RMS 阈值，需用真实声学回放验证神经 VAD/快速确认，并在此后收紧 3 秒暂停容量。
 
@@ -233,9 +233,9 @@ MLX adapter 没有新增音频队列：async consumer 每次只把同步 generat
 
 ### 2.17 P2 真实设备诊断入口（已实现，0.2.23）
 
-0.2.23 把既有内存 trace 变成用户可取回的验证材料：开启设置中的“显示聊天界面调试信息”后，可在聊天 debug 区复制当前通话或最近一次已挂断通话的诊断 JSON。挂断路径会先等待 `RealtimeSession.stop()` 完成，再保存最终快照；只保留最近一份且不写磁盘。报告重新经过严格白名单构造，而不是直接序列化任意运行时对象。0.2.25 因新增固定枚举 `runtime.vadShadow` 将 `diagnosticSchemaVersion` 升为 2；0.2.26 为区分真实 scorer 的 `warming|busy|unavailable|silero-onnx-shadow-v1` 将其升为 3；0.2.28 因新增固定 `aggregate.vadShadow` 聚合将其升为 4；0.2.30 因新增固定 `runtime.asr` 请求/生效/状态枚举将其升为 5；后续诊断扩展升至 6，2026-07-29 主动陪聊基础计数升为 7，本轮固定 trigger kind、互动类别、veto reason 与节奏退让/停止计数升为 8。新增 `aggregate.prefill`（本地 provider 的 prompt token 数、prefill/decode 耗时、模型换入耗时、代理侧首 token 墙钟与由此推导的共享模型排队等待，以及 prefix KV 复用判定）将其升为 10。事件 schema 仍为 v1；主动诊断不含话题正文、用户/助手文本、Memory 内容或内部候选 ID。
+0.2.23 把既有内存 trace 变成用户可取回的验证材料：开启设置中的“显示聊天界面调试信息”后，可在聊天 debug 区复制当前通话或最近一次已挂断通话的诊断 JSON。挂断路径会先等待 `RealtimeSession.stop()` 完成，再保存最终快照；只保留最近一份且不写磁盘。报告重新经过严格白名单构造，而不是直接序列化任意运行时对象。0.2.25 因新增固定枚举 `runtime.vadShadow` 将 `diagnosticSchemaVersion` 升为 2；0.2.26 为区分真实 scorer 的 `warming|busy|unavailable|silero-onnx-shadow-v1` 将其升为 3；0.2.28 因新增固定 `aggregate.vadShadow` 聚合将其升为 4；0.2.30 因新增固定 `runtime.asr` 请求/生效/状态枚举将其升为 5；后续诊断扩展升至 6，2026-07-29 主动陪聊基础计数升为 7，本轮固定 trigger kind、互动类别、veto reason 与节奏退让/停止计数升为 8。新增 `aggregate.prefill`（本地 provider 的 prompt token 数、prefill/decode 耗时、模型换入耗时、代理侧首 token 墙钟与由此推导的共享模型排队等待，以及 prefix KV 复用判定）将其升为 10；读取浏览器音轨实际生效的 AEC、noise suppression 与 AGC 固定枚举将其升为 11。事件 schema 仍为 v1；主动诊断不含话题正文、用户/助手文本、Memory 内容或内部候选 ID。
 
-**已实现**：报告固定枚举实际协商结果：provider、`worklet|legacy|none`、`managed-v1|raw`、`provider-pcm-v1|none`、`candidate-snapshot-v1|none`，以及 `runtime.asr` 的 `requested`、`active`、`status`。事件最多 256 条，独立延迟摘要最多 8 个 generation；连续 playback stats 会合并但保留 500ms 采样点中的 `queuedMs` 最高值及合并计数，避免长会话的统计挤掉 TTFA 生命周期边界。报告同时给出这些轮次的 p50/p95、candidate 到 confirmed/rejected、soft-end 到 reopen/commit、App 可观测 TTFA、采样队列最高值和丢样统计。所有阶段时间继续来自单调相对时钟。
+**已实现**：报告固定枚举实际协商结果：provider、`worklet|legacy|none`、`managed-v1|raw`、`provider-pcm-v1|none`、`candidate-snapshot-v1|none`，`runtime.asr` 的 `requested`、`active`、`status`，以及 `runtime.captureProcessing` 中浏览器音轨实际报告的 AEC、noise suppression、AGC `enabled|disabled|not-reported`。事件最多 256 条，独立延迟摘要最多 8 个 generation；连续 playback stats 会合并但保留 500ms 采样点中的 `queuedMs` 最高值及合并计数，避免长会话的统计挤掉 TTFA 生命周期边界。报告同时给出这些轮次的 p50/p95、candidate 到 confirmed/rejected、soft-end 到 reopen/commit、App 可观测 TTFA、采样队列最高值和丢样统计。所有阶段时间继续来自单调相对时钟。
 
 **隐私边界**：导出不含设置对象、Key、persona、用户/助手文本、URL、文件/设备路径或 PCM；只含固定枚举、按报告重新编号的 session/turn/response ID、相对时间和允许列表数值。来源丢弃、导出截断、非法项拒绝与 stats 合并分别计数。`underruns` 仍包含自然 drain，报告明确标为 `includes-natural-drain`，不能把它当成 provider 流式断粮、Python queue depth 或 MLX model gate 精确释放时刻。`maxSampledQueuedMs` 也只是 500ms 观测点的最高值，不是每个音频 chunk 的精确 ring 峰值。
 

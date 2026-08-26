@@ -3617,12 +3617,68 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.session.play_enabled = True
         frame = struct.pack("<h", 10000) * common.FRAME_SAMPLES
 
-        for _ in range(common.BARGE_IN_FRAMES_PLAY + 3):
+        for _ in range(common.BARGE_IN_FRAMES_PLAY):
             await self.session._on_frame(frame)
 
         types = [message["type"] for message in self.ws.json_messages()]
         self.assertEqual(types.count("speech_candidate"), 1)
         self.assertTrue(self.session.play_barge_pending)
+        self.assertEqual(
+            len(self.session.speech_pcm),
+            common.BARGE_IN_FRAMES_PLAY * common.FRAME_SAMPLES * 2,
+        )
+
+    async def test_playback_360ms_transient_does_not_open_speech_candidate(self):
+        self.session.playing = True
+        self.session.play_enabled = True
+        loud = struct.pack("<h", 10000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+
+        await self.session.on_pcm(loud * 12 + quiet * 3)
+
+        self.assertFalse(self.session.in_speech)
+        self.assertNotIn(
+            "speech_candidate",
+            [message["type"] for message in self.ws.json_messages()],
+        )
+
+    async def test_playback_cough_event_cannot_confirm_hallucinated_user_text(self):
+        original_submit = common.submit_asr
+        loud = struct.pack("<h", 7000) * common.FRAME_SAMPLES
+        quiet = b"\x00\x00" * common.FRAME_SAMPLES
+        old_response = self.session._new_scope("response")
+        self.session.response_scope = old_response
+        self.session.playing = True
+        self.session.play_enabled = True
+
+        def cough_result(loop, _pcm, **_kwargs):
+            future = loop.create_future()
+            future.set_result(common.asr_adapter.AsrResult(
+                "我刚才其实没有说话呀",
+                None,
+                language="zh",
+                emotion="neutral",
+                event="cough",
+            ))
+            return future
+
+        common.submit_asr = cough_result
+        try:
+            await self.session.on_pcm(
+                loud * (common.BARGE_IN_FRAMES_PLAY + 15) + quiet * 60
+            )
+            if self.session.asr_task is not None:
+                await self.session.asr_task
+        finally:
+            common.submit_asr = original_submit
+
+        message_types = [message["type"] for message in self.ws.json_messages()]
+        self.assertIn("speech_rejected", message_types)
+        self.assertNotIn("speech_confirmed", message_types)
+        rejected = last_json_of_type(self.ws, "speech_rejected")
+        self.assertEqual(rejected["resumedGeneration"], old_response.generation)
+        self.assertTrue(old_response.active)
+        self.assertTrue(self.session.play_enabled)
 
     async def test_start_negotiates_managed_audio_and_old_client_stays_raw(self):
         async def unused_stream(_text):

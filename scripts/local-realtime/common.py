@@ -539,7 +539,7 @@ BARGE_IN_RMS = 0.022
 BARGE_IN_FRAMES = 6
 # AI 播报中：更高更久才采信（防外放漏音/杂音）；确认前不停播、不发 asr_start
 BARGE_IN_RMS_PLAY = 0.04
-BARGE_IN_FRAMES_PLAY = 12  # ~360ms
+BARGE_IN_FRAMES_PLAY = 18  # ~540ms; reject common short impact/keyboard bursts
 MAX_HISTORY_MESSAGES = 24
 INITIAL_HISTORY_MAX_MESSAGES = 12
 INITIAL_HISTORY_MAX_MESSAGE_CHARS = 1024
@@ -559,6 +559,9 @@ LLM_POLL_INTERVAL_SECONDS = 0.01
 # instead of surfacing an error the user has to answer again; only the local
 # cascade retries, because a cloud timeout is far more likely to be a real fault.
 LOCAL_LLM_FIRST_EVENT_RETRIES = 1
+PLAYBACK_NON_SPEECH_ASR_EVENTS = frozenset(
+    {"bgm", "applause", "sneeze", "breath", "cough"}
+)
 MAX_AUDIO_SEGMENTS_PER_TURN = 64
 MAX_PENDING_PLAYBACK_SEGMENTS = MAX_AUDIO_SEGMENTS_PER_TURN * MAX_PENDING_HISTORY_TURNS
 LLM_STREAM_QUEUE_MAX = 32
@@ -3312,6 +3315,7 @@ class Session:
         self.endpoint = SoftEndpoint()
         self.asr_started = False
         self.barge_loud_frames = 0
+        self.barge_loud_pcm = bytearray()
         self.idle_loud_frames = 0
         self.idle_loud_pcm = bytearray()
         self.gen_id = 0
@@ -4465,6 +4469,9 @@ class Session:
         payload = {"type": "speech_rejected", "reason": "voice_rejected"}
         if candidate_id is not None:
             payload["candidateId"] = candidate_id
+        response_scope = self.response_scope
+        if response_scope is not None and response_scope.active:
+            payload["resumedGeneration"] = response_scope.generation
         await self.send_json(
             payload,
             scope=scope,
@@ -4485,16 +4492,26 @@ class Session:
             need_frames = BARGE_IN_FRAMES_PLAY if while_playing else BARGE_IN_FRAMES
             if rms >= loud_thr:
                 self.barge_loud_frames += 1
+                self.barge_loud_pcm.extend(frame)
+                max_preroll_bytes = need_frames * FRAME_SAMPLES * 2
+                if len(self.barge_loud_pcm) > max_preroll_bytes:
+                    del self.barge_loud_pcm[:-max_preroll_bytes]
             else:
-                self.barge_loud_frames = max(0, self.barge_loud_frames - 1)
+                next_count = max(0, self.barge_loud_frames - 1)
+                if next_count < self.barge_loud_frames and self.barge_loud_pcm:
+                    del self.barge_loud_pcm[: FRAME_SAMPLES * 2]
+                self.barge_loud_frames = next_count
 
             if not self.in_speech:
                 if self.barge_loud_frames >= need_frames or (
                     not while_playing and not self.playing and rms >= SPEECH_RMS
                 ):
                     self.in_speech = True
-                    self.speech_pcm = bytearray(frame)
-                    self.speech_ms = FRAME_MS
+                    self.speech_pcm = bytearray(self.barge_loud_pcm or frame)
+                    self.speech_ms = FRAME_MS * max(
+                        1, len(self.speech_pcm) // (FRAME_SAMPLES * 2)
+                    )
+                    self.barge_loud_pcm.clear()
                     self.silence_ms = 0
                     self.endpoint.reset()
                     # 忙碌期（合成中或播报中）一律走「旁路采集」：只暂停发送，
@@ -4511,6 +4528,8 @@ class Session:
                 return
 
         if not self.in_speech:
+            self.barge_loud_frames = 0
+            self.barge_loud_pcm.clear()
             if rms >= SPEECH_RMS:
                 self.idle_loud_frames += 1
                 self.idle_loud_pcm.extend(frame)
@@ -4576,6 +4595,7 @@ class Session:
             self.speech_ms = 0
             self.endpoint.reset()
             self.barge_loud_frames = 0
+            self.barge_loud_pcm.clear()
             self.idle_loud_frames = 0
             self.idle_loud_pcm.clear()
             self.play_barge_pending = False
@@ -4646,7 +4666,11 @@ class Session:
                 f"chars={len(result.text)} lang={result.language} "
                 f"emotion={result.emotion} event={result.event}"
             )
-            cleaned = is_valid_asr(result.text, nsp, pcm)
+            if from_play_barge and result.event in PLAYBACK_NON_SPEECH_ASR_EVENTS:
+                log("过滤: 播报期非语音事件")
+                cleaned = None
+            else:
+                cleaned = is_valid_asr(result.text, nsp, pcm)
             if not cleaned:
                 if (
                     from_play_barge
