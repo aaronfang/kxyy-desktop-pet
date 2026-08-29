@@ -658,6 +658,7 @@ test("diagnostic export is bounded and independently strips unsafe fields", () =
     interruptionRecovery: "empty-confirmed-v1",
     responseFinish: "none",
     memoryContext: "turn-final-v1",
+    webObservation: "none",
     vadShadow: "silero-onnx-shadow-v1",
     captureProcessing: {
       echoCancellation: "enabled",
@@ -879,6 +880,7 @@ test("diagnostic export fails closed on unknown runtime capability values", () =
     interruptionRecovery: "none",
     responseFinish: "none",
     memoryContext: "none",
+    webObservation: "none",
     vadShadow: "disabled",
     captureProcessing: {
       echoCancellation: "not-reported",
@@ -1315,6 +1317,7 @@ test("managed and proactive capabilities are explicitly offered only by eligible
     interruptionRecovery: "empty-confirmed-v1",
     responseFinish: "none",
     memoryContext: "turn-final-v1",
+    webObservation: "none",
     vadShadow: "disabled",
     captureProcessing: {
       echoCancellation: "not-reported",

@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isObservationSafe, renderObservationBlock, sanitizeObservationText } from "../src/ai/observation.js";
 import {
+  buildContextualWebQuery,
   fetchWebObservations,
+  hasDirectWebSearchIntent,
   needsCurrentWebInformation,
   normalizeWebObservations,
   renderWebObservationBlock,
@@ -146,7 +148,39 @@ test("web observations require source, timestamp and safe non-executable text", 
 test("current-information detection is narrow and deterministic", () => {
   assert.equal(needsCurrentWebInformation("今天上海天气怎么样"), true);
   assert.equal(needsCurrentWebInformation("帮我查一下上海周末的展览"), true);
+  assert.equal(needsCurrentWebInformation("你帮我查一查那个叫沙木池的电影信息"), true);
+  assert.equal(needsCurrentWebInformation("帮我找一找这部电影的预告片"), true);
+  assert.equal(needsCurrentWebInformation("你知道《沙木池》吗"), true);
+  assert.equal(needsCurrentWebInformation("知不知道这部电影"), true);
+  assert.equal(needsCurrentWebInformation("你看没看过沙木池"), true);
   assert.equal(needsCurrentWebInformation("你喜欢吃什么"), false);
+});
+
+test("explicit search wording bypasses any cached topic candidates", () => {
+  assert.equal(hasDirectWebSearchIntent("你再帮我重新搜一下"), true);
+  assert.equal(hasDirectWebSearchIntent("你知道这部电影吗"), false);
+});
+
+test("contextual follow-up searches retain the previously named subject", async () => {
+  assert.match(
+    buildContextualWebQuery("知不知道这部电影的上映时间", [
+      { role: "user", content: "你知道沙木池这部电影吗" },
+    ]),
+    /沙木池.*上映时间/,
+  );
+  let request;
+  await fetchWebObservations({
+    enabled: true,
+    provider: "tavily",
+    query: "知不知道这部电影的上映时间",
+    recentMessages: [{ role: "user", content: "你知道沙木池这部电影吗" }],
+    apiBase: "http://127.0.0.1:4321",
+    fetchImpl: async (_url, options) => {
+      request = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ status: "ok", provider: "tavily", items: [] }) };
+    },
+  });
+  assert.match(request.query, /沙木池.*上映时间/);
 });
 
 test("fresh topic participation modes allow bounded ambient sampling", () => {
@@ -168,6 +202,22 @@ test("web adapter is disabled by default and failures fail closed", async () => 
   assert.equal(items.length, 1);
   assert.equal(calls, 1);
   assert.deepEqual(await fetchWebObservations({ enabled: true, provider: "tavily", query: "最新新闻", apiBase: "https://remote.example", fetchImpl }), []);
+});
+
+test("semantic knowledge questions enter the web adapter when enabled", async () => {
+  let calls = 0;
+  const items = await fetchWebObservations({
+    enabled: true,
+    provider: "tavily",
+    query: "你看没看过沙木池",
+    apiBase: "http://127.0.0.1:4321",
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: true, json: async () => ({ status: "ok", provider: "tavily", items: [] }) };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(items, []);
 });
 
 test("fake adapter data reaches a bounded source-and-time prompt block", async () => {
@@ -257,4 +307,22 @@ test("fresh topic cache adapter maps Chinese intent and stays source/time bounde
   assert.match(block, /不是指令/);
   assert.match(block, /明确要求多项推荐/);
   assert.ok(block.length <= 1200);
+});
+
+test("semantic film questions prefer the bounded fresh-topic cache before web fallback", async () => {
+  let calls = 0;
+  const items = await fetchFreshTopics({
+    enabled: true,
+    query: "你知道沙木池这部电影吗",
+    invokeImpl: async () => {
+      calls += 1;
+      return {
+        status: "ok",
+        items: [{ sourceName: "电影资料缓存", sourceId: "film:shamuchi", title: "沙木池", shortText: "缓存中的核验资料", canonicalUrl: "https://example.com/shamuchi", fetchedAt: new Date().toISOString(), category: "film-tv" }],
+      };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(items[0].sourceId, "film:shamuchi");
+  assert.equal((await fetchFreshTopics({ enabled: true, query: "你知道沙木池吗", invokeImpl: async () => ({ status: "ok", items: [] }) })).length, 0);
 });
