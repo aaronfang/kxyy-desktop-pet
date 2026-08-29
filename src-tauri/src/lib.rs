@@ -747,6 +747,19 @@ fn migrate_settings(mut settings: Settings) -> Settings {
     settings
 }
 
+fn parse_settings_json(raw: &str) -> Option<Settings> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let version = value
+        .get("settingsSchemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    if version > SETTINGS_SCHEMA_VERSION {
+        return None;
+    }
+    let settings = serde_json::from_value::<Settings>(value).ok()?;
+    Some(migrate_settings(settings))
+}
+
 fn atomic_write_settings(path: &std::path::Path, json: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
@@ -760,7 +773,7 @@ fn atomic_write_settings(path: &std::path::Path, json: &str) -> std::io::Result<
 fn load_settings(app: &AppHandle) -> Settings {
     if let Some(p) = settings_path(app) {
         if let Ok(raw) = fs::read_to_string(&p) {
-            if let Ok(mut s) = serde_json::from_str::<Settings>(&raw) {
+            if let Some(mut s) = parse_settings_json(&raw) {
                 // 旧版通话音色合并进朗读音色。
                 if s.tts_voice.trim().is_empty() && !s.realtime_voice.trim().is_empty() {
                     s.tts_voice = s.realtime_voice.trim().to_string();
@@ -768,7 +781,7 @@ fn load_settings(app: &AppHandle) -> Settings {
                 s.realtime_voice.clear();
                 s.reasoning_mode = normalize_reasoning_mode(&s.reasoning_mode, s.thinking).into();
                 s.thinking = s.reasoning_mode == "always";
-                return migrate_settings(s);
+                return s;
             }
         }
     }
@@ -2605,7 +2618,7 @@ mod tests {
         normalize_local_voice_preset, normalize_realtime_conversation_mode,
         normalize_reasoning_mode, normalize_topic_preferences, normalize_turn_pause_tolerance,
         normalize_vl_provider, voice_config_fingerprint, atomic_write_settings,
-        migrate_settings, CapsuleEdge, Settings, TopicPreference,
+        migrate_settings, parse_settings_json, CapsuleEdge, Settings, TopicPreference,
         CAPSULE_HEIGHT, CAPSULE_WIDTH,
     };
 
@@ -2615,6 +2628,12 @@ mod tests {
         settings.settings_schema_version = 0;
         let migrated = migrate_settings(settings);
         assert_eq!(migrated.settings_schema_version, super::SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn settings_from_future_schema_is_rejected_without_partial_defaults() {
+        let raw = r#"{"settingsSchemaVersion":999,"petId":"future"}"#;
+        assert!(parse_settings_json(raw).is_none());
     }
 
     #[test]
