@@ -853,6 +853,11 @@ function sanitizeRuntimeSummary(runtime) {
       ["session-start-v1", "turn-final-v1", "none"],
       "none",
     ),
+    webObservation: safeEnum(
+      value.webObservation,
+      ["web-observation-v1", "none"],
+      "none",
+    ),
     vadShadow: safeEnum(
       value.vadShadow,
       [

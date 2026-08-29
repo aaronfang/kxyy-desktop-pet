@@ -2,7 +2,7 @@
 
 一个会在桌面散步、攀爬、陪你聊天的跨平台桌宠。支持 **Windows / macOS**，基于 **Tauri 2 + Rust + WebView**。
 
-当前正式版：[`v0.2.51`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.51)
+当前正式版：[`v0.2.52`](https://github.com/aaronfang/kxyy-desktop-pet/releases/tag/v0.2.52)
 
 VoxCPM2 为可选的本地零样本音色后端。macOS 首次选择时自动安装到 Application Support，当前仅支持 Apple Silicon，属于实验功能；Intel 版本仍可安装但应使用 Qwen3/云端语音。
 
@@ -264,6 +264,8 @@ npm run encrypt-assets
 2. 提交 `chore(release): vX.Y.Z`，先推 commit，再推 `vX.Y.Z` tag。
 3. 推送 tag 后 GitHub Actions 校验版本，并同时构建 Windows x64、macOS ARM64 和 macOS Intel 安装包。
 4. Changelog 根据 Conventional Commits 自动生成，完整历史见 [GitHub Releases](https://github.com/aaronfang/kxyy-desktop-pet/releases)。
+
+本版本的搜索能力说明见 [v0.2.52 发布说明](docs/release-notes-v0.2.52.md)。
 
 CI 与发布职责：
 

@@ -46,6 +46,7 @@ import {
   TRACE_EVENT,
   sanitizeVadShadowSummary,
 } from "./realtime-trace.js";
+import { normalizeWebObservations } from "./web-observations.js";
 
 const invoke = window.__TAURI__.core.invoke;
 
@@ -102,6 +103,7 @@ const SESSION_MEMORY_CAPABILITY = "session-start-v1";
 const TURN_MEMORY_CAPABILITY = "turn-final-v1";
 const TEMPORAL_CONTEXT_CAPABILITY = "turn-local-v1";
 const FRESH_TOPIC_CAPABILITY = "fresh-topic-v1";
+const WEB_OBSERVATION_CAPABILITY = "web-observation-v1";
 const PENDING_TURN_RESUME_CAPABILITY = "pending-turn-resume-v1";
 const PROACTIVE_TURN_CAPABILITY = "local-v1";
 const MAX_TURN_MEMORY_ITEMS = 3;
@@ -518,6 +520,7 @@ export class RealtimeSession {
     this._memoryContextMode = "none";
     this._temporalContextMode = "none";
     this._freshTopicMode = "none";
+    this._webObservationMode = "none";
     this._startupFreshTopics = [];
     this._memoryContextRequestedAt = 0;
     this._pendingMemoryContextReason = "turn";
@@ -800,6 +803,7 @@ export class RealtimeSession {
             startMsg.initialHistory,
           );
           cascadeCapabilities.freshTopic = [FRESH_TOPIC_CAPABILITY];
+          cascadeCapabilities.webObservation = [WEB_OBSERVATION_CAPABILITY];
           cascadeCapabilities.pendingTurnResume = [PENDING_TURN_RESUME_CAPABILITY];
           cascadeCapabilities.interruptionRecovery = [INTERRUPTION_RECOVERY_CAPABILITY];
           cascadeCapabilities.responseFinish = [RESPONSE_FINISH_CAPABILITY];
@@ -1119,6 +1123,10 @@ export class RealtimeSession {
           this._freshTopicMode =
             usesManagedCascade(this.trace.provider) && msg.freshTopic === FRESH_TOPIC_CAPABILITY
               ? FRESH_TOPIC_CAPABILITY
+              : "none";
+          this._webObservationMode =
+            usesManagedCascade(this.trace.provider) && msg.webObservation === WEB_OBSERVATION_CAPABILITY
+              ? WEB_OBSERVATION_CAPABILITY
               : "none";
           this._pendingTurnResumeMode =
             usesManagedCascade(this.trace.provider) &&
@@ -1542,7 +1550,7 @@ export class RealtimeSession {
   }
 
   /** 回传当前 final turn 的有界记忆卡片；旧 generation、旧服务或火山路径拒绝发送。 */
-  sendMemoryContext({ generation, items, temporalContext, freshTopics } = {}) {
+  sendMemoryContext({ generation, items, temporalContext, freshTopics, webObservations, webSearchRequested = false } = {}) {
     if (
       this._memoryContextMode === TURN_MEMORY_CAPABILITY &&
       Number.isSafeInteger(generation) &&
@@ -1610,6 +1618,9 @@ export class RealtimeSession {
       const safeFreshTopics = this._freshTopicMode === FRESH_TOPIC_CAPABILITY
         ? sanitizeFreshTopics(freshTopics)
         : [];
+      const safeWebObservations = this._webObservationMode === "web-observation-v1"
+        ? normalizeWebObservations(webObservations)
+        : [];
       this.ws.send(JSON.stringify({
         type: "memory_context",
         generation,
@@ -1619,6 +1630,8 @@ export class RealtimeSession {
         ...(openingStyle ? { openingStyle } : {}),
         reasoningPolicy,
         ...(safeFreshTopics.length ? { freshTopics: safeFreshTopics } : {}),
+        ...(safeWebObservations.length ? { webObservations: safeWebObservations } : {}),
+        ...(webSearchRequested ? { webSearchRequested: true } : {}),
       }));
       if (turnStrategy) {
         this._noteTurnStrategy(turnStrategy, {
@@ -3450,6 +3463,7 @@ export class RealtimeSession {
         interruptionRecovery: this._interruptionRecoveryMode,
         responseFinish: this._responseFinishMode,
         memoryContext: this._memoryContextMode,
+        webObservation: this._webObservationMode,
         vadShadow: this._vadShadowMode,
         captureProcessing: { ...this._captureProcessing },
         asr: { ...this._asrRuntime },

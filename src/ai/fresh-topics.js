@@ -22,8 +22,9 @@ const CATEGORY_PATTERNS = Object.freeze([
   ["science", /科学|科普|太空|航天|宇宙|science|space/i],
 ]);
 const FRESH_INTENT_RE = /刚刚|最新|近期|最近|新闻|热搜|比赛|比分|赛程|票房|发布|更新|政策|天气|热门|热榜|查一下|查查|搜索|搜一下|联网|网上|发生了什么/i;
-const CATEGORY_DISCOVERY_RE = /聊聊|说说|讲讲|介绍|推荐|有什么|有哪些|哪款|哪部|哪本|哪首|哪里|去哪儿?玩|值得|好玩|好看|好听|视频|新作|新品|新游|新片|新书|新歌|榜单|排行|限免|吃什么|玩什么|看什么|听什么/i;
+const CATEGORY_DISCOVERY_RE = /聊聊|说说|讲讲|介绍|推荐|有什么|有哪些|哪款|哪部|哪本|哪首|哪里|去哪儿?玩|值得|好玩|好看|好听|视频|新作|新品|新游|新片|新书|新歌|榜单|排行|限免|吃什么|玩什么|看什么|听什么|你知道|知不知道|知道不知道|看没看过|看过没有|有没有看过/i;
 const FIRST_PERSON_RECENT_STATEMENT_RE = /^(?:我|俺|咱)(?:最近|近期|这几天|刚刚|现在).*(?:在|会|刚|已经|一直|偶尔|平时)/i;
+const KNOWLEDGE_QUERY_RE = /(?:你知道|知不知道|知道不知道|看没看过|看过没有|有没有看过)/i;
 
 function normalizedCity(value) {
   return String(value || "")
@@ -107,6 +108,7 @@ export function needsFreshTopics(query, { proactive = false, participation = "re
   if (ambient && (participation === "occasional" || participation === "active")) {
     return value.length >= 4;
   }
+  if (KNOWLEDGE_QUERY_RE.test(value) && value.length >= 5) return true;
   if (FRESH_INTENT_RE.test(value)) {
     return categories.length > 0 || /新闻|热搜|发生了什么|查一下|查查|搜索|搜一下|联网|网上/i.test(value);
   }

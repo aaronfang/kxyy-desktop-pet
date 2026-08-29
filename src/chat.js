@@ -63,7 +63,7 @@ import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlayback
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
-import { fetchWebObservations, renderWebObservationBlock } from "./ai/web-observations.js";
+import { fetchWebObservations, hasDirectWebSearchIntent, needsCurrentWebInformation, renderWebObservationBlock, renderWebObservationUnavailableBlock } from "./ai/web-observations.js";
 import {
   buildRecommendationLinkPrompt,
   collectRecommendationLinks,
@@ -577,6 +577,7 @@ const voiceDebugTtsEl = document.getElementById("voice-debug-tts");
 const voiceDebugTtsMetaEl = document.getElementById("voice-debug-tts-meta");
 const personaDebugMetaEl = document.getElementById("persona-debug-meta");
 const apiDebugMetaEl = document.getElementById("api-debug-meta");
+const webDebugMetaEl = document.getElementById("web-debug-meta");
 const textDebugGenEl = document.getElementById("text-debug-gen");
 const textDebugBarEl = document.getElementById("text-debug-bar");
 const textDebugMetaEl = document.getElementById("text-debug-meta");
@@ -604,6 +605,24 @@ const apiDebug = {
   balanceText: "",
   lastElapsedMs: 0,
 };
+const webDebug = { state: "idle", source: "", count: 0, elapsedMs: 0 };
+
+function updateWebDebug({ state, source = webDebug.source, count = webDebug.count, elapsedMs = webDebug.elapsedMs } = {}) {
+  Object.assign(webDebug, { state, source, count, elapsedMs });
+  if (!webDebugMetaEl || !chatDebugEnabled()) return;
+  const labels = { idle: "未搜索", starting: "搜索准备中", searching: "搜索中", ok: "已找到", empty: "无结果", error: "搜索失败" };
+  const sourceLabel = source === "tavily" ? "网络 Tavily" : source === "fresh-cache" ? "时下信息缓存" : source;
+  const detail = sourceLabel ? ` · ${sourceLabel}` : "";
+  const countText = Number.isFinite(count) && count > 0 ? ` · ${count} 条` : "";
+  const timeText = elapsedMs > 0 ? ` · ${(elapsedMs / 1000).toFixed(1)}s` : "";
+  webDebugMetaEl.textContent = `搜索 ${labels[state] || state}${detail}${countText}${timeText}`;
+  webDebugMetaEl.title = webDebugMetaEl.textContent;
+}
+function showWebSearchLead(query) {
+  if (settings.webGroundingEnabled === true && settings.webGroundingProvider === "tavily" && hasDirectWebSearchIntent(query)) {
+    addBubble("assistant", "我去查一下，马上回来。");
+  }
+}
 /** 本地文字生成进度（当前 Windows/mac 代理会缓冲整段 SSE，用计时不定条表示「生成中」）。 */
 const textGenDebug = {
   active: false,
@@ -1737,13 +1756,19 @@ async function buildRequestMessages(opts = {}) {
   webPrompt += buildRecommendationLinkPrompt(query, recentRecommendationLinks);
   if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
     const query = lastRealUserMessage()?.content || "";
-    const observations = await fetchWebObservations({
-      enabled: true,
-      provider: settings.webGroundingProvider || "none",
-      query,
-      apiBase,
-    });
-    webPrompt += renderWebObservationBlock(observations);
+    const source = settings.webGroundingProvider || "none";
+    const startedAt = performance.now();
+    updateWebDebug({ state: "searching", source });
+    let observations = [];
+    try {
+      observations = await fetchWebObservations({ enabled: true, provider: source, query, recentMessages: history.slice(-8), apiBase });
+      updateWebDebug({ state: observations.length ? "ok" : "empty", source, count: observations.length, elapsedMs: performance.now() - startedAt });
+    } catch (_) {
+      updateWebDebug({ state: "error", source, elapsedMs: performance.now() - startedAt });
+    }
+    webPrompt += observations.length
+      ? renderWebObservationBlock(observations)
+      : (needsCurrentWebInformation(query) ? renderWebObservationUnavailableBlock() : "");
     if (chatDebugEnabled()) console.log("[web-observations]", { count: observations.length });
   }
   const maxTurns = settings.textProvider === "local" ? LOCAL_MAX_TURNS : MAX_TURNS;
@@ -1878,6 +1903,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       beginLocalTextGen({ thinking: deliberate });
       localGenStarted = true;
     }
+    if (!proactiveKind) showWebSearchLead(lastRealUserMessage()?.content || "");
     let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
     if (usesDeepseekMultimodalModel(settings)) {
       requestMessages = buildDeepseekMultimodalMessages(
@@ -2740,6 +2766,20 @@ async function provideTurnMemoryContext(session, generation, reason = "turn", co
     excludedSourceIds: [...callFreshTopicIds],
     invokeImpl: invoke,
   });
+  let webObservations = [];
+  const forceWebSearch = hasDirectWebSearchIntent(last?.content || "");
+  if (!proactiveTopic && (forceWebSearch || !fetchedTopics.length) && session?._webObservationMode === "web-observation-v1" && settings.webGroundingEnabled === true) {
+    const source = settings.webGroundingProvider || "none";
+    const startedAt = performance.now();
+    showWebSearchLead(last?.content || "");
+    updateWebDebug({ state: "searching", source });
+    try {
+      webObservations = await fetchWebObservations({ enabled: true, provider: source, query: last?.content || "", recentMessages: history.slice(-8), apiBase });
+      updateWebDebug({ state: webObservations.length ? "ok" : "empty", source, count: webObservations.length, elapsedMs: performance.now() - startedAt });
+    } catch (_) {
+      updateWebDebug({ state: "error", source, elapsedMs: performance.now() - startedAt });
+    }
+  }
   let freshTopics = takeFreshTopicsForSession(fetchedTopics, callFreshTopicIds);
   if ((proactiveTopic || lateralAssociation) && callFreshAssociationState.ambientEligible && !callFreshAssociationState.ambientUsed) {
     const [association] = pairFreshAssociations({
@@ -2767,6 +2807,8 @@ async function provideTurnMemoryContext(session, generation, reason = "turn", co
     items: selectRealtimeMemoryItems(recalledItems),
     temporalContext,
     freshTopics,
+    webObservations,
+    webSearchRequested: !proactiveTopic && (forceWebSearch || !fetchedTopics.length) && needsCurrentWebInformation(last?.content || ""),
   });
 }
 

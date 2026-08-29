@@ -400,6 +400,7 @@ body {
 }
 #voice-debug-label,
 #api-debug-meta,
+#web-debug-meta,
 #call-debug-meta {
   white-space: nowrap;
   overflow: hidden;
@@ -436,10 +437,12 @@ body {
   white-space: pre-line;
 }
 #api-debug-meta:empty,
+#web-debug-meta:empty,
 #call-debug-meta:empty {
   display: none;
 }
 #api-debug-meta,
+#web-debug-meta,
 #call-debug-meta {
   margin-top: 2px;
   color: rgba(255, 255, 255, 0.4);

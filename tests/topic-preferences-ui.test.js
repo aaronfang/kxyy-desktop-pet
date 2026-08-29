@@ -41,6 +41,15 @@ test("realtime experimental role consumes structured preferences without adding 
   assert.match(chatJs, /settings\.topicPreferences/);
 });
 
+test("realtime turns negotiate and forward explicit web observations", () => {
+  assert.match(chatJs, /fetchWebObservations\(\{/);
+  assert.match(chatJs, /webObservations/);
+  const realtimeJs = fs.readFileSync(new URL("src/ai/realtime.js", root), "utf8");
+  assert.match(realtimeJs, /web-observation-v1/);
+  assert.match(realtimeJs, /webObservations: safeWebObservations/);
+  assert.match(realtimeJs, /webObservation: this\._webObservationMode/);
+});
+
 test("text chat keeps a session cooldown for fresh topic sources", () => {
   assert.match(chatJs, /const textFreshTopicIds = new Set\(\)/);
   assert.match(chatJs, /excludedSourceIds: \[\.\.\.textFreshTopicIds\]/);
