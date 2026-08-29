@@ -29,6 +29,7 @@ use tauri_plugin_opener::OpenerExt;
 
 // 角色清单在编译期嵌入，主进程托盘与前端共用同一份数据。
 const ROSTER_JSON: &str = include_str!("../../shared/roster.json");
+const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
 const SIZE_PRESETS: &[(u32, &str)] = &[
     (100, "小 (100%)"),
@@ -137,6 +138,10 @@ fn normalize_topic_preferences(values: &[TopicPreference]) -> Vec<TopicPreferenc
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
+    /// Version of the persisted settings contract. Migrations are applied
+    /// before the settings enter runtime state.
+    #[serde(default)]
+    settings_schema_version: u32,
     pet_id: String,
     size_percent: u32,
     hidden: bool,
@@ -431,6 +436,7 @@ impl Settings {
     fn defaults() -> Self {
         let r = roster();
         Settings {
+            settings_schema_version: SETTINGS_SCHEMA_VERSION,
             pet_id: r.default_pet_id,
             size_percent: 150,
             hidden: false,
@@ -733,6 +739,24 @@ fn settings_path(app: &AppHandle) -> Option<PathBuf> {
         .map(|d| d.join("settings.json"))
 }
 
+fn migrate_settings(mut settings: Settings) -> Settings {
+    if settings.settings_schema_version == 0 {
+        settings.settings_schema_version = SETTINGS_SCHEMA_VERSION;
+    }
+    settings.settings_schema_version = SETTINGS_SCHEMA_VERSION;
+    settings
+}
+
+fn atomic_write_settings(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let backup = path.with_extension("json.bak");
+    fs::write(&tmp, json)?;
+    if path.exists() {
+        let _ = fs::copy(path, &backup);
+    }
+    fs::rename(&tmp, path)
+}
+
 fn load_settings(app: &AppHandle) -> Settings {
     if let Some(p) = settings_path(app) {
         if let Ok(raw) = fs::read_to_string(&p) {
@@ -744,7 +768,7 @@ fn load_settings(app: &AppHandle) -> Settings {
                 s.realtime_voice.clear();
                 s.reasoning_mode = normalize_reasoning_mode(&s.reasoning_mode, s.thinking).into();
                 s.thinking = s.reasoning_mode == "always";
-                return s;
+                return migrate_settings(s);
             }
         }
     }
@@ -760,7 +784,7 @@ fn save_settings(app: &AppHandle, _snapshot: &Settings) {
             let _ = fs::create_dir_all(dir);
         }
         if let Ok(json) = serde_json::to_string_pretty(&current) {
-            let _ = fs::write(p, json);
+            let _ = atomic_write_settings(&p, &json);
         }
     }
 }
@@ -2580,9 +2604,33 @@ mod tests {
         capsule_collapsed_width, capsule_drag_result, capsule_resized_x, normalize_asr_provider,
         normalize_local_voice_preset, normalize_realtime_conversation_mode,
         normalize_reasoning_mode, normalize_topic_preferences, normalize_turn_pause_tolerance,
-        normalize_vl_provider, voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference,
+        normalize_vl_provider, voice_config_fingerprint, atomic_write_settings,
+        migrate_settings, CapsuleEdge, Settings, TopicPreference,
         CAPSULE_HEIGHT, CAPSULE_WIDTH,
     };
+
+    #[test]
+    fn settings_migration_assigns_current_schema_version() {
+        let mut settings = Settings::defaults();
+        settings.settings_schema_version = 0;
+        let migrated = migrate_settings(settings);
+        assert_eq!(migrated.settings_schema_version, super::SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn settings_write_keeps_previous_file_as_recoverable_backup() {
+        let root = std::env::temp_dir().join(format!("kxyy-settings-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join("settings.json");
+        std::fs::write(&path, "old").expect("seed settings");
+        atomic_write_settings(&path, "new").expect("atomic write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bak")).unwrap(), "old");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+        let _ = std::fs::remove_dir(&root);
+    }
 
     #[test]
     fn reasoning_mode_migrates_legacy_boolean_and_preserves_fixed_preferences() {
