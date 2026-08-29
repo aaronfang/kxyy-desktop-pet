@@ -3,6 +3,7 @@ mod fresh_topics;
 mod local_text;
 mod memory;
 mod memory_core;
+mod operation;
 mod persona_assets;
 mod realtime;
 
