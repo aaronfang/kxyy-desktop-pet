@@ -6,6 +6,7 @@ mod memory_core;
 mod operation;
 mod persona_assets;
 mod realtime;
+mod turn_state;
 
 mod voice_service;
 
