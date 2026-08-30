@@ -1846,7 +1846,7 @@ fn capability_snapshot(
         with_reason("memory", memory_status, "sqlite", memory.last_error.as_deref().map(|_| "storage-unavailable")),
         text,
         snapshot("voice", voice_status, if voice_backend.is_empty() { "none" } else { &voice_backend }),
-        snapshot("vad-shadow", if vad_enabled { CapabilityStatus::Starting } else { CapabilityStatus::Disabled }, "silero"),
+        snapshot("vad-shadow", if !vad_enabled { CapabilityStatus::Disabled } else if voice_service::vad_runtime_ready() { CapabilityStatus::Ready } else { CapabilityStatus::NotInstalled }, "silero"),
         snapshot("fresh-topics", if fresh_enabled { CapabilityStatus::Ready } else { CapabilityStatus::Disabled }, "bounded-cache"),
     ]
 }

@@ -1095,6 +1095,14 @@ fn vad_runtime_root() -> Option<PathBuf> {
     Some(dirs_settings_path()?.parent()?.join("vad-runtime"))
 }
 
+/// Whether the optional shadow VAD runtime has passed the installer's marker
+/// check. This never starts a process and is safe to use for read-only UI.
+pub fn vad_runtime_ready() -> bool {
+    vad_runtime_root()
+        .map(|root| root.join(".kxyy-ort-ready").is_file())
+        .unwrap_or(false)
+}
+
 fn sensevoice_runtime_root() -> Option<PathBuf> {
     Some(
         dirs_settings_path()?
