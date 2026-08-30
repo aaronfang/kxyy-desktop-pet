@@ -33,6 +33,10 @@
         <span class="tab-icon">🎨</span>
         <span class="tab-label">外观</span>
       </button>
+      <button class="tab-btn" data-tab="status">
+        <span class="tab-icon">📊</span>
+        <span class="tab-label">运行状态</span>
+      </button>
     </nav>
 
     <!-- ====== 右侧内容区 ====== -->
@@ -178,6 +182,22 @@
 
           <p id="vlBypassedHint" class="hint" hidden>当前文字模型直接处理文字和图片；本组设置不参与请求。</p>
           <p id="vlRoutingHint" class="hint">Flash / Pro 或本地文字模型发图时，先由这里选择的模型生成图片描述，再交给文字模型回复。</p>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-status">
+        <section>
+          <div class="section-heading"><h2>能力状态</h2><button id="refreshCapabilities" type="button" class="ghost">刷新</button></div>
+          <div id="capabilityList" class="status-list"><p class="hint">加载中…</p></div>
+        </section>
+        <section>
+          <div class="section-heading"><h2>后台活动</h2><button id="refreshActivities" type="button" class="ghost">刷新</button></div>
+          <div id="activityList" class="status-list"><p class="hint">加载中…</p></div>
+        </section>
+        <section>
+          <div class="section-heading"><h2>目标与待办</h2><button id="refreshGoals" type="button" class="ghost">刷新</button></div>
+          <div class="goal-create"><input id="newGoalTitle" type="text" maxlength="120" placeholder="添加一个目标或待办" /><button id="addGoal" type="button" class="primary">添加</button></div>
+          <div id="goalList" class="status-list"><p class="hint">加载中…</p></div>
         </section>
       </div>
 

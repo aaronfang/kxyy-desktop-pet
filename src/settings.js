@@ -13,6 +13,52 @@ import { DEEPSEEK_VISION_MODEL } from "./deepseek-multimodal.js";
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
 const emit = window.__TAURI__.event.emit;
+const el = (id) => document.getElementById(id);
+
+const capabilityLabels = { memory: "长期记忆", text: "文字模型", voice: "语音服务", "vad-shadow": "语音识别增强", "fresh-topics": "时下信息" };
+const capabilityStatusLabels = { disabled: "已关闭", unsupported: "不支持", "not-installed": "未安装", starting: "启动中", ready: "可用", busy: "忙碌", faulted: "故障" };
+const goalStatusLabels = { active: "进行中", completed: "已完成", paused: "已暂停", cancelled: "已取消" };
+
+function renderCapabilityList(items) {
+  const box = el("capabilityList"); if (!box) return;
+  box.replaceChildren();
+  for (const item of Array.isArray(items) ? items : []) {
+    const row = document.createElement("div"); row.className = "status-item";
+    const name = document.createElement("strong"); name.textContent = capabilityLabels[item.name] || item.name || "未知能力";
+    const meta = document.createElement("span"); meta.className = "status-meta"; meta.textContent = item.driver || "";
+    const badge = document.createElement("span"); badge.className = `status-badge ${item.status || ""}`; badge.textContent = capabilityStatusLabels[item.status] || "未知";
+    const left = document.createElement("div"); left.append(name, document.createElement("br"), meta); row.append(left, badge); box.append(row);
+  }
+  if (!box.children.length) box.innerHTML = '<p class="hint">暂无状态</p>';
+}
+async function loadCapabilities() { try { renderCapabilityList(await invoke("capability_snapshot")); } catch (_) {} }
+function renderActivities(items) {
+  const box = el("activityList"); if (!box) return; box.replaceChildren();
+  for (const item of (Array.isArray(items) ? items : []).slice(0, 30)) {
+    const row = document.createElement("div"); row.className = "status-item";
+    const text = document.createElement("span"); text.textContent = item.summary || item.category || "后台活动";
+    const button = document.createElement("button"); button.type = "button"; button.className = "ghost"; button.textContent = item.status === "unread" ? "标为已读" : "已读"; button.disabled = item.status !== "unread";
+    button.addEventListener("click", async () => { await invoke("activity_set_status", { id: item.id, status: "read" }); loadActivities(); }); row.append(text, button); box.append(row);
+  }
+  if (!box.children.length) box.innerHTML = '<p class="hint">暂无后台活动</p>';
+}
+async function loadActivities() { try { renderActivities(await invoke("activity_list")); } catch (_) {} }
+function renderGoals(items) {
+  const box = el("goalList"); if (!box) return; box.replaceChildren();
+  for (const item of (Array.isArray(items) ? items : []).slice(0, 50)) {
+    const row = document.createElement("div"); row.className = "status-item";
+    const text = document.createElement("span"); text.textContent = item.title || "未命名目标";
+    const select = document.createElement("select"); for (const [value,label] of Object.entries(goalStatusLabels)) { const o=document.createElement("option");o.value=value;o.textContent=label;select.append(o); } select.value=item.status||"active";
+    select.addEventListener("change", async () => { await invoke("goal_set_status", { id:item.id, status:select.value, updatedAtMs:Date.now() }); }); row.append(text, select); box.append(row);
+  }
+  if (!box.children.length) box.innerHTML = '<p class="hint">还没有目标</p>';
+}
+async function loadGoals() { try { renderGoals(await invoke("goal_list")); } catch (_) {} }
+
+el("refreshCapabilities")?.addEventListener("click", loadCapabilities);
+el("refreshActivities")?.addEventListener("click", loadActivities);
+el("refreshGoals")?.addEventListener("click", loadGoals);
+el("addGoal")?.addEventListener("click", async () => { const input=el("newGoalTitle"); const title=input?.value.trim(); if(!title)return; const now=Date.now(); await invoke("goal_upsert", { item:{ id:`goal-${now}-${Math.random().toString(36).slice(2,8)}`, title, status:"active", createdAtMs:now, updatedAtMs:now } }); input.value=""; loadGoals(); });
 
 // 头像不进 FIELDS：走上传按钮维护，值缓存在下面两个变量里。
 const FIELDS = [
@@ -58,7 +104,6 @@ const FIELDS = [
   "capsuleCollapsedWidth",
 ];
 
-const el = (id) => document.getElementById(id);
 const statusEl = el("status");
 const saveBtn = el("save");
 
@@ -2533,6 +2578,7 @@ async function init() {
   probeBackendStatus();
   probeLocalTextStatus();
   probeFreshTopicStatus();
+  await Promise.all([loadCapabilities(), loadActivities(), loadGoals()]);
 }
 
 init();
