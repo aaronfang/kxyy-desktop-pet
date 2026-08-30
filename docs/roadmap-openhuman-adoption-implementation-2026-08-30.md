@@ -1,7 +1,7 @@
 # OpenHuman 借鉴能力实施路线图
 
 日期：2026-08-30  
-状态：待实施  
+状态：P0–P6 基础实现完成，P7/P8 待发布候选验收  
 适用范围：元元桌宠的可靠性、记忆管理、后台任务和可观察性改进  
 参考研究：[research-openhuman-reuse-2026-08-27.md](./research-openhuman-reuse-2026-08-27.md)
 
@@ -273,4 +273,3 @@ npm run build
 ## 13. 明确不纳入本路线图
 
 完整 OpenHuman/TinyAgents/TinyMemory 依赖、100+ OAuth、17 消息渠道、MCP/Skills marketplace、tiny.place/x402、远程 agent economy、会议接入、默认连续屏幕/系统音频观察，以及任何会绕过当前 persona、Memory scope、实时音频和隐私边界的自动化功能，都不属于本次改进目标。
-

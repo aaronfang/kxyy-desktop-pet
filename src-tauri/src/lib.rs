@@ -1,10 +1,13 @@
 mod api;
 mod activity;
+mod capability;
 mod fresh_topics;
+mod goal;
 mod local_text;
 mod memory;
 mod memory_core;
 mod operation;
+mod task_route;
 mod persona_assets;
 mod realtime;
 mod turn_state;
@@ -836,6 +839,19 @@ fn activity_set_status(
     status: activity::ActivityStatus,
 ) -> Result<bool, String> {
     state.set_status(&id, status).map_err(|e| format!("更新活动状态失败：{e}"))
+}
+
+#[tauri::command]
+fn goal_list(state: tauri::State<goal::GoalState>) -> Vec<goal::Goal> { state.list() }
+
+#[tauri::command]
+fn goal_upsert(state: tauri::State<goal::GoalState>, item: goal::Goal) -> Result<(), String> {
+    state.upsert(item).map_err(|e| format!("保存目标失败：{e}"))
+}
+
+#[tauri::command]
+fn goal_set_status(state: tauri::State<goal::GoalState>, id: String, status: goal::GoalStatus, updated_at_ms: u64) -> Result<bool, String> {
+    state.set_status(&id, status, updated_at_ms).map_err(|e| format!("更新目标状态失败：{e}"))
 }
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
@@ -1779,6 +1795,62 @@ fn check_voice_service(app: AppHandle) -> serde_json::Value {
     })
 }
 
+/// Return a privacy-safe, fixed-vocabulary snapshot of the app capabilities.
+/// This is intentionally read-only and never exposes provider messages, paths,
+/// model errors, credentials, or user content.
+#[tauri::command]
+fn capability_snapshot(
+    app: AppHandle,
+    memory_state: tauri::State<memory::MemoryState>,
+) -> Vec<capability::CapabilitySnapshot> {
+    use capability::{snapshot, with_reason, CapabilityStatus};
+
+    let memory = memory::memory_status(memory_state);
+    let memory_status = if memory.available {
+        CapabilityStatus::Ready
+    } else {
+        CapabilityStatus::Faulted
+    };
+
+    let (text_provider, voice_backend, vad_enabled, fresh_enabled) = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap();
+        (
+            settings.text_provider.trim().to_ascii_lowercase(),
+            voice_service::normalize_backend(&settings.realtime_backend),
+            settings.vad_shadow_enabled,
+            settings.web_grounding_enabled,
+        )
+    };
+
+    let text = if text_provider == "local" {
+        if local_text::is_running() {
+            snapshot("text", CapabilityStatus::Ready, "ollama")
+        } else {
+            snapshot("text", CapabilityStatus::NotInstalled, "ollama")
+        }
+    } else {
+        snapshot("text", CapabilityStatus::Ready, "deepseek")
+    };
+
+    let voice = voice_service::status(&app, &voice_backend);
+    let voice_status = match voice.state.as_str() {
+        "running" | "ready" => CapabilityStatus::Ready,
+        "starting" => CapabilityStatus::Starting,
+        "failed" => CapabilityStatus::Faulted,
+        "skipped" | "stopped" if voice_backend.is_empty() => CapabilityStatus::Disabled,
+        _ => CapabilityStatus::Unsupported,
+    };
+
+    vec![
+        with_reason("memory", memory_status, "sqlite", memory.last_error.as_deref().map(|_| "storage-unavailable")),
+        text,
+        snapshot("voice", voice_status, if voice_backend.is_empty() { "none" } else { &voice_backend }),
+        snapshot("vad-shadow", if vad_enabled { CapabilityStatus::Starting } else { CapabilityStatus::Disabled }, "silero"),
+        snapshot("fresh-topics", if fresh_enabled { CapabilityStatus::Ready } else { CapabilityStatus::Disabled }, "bounded-cache"),
+    ]
+}
+
 /// Recover a managed local voice backend after the realtime transport has
 /// exhausted its non-destructive reconnect attempts. This is deliberately
 /// narrower than settings-driven restart: it never applies to Volcano and
@@ -2437,6 +2509,8 @@ pub fn run() {
             app.manage(fresh_topics::FreshTopicService::open(fresh_topics_path));
             let activity_path = handle.path().app_config_dir().unwrap_or_default().join("activity.json");
             app.manage(activity::ActivityState::open(activity_path));
+            let goal_path = handle.path().app_config_dir().unwrap_or_default().join("goals.json");
+            app.manage(goal::GoalState::open(goal_path));
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
@@ -2606,6 +2680,7 @@ pub fn run() {
             open_external_url,
             merge_topic_preferences,
             check_voice_service,
+            capability_snapshot,
             recover_voice_service,
             probe_voice_backend,
             toggle_chat_window,
@@ -2646,6 +2721,9 @@ pub fn run() {
             ,activity_list
             ,activity_upsert
             ,activity_set_status
+            ,goal_list
+            ,goal_upsert
+            ,goal_set_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
