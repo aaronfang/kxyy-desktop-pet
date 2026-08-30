@@ -816,6 +816,28 @@ fn turn_state_clear(app: AppHandle, operation_id: String) -> Result<bool, String
     turn_state::clear_snapshot(&root, &operation_id).map_err(|e| format!("清除处理中状态失败：{e}"))
 }
 
+#[tauri::command]
+fn activity_list(state: tauri::State<activity::ActivityState>) -> Vec<activity::ActivityItem> {
+    state.list()
+}
+
+#[tauri::command]
+fn activity_upsert(
+    state: tauri::State<activity::ActivityState>,
+    item: activity::ActivityItem,
+) -> Result<(), String> {
+    state.upsert(item).map_err(|e| format!("保存活动记录失败：{e}"))
+}
+
+#[tauri::command]
+fn activity_set_status(
+    state: tauri::State<activity::ActivityState>,
+    id: String,
+    status: activity::ActivityStatus,
+) -> Result<bool, String> {
+    state.set_status(&id, status).map_err(|e| format!("更新活动状态失败：{e}"))
+}
+
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let s = app.state::<AppState>().settings.lock().unwrap().clone();
     let r = roster();
@@ -2413,6 +2435,8 @@ pub fn run() {
                 .unwrap_or_default()
                 .join("fresh-topics-v1.json");
             app.manage(fresh_topics::FreshTopicService::open(fresh_topics_path));
+            let activity_path = handle.path().app_config_dir().unwrap_or_default().join("activity.json");
+            app.manage(activity::ActivityState::open(activity_path));
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 api_port,
@@ -2619,6 +2643,9 @@ pub fn run() {
             memory::memory_import_legacy,
             turn_state_list,
             turn_state_clear
+            ,activity_list
+            ,activity_upsert
+            ,activity_set_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
