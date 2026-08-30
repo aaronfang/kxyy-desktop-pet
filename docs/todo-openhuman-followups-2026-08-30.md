@@ -48,6 +48,13 @@
 - [ ] 接入聊天时采用灰度/feature flag；无摘要、超时、冲突或过滤失败时回退当前 Memory recall。
 - [ ] 明确 Markdown/Obsidian 导入导出边界，不能形成第二事实库。
 
+### 确定性实体检索
+
+- [ ] 建立 canonical entity 与 aliases 注册表，解决同一人物/项目/宠物的不同叫法。
+- [ ] 为 `memory_recall` 增加 source/topic/time-window/entity 的可解释过滤视图。
+- [ ] 增加不调用 LLM 的 `walk`/`drill-down` 类纯算法检索，召回失败时回退现有选择性 recall。
+- [ ] 测试同义词、跨来源合并、时间窗边界、实体冲突和 card/user 隔离。
+
 ## P1：Silero VAD 从观察到可用的验证链
 
 当前 Silero 只做 shadow 观测，不能改变 RMS、ASR、句尾或打断决策。
@@ -63,6 +70,19 @@
 
 ## P2：已建合同但尚未完全接入业务
 
+### 可恢复 agent 状态图
+
+- [ ] 把后台主动对话、Memory 整理、语音服务维护抽象成有限状态图。
+- [ ] 每个节点定义输入版本、取消点、重试策略、超时和恢复动作。
+- [ ] 增加只读 checkpoint/run status 查询；不实现完整 workflow 画布或多级 agent fleet。
+
+### 只读事件回放
+
+- [ ] 为关键运行事件分配单调 offset，提供 `run_status`、活跃列表和分页回放接口。
+- [ ] 窗口或通话胶囊重连时按 offset 补齐错过事件，不依赖一次性广播。
+- [ ] 事件只保存枚举、计数、相对时间和脱敏 ID；禁止保存完整聊天文本、PCM 和密钥。
+- [ ] 测试旧 offset、重复回放、迟到事件、容量上限和重启恢复。
+
 ### 能力注册表与任务路由
 
 - [ ] 将 `chat-fast`、`reasoning`、`vision`、`memory-summary`、`local-offline`、`voice` hint 接入真实请求入口。
@@ -76,6 +96,26 @@
 - [ ] 增加统一低优先级 scheduler gate：通话、用户忙碌、低电量、资源不足时延后任务。
 - [ ] 广播失败不能丢持久化记录；重试不能重复执行 operation。
 - [ ] 设置页增加重试、忽略、清理过期项，并自动刷新未读状态。
+
+### 隐私模式与网络出口策略
+
+- [ ] 增加 Rust 强制的“一键不出机”模式，不能只依赖 UI 提示。
+- [ ] 将 local text、Memory、fresh-topic、TTS/ASR、外部搜索的网络出口写成 allow-list policy。
+- [ ] 隐私模式开启时，所有云端请求和后台外部观察必须被拒绝并给出固定原因；本地功能仍可用。
+- [ ] 增加策略单元测试、断网测试和设置页可解释状态；诊断不得包含 URL、密钥或原始错误。
+
+### Token/上下文预算
+
+- [ ] 对 Memory recall、fresh-topic、工具错误和历史回合实现固定字段截断、去重和摘要预算。
+- [ ] 先采用非 ML 的确定性压缩，不改变原始 Memory 数据，只改变进入模型的观察块。
+- [ ] 诊断只记录输入/输出 token 计数、压缩原因和耗时，不记录文本。
+- [ ] 测试超长输入、重复内容、注入文本、压缩失败和预算回退。
+
+### Provider 凭据与健康合同
+
+- [ ] 为 DeepSeek、Ollama、Tavily、Volcano、CosyVoice 和本地服务统一声明能力、健康状态和凭据 scope。
+- [ ] 凭据只由 Rust 持有；前端只能读取固定状态，不能读取原始 key 或 provider URL。
+- [ ] provider 不可用、能力不匹配和凭据缺失必须返回结构化错误并安全回退。
 
 ## P3：可选增强
 
@@ -91,6 +131,8 @@
 - [ ] Windows 安装、WebView2、设置迁移、语音服务恢复和 VAD runtime 必须在 Windows 真实环境补测。
 - [ ] 记录应用版本、Memory schema/milestone、commit、构建产物和未运行项目。
 - [ ] 未满足验证门槛的能力必须保持关闭或 shadow-only，不能用 mock 结果替代真实设备结论。
+- [ ] 为关键 Tauri 窗口和设置控件补固定 `data-testid`，E2E 使用隔离 workspace 与 mock backend。
+- [ ] E2E 失败自动保存脱敏截图、DOM/状态快照和 mock 请求摘要，禁止保存文本、PCM、密钥或路径。
 
 ## 明确不做
 
