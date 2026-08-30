@@ -1,4 +1,5 @@
 mod api;
+mod activity;
 mod fresh_topics;
 mod local_text;
 mod memory;
