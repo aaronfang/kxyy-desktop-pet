@@ -803,6 +803,18 @@ fn save_settings(app: &AppHandle, _snapshot: &Settings) {
     }
 }
 
+#[tauri::command]
+fn turn_state_list(app: AppHandle) -> Result<Vec<turn_state::TurnSnapshot>, String> {
+    let root = app.path().app_config_dir().map_err(|e| format!("读取应用目录失败：{e}"))?.join("turn-states");
+    turn_state::list_snapshots(&root).map_err(|e| format!("读取处理中状态失败：{e}"))
+}
+
+#[tauri::command]
+fn turn_state_clear(app: AppHandle, operation_id: String) -> Result<bool, String> {
+    let root = app.path().app_config_dir().map_err(|e| format!("读取应用目录失败：{e}"))?.join("turn-states");
+    turn_state::clear_snapshot(&root, &operation_id).map_err(|e| format!("清除处理中状态失败：{e}"))
+}
+
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let s = app.state::<AppState>().settings.lock().unwrap().clone();
     let r = roster();
@@ -2436,6 +2448,9 @@ pub fn run() {
             local_text::ensure(&handle, &settings.text_provider, &settings.local_text_model);
             // 网页观察开启时，后台预取不阻塞窗口、语音服务或本地模型预热。
             fresh_topics::schedule_startup_prefetch(handle.clone());
+            if let Ok(root) = handle.path().app_config_dir().map(|path| path.join("turn-states")) {
+                let _ = turn_state::recover_running_snapshots(&root);
+            }
             memory::trigger_worker(&handle);
 
             if let Some(win) = app.get_webview_window("main") {
@@ -2600,7 +2615,9 @@ pub fn run() {
             memory::memory_update,
             memory::memory_delete,
             memory::memory_clear_scope,
-            memory::memory_import_legacy
+            memory::memory_import_legacy,
+            turn_state_list,
+            turn_state_clear
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

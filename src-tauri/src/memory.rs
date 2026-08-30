@@ -14,6 +14,8 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
+use crate::turn_state::{self, TurnLifecycle, TurnSnapshot};
+
 const SCHEMA_VERSION: i64 = 5;
 const SOURCE_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
@@ -3006,8 +3008,36 @@ pub fn memory_enqueue_session(
             .ok_or_else(|| "记忆数据库不可用".to_string())?;
         enqueue_session(conn, request)?
     };
+    if response.accepted && !response.job_id.is_empty() {
+        write_job_snapshot(&app, &response.job_id, 0, "queued", TurnLifecycle::Running, "记忆整理已排队");
+    }
     trigger_worker(&app);
     Ok(response)
+}
+
+fn turn_state_root(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|path| path.join("turn-states"))
+}
+
+fn write_job_snapshot(
+    app: &AppHandle,
+    operation_id: &str,
+    generation: u64,
+    phase: &str,
+    lifecycle: TurnLifecycle,
+    summary: &str,
+) {
+    let Some(root) = turn_state_root(app) else { return };
+    let Some(path) = turn_state::snapshot_path(&root, operation_id) else { return };
+    let snapshot = TurnSnapshot {
+        operation_id: operation_id.to_string(),
+        generation,
+        phase: phase.to_string(),
+        lifecycle,
+        updated_at_ms: now_ts().saturating_mul(1000) as u64,
+        summary: truncate_chars(summary, 120),
+    };
+    let _ = turn_state::write_snapshot(&path, &snapshot);
 }
 
 fn enqueue_session(
@@ -4611,6 +4641,7 @@ fn worker_loop(app: AppHandle) {
             }
             break;
         };
+        write_job_snapshot(&app, &job.id, database_generation, "processing", TurnLifecycle::Running, "正在整理记忆");
         let result = process_job(&app, &job);
         let state = app.state::<MemoryState>();
         let mut guard = state.conn.lock().unwrap();
@@ -4625,10 +4656,12 @@ fn worker_loop(app: AppHandle) {
                         state.set_error(&msg);
                         let _ = retry_job(conn, &job, &msg);
                     } else {
+                        write_job_snapshot(&app, &job.id, database_generation, "completed", TurnLifecycle::Completed, "记忆整理完成");
                         state.clear_error();
                     }
                 }
                 Err(e) => {
+                    write_job_snapshot(&app, &job.id, database_generation, "failed", TurnLifecycle::Failed, "记忆整理失败，可重试");
                     state.set_error(&e);
                     let _ = retry_job(conn, &job, &e);
                 }

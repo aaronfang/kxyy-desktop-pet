@@ -11,6 +11,7 @@ pub enum TurnLifecycle {
     Running,
     Completed,
     Cancelled,
+    Failed,
     Interrupted,
 }
 
@@ -58,12 +59,66 @@ pub fn mark_interrupted(snapshot: &mut TurnSnapshot) {
     }
 }
 
+pub fn list_snapshots(root: &Path) -> io::Result<Vec<TurnSnapshot>> {
+    let mut snapshots = Vec::new();
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(snapshots),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(snapshot) = read_snapshot(&entry.path()) {
+            snapshots.push(snapshot);
+        }
+    }
+    snapshots.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    Ok(snapshots)
+}
+
+pub fn clear_snapshot(root: &Path, operation_id: &str) -> io::Result<bool> {
+    let Some(path) = snapshot_path(root, operation_id) else {
+        return Ok(false);
+    };
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn recover_running_snapshots(root: &Path) -> io::Result<usize> {
+    let snapshots = list_snapshots(root)?;
+    let mut changed = 0;
+    for mut snapshot in snapshots {
+        if snapshot.lifecycle != TurnLifecycle::Running {
+            continue;
+        }
+        mark_interrupted(&mut snapshot);
+        if let Some(path) = snapshot_path(root, &snapshot.operation_id) {
+            write_snapshot(&path, &snapshot)?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("kxyy-turn-state-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "kxyy-turn-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -111,5 +166,37 @@ mod tests {
         };
         mark_interrupted(&mut snapshot);
         assert_eq!(snapshot.lifecycle, TurnLifecycle::Completed);
+    }
+
+    #[test]
+    fn failed_snapshot_is_distinct_from_interrupted_snapshot() {
+        let failed = TurnLifecycle::Failed;
+        assert_ne!(failed, TurnLifecycle::Interrupted);
+        let encoded = serde_json::to_string(&failed).unwrap();
+        assert_eq!(encoded, "\"failed\"");
+    }
+
+    #[test]
+    fn listing_ignores_corrupt_files_and_clear_is_idempotent() {
+        let root = temp_root();
+        let _ = fs::create_dir_all(&root);
+        fs::write(root.join("broken.json"), b"not-json").expect("corrupt fixture");
+        assert!(list_snapshots(&root).expect("list").is_empty());
+        assert!(!clear_snapshot(&root, "missing").expect("clear missing"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_marks_only_running_snapshots() {
+        let root = temp_root();
+        let running_path = snapshot_path(&root, "running").unwrap();
+        let done_path = snapshot_path(&root, "done").unwrap();
+        let base = |id: &str, lifecycle| TurnSnapshot { operation_id: id.into(), generation: 1, phase: "x".into(), lifecycle, updated_at_ms: 1, summary: "x".into() };
+        write_snapshot(&running_path, &base("running", TurnLifecycle::Running)).unwrap();
+        write_snapshot(&done_path, &base("done", TurnLifecycle::Completed)).unwrap();
+        assert_eq!(recover_running_snapshots(&root).unwrap(), 1);
+        assert_eq!(read_snapshot(&running_path).unwrap().lifecycle, TurnLifecycle::Interrupted);
+        assert_eq!(read_snapshot(&done_path).unwrap().lifecycle, TurnLifecycle::Completed);
+        let _ = fs::remove_dir_all(root);
     }
 }
