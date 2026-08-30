@@ -3,7 +3,7 @@
 日期：2026-08-30  
 状态：P0–P6 基础实现完成，P7/P8 待发布候选验收  
 适用范围：元元桌宠的可靠性、记忆管理、后台任务和可观察性改进  
-参考研究：[research-openhuman-reuse-2026-08-27.md](./research-openhuman-reuse-2026-08-27.md)
+参考研究：[research-openhuman-reuse-2026-08-27.md](./research-openhuman-reuse-2026-08-27.md)；后续待办：[todo-openhuman-followups-2026-08-30.md](./todo-openhuman-followups-2026-08-30.md)
 
 ## 0. 目标与执行方式
 
