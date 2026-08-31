@@ -195,9 +195,14 @@
           <div id="activityList" class="status-list"><p class="hint">加载中…</p></div>
         </section>
         <section>
-          <div class="section-heading"><h2>目标与待办</h2><button id="refreshGoals" type="button" class="ghost">刷新</button></div>
-          <div class="goal-create"><input id="newGoalTitle" type="text" maxlength="120" placeholder="添加一个目标或待办" /><button id="addGoal" type="button" class="primary">添加</button></div>
-          <div id="goalList" class="status-list"><p class="hint">加载中…</p></div>
+          <div class="section-heading"><h2>记忆整理任务</h2><button id="refreshMemoryJobs" type="button" class="ghost">刷新</button></div>
+          <div id="memoryJobList" class="status-list"><p class="hint">加载中…</p></div>
+        </section>
+        <section>
+          <div class="section-heading"><h2>目标与待办</h2><label class="inline-check"><input id="showExpiredGoals" type="checkbox" /> 显示已过期</label><button id="refreshGoals" type="button" class="ghost">刷新</button></div>
+          <div class="goal-create"><select id="newGoalKind" aria-label="类型"><option value="long_term_goal">长期目标</option><option value="todo">待办</option></select><input id="newGoalTitle" type="text" maxlength="120" placeholder="添加长期目标" /><input id="newGoalDueAt" type="date" aria-label="截止日期" /><button id="addGoal" type="button" class="primary">添加</button></div>
+          <h3>长期目标</h3><div id="longTermGoalList" class="status-list"><p class="hint">加载中…</p></div>
+          <h3>待办</h3><div id="todoList" class="status-list"><p class="hint">加载中…</p></div>
         </section>
       </div>
 

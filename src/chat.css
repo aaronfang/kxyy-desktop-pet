@@ -284,6 +284,21 @@ body {
   color: var(--accent);
   animation: blink 1s steps(2, start) infinite;
 }
+
+.goal-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 12px 10px 44px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255,255,255,.18);
+  border-radius: 6px;
+  background: rgba(30, 28, 42, .78);
+  color: #eee;
+  font-size: 12px;
+}
+.goal-suggestion strong { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.goal-suggestion button { flex: 0 0 auto; }
 @keyframes blink {
   to {
     visibility: hidden;

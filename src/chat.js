@@ -62,6 +62,10 @@ import {
 import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { asksNotToRemember } from "./memory-ui.js";
+import { suggestGoalFromMessage, confirmGoalSuggestion } from "./ai/goal-intent.js";
+import { suggestGoalCompletion } from "./ai/goal-completion.js";
+import { ingestMemorySource } from "./ai/memory-source-card.js";
+import { createMemoryChunks } from "./ai/memory-chunks.js";
 import { renderObservationBlock } from "./ai/observation.js";
 import { fetchWebObservations, hasDirectWebSearchIntent, needsCurrentWebInformation, renderWebObservationBlock, renderWebObservationUnavailableBlock } from "./ai/web-observations.js";
 import {
@@ -144,6 +148,7 @@ const PAT_COOLDOWN_MS = 2500;
 const DEFAULT_PAT_TEXT = "{name}拍了拍{ai}";
 const AI_DISPLAY_NAME = "开心元元";
 const DELETABLE_SEL = ".bubble[data-mid], .pat-notice[data-mid]";
+const dismissedGoalSuggestions = new Set();
 
 // 自动朗读队列：主回复与 follow-up 等多条回复按顺序朗读，避免共用 token 时被误判为「关闭」。
 let ttsQueue = Promise.resolve();
@@ -1174,6 +1179,37 @@ function addBubble(role, text, { mid } = {}) {
   return bubble;
 }
 
+function offerGoalSuggestion(candidate) {
+  if (!candidate || dismissedGoalSuggestions.has(candidate.idempotencyKey)) return;
+  const row = document.createElement("div"); row.className = "goal-suggestion";
+  const label = document.createElement("span"); label.textContent = candidate.kind === "todo" ? "要不要记为待办？" : "要不要记为长期目标？";
+  const title = document.createElement("strong"); title.textContent = candidate.title;
+  const confirm = document.createElement("button"); confirm.type = "button"; confirm.className = "primary"; confirm.textContent = "确认保存";
+  const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.className = "ghost"; dismiss.textContent = "暂不保存";
+  confirm.addEventListener("click", async () => { confirm.disabled = true; dismiss.disabled = true; const item = confirmGoalSuggestion(candidate); try { const result = await invoke("goal_create", { item: { id: item.idempotencyKey, title: item.title, kind: item.kind, description: "", dueAtMs: item.dueAtMs, source: "chat_confirmation", sourceRef: item.sourceMessageId, reminderPolicy: item.reminderPolicy, completedAtMs: null, cancelledAtMs: null, schemaVersion: 2, status: "active", createdAtMs: Date.now(), updatedAtMs: Date.now() } }); if (!result?.ok) throw new Error("保存失败"); label.textContent = "已保存"; confirm.remove(); dismiss.remove(); } catch (_) { confirm.disabled = false; dismiss.disabled = false; label.textContent = "保存失败，可重试"; } });
+  dismiss.addEventListener("click", () => { dismissedGoalSuggestions.add(candidate.idempotencyKey); row.remove(); });
+  row.append(label, title, confirm, dismiss); messagesEl.appendChild(row); scrollBottom();
+}
+
+function offerGoalCompletion(candidate, goal) {
+  if (!candidate || !goal || dismissedGoalSuggestions.has(`completion:${candidate.goalId}`)) return;
+  const row = document.createElement("div"); row.className = "goal-suggestion";
+  const label = document.createElement("span"); label.textContent = candidate.status === "cancelled" ? "要取消这个事项吗？" : "要标记这个事项已完成吗？";
+  const title = document.createElement("strong"); title.textContent = String(goal.title || "").slice(0, 120);
+  const confirm = document.createElement("button"); confirm.type = "button"; confirm.className = "primary"; confirm.textContent = "确认更新";
+  const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.className = "ghost"; dismiss.textContent = "暂不更新";
+  confirm.addEventListener("click", async () => {
+    confirm.disabled = true; dismiss.disabled = true;
+    try {
+      const result = await invoke("goal_transition", { id: candidate.goalId, status: candidate.status, updatedAtMs: Date.now() });
+      if (!result?.ok) throw new Error("更新失败");
+      label.textContent = "已更新"; confirm.remove(); dismiss.remove();
+    } catch (_) { confirm.disabled = false; dismiss.disabled = false; label.textContent = "更新失败，可重试"; }
+  });
+  dismiss.addEventListener("click", () => { dismissedGoalSuggestions.add(`completion:${candidate.goalId}`); row.remove(); });
+  row.append(label, title, confirm, dismiss); messagesEl.appendChild(row); scrollBottom();
+}
+
 function renderTextWithSafeLinks(node, text) {
   node.textContent = "";
   const value = String(text || "");
@@ -2113,6 +2149,17 @@ async function send(text, opts = {}) {
     mid: userId,
     doNotRemember: currentTurnDoNotRemember,
   });
+  if (text && !currentTurnDoNotRemember) {
+    offerGoalSuggestion(suggestGoalFromMessage(text));
+    if (/(?:完成了|做完了|已经完成|不用了|不需要了)/u.test(text)) {
+      try {
+        const goals = await invoke("goal_list", { includeExpired: true });
+        const completion = suggestGoalCompletion(text, goals || []);
+        const goal = completion && (goals || []).find((item) => item.id === completion.goalId);
+        offerGoalCompletion(completion, goal);
+      } catch (_) { /* Goal suggestions never block chat. */ }
+    }
+  }
   petSignal("user");
 
   const streamBubble = addBubble("assistant", "", { mid: replyId });
@@ -2142,6 +2189,14 @@ async function send(text, opts = {}) {
     const mainResult = await streamAssistantReply(streamBubble, streamRow, { replyId });
 
     const reply = history[history.length - 1]?.content || "";
+    if (text && reply && !currentTurnDoNotRemember) {
+      void ingestMemorySource({
+        invoke,
+        card: { sourceId: `chat-turn-${replyId}`, sourceType: "text_chat", scope: settings.personaCardId || "default", observedAt: Date.now(), consent: "allowed", sensitivity: "normal", excerpt: `${text}\n${reply}` },
+        text: `${text}\n${reply}`,
+        split: (value, card) => createMemoryChunks(value, card),
+      }).catch(() => {});
+    }
     if (shouldDoFollowup(text, reply, DEFAULT_FOLLOWUP_CHANCE)) {
       // 先等主回复「文字+语音」同步出现完成，再出 followup 第二行，避免两行光标同时冒出。
       if (mainResult?.speechDone) {
@@ -2717,6 +2772,23 @@ function commitCallAudibleSegment(text, { generation, segmentId } = {}) {
   } else {
     turn.entry.content = turn.audibleText;
   }
+  // Realtime memory is playback-derived: only a segment receipt may create a source card.
+  void ingestMemorySource({
+    invoke,
+    card: {
+      sourceId: `realtime-${generation}-${segmentId}`,
+      sourceType: "realtime_completed",
+      scope: settings.personaCardId || "default",
+      observedAt: Date.now(),
+      consent: "allowed",
+      sensitivity: "normal",
+      completed: true,
+      excerpt: sentence,
+      eventIds: [String(generation), String(segmentId)],
+    },
+    text: sentence,
+    split: (value, card) => createMemoryChunks(value, card),
+  }).catch(() => {});
   void maybeUpdateRecap();
 }
 

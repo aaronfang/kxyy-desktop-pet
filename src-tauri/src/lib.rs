@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -842,7 +842,7 @@ fn activity_set_status(
 }
 
 #[tauri::command]
-fn goal_list(state: tauri::State<goal::GoalState>) -> Vec<goal::Goal> { state.list() }
+fn goal_list(state: tauri::State<goal::GoalState>, kind: Option<goal::GoalKind>, status: Option<goal::GoalStatus>, scope: Option<String>, include_expired: Option<bool>) -> Vec<goal::Goal> { state.list(kind, status, scope.as_deref(), include_expired.unwrap_or(false)) }
 
 #[tauri::command]
 fn goal_upsert(state: tauri::State<goal::GoalState>, item: goal::Goal) -> Result<(), String> {
@@ -851,7 +851,43 @@ fn goal_upsert(state: tauri::State<goal::GoalState>, item: goal::Goal) -> Result
 
 #[tauri::command]
 fn goal_set_status(state: tauri::State<goal::GoalState>, id: String, status: goal::GoalStatus, updated_at_ms: u64) -> Result<bool, String> {
-    state.set_status(&id, status, updated_at_ms).map_err(|e| format!("更新目标状态失败：{e}"))
+    state.transition(&id, status, updated_at_ms).map_err(|e| match e { goal::TransitionError::NotFound => "目标不存在".into(), goal::TransitionError::InvalidTransition | goal::TransitionError::StaleRevision => "不允许的状态变更".into() })
+}
+
+#[tauri::command]
+fn goal_delete(state: tauri::State<goal::GoalState>, id: String) -> Result<bool, String> { state.delete(&id).map_err(|e| format!("删除目标失败：{e}")) }
+
+#[tauri::command]
+fn goal_create(state: tauri::State<goal::GoalState>, item: goal::Goal) -> Result<goal::GoalMutationResult, String> {
+    state.upsert(item).map(|_| goal::GoalMutationResult::ok()).map_err(|e| format!("创建目标失败：{e}"))
+}
+
+#[tauri::command]
+fn goal_update(state: tauri::State<goal::GoalState>, item: goal::Goal) -> Result<goal::GoalMutationResult, String> {
+    match state.update_checked(item) { Ok(()) => Ok(goal::GoalMutationResult::ok()), Err(goal::TransitionError::StaleRevision) => { let mut result = goal::GoalMutationResult::ok(); result.ok = false; result.stale_revision = true; Ok(result) }, Err(goal::TransitionError::NotFound) => { let mut result = goal::GoalMutationResult::ok(); result.ok = false; result.not_found = true; Ok(result) }, Err(_) => Err("更新目标失败".into()) }
+}
+
+#[tauri::command]
+fn goal_transition(state: tauri::State<goal::GoalState>, id: String, status: goal::GoalStatus, updated_at_ms: u64) -> goal::GoalMutationResult {
+    match state.transition(&id, status, updated_at_ms) { Ok(_) => goal::GoalMutationResult::ok(), Err(e) => goal::GoalMutationResult::error(e) }
+}
+
+fn run_goal_reminder_dry_run(app: &AppHandle) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let goals = app.state::<goal::GoalState>().reminder_candidates(now);
+    let Some(goal) = goals.first() else { return; };
+    let id = format!("goal-reminder-dry-run:{}:{}", goal.id, goal.revision);
+    let item = activity::ActivityItem {
+        id,
+        category: "goal_reminder".into(),
+        operation_id: format!("goal-reminder:{}", goal.id),
+        status: activity::ActivityStatus::Unread,
+        retryable: false,
+        summary: format!("有一个允许相关提醒的目标：{}", goal.title.chars().take(120).collect::<String>()),
+        deep_link: Some("settings://goals".into()),
+        created_at_ms: now,
+    };
+    let _ = app.state::<activity::ActivityState>().upsert(item);
 }
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
@@ -1983,6 +2019,11 @@ fn open_settings(app: AppHandle) {
     open_settings_window(&app);
 }
 
+#[cfg(debug_assertions)]
+fn dev_ui_should_open_settings(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true" | "yes"))
+}
+
 /// 设置页保存的 AI / 聊天相关配置。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2551,6 +2592,8 @@ pub fn run() {
                 let _ = turn_state::recover_running_snapshots(&root);
             }
             memory::trigger_worker(&handle);
+            // Reminder runtime is intentionally dry-run only until proactive voice is explicitly enabled.
+            run_goal_reminder_dry_run(&handle);
 
             if let Some(win) = app.get_webview_window("main") {
                 // 先显示以获取显示器信息，再根据设置定位到目标屏幕，铺满其工作区（排除任务栏）。
@@ -2653,6 +2696,15 @@ pub fn run() {
                 });
             }
 
+            // Test-only entry point for the transparent/menu-bar app. Release builds do not
+            // compile this branch, so an inherited environment variable cannot change UX.
+            #[cfg(debug_assertions)]
+            if dev_ui_should_open_settings(std::env::var("KXYY_DEV_OPEN_SETTINGS").ok().as_deref())
+                || dev_ui_should_open_settings(std::env::var("KXYY_DEV_UI_TEST").ok().as_deref())
+            {
+                open_settings_window(&handle);
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2710,6 +2762,18 @@ pub fn run() {
             memory::memory_edges,
             memory::memory_graph,
             memory::memory_recall,
+            memory::memory_source_card_upsert,
+            memory::memory_chunk_job_enqueue,
+            memory::memory_chunk_job_claim,
+            memory::memory_chunk_job_cancel,
+            memory::memory_chunk_job_finish,
+            memory::memory_chunk_job_list,
+            memory::memory_chunk_job_retry,
+            memory::memory_entity_alias_upsert,
+            memory::memory_entity_walk,
+            memory::memory_entity_alias_list,
+            memory::memory_source_scope_clear,
+            memory::memory_source_summary,
             memory::memory_enqueue_session,
             memory::memory_list,
             memory::memory_update,
@@ -2724,6 +2788,10 @@ pub fn run() {
             ,goal_list
             ,goal_upsert
             ,goal_set_status
+            ,goal_delete
+            ,goal_create
+            ,goal_update
+            ,goal_transition
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -2752,6 +2820,17 @@ mod tests {
         settings.settings_schema_version = 0;
         let migrated = migrate_settings(settings);
         assert_eq!(migrated.settings_schema_version, super::SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_settings_entrypoint_accepts_only_explicit_truthy_values() {
+        assert!(super::dev_ui_should_open_settings(Some("1")));
+        assert!(super::dev_ui_should_open_settings(Some("true")));
+        assert!(super::dev_ui_should_open_settings(Some(" yes ")));
+        assert!(!super::dev_ui_should_open_settings(None));
+        assert!(!super::dev_ui_should_open_settings(Some("0")));
+        assert!(!super::dev_ui_should_open_settings(Some("on")));
     }
 
     #[test]

@@ -9,6 +9,10 @@ import {
 } from "./ai/topic-preferences.js";
 import { memoryHealthState } from "./memory-ui.js";
 import { DEEPSEEK_VISION_MODEL } from "./deepseek-multimodal.js";
+import { explainMemoryRecall } from "./ai/memory-explain.js";
+import { sortGoals } from "./ai/goal-view.js";
+import { commitmentToGoal } from "./ai/goal-commitment.js";
+import { planGoalAction } from "./ai/goal-actions.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -17,7 +21,8 @@ const el = (id) => document.getElementById(id);
 
 const capabilityLabels = { memory: "长期记忆", text: "文字模型", voice: "语音服务", "vad-shadow": "语音识别增强", "fresh-topics": "时下信息" };
 const capabilityStatusLabels = { disabled: "已关闭", unsupported: "不支持", "not-installed": "未安装", starting: "启动中", ready: "可用", busy: "忙碌", faulted: "故障" };
-const goalStatusLabels = { active: "进行中", completed: "已完成", paused: "已暂停", cancelled: "已取消" };
+const goalStatusLabels = { active: "待处理", in_progress: "进行中", blocked: "受阻", completed: "已完成", done: "已完成", paused: "已暂停", cancelled: "已取消", expired: "已过期" };
+const jobStatusLabels = { pending: "等待中", retrying: "待重试", processing: "处理中", failed: "失败", completed: "已完成", cancelled: "已取消" };
 
 function renderCapabilityList(items) {
   const box = el("capabilityList"); if (!box) return;
@@ -43,22 +48,42 @@ function renderActivities(items) {
   if (!box.children.length) box.innerHTML = '<p class="hint">暂无后台活动</p>';
 }
 async function loadActivities() { try { renderActivities(await invoke("activity_list")); } catch (_) {} }
+function renderMemoryJobs(items) { const box = el("memoryJobList"); if (!box) return; box.replaceChildren(); for (const item of (Array.isArray(items) ? items : []).slice(0, 32)) { const row = document.createElement("div"); row.className = "status-item"; const text = document.createElement("span"); text.textContent = `${item.sourceType || "memory"} · ${jobStatusLabels[item.status] || "未知"} · 尝试 ${item.attempts || 0}`; row.append(text); if (item.status === "failed") { const retry = document.createElement("button"); retry.className = "ghost"; retry.textContent = "重试"; retry.addEventListener("click", async () => { await invoke("memory_chunk_job_retry", { jobId: item.jobId }); await loadMemoryJobs(); }); row.append(retry); } box.append(row); } if (!box.children.length) box.innerHTML = '<p class="hint">暂无记忆整理任务</p>'; }
+async function loadMemoryJobs() { try { renderMemoryJobs(await invoke("memory_chunk_job_list", { includeCompleted: false })); } catch (_) {} }
 function renderGoals(items) {
-  const box = el("goalList"); if (!box) return; box.replaceChildren();
-  for (const item of (Array.isArray(items) ? items : []).slice(0, 50)) {
-    const row = document.createElement("div"); row.className = "status-item";
-    const text = document.createElement("span"); text.textContent = item.title || "未命名目标";
-    const select = document.createElement("select"); for (const [value,label] of Object.entries(goalStatusLabels)) { const o=document.createElement("option");o.value=value;o.textContent=label;select.append(o); } select.value=item.status||"active";
-    select.addEventListener("change", async () => { await invoke("goal_set_status", { id:item.id, status:select.value, updatedAtMs:Date.now() }); }); row.append(text, select); box.append(row);
+  const boxes = { long_term_goal: el("longTermGoalList"), todo: el("todoList") }; Object.values(boxes).forEach((box) => box?.replaceChildren());
+  for (const item of sortGoals(items, Date.now()).slice(0, 50)) {
+    const box = boxes[item.kind] || boxes.long_term_goal; if (!box) continue; const row = document.createElement("div"); row.className = "status-item";
+    const text = document.createElement("span"); const sourceLabel = { manual: "手动", chat_confirmation: "聊天确认", memory_commitment: "承诺转换" }[item.source] || "其他"; text.textContent = `${item.title || "未命名目标"} · 来源：${sourceLabel}${item.createdAtMs ? ` · 创建 ${new Date(item.createdAtMs).toLocaleDateString("zh-CN")}` : ""}${item.dueAtMs ? ` · 截止 ${new Date(item.dueAtMs).toLocaleDateString("zh-CN")}` : ""}`;
+    const select = document.createElement("select"); const allowed = item.kind === "todo" ? ["active","in_progress","blocked","done","cancelled","expired"] : ["active","paused","completed","cancelled","expired"]; for (const value of allowed) { const o=document.createElement("option");o.value=value;o.textContent=goalStatusLabels[value];select.append(o); } select.value=item.status||"active";
+    select.addEventListener("change", async () => { const result = await invoke("goal_transition", { id:item.id, status:select.value, updatedAtMs:Date.now() }); if (!result?.ok) select.value = item.status || "active"; await loadGoals(); });
+    const edit=document.createElement("button"); edit.className="ghost"; edit.textContent="编辑"; edit.addEventListener("click", async()=>{
+      if (row.querySelector(".goal-edit-input")) return;
+      const input=document.createElement("input"); input.className="goal-edit-input"; input.type="text"; input.maxLength=120; input.value=item.title || ""; input.setAttribute("aria-label", "编辑目标标题");
+      const save=document.createElement("button"); save.className="primary"; save.textContent="保存";
+      const cancel=document.createElement("button"); cancel.className="ghost"; cancel.textContent="取消";
+      const original=text.textContent; text.replaceChildren(input); edit.hidden=true; del.hidden=true; row.append(save,cancel);
+      const finish=()=>{ save.remove(); cancel.remove(); edit.hidden=false; del.hidden=false; text.textContent=original; };
+      cancel.addEventListener("click", finish);
+      save.addEventListener("click", async()=>{ const title=input.value.trim(); if (!title) { input.focus(); return; } save.disabled=true; try { const result=await invoke("goal_update", { item:{ ...item, title, updatedAtMs:Date.now() } }); if (!result?.ok) throw new Error(result?.staleRevision ? "条目已被其他窗口更新，请刷新" : "保存失败"); await loadGoals(); } catch (e) { save.disabled=false; input.setCustomValidity(e.message || "保存失败"); input.reportValidity(); } });
+      input.focus();
+    });
+    const del=document.createElement("button"); del.className="ghost"; del.textContent="删除"; del.addEventListener("click", async()=>{ if (!window.confirm("删除此工作项？不会删除来源记忆。")) return; const plan=planGoalAction(item,"delete"); if (plan) await invoke("goal_delete",{id:plan.goalId}); await loadGoals(); });
+    row.append(text, select, edit, del);
+    if (item.source === "memory_commitment" && item.sourceRef) { const forget=document.createElement("button"); forget.className="ghost danger"; forget.textContent="忘掉来源"; forget.addEventListener("click", async()=>{ if (!window.confirm("同时从长期记忆中忘掉这条承诺？此操作不可撤销。")) return; const plan=planGoalAction(item,"forget"); if (!plan) return; if (plan.memory) await invoke("memory_delete", { request: { items: [plan.memory] } }); await invoke("goal_delete", { id: plan.goalId }); await loadGoals(); }); row.append(forget); }
+    box.append(row);
   }
-  if (!box.children.length) box.innerHTML = '<p class="hint">还没有目标</p>';
+  Object.entries(boxes).forEach(([kind,box])=>{if(box && !box.children.length) box.innerHTML = `<p class="hint">还没有${kind === "todo" ? "待办" : "长期目标"}</p>`;});
 }
-async function loadGoals() { try { renderGoals(await invoke("goal_list")); } catch (_) {} }
+async function loadGoals() { try { renderGoals(await invoke("goal_list", { scope: el("personaCardId")?.value.trim() || "default", includeExpired: Boolean(el("showExpiredGoals")?.checked) })); } catch (_) {} }
 
 el("refreshCapabilities")?.addEventListener("click", loadCapabilities);
 el("refreshActivities")?.addEventListener("click", loadActivities);
+el("refreshMemoryJobs")?.addEventListener("click", loadMemoryJobs);
 el("refreshGoals")?.addEventListener("click", loadGoals);
-el("addGoal")?.addEventListener("click", async () => { const input=el("newGoalTitle"); const title=input?.value.trim(); if(!title)return; const now=Date.now(); await invoke("goal_upsert", { item:{ id:`goal-${now}-${Math.random().toString(36).slice(2,8)}`, title, status:"active", createdAtMs:now, updatedAtMs:now } }); input.value=""; loadGoals(); });
+el("showExpiredGoals")?.addEventListener("change", loadGoals);
+el("newGoalKind")?.addEventListener("change", () => { const input=el("newGoalTitle"); if(input) input.placeholder = el("newGoalKind").value === "todo" ? "添加待办" : "添加长期目标"; });
+el("addGoal")?.addEventListener("click", async () => { const input=el("newGoalTitle"); const title=input?.value.trim(); if(!title)return; const now=Date.now(); const dueValue=el("newGoalDueAt")?.value; const dueAtMs=dueValue ? Date.parse(`${dueValue}T23:59:59`) : null; await invoke("goal_create", { item:{ id:`goal-${now}-${Math.random().toString(36).slice(2,8)}`, title, scope: el("personaCardId")?.value.trim() || "default", kind:el("newGoalKind")?.value || "long_term_goal", description:"", dueAtMs:Number.isFinite(dueAtMs) ? dueAtMs : null, source:"manual", sourceRef:null, reminderPolicy:"manual_only", completedAtMs:null, cancelledAtMs:null, schemaVersion:2, status:"active", createdAtMs:now, updatedAtMs:now } }); input.value=""; if(el("newGoalDueAt")) el("newGoalDueAt").value=""; await loadGoals(); });
 
 // 头像不进 FIELDS：走上传按钮维护，值缓存在下面两个变量里。
 const FIELDS = [
@@ -1488,7 +1513,9 @@ async function migrateSelectedCardMemory() {
 }
 
 function selectedMemoryCardId() {
-  return (el("memoryCardId")?.value ?? el("personaCardId").value).trim();
+  const selected = el("memoryCardId")?.value?.trim();
+  const fallback = el("personaCardId")?.value?.trim();
+  return selected || fallback || "default";
 }
 
 function selectedMemoryCardLabel() {
@@ -1731,6 +1758,10 @@ function renderMemoryItems(items) {
     text.className = "memory-card-text";
     text.textContent = item.text;
     card.append(head, text);
+    const explanation = explainMemoryRecall(item, item.reason);
+    const why = document.createElement("p"); why.className = "memory-source";
+    why.textContent = `来源：${explanation.sourceType || "Memory"}${explanation.occurredAt ? ` · ${formatMemoryDate(explanation.occurredAt)}` : ""}${explanation.reason ? ` · 召回：${explanation.reason}` : ""}${explanation.uncertain ? " · 待核实" : ""}`;
+    card.appendChild(why);
     if (item.sourceExcerpt) {
       const source = document.createElement("p");
       source.className = "memory-source";
@@ -1750,6 +1781,21 @@ function renderMemoryItems(items) {
       actions.appendChild(memoryActionButton("标记已兑现", async () => {
         await invoke("memory_update", { request: { kind: item.kind, id: item.id, status: "fulfilled" } });
         await loadMemoryPage();
+      }));
+      actions.appendChild(memoryActionButton("转为待办", async () => {
+        const goal = commitmentToGoal({ id: item.id, text: item.text, dueAt: item.dueAt });
+        if (!goal) return;
+        const now = Date.now();
+        const result = await invoke("goal_create", { item: {
+          ...goal,
+          completedAtMs: null,
+          cancelledAtMs: null,
+          schemaVersion: 2,
+          status: "active",
+          createdAtMs: now,
+          updatedAtMs: now,
+        } });
+        if (!result?.ok) window.alert("待办未保存，请重试");
       }));
     }
     const timeline = document.createElement("div");
@@ -2428,6 +2474,7 @@ el("memoryExport")?.addEventListener("click", async () => {
   }
 });
 
+
 el("memoryBackup")?.addEventListener("click", async () => {
   const button = el("memoryBackup");
   button.disabled = true;
@@ -2578,7 +2625,7 @@ async function init() {
   probeBackendStatus();
   probeLocalTextStatus();
   probeFreshTopicStatus();
-  await Promise.all([loadCapabilities(), loadActivities(), loadGoals()]);
+  await Promise.all([loadCapabilities(), loadActivities(), loadMemoryJobs(), loadGoals()]);
 }
 
 init();

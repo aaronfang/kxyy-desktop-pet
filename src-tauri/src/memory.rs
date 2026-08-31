@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::turn_state::{self, TurnLifecycle, TurnSnapshot};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 const SOURCE_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 // Chinese characters are close to one token in the target models; keep this
@@ -313,6 +313,62 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_memory_jobs_due
             ON memory_jobs(status, next_attempt_at);
+         CREATE TABLE IF NOT EXISTS memory_source_cards (
+            source_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            observed_at INTEGER NOT NULL,
+            valid_from INTEGER,
+            valid_to INTEGER,
+            sensitivity TEXT NOT NULL DEFAULT 'normal',
+            consent TEXT NOT NULL DEFAULT 'allowed',
+            excerpt TEXT NOT NULL DEFAULT '',
+            event_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(scope_key, source_type, source_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_source_cards_scope_time
+            ON memory_source_cards(scope_key, observed_at DESC);
+         CREATE TABLE IF NOT EXISTS memory_chunks (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            start_offset INTEGER NOT NULL,
+            end_offset INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(scope_key, source_type, source_id, chunk_index)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_chunks_source
+            ON memory_chunks(scope_key, source_type, source_id, chunk_index);
+         CREATE TABLE IF NOT EXISTS memory_chunk_jobs (
+            id TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            lease_until INTEGER,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(scope_key, source_type, source_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_chunk_jobs_due
+            ON memory_chunk_jobs(status, lease_until, updated_at);
+         CREATE TABLE IF NOT EXISTS memory_entity_aliases (
+            scope_key TEXT NOT NULL,
+            canonical TEXT NOT NULL,
+            alias TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(scope_key, normalized_alias)
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_entity_aliases_canonical
+            ON memory_entity_aliases(scope_key, canonical);
          CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(
             item_id UNINDEXED,
             kind UNINDEXED,
@@ -354,6 +410,10 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     if existing_version < 5 {
         backfill_v5_graph(&tx)?;
     }
+    if existing_version < 7 {
+        let has_column: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_table_info('memory_chunk_jobs') WHERE name='next_attempt_at'", [], |row| row.get(0))?;
+        if has_column == 0 { tx.execute("ALTER TABLE memory_chunk_jobs ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0", [])?; }
+    }
     tx.execute(
         "INSERT INTO memory_meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -364,6 +424,10 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
 
 fn maintenance(conn: &Connection) -> rusqlite::Result<()> {
     let now = now_ts();
+    conn.execute(
+        "UPDATE memory_chunk_jobs SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' ELSE 'retrying' END, lease_until=NULL, next_attempt_at=?1, updated_at=?1 WHERE status='processing' AND (cancel_requested=1 OR (lease_until IS NOT NULL AND lease_until < ?1))",
+        [now],
+    )?;
     conn.execute(
         "UPDATE memory_jobs SET status='retrying',next_attempt_at=?1,
          last_error=COALESCE(last_error,'应用在巩固过程中退出，已自动重试'),updated_at=?1
@@ -926,6 +990,65 @@ pub struct MemoryEnqueueResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemorySourceCardRequest {
+    pub source_id: String,
+    pub source_type: String,
+    pub scope: String,
+    pub observed_at: i64,
+    #[serde(default)] pub valid_from: Option<i64>,
+    #[serde(default)] pub valid_to: Option<i64>,
+    #[serde(default = "default_normal")] pub sensitivity: String,
+    #[serde(default = "default_allowed")] pub consent: String,
+    #[serde(default)] pub excerpt: String,
+    #[serde(default)] pub event_ids: Vec<String>,
+    #[serde(default)] pub chunks: Vec<MemorySourceChunkRequest>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySourceChunkRequest { pub id: String, pub chunk_index: i64, pub start_offset: i64, pub end_offset: i64, pub text: String }
+fn default_normal() -> String { "normal".into() }
+fn default_allowed() -> String { "allowed".into() }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySourceCardResponse { pub ok: bool, pub duplicate: bool, pub chunk_count: usize }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryChunkJobRequest { pub scope: String, pub source_type: String, pub source_id: String }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryChunkJobResponse { pub ok: bool, pub duplicate: bool, pub job_id: String }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryChunkJobClaim { pub job_id: String, pub scope: String, pub source_type: String, pub source_id: String, pub attempts: i64, pub lease_until: i64 }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryChunkJobFinishRequest { pub job_id: String, pub success: bool }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryChunkJobStatus { pub job_id: String, pub source_type: String, pub status: String, pub attempts: i64, pub lease_until: Option<i64>, pub cancel_requested: bool }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntityAliasRequest { pub scope: String, pub canonical: String, pub aliases: Vec<String> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntityWalkRequest { pub scope: String, pub entity: String, #[serde(default)] pub from: Option<i64>, #[serde(default)] pub to: Option<i64>, #[serde(default)] pub max_items: Option<usize> }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntityWalkItem { pub chunk_id: String, pub source_id: String, pub source_type: String, pub observed_at: i64, pub text: String }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntityAliasItem { pub canonical: String, pub alias: String, pub normalized_alias: String }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySourceSummaryRequest { pub scope: String, pub source_id: String, #[serde(default)] pub max_chars: Option<usize> }
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySourceSummaryResponse { pub source_id: String, pub source_type: String, pub observed_at: i64, pub text: String, pub truncated: bool }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryRecallRequest {
     pub card_id: String,
     pub nickname: String,
@@ -1299,6 +1422,7 @@ pub struct MemoryListItem {
     pub importance: f64,
     pub pinned: bool,
     pub occurred_at: Option<i64>,
+    pub due_at: Option<i64>,
     pub source_excerpt: Option<String>,
     pub updated_at: i64,
 }
@@ -3189,6 +3313,125 @@ pub fn memory_recall(
     recall_memory(conn, &request)
 }
 
+#[tauri::command]
+pub fn memory_source_card_upsert(
+    app: AppHandle,
+    state: State<'_, MemoryState>,
+    request: MemorySourceCardRequest,
+) -> Result<MemorySourceCardResponse, String> {
+    if request.source_id.trim().is_empty() || request.scope.trim().is_empty() || request.observed_at <= 0 || request.source_id.chars().count() > 120 || request.scope.chars().count() > 160 { return Err("来源卡字段无效".into()); }
+    if request.chunks.iter().any(|c| c.id.trim().is_empty() || c.text.is_empty() || c.text.chars().count() > 800 || c.start_offset < 0 || c.end_offset < c.start_offset) { return Err("来源分块无效".into()); }
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let event_json = serde_json::to_string(&request.event_ids).map_err(|e| e.to_string())?;
+    let changed = tx.execute("INSERT OR IGNORE INTO memory_source_cards(source_id,source_type,scope_key,observed_at,valid_from,valid_to,sensitivity,consent,excerpt,event_ids_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![&request.source_id,&request.source_type,&request.scope,request.observed_at,request.valid_from,request.valid_to,&request.sensitivity,&request.consent,truncate_chars(&request.excerpt,320),event_json,now_ts()]).map_err(|e| e.to_string())?;
+    for chunk in &request.chunks { tx.execute("INSERT OR IGNORE INTO memory_chunks(id,source_id,source_type,scope_key,chunk_index,start_offset,end_offset,text,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![&chunk.id,&request.source_id,&request.source_type,&request.scope,chunk.chunk_index,chunk.start_offset,chunk.end_offset,&chunk.text,now_ts()]).map_err(|e| e.to_string())?; }
+    let job_id = format!("extract-chunk:{}:{}:{}", request.scope, request.source_type, request.source_id);
+    tx.execute("INSERT OR IGNORE INTO memory_chunk_jobs(id,scope_key,source_type,source_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)", params![job_id, &request.scope, &request.source_type, &request.source_id, now_ts()]).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    trigger_worker(&app);
+    Ok(MemorySourceCardResponse { ok: true, duplicate: changed == 0, chunk_count: request.chunks.len() })
+}
+
+#[tauri::command]
+pub fn memory_chunk_job_enqueue(state: State<'_, MemoryState>, request: MemoryChunkJobRequest) -> Result<MemoryChunkJobResponse, String> {
+    if request.scope.trim().is_empty() || request.source_type.trim().is_empty() || request.source_id.trim().is_empty() { return Err("分块任务字段无效".into()); }
+    let job_id = format!("extract-chunk:{}:{}:{}", request.scope, request.source_type, request.source_id);
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let now = now_ts();
+    let changed = conn.execute("INSERT OR IGNORE INTO memory_chunk_jobs(id,scope_key,source_type,source_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)", params![job_id,request.scope,request.source_type,request.source_id,now]).map_err(|e| e.to_string())?;
+    Ok(MemoryChunkJobResponse { ok: true, duplicate: changed == 0, job_id: format!("extract-chunk:{}:{}:{}", request.scope, request.source_type, request.source_id) })
+}
+
+#[tauri::command]
+pub fn memory_chunk_job_claim(state: State<'_, MemoryState>, lease_seconds: Option<i64>) -> Result<Option<MemoryChunkJobClaim>, String> {
+    let mut guard = state.conn.lock().unwrap(); let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?; let now = now_ts(); let lease = now + lease_seconds.unwrap_or(60).clamp(10, 300);
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let row: Option<(String,String,String,String,i64)> = tx.query_row("SELECT id,scope_key,source_type,source_id,attempts FROM memory_chunk_jobs WHERE cancel_requested=0 AND attempts < 3 AND next_attempt_at <= ?1 AND ((status IN ('pending','retrying')) OR (status='processing' AND lease_until IS NOT NULL AND lease_until < ?1)) ORDER BY updated_at ASC LIMIT 1", [now], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e| e.to_string())?;
+    let Some((id,scope,source_type,source_id,attempts)) = row else { tx.commit().map_err(|e| e.to_string())?; return Ok(None); };
+    let next_attempts = attempts + 1; tx.execute("UPDATE memory_chunk_jobs SET status='processing',attempts=?1,lease_until=?2,updated_at=?2 WHERE id=?3", params![next_attempts, lease, &id]).map_err(|e| e.to_string())?; tx.commit().map_err(|e| e.to_string())?;
+    Ok(Some(MemoryChunkJobClaim { job_id:id, scope, source_type, source_id, attempts:next_attempts, lease_until:lease }))
+}
+
+#[tauri::command]
+pub fn memory_chunk_job_cancel(state: State<'_, MemoryState>, job_id: String) -> Result<bool, String> {
+    let mut guard = state.conn.lock().unwrap(); let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let changed = conn.execute("UPDATE memory_chunk_jobs SET cancel_requested=1,status='cancelled',updated_at=?1 WHERE id=?2 AND status NOT IN ('completed','cancelled')", params![now_ts(), job_id]).map_err(|e| e.to_string())?; Ok(changed > 0)
+}
+
+#[tauri::command]
+pub fn memory_chunk_job_finish(state: State<'_, MemoryState>, request: MemoryChunkJobFinishRequest) -> Result<bool, String> {
+    let mut guard = state.conn.lock().unwrap(); let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?; let now = now_ts();
+    let changed = if request.success { conn.execute("UPDATE memory_chunk_jobs SET status='completed',lease_until=NULL,next_attempt_at=0,updated_at=?1 WHERE id=?2 AND status='processing'", params![now, request.job_id]).map_err(|e| e.to_string())? } else { conn.execute("UPDATE memory_chunk_jobs SET status=CASE WHEN attempts >= 3 THEN 'failed' ELSE 'retrying' END,lease_until=NULL,next_attempt_at=CASE WHEN attempts >= 3 THEN 0 ELSE ?1 + attempts * 30 END,updated_at=?1 WHERE id=?2 AND status='processing'", params![now, request.job_id]).map_err(|e| e.to_string())? };
+    Ok(changed > 0)
+}
+
+#[tauri::command]
+pub fn memory_chunk_job_list(state: State<'_, MemoryState>, include_completed: Option<bool>) -> Result<Vec<MemoryChunkJobStatus>, String> {
+    let guard = state.conn.lock().unwrap(); let conn = guard.as_ref().ok_or_else(|| "记忆数据库不可用".to_string())?; let include = include_completed.unwrap_or(false);
+    let sql = if include { "SELECT id,source_type,status,attempts,lease_until,cancel_requested FROM memory_chunk_jobs ORDER BY updated_at DESC LIMIT 64" } else { "SELECT id,source_type,status,attempts,lease_until,cancel_requested FROM memory_chunk_jobs WHERE status NOT IN ('completed','cancelled') ORDER BY updated_at DESC LIMIT 64" };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?; let rows = stmt.query_map([], |r| Ok(MemoryChunkJobStatus { job_id:r.get(0)?, source_type:r.get(1)?, status:r.get(2)?, attempts:r.get(3)?, lease_until:r.get(4)?, cancel_requested:r.get::<_,i64>(5)? != 0 })).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn memory_chunk_job_retry(state: State<'_, MemoryState>, job_id: String) -> Result<bool, String> {
+    let mut guard = state.conn.lock().unwrap(); let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let changed = conn.execute("UPDATE memory_chunk_jobs SET status='retrying',lease_until=NULL,next_attempt_at=?1,updated_at=?1 WHERE id=?2 AND status='failed' AND cancel_requested=0 AND attempts < 3", params![now_ts(), job_id]).map_err(|e| e.to_string())?;
+    Ok(changed > 0)
+}
+
+#[tauri::command]
+pub fn memory_entity_alias_upsert(state: State<'_, MemoryState>, request: MemoryEntityAliasRequest) -> Result<usize, String> {
+    if request.scope.trim().is_empty() || request.canonical.trim().is_empty() { return Err("实体索引字段无效".into()); }
+    let mut guard = state.conn.lock().unwrap(); let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?; let mut count = 0;
+    for alias in request.aliases.iter().take(12) { let normalized: String = alias.trim().to_lowercase().chars().filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation()).take(80).collect(); if normalized.is_empty() { continue; } count += conn.execute("INSERT OR IGNORE INTO memory_entity_aliases(scope_key,canonical,alias,normalized_alias,created_at) VALUES(?1,?2,?3,?4,?5)", params![request.scope,request.canonical,alias,normalized,now_ts()]).map_err(|e| e.to_string())?; }
+    Ok(count)
+}
+
+#[tauri::command]
+pub fn memory_entity_walk(state: State<'_, MemoryState>, request: MemoryEntityWalkRequest) -> Result<Vec<MemoryEntityWalkItem>, String> {
+    if request.scope.trim().is_empty() || request.entity.trim().is_empty() { return Ok(vec![]); }
+    let max = request.max_items.unwrap_or(32).clamp(1, 64); let normalized = request.entity.trim().to_lowercase().chars().filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation()).take(80).collect::<String>();
+    let guard = state.conn.lock().unwrap(); let conn = guard.as_ref().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let mut stmt = conn.prepare("SELECT c.id,c.source_id,c.source_type,s.observed_at,c.text FROM memory_chunks c JOIN memory_source_cards s ON s.source_id=c.source_id AND s.source_type=c.source_type AND s.scope_key=c.scope_key WHERE c.scope_key=?1 AND (c.text LIKE '%'||?2||'%' OR EXISTS(SELECT 1 FROM memory_entity_aliases a WHERE a.scope_key=?1 AND a.normalized_alias=?2 AND c.text LIKE '%'||a.alias||'%')) AND (?3 IS NULL OR s.observed_at>=?3) AND (?4 IS NULL OR s.observed_at<=?4) ORDER BY s.observed_at DESC,c.chunk_index LIMIT ?5").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(params![request.scope, normalized, request.from, request.to, max as i64], |r| Ok(MemoryEntityWalkItem { chunk_id:r.get(0)?, source_id:r.get(1)?, source_type:r.get(2)?, observed_at:r.get(3)?, text:truncate_chars(&r.get::<_,String>(4)?, 320) })).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn memory_entity_alias_list(state: State<'_, MemoryState>, scope: String) -> Result<Vec<MemoryEntityAliasItem>, String> {
+    if scope.trim().is_empty() { return Ok(vec![]); }
+    let guard = state.conn.lock().unwrap(); let conn = guard.as_ref().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let mut stmt = conn.prepare("SELECT canonical,alias,normalized_alias FROM memory_entity_aliases WHERE scope_key=?1 ORDER BY canonical,normalized_alias LIMIT 256").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([scope], |r| Ok(MemoryEntityAliasItem { canonical:r.get(0)?, alias:r.get(1)?, normalized_alias:r.get(2)? })).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn memory_source_scope_clear(state: State<'_, MemoryState>, scope: String) -> Result<MemoryMutationResponse, String> {
+    if scope.trim().is_empty() { return Ok(MemoryMutationResponse { ok: true, affected: 0 }); }
+    let mut guard = state.conn.lock().unwrap(); let conn = guard.as_mut().ok_or_else(|| "记忆数据库不可用".to_string())?; let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut affected = 0usize;
+    for (table, column) in [("memory_chunk_jobs", "scope_key"), ("memory_chunks", "scope_key"), ("memory_source_cards", "scope_key"), ("memory_entity_aliases", "scope_key")] { affected += tx.execute(&format!("DELETE FROM {table} WHERE {column}=?1"), [&scope]).map_err(|e| e.to_string())?; }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(MemoryMutationResponse { ok: true, affected })
+}
+
+#[tauri::command]
+pub fn memory_source_summary(state: State<'_, MemoryState>, request: MemorySourceSummaryRequest) -> Result<Option<MemorySourceSummaryResponse>, String> {
+    if request.scope.trim().is_empty() || request.source_id.trim().is_empty() { return Ok(None); }
+    let limit = request.max_chars.unwrap_or(600).clamp(120, 600); let guard = state.conn.lock().unwrap(); let conn = guard.as_ref().ok_or_else(|| "记忆数据库不可用".to_string())?;
+    let mut stmt = conn.prepare("SELECT c.source_type,s.observed_at,c.text FROM memory_chunks c JOIN memory_source_cards s ON s.scope_key=c.scope_key AND s.source_type=c.source_type AND s.source_id=c.source_id WHERE c.scope_key=?1 AND c.source_id=?2 ORDER BY c.chunk_index LIMIT 64").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(params![request.scope, request.source_id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,String>(2)?))).map_err(|e| e.to_string())?;
+    let mut text = String::new(); let mut source_type = String::new(); let mut observed_at = 0; let mut truncated = false;
+    for row in rows { let (kind, time, chunk) = row.map_err(|e| e.to_string())?; source_type = kind; observed_at = time; let next = if text.is_empty() { chunk } else { format!("{}\n{}", text, chunk) }; if next.chars().count() > limit { truncated = true; break; } text = next; }
+    if text.is_empty() { return Ok(None); } Ok(Some(MemorySourceSummaryResponse { source_id: request.source_id, source_type, observed_at, text, truncated }))
+}
+
+
 fn recall_memory(
     conn: &mut Connection,
     request: &MemoryRecallRequest,
@@ -3630,6 +3873,7 @@ pub fn memory_list(
                         importance: r.get(5)?,
                         pinned: r.get::<_, i64>(6)? != 0,
                         occurred_at: r.get(7)?,
+                        due_at: None,
                         updated_at: r.get(8)?,
                         source_excerpt: r.get(9)?,
                     },
@@ -3666,6 +3910,7 @@ pub fn memory_list(
                         importance: r.get(5)?,
                         pinned: r.get::<_, i64>(6)? != 0,
                         occurred_at: r.get(7)?,
+                        due_at: None,
                         updated_at: r.get(8)?,
                         source_excerpt: r.get(9)?,
                     },
@@ -3703,7 +3948,8 @@ pub fn memory_list(
                         confidence: r.get(4)?,
                         importance: r.get(5)?,
                         pinned: r.get::<_, i64>(6)? != 0,
-                        occurred_at: r.get(7)?,
+                        occurred_at: None,
+                        due_at: r.get(7)?,
                         updated_at: r.get(8)?,
                         source_excerpt: r.get(9)?,
                     },
@@ -4597,6 +4843,9 @@ fn worker_loop(app: AppHandle) {
             let mut guard = state.conn.lock().unwrap();
             let available = guard.is_some();
             let result = guard.as_mut().map(take_due_job);
+            if let Some(conn) = guard.as_mut() {
+                let _ = process_one_chunk_job(conn);
+            }
             let database_generation = state.database_generation.load(Ordering::SeqCst);
             (available, result, database_generation)
         };
@@ -4685,6 +4934,16 @@ fn worker_loop(app: AppHandle) {
     if has_due {
         trigger_worker(&app);
     }
+}
+
+fn process_one_chunk_job(conn: &mut Connection) -> rusqlite::Result<bool> {
+    let now = now_ts();
+    let id: Option<String> = conn.query_row("SELECT id FROM memory_chunk_jobs WHERE status IN ('pending','retrying') AND cancel_requested=0 AND attempts<3 AND next_attempt_at<=?1 ORDER BY updated_at LIMIT 1", [now], |r| r.get(0)).optional()?;
+    let Some(id) = id else { return Ok(false); };
+    conn.execute("UPDATE memory_chunk_jobs SET status='processing',attempts=attempts+1,lease_until=?1,updated_at=?1 WHERE id=?2", params![now + 60, &id])?;
+    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_source_cards s JOIN memory_chunk_jobs j ON j.scope_key=s.scope_key AND j.source_type=s.source_type AND j.source_id=s.source_id WHERE j.id=?1)", [&id], |r| r.get(0))?;
+    if valid { conn.execute("UPDATE memory_chunk_jobs SET status='completed',lease_until=NULL,updated_at=?1 WHERE id=?2", params![now_ts(), &id])?; } else { conn.execute("UPDATE memory_chunk_jobs SET status=CASE WHEN attempts>=3 THEN 'failed' ELSE 'retrying' END,lease_until=NULL,next_attempt_at=?1,updated_at=?1 WHERE id=?2", params![now_ts()+30, &id])?; }
+    Ok(true)
 }
 
 fn wait_for_worker_wakeup(state: &MemoryState, observed_generation: u64, seconds: u64) {
@@ -5603,6 +5862,25 @@ mod tests {
     #[test]
     fn schema_and_chinese_fts_are_available() {
         let conn = test_db();
+        for table in ["memory_source_cards", "memory_chunks"] {
+            let present: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| row.get(0)).unwrap();
+            assert_eq!(present, 1, "missing {table}");
+        }
+        conn.execute("INSERT INTO memory_source_cards(source_id,source_type,scope_key,observed_at,created_at) VALUES('s','text_chat','card/user',1,1)", []).unwrap();
+        conn.execute("INSERT OR IGNORE INTO memory_source_cards(source_id,source_type,scope_key,observed_at,created_at) VALUES('s','text_chat','card/user',2,2)", []).unwrap();
+        conn.execute("INSERT INTO memory_chunks(id,source_id,source_type,scope_key,chunk_index,start_offset,end_offset,text,created_at) VALUES('c','s','text_chat','card/user',0,0,1,'x',1)", []).unwrap();
+        conn.execute("INSERT OR IGNORE INTO memory_chunks(id,source_id,source_type,scope_key,chunk_index,start_offset,end_offset,text,created_at) VALUES('c','s','text_chat','card/user',0,0,1,'y',2)", []).unwrap();
+        let source_count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_source_cards", [], |r| r.get(0)).unwrap();
+        let chunk_count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_chunks", [], |r| r.get(0)).unwrap();
+        assert_eq!((source_count, chunk_count), (1, 1));
+        conn.execute("INSERT INTO memory_source_cards(source_id,source_type,scope_key,observed_at,created_at) VALUES('s','text_chat','other/user',1,1)", []).unwrap();
+        let now = now_ts();
+        conn.execute("INSERT INTO memory_chunk_jobs(id,scope_key,source_type,source_id,status,lease_until,created_at,updated_at) VALUES('expired','card/user','text_chat','s','processing',?1,?2,?2)", params![now - 1, now]).unwrap();
+        conn.execute("INSERT INTO memory_chunk_jobs(id,scope_key,source_type,source_id,status,cancel_requested,created_at,updated_at) VALUES('cancelled-processing','card/user','text_chat','s2','processing',1,?1,?1)", [now]).unwrap();
+        maintenance(&conn).unwrap();
+        let status: String = conn.query_row("SELECT status FROM memory_chunk_jobs WHERE id='expired'", [], |r| r.get(0)).unwrap();
+        let cancelled: String = conn.query_row("SELECT status FROM memory_chunk_jobs WHERE id='cancelled-processing'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "retrying"); assert_eq!(cancelled, "cancelled");
         let user = get_or_create_user(&conn, "card", "小明").unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         insert_fact(
@@ -5968,7 +6246,7 @@ mod tests {
                 |r| r.get::<_, String>(0)
             )
             .unwrap(),
-            "5"
+            SCHEMA_VERSION.to_string()
         );
         assert_eq!(
             conn.query_row(
