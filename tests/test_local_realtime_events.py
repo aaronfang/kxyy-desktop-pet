@@ -373,8 +373,8 @@ class TextProviderAdapterTests(unittest.TestCase):
                     common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS,
                 )
                 self.assertEqual(
-                    common.llm_first_event_retry_count(),
-                    common.LOCAL_LLM_FIRST_EVENT_RETRIES,
+                    common.llm_first_event_grace_extension_count(),
+                    common.LOCAL_LLM_FIRST_EVENT_GRACE_EXTENSIONS,
                 )
 
                 settings_path.write_text('{"textProvider":"deepseek"}', encoding="utf-8")
@@ -382,7 +382,7 @@ class TextProviderAdapterTests(unittest.TestCase):
                     common.llm_first_event_timeout_seconds(),
                     common.LLM_FIRST_EVENT_TIMEOUT_SECONDS,
                 )
-                self.assertEqual(common.llm_first_event_retry_count(), 0)
+                self.assertEqual(common.llm_first_event_grace_extension_count(), 0)
             finally:
                 common.SETTINGS = original_settings
 
@@ -2832,11 +2832,11 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_llm_first_event_timeout_releases_response(self):
         original_timeout = common.LLM_FIRST_EVENT_TIMEOUT_SECONDS
         original_timeout_selector = common.llm_first_event_timeout_seconds
-        original_retry_selector = common.llm_first_event_retry_count
+        original_grace_selector = common.llm_first_event_grace_extension_count
         original_synth = common._synth_tts
         common.LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
         common.llm_first_event_timeout_seconds = lambda: common.LLM_FIRST_EVENT_TIMEOUT_SECONDS
-        common.llm_first_event_retry_count = lambda: 0
+        common.llm_first_event_grace_extension_count = lambda: 0
         common._synth_tts = lambda _text: b"\x00\x00"
         try:
             scope = self.session._new_scope("response")
@@ -2848,59 +2848,68 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         finally:
             common.LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_timeout
             common.llm_first_event_timeout_seconds = original_timeout_selector
-            common.llm_first_event_retry_count = original_retry_selector
+            common.llm_first_event_grace_extension_count = original_grace_selector
             common._synth_tts = original_synth
 
-    async def test_local_first_event_timeout_retries_once_and_recovers(self):
+    async def test_local_first_event_grace_recovers_without_duplicate_request(self):
         original_selector = common.llm_first_event_timeout_seconds
-        original_retry_selector = common.llm_first_event_retry_count
+        original_grace_selector = common.llm_first_event_grace_extension_count
         original_local = common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
         original_synth = common._synth_tts
         common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
         common.llm_first_event_timeout_seconds = (
             lambda: common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
         )
-        common.llm_first_event_retry_count = lambda: common.LOCAL_LLM_FIRST_EVENT_RETRIES
+        common.llm_first_event_grace_extension_count = (
+            lambda: common.LOCAL_LLM_FIRST_EVENT_GRACE_EXTENSIONS
+        )
         common._synth_tts = lambda _text: b"\x00\x00"
         attempts = []
 
-        def flaky_start(_role, _history, _text, _scope, out):
+        def delayed_start(_role, _history, _text, _scope, out):
             attempts.append(out)
-            # First attempt hangs without emitting; the retry answers normally.
-            if len(attempts) > 1:
-                out.put_nowait({"type": "delta", "text": "重试之后的回复，说得具体一点。"})
+
+            def emit_reply():
+                out.put_nowait({
+                    "type": "delta",
+                    "text": "等待之后的回复，说得具体一点。",
+                })
                 out.put_nowait({"type": "done"})
+
+            self.session.loop.call_later(
+                0.015,
+                emit_reply,
+            )
             return object()
 
-        common.start_llm_stream_producer = flaky_start
+        common.start_llm_stream_producer = delayed_start
         try:
             scope = self.session._new_scope("response")
             self.session.response_scope = scope
             await self.session._reply_pipeline("用户输入", scope)
 
-            self.assertEqual(len(attempts), 2)
-            # The retry must not reuse the abandoned queue, or the hung producer's
-            # late events could contaminate the recovered turn.
-            self.assertIsNot(attempts[0], attempts[1])
+            self.assertEqual(len(attempts), 1)
             kinds = [message["type"] for message in self.ws.json_messages()]
             self.assertIn("assistant", kinds)
             self.assertNotIn("error", kinds)
         finally:
             common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_local
             common.llm_first_event_timeout_seconds = original_selector
-            common.llm_first_event_retry_count = original_retry_selector
+            common.llm_first_event_grace_extension_count = original_grace_selector
             common._synth_tts = original_synth
 
-    async def test_local_first_event_retry_is_bounded_to_one_extra_attempt(self):
+    async def test_local_first_event_grace_is_bounded_without_duplicate_request(self):
         original_selector = common.llm_first_event_timeout_seconds
-        original_retry_selector = common.llm_first_event_retry_count
+        original_grace_selector = common.llm_first_event_grace_extension_count
         original_local = common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
         original_synth = common._synth_tts
         common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 0.01
         common.llm_first_event_timeout_seconds = (
             lambda: common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS
         )
-        common.llm_first_event_retry_count = lambda: common.LOCAL_LLM_FIRST_EVENT_RETRIES
+        common.llm_first_event_grace_extension_count = (
+            lambda: common.LOCAL_LLM_FIRST_EVENT_GRACE_EXTENSIONS
+        )
         common._synth_tts = lambda _text: b"\x00\x00"
         attempts = []
 
@@ -2914,14 +2923,94 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             self.session.response_scope = scope
             await self.session._reply_pipeline("用户输入", scope)
 
-            self.assertEqual(len(attempts), 1 + common.LOCAL_LLM_FIRST_EVENT_RETRIES)
+            self.assertEqual(len(attempts), 1)
             self.assertEqual(self.ws.json_messages()[-1]["type"], "error")
             self.assertIn("首个响应超时", self.ws.json_messages()[-1]["message"])
         finally:
             common.LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = original_local
             common.llm_first_event_timeout_seconds = original_selector
-            common.llm_first_event_retry_count = original_retry_selector
+            common.llm_first_event_grace_extension_count = original_grace_selector
             common._synth_tts = original_synth
+
+    async def test_local_first_event_timeout_keeps_capacity_for_the_next_call(self):
+        original_iter = common.iter_llm_stream
+        original_slots = common._llm_stream_slots
+        original_timeout_selector = common.llm_first_event_timeout_seconds
+        original_grace_selector = common.llm_first_event_grace_extension_count
+        original_synth = common._synth_tts
+        release = threading.Event()
+        existing_threads = set(threading.enumerate())
+
+        def blocking_iter(*_args, **_kwargs):
+            release.wait(timeout=1)
+            return
+            yield  # pragma: no cover - keeps this a generator
+
+        common.iter_llm_stream = blocking_iter
+        common.start_llm_stream_producer = self.original_start_llm_stream
+        common._llm_stream_slots = threading.BoundedSemaphore(
+            common.LLM_STREAM_MAX_PRODUCERS
+        )
+        common.llm_first_event_timeout_seconds = lambda: 0.01
+        common.llm_first_event_grace_extension_count = lambda: 1
+        common._synth_tts = lambda _text: b"\x00\x00"
+        next_scope = None
+        try:
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            await self.session._reply_pipeline("用户输入", scope)
+
+            next_scope = self.session._new_scope("response")
+            next_events = queue.Queue(maxsize=common.LLM_STREAM_QUEUE_MAX)
+            next_producer = common.start_llm_stream_producer(
+                "role", [], "下一通电话", next_scope, next_events
+            )
+            self.assertIsNotNone(
+                next_producer,
+                "a timed-out call must not consume both global LLM producer slots",
+            )
+        finally:
+            if next_scope is not None:
+                next_scope.cancel("test_cleanup")
+            release.set()
+            for thread in set(threading.enumerate()) - existing_threads:
+                if thread.name.startswith("llm-stream-"):
+                    thread.join(timeout=1)
+            common.iter_llm_stream = original_iter
+            common._llm_stream_slots = original_slots
+            common.llm_first_event_timeout_seconds = original_timeout_selector
+            common.llm_first_event_grace_extension_count = original_grace_selector
+            common._synth_tts = original_synth
+
+    async def test_reply_omits_generic_empathy_opening_across_stream_deltas(self):
+        synthesized = []
+
+        def synthesize(text):
+            synthesized.append(text)
+            return b"\x01\x00" * 40
+
+        common._synth_tts = synthesize
+        self.stream_events = [
+            {"type": "delta", "text": "嗯，我也"},
+            {"type": "delta", "text": "懂那种感觉，"},
+            {"type": "delta", "text": "一个人待着确实自在，也不用勉强自己。"},
+            {"type": "done"},
+        ]
+        scope = self.session._new_scope("response")
+        self.session.response_scope = scope
+
+        await self.session._reply_pipeline("我就喜欢一个人待着", scope)
+
+        assistant_text = "".join(
+            message.get("text", "")
+            for message in self.ws.json_messages()
+            if message.get("type") == "assistant"
+        )
+        self.assertEqual(
+            assistant_text,
+            "一个人待着确实自在，也不用勉强自己。",
+        )
+        self.assertEqual(synthesized, [assistant_text])
 
     async def test_response_finish_recover_cancels_only_when_all_audio_receipts_arrived(self):
         await self.session.on_start({
@@ -2965,12 +3054,14 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
             ("哦", "acknowledge"), ("好的", "acknowledge"),
             ("明白了", "acknowledge"), ("原来如此", "acknowledge"),
             ("听你的听你的", "agree"), ("那没毛病", "agree"), ("行啊行", "agree"),
+            ("系啊系啊", "agree"), ("那可太好了", "agree"),
             ("哈哈哈", "amused"), ("嘿嘿", "amused"), ("笑死我了", "amused"),
             ("太逗了", "amused"), ("真好笑", "amused"),
             ("是吗", "curious"), ("真的啊", "curious"), ("然后呢？", "curious"),
             ("后来呢", "curious"), ("怎么说", "curious"), ("为什么呀", "curious"),
             ("对啊", "agree"), ("是的", "agree"), ("没错", "agree"),
             ("确实", "agree"), ("我也觉得", "agree"), ("有道理", "agree"),
+            ("行啊行啊，我倒是挺喜欢牛腩配溏心蛋的", "substantive"),
             ("我今天完成了一个新项目", "substantive"), ("", "silence"),
         ]
         for text, expected in cases:
@@ -3393,6 +3484,9 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         rendered = common.format_turn_strategy_hint(strategy, semantic_handoff=True)
         self.assertIn("不要依赖固定关键词", rendered)
         self.assertIn("连续贡献至少两个", rendered)
+        self.assertIn("3~6 个自然口语句", rendered)
+        self.assertIn("至少 3 句", rendered)
+        self.assertIn("最后才", rendered)
         self.assertIn("不要反问用户想聊什么", rendered)
         self.assertNotIn(common.SEMANTIC_HANDOFF_HINT, common.format_turn_strategy_hint(strategy))
 

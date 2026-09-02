@@ -554,11 +554,10 @@ LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
 LOCAL_LLM_FIRST_EVENT_TIMEOUT_SECONDS = 15.0
 LOCAL_LLM_POLL_INTERVAL_SECONDS = 0.002
 LLM_POLL_INTERVAL_SECONDS = 0.01
-# A local first-event timeout usually means the model was evicted and is loading,
-# or the previous generation still occupies it. One silent retry recovers the turn
-# instead of surfacing an error the user has to answer again; only the local
-# cascade retries, because a cloud timeout is far more likely to be a real fault.
-LOCAL_LLM_FIRST_EVENT_RETRIES = 1
+# A local first-event timeout usually means the model was evicted and is loading.
+# Extend the same bounded request once instead of starting a duplicate request that
+# can occupy both global producer slots after the call is cancelled.
+LOCAL_LLM_FIRST_EVENT_GRACE_EXTENSIONS = 1
 PLAYBACK_NON_SPEECH_ASR_EVENTS = frozenset(
     {"bgm", "applause", "sneeze", "breath", "cough"}
 )
@@ -1036,7 +1035,7 @@ def classify_realtime_conversation_turn(text: str) -> str:
         return "amused"
     if re.fullmatch(r"(?:是吗|真的(?:啊|吗)?|然后呢|后来呢|还有呢|怎么说|为什么(?:呀|啊)?)", compact):
         return "curious"
-    if re.fullmatch(r"(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理|听你的(?:听你的)*|那?没毛病|行(?:啊|呀|吧)?行?)", compact):
+    if re.fullmatch(r"(?:对+|对啊|是的|没错|确实|可不是|我也觉得|有道理|听你的(?:听你的)*|那?没毛病|行(?:啊|呀|吧)?行?|系(?:啊|呀)?系(?:啊|呀)?|那?可太好(?:了|啦))", compact):
         return "agree"
     return "substantive"
 
@@ -1151,8 +1150,9 @@ def format_topic_revisit_hint(value) -> str:
 SEMANTIC_HANDOFF_HINT = (
     "同时只在本轮内部按语义判断：用户是否正把选题或推进谈话的责任交给你，例如表达自己没思路、"
     "愿意主要倾听、请你自行选方向或让你负责继续展开；不要依赖固定关键词，也不要输出判断或分类标签。"
-    "如果是，即使措辞没有命中固定示例，也由你直接接管：自己选一个具体方向，连续贡献至少两个相关的"
-    "信息点、观察或推进步骤，再留一个低负担回应入口；不要反问用户想聊什么、喜欢什么或让用户替你选题。"
+    "如果是，即使措辞没有命中固定示例，也由你直接接管：自己选一个具体方向，用 3~6 个自然口语句"
+    "持续展开，连续贡献至少两个相关的信息点、观察或推进步骤；其中至少 3 句先讲有实际内容的陈述，"
+    "最后才留一个低负担回应入口。不要反问用户想聊什么、喜欢什么或让用户替你选题。"
     "普通具体问答、明确建议或观点请求、用户正在补充新事实或追问，以及健康、安全、强情绪和严肃话题"
     "都不算交棒，继续准确回应当前内容。"
 )
@@ -1469,6 +1469,70 @@ class StableSentenceBuffer:
             if self._buffer[index] in self.WEAK:
                 return index + 1
         return None
+
+
+_GENERIC_EMPATHY_OPENING_RE = re.compile(
+    r"^(?:[嗯啊哦]+[，,、\s]*)?"
+    r"(?:我(?:也)?懂(?:这|那)种感觉|我(?:也)?(?:懂|明白))"
+    r"(?=[，,。！？!?、\s]|你|这|那)"
+    r"[，,。！？!?、\s]*"
+)
+_GENERIC_EMPATHY_OPENING_PREFIXES = (
+    "我懂",
+    "我也懂",
+    "我明白",
+    "我也明白",
+    "我懂这种感觉",
+    "我也懂这种感觉",
+    "我懂那种感觉",
+    "我也懂那种感觉",
+)
+_GENERIC_EMPATHY_OPENING_MAX_CHARS = 32
+
+
+class RealtimeReplyOpeningFilter:
+    """Drop one generic empathy opener without delaying unrelated SSE deltas."""
+
+    def __init__(self):
+        self._buffer = ""
+        self._decided = False
+
+    def feed(self, delta: str) -> list[str]:
+        if not delta:
+            return []
+        if self._decided:
+            return [str(delta)]
+        self._buffer += str(delta)
+        match = _GENERIC_EMPATHY_OPENING_RE.match(self._buffer)
+        if match:
+            self._decided = True
+            remaining = self._buffer[match.end():]
+            self._buffer = ""
+            return [remaining] if remaining else []
+        if self._could_still_match() and len(self._buffer) < _GENERIC_EMPATHY_OPENING_MAX_CHARS:
+            return []
+        return self._release_buffer()
+
+    def flush(self) -> list[str]:
+        if self._decided or not self._buffer:
+            return []
+        match = _GENERIC_EMPATHY_OPENING_RE.match(self._buffer)
+        if match:
+            self._buffer = self._buffer[match.end():]
+        return self._release_buffer()
+
+    def _could_still_match(self) -> bool:
+        remainder = re.sub(r"^(?:[嗯啊哦]+[，,、\s]*)?", "", self._buffer)
+        return not remainder or any(
+            prefix.startswith(remainder) or remainder.startswith(prefix)
+            for prefix in _GENERIC_EMPATHY_OPENING_PREFIXES
+        )
+
+    def _release_buffer(self) -> list[str]:
+        self._decided = True
+        buffered = self._buffer
+        self._buffer = ""
+        return [buffered] if buffered else []
 
 
 class AudibleHistory:
@@ -1860,9 +1924,13 @@ def llm_first_event_timeout_seconds() -> float:
     )
 
 
-def llm_first_event_retry_count() -> int:
-    """Retry only local first-output timeouts; cloud failures stay fail-fast."""
-    return LOCAL_LLM_FIRST_EVENT_RETRIES if local_text_provider_selected() else 0
+def llm_first_event_grace_extension_count() -> int:
+    """Extend only local first-output waits; cloud failures stay fail-fast."""
+    return (
+        LOCAL_LLM_FIRST_EVENT_GRACE_EXTENSIONS
+        if local_text_provider_selected()
+        else 0
+    )
 
 
 def llm_poll_interval_seconds() -> float:
@@ -4977,6 +5045,7 @@ class Session:
             soft_chars=REALTIME_TTS_SOFT_CHARS,
             hard_chars=REALTIME_TTS_HARD_CHARS,
         )
+        opening_filter = RealtimeReplyOpeningFilter()
         tts_pipeline: BoundedOrderedTtsPipeline | None = None
         try:
             assert _synth_tts is not None
@@ -5406,6 +5475,25 @@ class Session:
                 assert tts_pipeline is not None
                 await tts_pipeline.submit(sentence)
 
+            async def accept_reply_delta(delta: str) -> bool:
+                nonlocal llm_output_started, reply_chars
+                if not delta:
+                    return True
+                llm_output_started = True
+                if reply_chars + len(delta) > LLM_REPLY_MAX_CHARS:
+                    raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
+                reply_parts.append(delta)
+                reply_chars += len(delta)
+                if not await self.send_json(
+                    {"type": "assistant", "text": delta},
+                    scope=scope,
+                ):
+                    return False
+                self._response_generated = True
+                for sentence in sentences.feed(delta):
+                    await enqueue_sentence(sentence)
+                return True
+
             tts_pipeline = BoundedOrderedTtsPipeline(
                 synthesize_sentence,
                 play_sentence,
@@ -5427,30 +5515,18 @@ class Session:
             first_event_timeout = llm_first_event_timeout_seconds()
             poll_interval = llm_poll_interval_seconds()
             first_event_deadline = time.perf_counter() + first_event_timeout
-            local_first_event_retries = llm_first_event_retry_count()
-            is_local_first_event = local_first_event_retries > 0
+            local_first_event_grace_extensions = (
+                llm_first_event_grace_extension_count()
+            )
+            is_local_first_event = local_first_event_grace_extensions > 0
             while scope.active and not stream_done:
                 try:
                     event = events.get_nowait()
                 except queue.Empty:
                     if time.perf_counter() >= first_event_deadline:
-                        # Nothing has been emitted yet at this point, so restarting is
-                        # free of duplicate text or audio. A fresh queue keeps the
-                        # abandoned producer's late events from mixing into the retry.
-                        if local_first_event_retries > 0:
-                            local_first_event_retries -= 1
-                            log("本地文字模型首个响应超时，自动重试一次")
-                            events = queue.Queue(maxsize=LLM_STREAM_QUEUE_MAX)
-                            if start_llm_stream_producer(
-                                self.system_role,
-                                history_snapshot,
-                                request_text,
-                                scope,
-                                events,
-                            ) is None:
-                                raise SafeRealtimeError(
-                                    "本地文字模型首个响应超时，模型可能仍在加载，请稍后重试"
-                                )
+                        if local_first_event_grace_extensions > 0:
+                            local_first_event_grace_extensions -= 1
+                            log("本地文字模型首个响应仍在等待，延长冷启动窗口一次")
                             first_event_deadline = (
                                 time.perf_counter() + first_event_timeout
                             )
@@ -5478,27 +5554,19 @@ class Session:
                         if isinstance(value, int):
                             llm_usage[key] = value
                 elif event_type == "delta":
-                    delta = str(event.get("text") or "")
-                    if not delta:
-                        continue
-                    llm_output_started = True
-                    if reply_chars + len(delta) > LLM_REPLY_MAX_CHARS:
-                        raise SafeRealtimeError("文字模型回复过长，已停止本轮生成")
-                    reply_parts.append(delta)
-                    reply_chars += len(delta)
-                    if not await self.send_json(
-                        {"type": "assistant", "text": delta},
-                        scope=scope,
+                    for delta in opening_filter.feed(
+                        str(event.get("text") or "")
                     ):
-                        return
-                    self._response_generated = True
-                    for sentence in sentences.feed(delta):
-                        await enqueue_sentence(sentence)
+                        if not await accept_reply_delta(delta):
+                            return
                 elif event_type == "error":
                     raise SafeRealtimeError(
                         str(event.get("message") or "文字模型请求失败")
                     )
                 elif event_type == "done":
+                    for delta in opening_filter.flush():
+                        if not await accept_reply_delta(delta):
+                            return
                     stream_done = True
 
             if not scope.active:

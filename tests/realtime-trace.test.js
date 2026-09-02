@@ -2202,12 +2202,14 @@ test("realtime proactive policy classifies explicit controls without model infer
     ["哦", "acknowledge"], ["好的", "acknowledge"],
     ["明白了", "acknowledge"], ["原来如此", "acknowledge"],
     ["听你的听你的", "agree"], ["那没毛病", "agree"], ["行啊行", "agree"],
+    ["系啊系啊", "agree"], ["那可太好了", "agree"],
     ["哈哈哈", "amused"], ["嘿嘿", "amused"], ["笑死我了", "amused"],
     ["太逗了", "amused"], ["真好笑", "amused"],
     ["是吗", "curious"], ["真的啊", "curious"], ["然后呢？", "curious"],
     ["后来呢", "curious"], ["怎么说", "curious"], ["为什么呀", "curious"],
     ["对啊", "agree"], ["是的", "agree"], ["没错", "agree"],
     ["确实", "agree"], ["我也觉得", "agree"], ["有道理", "agree"],
+    ["行啊行啊，我倒是挺喜欢牛腩配溏心蛋的", "substantive"],
     ["我今天完成了一个新项目", "substantive"], ["", "silence"],
   ];
   for (const [text, expected] of cases) {
