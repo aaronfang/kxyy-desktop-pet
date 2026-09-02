@@ -153,9 +153,33 @@ fn canonicalize_url(value: &str) -> Option<String> {
         })
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
+
+    // Migrate links written by older builds to 汽水音乐's current share route.
+    let mut legacy_soda_track_id = None;
+    if url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("music.douyin.com"))
+        && url
+            .path_segments()
+            .map(|segments| segments.collect::<Vec<_>>())
+            .as_deref()
+            .is_some_and(|segments| segments.len() == 2 && segments[0] == "song")
+    {
+        let segments = url
+            .path_segments()
+            .map(|segments| segments.collect::<Vec<_>>())?;
+        let track_id = segments[1].to_string();
+        if !track_id.is_empty() && track_id.chars().all(|character| character.is_ascii_digit()) {
+            url.set_path("/qishui/share/track");
+            legacy_soda_track_id = Some(track_id);
+        }
+    }
     url.set_query(None);
     if !pairs.is_empty() {
         url.query_pairs_mut().extend_pairs(pairs);
+    }
+    if let Some(track_id) = legacy_soda_track_id {
+        url.query_pairs_mut().append_pair("track_id", &track_id);
     }
     let result = url.to_string();
     (result.chars().count() <= 512).then_some(result)
@@ -2815,6 +2839,12 @@ impl FreshTopicSource for DoubanMovieSource {
 pub struct NeteaseNewSongsSource;
 pub struct SodaMusicSource;
 
+fn soda_music_track_url(track_id: &str) -> String {
+    // The upstream hot-content API returns numeric IDs; keep the URL fixed to
+    // the share route used by the current 汽水音乐 web client.
+    format!("https://music.douyin.com/qishui/share/track?track_id={track_id}")
+}
+
 impl FreshTopicSource for SodaMusicSource {
     fn id(&self) -> &'static str {
         "soda-music-hot"
@@ -2890,7 +2920,7 @@ impl FreshTopicSource for SodaMusicSource {
             if let Some(topic) = normalized_topic(FreshTopic {
                 source_id: format!("soda-song:{id}"),
                 source_name: self.name().into(),
-                canonical_url: format!("https://music.douyin.com/song/{id}"),
+                canonical_url: soda_music_track_url(id),
                 title: title.into(),
                 published_at: None,
                 fetched_at: fetched_at.into(),
@@ -4505,6 +4535,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn soda_music_track_url_uses_the_share_route() {
+        assert_eq!(
+            soda_music_track_url("7512402632118503441"),
+            "https://music.douyin.com/qishui/share/track?track_id=7512402632118503441"
+        );
+    }
+
+    #[test]
+    fn canonicalize_url_migrates_legacy_soda_music_song_links() {
+        assert_eq!(
+            canonicalize_url("https://music.douyin.com/song/7512402632118503441"),
+            Some("https://music.douyin.com/qishui/share/track?track_id=7512402632118503441".into())
+        );
+    }
 
     fn cache_path() -> PathBuf {
         let nonce = SystemTime::now()
