@@ -48,6 +48,27 @@ body {
   font-size: 12px;
 }
 #chat-toolbar[hidden] { display: none; }
+#familiarity-panel {
+  align-self: flex-end;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  max-width: 230px;
+  padding: 4px 9px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px;
+  color: rgba(244,242,251,.72);
+  background: rgba(18,14,28,.48);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+#familiarity-panel:hover { background: rgba(38,34,56,.72); color: var(--text); }
+.familiarity-track { width: 56px; height: 4px; overflow: hidden; border-radius: 3px; background: rgba(255,255,255,.16); }
+.familiarity-track i { display: block; width: 0%; height: 100%; border-radius: inherit; background: var(--accent); transition: width .35s ease; }
+#familiarity-change { color: #f5c86b; white-space: nowrap; }
+#familiarity-panel[hidden] { display: none; }
 #chat-collapse,
 #call-capsule button {
   display: inline-flex;
@@ -196,6 +217,7 @@ body {
 
 /* 头像 */
 .avatar {
+  position: relative;
   flex: 0 0 auto;
   width: 45px;
   height: 45px;
@@ -204,6 +226,57 @@ body {
   background: rgba(255, 255, 255, 0.12);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
+.row.assistant .avatar::before,
+.row.assistant .avatar::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  pointer-events: none;
+  opacity: 0;
+  border-radius: 50%;
+}
+#chat.mood-bright .row.assistant .avatar::before {
+  opacity: .8;
+  inset: 0;
+  z-index: 2;
+  box-shadow: inset 0 0 9px 3px rgba(255, 220, 116, .72), 0 0 9px 3px rgba(255, 187, 78, .55);
+  animation: mood-glow 1.8s ease-in-out infinite;
+}
+#chat.mood-low .row.assistant .avatar::after {
+  opacity: .75;
+  inset: 0;
+  z-index: 2;
+  border-radius: 0;
+  background: repeating-linear-gradient(108deg, transparent 0 7px, rgba(148, 190, 255, .55) 8px 9px, transparent 10px 15px);
+  animation: mood-rain 1.15s linear infinite;
+}
+#chat.mood-tense .row.assistant .avatar::before {
+  opacity: .55;
+  box-shadow: 0 0 0 2px rgba(244, 112, 112, .55);
+  animation: mood-pulse .75s ease-in-out infinite;
+}
+.avatar.mood-bright {
+  box-shadow: 0 0 9px 3px rgba(255, 220, 116, .7), 0 0 18px 6px rgba(255, 187, 78, .3);
+  animation: mood-glow 1.8s ease-in-out infinite;
+}
+.avatar.mood-neutral {
+  box-shadow: 0 0 0 1px rgba(195, 177, 255, .28), 0 0 8px 1px rgba(183, 156, 255, .16);
+  animation: mood-neutral-breathe 3.2s ease-in-out infinite;
+}
+.avatar.mood-low::after {
+  opacity: .75;
+  inset: 0;
+  z-index: 2;
+  background: repeating-linear-gradient(108deg, transparent 0 7px, rgba(148, 190, 255, .55) 8px 9px, transparent 10px 15px);
+  animation: mood-rain 1.15s linear infinite;
+}
+.avatar.mood-tense { animation: mood-pulse .75s ease-in-out infinite; box-shadow: 0 0 0 2px rgba(244, 112, 112, .55); }
+@keyframes mood-glow { 50% { opacity: .45; transform: scale(1.08); } }
+@keyframes mood-neutral-breathe {
+  50% { box-shadow: 0 0 0 1px rgba(195, 177, 255, .42), 0 0 12px 2px rgba(183, 156, 255, .24); }
+}
+@keyframes mood-rain { to { transform: translateY(7px); } }
+@keyframes mood-pulse { 50% { transform: scale(.94); opacity: .25; } }
 .avatar img {
   width: 100%;
   height: 100%;
