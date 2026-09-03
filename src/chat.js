@@ -42,6 +42,7 @@ import {
   detectDeepIntent,
   detectShortTermConversationMood,
   buildRelationshipMoodHint,
+  inferFamiliaritySignals,
   computeLiveContext,
   computeTemporalContextData,
   parseBilingualReply,
@@ -59,8 +60,9 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks } from "./ai/tts.js";
+import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks, detectEmotion } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
+import { formatChatTranscript } from "./ai/chat-transcript.js";
 import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
 import { fetchWebObservations, hasDirectWebSearchIntent, needsCurrentWebInformation, renderWebObservationBlock, renderWebObservationUnavailableBlock } from "./ai/web-observations.js";
@@ -439,6 +441,11 @@ const callBtn = document.getElementById("call-btn");
 const chatEl = document.getElementById("chat");
 const chatToolbarEl = document.getElementById("chat-toolbar");
 const chatCollapseBtn = document.getElementById("chat-collapse");
+const familiarityPanel = document.getElementById("familiarity-panel");
+const familiarityLabel = document.getElementById("familiarity-label");
+const familiarityProgress = document.getElementById("familiarity-progress");
+const familiarityScoreEl = document.getElementById("familiarity-score");
+const familiarityChangeEl = document.getElementById("familiarity-change");
 const callCapsuleEl = document.getElementById("call-capsule");
 const callCapsuleWaveEl = document.getElementById("call-capsule-wave");
 const callCapsuleActionsEl = document.getElementById("call-capsule-actions");
@@ -449,6 +456,87 @@ const callCapsuleHangupBtn = document.getElementById("call-capsule-hangup");
 let callCapsuleEdge = null;
 let callCapsuleCollapseTimer = 0;
 let callCapsuleHovered = false;
+
+// v4 resets the provisional v3 meter so configured long-term relationships
+// receive their correct starting stage instead of inheriting "熟悉中".
+const FAMILIARITY_STORAGE_PREFIX = "kxyy_familiarity_v4_";
+const FAMILIARITY_DELTAS = Object.freeze({
+  user_shared_personal_detail: 1,
+  user_recalled_shared_topic: 2,
+  user_initiated_tease: 1,
+  user_confirmed_nickname: 2,
+  user_requested_formality: -2,
+  user_engaged_turn: 1,
+});
+const FAMILIARITY_LABELS = Object.freeze([
+  [20, "初识"], [45, "熟悉中"], [70, "熟人"], [90, "亲近"], [101, "默契"],
+]);
+let familiarityState = { score: 0, lastReason: "" };
+
+function familiarityBaseline() {
+  const profileName = String(activeProfile?.nickname || assets?.userProfile?.nickname || "").trim();
+  const configuredRelationship = String(
+    settings?.personaRelationship || assets?.userProfile?.relationship_with_yuan || "",
+  ).trim();
+  const knownLongTermFan = isKxyyPersona(settings.personaCardId)
+    && (
+      String(settings.userName || "").trim() === "ππ"
+      || profileName === "ππ"
+      || /老粉|熟人|朋友|长期|常来/.test(configuredRelationship)
+    );
+  return knownLongTermFan ? 70 : (isKxyyPersona(settings.personaCardId) ? 20 : 0);
+}
+
+function familiarityStorageKey() {
+  const card = String(settings?.personaCardId || "default").replace(/[^\w-]/g, "_");
+  const name = String(settings?.userName || "default").replace(/[^\w\u4e00-\u9fff-]/g, "_");
+  return `${FAMILIARITY_STORAGE_PREFIX}${card}_${name}`;
+}
+
+function familiarityLabelFor(score) {
+  return FAMILIARITY_LABELS.find(([minimum]) => score < minimum)?.[1] || "默契";
+}
+
+function renderFamiliarity(change = "") {
+  const score = Math.max(0, Math.min(100, Number(familiarityState.score) || 0));
+  const label = familiarityLabelFor(score);
+  if (familiarityLabel) familiarityLabel.textContent = `熟悉度 · ${label}`;
+  if (familiarityProgress) familiarityProgress.style.width = `${score}%`;
+  if (familiarityScoreEl) familiarityScoreEl.textContent = String(score);
+  if (familiarityChangeEl) familiarityChangeEl.textContent = change;
+}
+
+function loadFamiliarity() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(familiarityStorageKey()) || "null");
+    familiarityState = {
+      score: Number.isFinite(raw?.score) ? Math.max(0, Math.min(100, Math.round(raw.score))) : familiarityBaseline(),
+      lastReason: String(raw?.lastReason || ""),
+    };
+  } catch {
+    familiarityState = { score: familiarityBaseline(), lastReason: "" };
+  }
+  renderFamiliarity();
+}
+
+function prepareFamiliarity(text) {
+  const signals = inferFamiliaritySignals([{ role: "user", content: text }]);
+  const signal = signals.find((item) => FAMILIARITY_DELTAS[item] && item !== "user_engaged_turn")
+    || (Array.from(String(text || "").trim()).length >= 2 ? "user_engaged_turn" : null);
+  if (!signal) return null;
+  return { signal, delta: FAMILIARITY_DELTAS[signal] };
+}
+
+function commitFamiliarity(candidate) {
+  if (!candidate) return;
+  const { delta } = candidate;
+  familiarityState.score = Math.max(0, Math.min(100, familiarityState.score + delta));
+  const reason = delta > 0 ? "默契 +" + delta : "先收敛一下";
+  familiarityState.lastReason = reason;
+  try { localStorage.setItem(familiarityStorageKey(), JSON.stringify(familiarityState)); } catch {}
+  renderFamiliarity(reason);
+  window.setTimeout(() => renderFamiliarity(), 2600);
+}
 const stickerPanel = document.getElementById("sticker-panel");
 const stickerGrid = document.getElementById("sticker-grid");
 const stickerPreviewEl = document.getElementById("sticker-preview");
@@ -458,6 +546,40 @@ const stickerRemoveBtn = document.getElementById("sticker-remove");
 /** 通知 main 窗口驱动桌宠（失败静默，聊天不受影响）。 */
 function petSignal(type, emotion) {
   emit("pet-chat", { type, emotion: emotion || "" }).catch(() => {});
+}
+
+const MOOD_VISUAL_FOR_EMOTION = Object.freeze({
+  excited: "bright", gentle: "bright", shy: "bright",
+  sad: "low", angry: "tense", neutral: "neutral",
+  开心: "bright", 高兴: "bright", 兴奋: "bright", 害羞: "bright", 温柔: "bright",
+  难过: "low", 伤心: "low", 委屈: "low", 哭: "low",
+  生气: "tense", 愤怒: "tense", 紧张: "tense",
+});
+
+function setMoodVisual(mood = "neutral") {
+  const allowed = new Set(["neutral", "bright", "low", "tense", "sleepy"]);
+  const next = allowed.has(mood) ? mood : "neutral";
+  chatEl?.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
+  chatEl?.classList.add(`mood-${next}`);
+  chatEl?.setAttribute("data-mood", next);
+  messagesEl?.querySelectorAll(".row.assistant .avatar").forEach((avatar) => {
+    avatar.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
+    avatar.classList.add(`mood-${next}`);
+  });
+}
+
+function moodVisualForEmotion(emotion = "") {
+  return MOOD_VISUAL_FOR_EMOTION[emotion] || "neutral";
+}
+
+function updateMoodFromReply(rawText, explicitEmotion = "") {
+  const emotion = explicitEmotion || detectEmotion(rawText);
+  const visual = moodVisualForEmotion(emotion);
+  // 助手没有明确情绪时，保留用户刚表达的心情，避免低落/开心状态
+  // 在同一轮回复完成后立刻被中性回复覆盖到看不见。
+  if (visual !== "neutral" || !chatEl?.dataset.mood || chatEl.dataset.mood === "neutral") {
+    setMoodVisual(visual);
+  }
 }
 
 function genMsgId() {
@@ -562,6 +684,10 @@ function userAvatarSrc() {
 function createAvatar(role) {
   const av = document.createElement("div");
   av.className = "avatar";
+  if (role !== "user") {
+    const mood = chatEl?.dataset.mood;
+    if (mood) av.classList.add(`mood-${mood}`);
+  }
   if (role !== "user") av.title = "双击拍一拍";
   const img = document.createElement("img");
   img.src = role === "user" ? userAvatarSrc() : aiAvatarSrc();
@@ -1356,6 +1482,7 @@ async function loadConfig() {
   } catch (_) {}
   applyAppearance();
   refreshIdentity();
+  loadFamiliarity();
   if (settings.textProvider !== "local" && chatDebugEnabled()) void fetchDeepSeekBalance();
   // 启动服务状态探测
   scheduleStartupStatusCheck();
@@ -1613,6 +1740,7 @@ async function buildRequestMessages(opts = {}) {
   const relationshipMoodPrompt = buildRelationshipMoodHint(
     profile,
     detectShortTermConversationMood(lastRealUserMessage()?.content || ""),
+    history,
   );
   let memoryPrompt = "";
   let recalledMemoryItems = [];
@@ -2041,6 +2169,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     });
 
     petSignal("reply", emotion);
+    updateMoodFromReply(raw, emotion);
 
     const replySticker = emotion ? pickSticker(emotion) : null;
     // 会朗读时：切句后走「文字随语音逐句同步出现」流水线（首句复用流式气泡）。
@@ -2137,9 +2266,16 @@ async function send(text, opts = {}) {
       ...(image ? { images: [image.dataUrl] } : {}),
       ...(sticker ? { sticker } : {}),
     });
+    const userMood = detectShortTermConversationMood(text);
+    if (userMood === "low") setMoodVisual("low");
+    else if (userMood === "tense") setMoodVisual("tense");
+    else if (userMood === "bright") setMoodVisual("bright");
+    const familiarityCandidate = prepareFamiliarity(text);
     if (text && !currentTurnDoNotRemember) void inferAndPersistTopicPreferences(text);
 
     const mainResult = await streamAssistantReply(streamBubble, streamRow, { replyId });
+    // 只有整轮回复成功后才结算关系变化；请求失败、取消或空回复不改变长期分数。
+    commitFamiliarity(familiarityCandidate);
 
     const reply = history[history.length - 1]?.content || "";
     if (shouldDoFollowup(text, reply, DEFAULT_FOLLOWUP_CHANCE)) {
@@ -2307,6 +2443,20 @@ async function copyRealtimeDiagnostic() {
     if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "已复制";
   } catch {
     if (realtimeDiagnosticStatusEl) realtimeDiagnosticStatusEl.textContent = "复制失败";
+  }
+}
+
+async function copyChatHistory() {
+  const text = formatChatTranscript(history, {
+    userName: userDisplayName() || "用户",
+    assistantName: aiName(),
+  });
+  if (!text) return;
+  try {
+    await writeClipboardText(text);
+    appendPatNotice("聊天记录已复制");
+  } catch {
+    appendPatNotice("聊天记录复制失败");
   }
 }
 
@@ -3229,6 +3379,7 @@ function resetConversation() {
   resetTtsQueue();
   busy = false;
   petSignal("abort");
+  setMoodVisual("neutral");
 }
 
 function setupContextMenu() {
@@ -3241,6 +3392,7 @@ function setupContextMenu() {
       if (el) {
         const mid = el.dataset.mid;
         showContextMenu(e.clientX, e.clientY, [
+          { label: "复制聊天记录", action: () => void copyChatHistory() },
           {
             label: "删除",
             danger: true,
@@ -3251,6 +3403,7 @@ function setupContextMenu() {
         ]);
       } else {
         showContextMenu(e.clientX, e.clientY, [
+          { label: "复制聊天记录", action: () => void copyChatHistory() },
           {
             label: "清空聊天记录",
             danger: true,
@@ -3348,6 +3501,7 @@ listen("apply-settings", async ({ payload }) => {
     await enqueueMemory();
   }
   settings = { ...settings, ...payload };
+  if (personaChanged || payload.userName !== undefined) loadFamiliarity();
   const nextCardId = (settings.personaCardId || "").trim();
   const nextBackend = (settings.realtimeBackend || "").trim().toLowerCase();
   console.log("[chat] settings.showChatDebug =", settings.showChatDebug, "debugWasOn =", debugWasOn);
@@ -3436,6 +3590,7 @@ listen("flush-memory-before-quit", async () => {
 });
 
 loadConfig().then(() => {
+  setMoodVisual("neutral");
   inputEl.focus();
   resetFreshIdleTimer();
 });

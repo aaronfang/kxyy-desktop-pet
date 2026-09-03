@@ -12,6 +12,12 @@
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
       </button>
     </div>
+    <button id="familiarity-panel" type="button" title="查看关系进展" aria-label="查看关系进展">
+      <span id="familiarity-label">熟悉度 · 初识</span>
+      <span class="familiarity-track"><i id="familiarity-progress"></i></span>
+      <span id="familiarity-score">0</span>
+      <span id="familiarity-change" aria-live="polite"></span>
+    </button>
     <div id="messages" aria-live="polite"></div>
     <div id="attach-preview" hidden>
       <img id="attach-thumb" alt="待发送图片" />

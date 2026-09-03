@@ -6,6 +6,13 @@ import {
   buildMotifCooldownHint,
   buildRelationshipMoodHint,
   buildMessages,
+  buildSystemPrompt,
+  buildCompactSystemPrompt,
+  buildOnlineAbstractSystemPrompt,
+  FAMILIARITY_STAGE,
+  applyFamiliaritySignal,
+  familiarityStageFor,
+  inferFamiliaritySignals,
   computeLiveContext,
   computeTemporalContextData,
   filterFewShotForConversationMode,
@@ -28,6 +35,72 @@ const YUANYUAN_CARD = JSON.parse(fs.readFileSync(
   new URL("../persona-cards/kxyy-yuanyuan/persona-card.json", import.meta.url),
   "utf8",
 ));
+
+test("yuan yuan conversation prompts progressively add colloquial familiarity and bounded teasing", () => {
+  const assets = {
+    systemPrompt: "persona",
+    activeCardId: "kxyy-yuanyuan",
+    displayName: "开心元元",
+    identity: { name: "开心元元", personality_tags: ["自然"] },
+  };
+  for (const prompt of [
+    buildSystemPrompt(assets, { name: "ππ", useUserProfile: false }),
+    buildCompactSystemPrompt(assets, { name: "ππ" }),
+    buildOnlineAbstractSystemPrompt(assets, { name: "ππ" }),
+  ]) {
+    assert.match(prompt, /熟悉感是渐进的/);
+    assert.match(prompt, /不要一味附和/);
+    assert.match(prompt, /调侃要针对当下内容/);
+  }
+
+  const generic = buildCompactSystemPrompt({
+    systemPrompt: "persona",
+    activeCardId: "generic-card",
+    displayName: "普通角色",
+    identity: { name: "普通角色", personality_tags: ["克制"] },
+  }, { name: "用户" });
+  assert.doesNotMatch(generic, /熟悉感是渐进的/);
+});
+
+test("familiarity advances from explicit engagement evidence, not hidden turn count", () => {
+  assert.equal(familiarityStageFor([]), FAMILIARITY_STAGE.NEW);
+  assert.equal(familiarityStageFor(["user_shared_personal_detail"]), FAMILIARITY_STAGE.WARMING);
+  assert.equal(familiarityStageFor([
+    "user_shared_personal_detail",
+    "user_recalled_shared_topic",
+    "user_accepted_tease",
+  ]), FAMILIARITY_STAGE.FAMILIAR);
+  assert.equal(familiarityStageFor(Array(20).fill("ordinary_turn")), FAMILIARITY_STAGE.NEW);
+});
+
+test("explicit boundary feedback immediately reduces familiarity and blocks teasing", () => {
+  let state = applyFamiliaritySignal({}, "user_shared_personal_detail");
+  state = applyFamiliaritySignal(state, "user_accepted_tease");
+  assert.equal(state.stage, FAMILIARITY_STAGE.WARMING);
+  state = applyFamiliaritySignal(state, "user_rejected_nickname");
+  assert.equal(state.stage, FAMILIARITY_STAGE.NEW);
+  assert.equal(state.teasing, "off");
+  assert.equal(state.evidence, 0);
+});
+
+test("familiarity inference uses explicit conversational signals and ignores ordinary turns", () => {
+  const signals = inferFamiliaritySignals([
+    { role: "user", content: "嗯" },
+    { role: "user", content: "你还记得我上次说的那个项目吗" },
+    { role: "user", content: "你又逗我，真会啊" },
+    { role: "user", content: "别这么叫，认真点" },
+  ]);
+  assert.deepEqual(signals, [
+    "user_recalled_shared_topic",
+    "user_initiated_tease",
+    "user_requested_formality",
+  ]);
+  const hint = buildRelationshipMoodHint(null, "neutral", [
+    { role: "user", content: "我最近在做一个自己的项目，挺忙的" },
+    { role: "user", content: "你还记得吗" },
+  ]);
+  assert.match(hint, /当前会话熟悉度表现层/);
+});
 
 test("daily context carries exact local time and timezone without inferred livestream state", () => {
   const context = computeLiveContext(
@@ -242,6 +315,35 @@ test("deep intent accepts long concrete personal expression and rejects non-conv
     ["【图片内容】一个人站在窗边，画面里有很多文字，详细说说你怎么看。", false],
   ];
   for (const [text, expected] of cases) assert.equal(detectDeepIntent(text), expected, text);
+});
+
+test("conversation prompts preserve persona agency and support a longer listening mode", () => {
+  const ordinary = buildMessages({
+    systemPrompt: "persona",
+    fewShot: [],
+    history: [{ role: "user", content: "我最近有点迷茫" }],
+    maxTurns: 4,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+  });
+  const ordinaryPrompt = ordinary.filter((m) => m.role === "system").map((m) => m.content).join("\n");
+  assert.match(ordinaryPrompt, /不要把“我懂”/);
+  assert.match(ordinaryPrompt, /温和反驳/);
+
+  const deep = buildMessages({
+    systemPrompt: "persona",
+    fewShot: [],
+    history: [{ role: "user", content: "你能再多说一点吗？我有的时候也不知道想说什么" }],
+    maxTurns: 4,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+    deep: true,
+  });
+  const deepPrompt = deep.filter((m) => m.role === "system").map((m) => m.content).join("\n");
+  assert.match(deepPrompt, /连续讲 3~6 段/);
+  assert.match(deepPrompt, /不必每段都问问题/);
 });
 
 test("relationship and short-term mood only modulate allowlisted presentation", () => {
