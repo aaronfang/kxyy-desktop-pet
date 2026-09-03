@@ -23,6 +23,8 @@ import {
   safeRecommendationUrl,
 } from "../src/ai/recommendation-links.js";
 
+const FRESH_FIXTURE_TIME = new Date(Date.now() - 60_000).toISOString();
+
 test("Bilibili video recommendation is treated as a fresh discovery request", () => {
   const query = "哎，你给我推荐几条B站上的热门视频呗，有没有什么好玩的视频？";
   assert.deepEqual(inferFreshTopicCategories(query), ["daily-life"]);
@@ -37,8 +39,8 @@ test("Bilibili requests keep only Bilibili source items", async () => {
     invokeImpl: async () => ({
       status: "ok",
       items: [
-        { sourceName: "百度热榜", sourceId: "baidu:1", title: "不相关", shortText: "不相关", canonicalUrl: "https://example.com/a", fetchedAt: "2026-08-24T01:00:00Z", category: "daily-life" },
-        { sourceName: "哔哩哔哩热门", sourceId: "bilibili:1", title: "真实视频", shortText: "真实视频", canonicalUrl: "https://www.bilibili.com/video/BV1abc", fetchedAt: "2026-08-24T01:00:00Z", category: "daily-life" },
+        { sourceName: "百度热榜", sourceId: "baidu:1", title: "不相关", shortText: "不相关", canonicalUrl: "https://example.com/a", fetchedAt: FRESH_FIXTURE_TIME, category: "daily-life" },
+        { sourceName: "哔哩哔哩热门", sourceId: "bilibili:1", title: "真实视频", shortText: "真实视频", canonicalUrl: "https://www.bilibili.com/video/BV1abc", fetchedAt: FRESH_FIXTURE_TIME, category: "daily-life" },
       ],
     }),
   });
@@ -53,7 +55,7 @@ test("generic video requests are not silently restricted to Bilibili", async () 
     invokeImpl: async () => ({
       status: "ok",
       items: [
-        { sourceName: "其它视频来源", sourceId: "video:1", title: "真实视频", shortText: "真实视频", canonicalUrl: "https://example.com/video/1", fetchedAt: "2026-08-24T01:00:00Z", category: "daily-life" },
+        { sourceName: "其它视频来源", sourceId: "video:1", title: "真实视频", shortText: "真实视频", canonicalUrl: "https://example.com/video/1", fetchedAt: FRESH_FIXTURE_TIME, category: "daily-life" },
       ],
     }),
   });
