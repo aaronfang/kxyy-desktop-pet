@@ -1,4 +1,5 @@
 import { buildCurrentEvidenceWindow } from "./shared-experience-evidence-window.js";
+import { sharedExperienceEvidenceEmphasis } from "./shared-experience-content-mode.js";
 
 const DEFAULT_MAX_EVENTS = 24;
 const DEFAULT_MAX_AUDIO_EVENTS = 24;
@@ -341,6 +342,7 @@ export function createSharedExperienceWorkspace({
         return `[${ageMs <= 24000 ? "当前" : "历史"}；距本轮${ageMs}ms]`;
       };
       const mediaEvidenceCount = snapshot.evidenceJournal.filter((event) => event.kind === "visual" || event.kind === "audio").length;
+      const evidenceEmphasis = sharedExperienceEvidenceEmphasis({ contentMode: snapshot.contentMode, audioEvents: snapshot.audioEvents, visualEvents: snapshot.visualEvents });
       const elapsedMs = Math.max(0, nowMs() - initialSegmentStartedAtMs);
       const maturity = elapsedMs >= 12 * 60_000 && mediaEvidenceCount >= 40 && snapshot.evidenceBlocks.length
         ? "story"
@@ -354,6 +356,7 @@ export function createSharedExperienceWorkspace({
         "最新证据里的明确行动优先于旧状态：已经出发不能因为前面有人受伤就推断尚未出发。不补证据未出现的具体物品、行动步骤或原因。人物的观点不是客观真相；有人不相信外界有人，不代表外界确实无人。问题若带有未证实前提，先自然纠正，不顺着编。",
         "标为历史的场景、手持物品和人物姿态，只说明以前出现过，不自动延续到现在。问当前看到什么时先看当前条目；当前缺少细节就说明具体哪点没看清，不用旧火堆、旧物品填空。回顾或讨论前因后果时仍可以使用历史。",
         "当前表示最近 24 秒内的观察，不保证状态一直未变；更新的明确变化优先，较新画面省略某个物品不等于它已消失。",
+        `当前证据重点：${evidenceEmphasis === "visual-led" ? "画面事件更密集，优先依据连续画面中的出现、消失、位置和动作变化；稀疏声音只作补充。" : evidenceEmphasis === "audio-led" ? "声音信息更密集，优先依据连续 ASR；画面用于补充场景和动作。" : evidenceEmphasis === "audio-supported" ? "声音是主要线索，画面用于确认场景、人物外观和动作变化。" : "声音和画面都要结合，优先采用时间上较新的明确变化。"}`,
         "这是边看边聊的口播回复：最多 5 句。有足够上下文时通常说 2–4 句：第一句用独立短句直接回答问题，接着从已有内容里补一个具体观察，并给出自然的感受、判断或对接下来发展的轻度猜测。只有证据确实只够回答一个简单事实时才用一句结束。补充必须推进交流，不能换词复述答案，也不能为凑长度编造动作、动机或前情。像朋友一起看那样直接聊内容，不要复述问题、逐项报告证据或展开背景百科。",
         "不要用‘这句是……’、‘具体是什么还没揭晓’、‘还得再等等看’、‘等后面揭晓’、‘声音说……画面显示……’这类解说审计或脚本话术。资料不足时用自然的判断表达，例如‘目前更像是……，后面怎么走还不好说’，不要每轮固定声明未知。只有用户追问依据或出现会改变判断的重要冲突时，才说明声音、画面等来源。",
         maturity === "shallow"

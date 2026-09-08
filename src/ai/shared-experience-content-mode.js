@@ -11,3 +11,13 @@ export function classifySharedExperienceContentMode(title = "") {
   if (!normalized) return "unknown";
   return NARRATED_TITLE.test(normalized) ? "narrated" : "direct";
 }
+
+export function sharedExperienceEvidenceEmphasis({ contentMode = "unknown", audioEvents = [], visualEvents = [] } = {}) {
+  if (contentMode === "narrated") return "audio-led";
+  const audio = Array.isArray(audioEvents) ? audioEvents.filter((event) => String(event?.text || "").trim()).length : 0;
+  const visual = Array.isArray(visualEvents) ? visualEvents.filter((event) => String(event?.summary || event?.text || "").trim()).length : 0;
+  if (audio === 0 && visual > 0) return "visual-led";
+  if (visual >= audio * 2) return "visual-led";
+  if (audio >= visual * 2) return "audio-supported";
+  return "balanced";
+}
