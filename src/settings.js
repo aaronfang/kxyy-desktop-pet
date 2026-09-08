@@ -43,6 +43,7 @@ const FIELDS = [
   "localVlModel",
   "vlProvider",
   "temperature",
+  "sharedExperienceBudgetUsd",
   "personaCardId",
   "userName",
   "patText",
@@ -578,6 +579,9 @@ function fill(s) {
   if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
   if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
+  el("sharedExperienceBudgetUsd").value = Number.isFinite(Number(s.sharedExperienceBudgetUsd))
+    ? Math.max(0, Math.min(100, Number(s.sharedExperienceBudgetUsd)))
+    : 1;
   el("userName").value = s.userName || "";
   el("patText").value = s.patText || "";
   el("personaRelationship").value = s.personaRelationship || "";
@@ -977,6 +981,10 @@ function collect() {
     memoryWorkspace: el("memoryWorkspace")?.checked === true,
     memoryWorkspaceMode: el("memoryWorkspaceMode")?.value || "conservative",
     temperature: Number(el("temperature").value) || 0.8,
+    sharedExperienceBudgetUsd: Math.max(
+      0,
+      Math.min(100, Number(el("sharedExperienceBudgetUsd").value) || 0),
+    ),
     personaCardId: el("personaCardId").value.trim(),
     userName: el("userName").value.trim(),
     patText: el("patText").value.trim(),

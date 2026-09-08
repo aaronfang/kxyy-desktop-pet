@@ -70,6 +70,7 @@ dist/
 /scripts/voxcpm-ab/reports/
 /scripts/voxcpm-ab/__pycache__/
 # 临时调试输出（根目录）
+/scripts/mage-vl/__pycache__/
 /check-err.txt
 /dev-output.txt
 /out.txt

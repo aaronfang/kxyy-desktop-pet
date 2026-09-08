@@ -83,6 +83,36 @@ body {
   color: var(--text);
   cursor: pointer;
 }
+#shared-experience-btn { border: 0; background: transparent; color: rgba(244,242,251,.75); cursor: pointer; font-size: 16px; padding: 0 4px; }
+#shared-experience-btn:hover { color: var(--text); }
+#shared-experience-btn:disabled { opacity: .45; cursor: wait; }
+#shared-experience-stop-btn { border: 0; background: transparent; color: #ffaaa8; cursor: pointer; font-size: 13px; padding: 0 4px; }
+#shared-experience-stop-btn:hover { color: #ffd0ce; }
+#shared-experience-pause-btn { border: 0; background: transparent; color: #f5c86b; cursor: pointer; font-size: 13px; padding: 0 4px; }
+#shared-experience-pause-btn:hover { color: #ffe1a0; }
+#shared-experience-debug-btn { border: 0; background: transparent; color: rgba(244,242,251,.62); cursor: pointer; font-size: 16px; padding: 0 4px; }
+#shared-experience-debug-btn:hover { color: var(--text); }
+#shared-experience-status { flex: 0 0 auto; margin: 3px 8px 0; color: rgba(255,255,255,.58); font-size: 11px; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#shared-experience-status.error { color: #ffaaa8; }
+#chat > #shared-experience-picker { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: rgba(8, 7, 16, .58); }
+#chat > #shared-experience-picker[hidden] { display: none; }
+#shared-experience-picker-panel { width: min(360px, calc(100vw - 32px)); max-height: min(460px, calc(100vh - 32px)); overflow: auto; padding: 14px; border: 1px solid rgba(255,255,255,.16); border-radius: 10px; background: rgba(34, 29, 49, .98); box-shadow: 0 16px 48px rgba(0,0,0,.42); }
+#shared-experience-picker-title { margin-bottom: 10px; color: var(--text); font-size: 14px; font-weight: 600; }
+.shared-experience-window { display: block; width: 100%; margin: 5px 0; padding: 9px 10px; border: 1px solid rgba(255,255,255,.1); border-radius: 6px; background: rgba(255,255,255,.06); color: var(--text); text-align: left; cursor: pointer; }
+.shared-experience-window:hover { background: rgba(255,255,255,.14); }
+.shared-experience-window-owner { display: block; color: rgba(255,255,255,.55); font-size: 11px; }
+.shared-experience-window-title { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+#shared-experience-picker-cancel { margin-top: 8px; border: 0; background: transparent; color: rgba(255,255,255,.62); cursor: pointer; }
+#chat > #shared-experience-debug { position: fixed; inset: 0; z-index: 19; pointer-events: none; }
+#chat > #shared-experience-debug[hidden] { display: none; }
+#shared-experience-debug-panel { position: absolute; right: 8px; top: 8px; width: min(340px, calc(100vw - 16px)); max-height: calc(100vh - 110px); overflow: hidden; padding: 8px; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(20,17,31,.94); box-shadow: 0 8px 24px rgba(0,0,0,.32); color: var(--text); pointer-events: auto; }
+#shared-experience-debug-head { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; }
+#shared-experience-debug-close { border: 0; background: transparent; color: rgba(255,255,255,.7); font-size: 20px; cursor: pointer; }
+#shared-experience-debug-meta { margin-top: 5px; color: rgba(255,255,255,.55); font-size: 11px; }
+#shared-experience-debug-output { max-height: min(320px, calc(100vh - 180px)); overflow: auto; margin-top: 5px; color: rgba(255,255,255,.84); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; user-select: text; }
+@media (min-width: 680px) {
+  #chat.debug-open #messages { padding-right: 354px; }
+}
 #chat-collapse:hover,
 #call-capsule button:hover {
   background: rgba(90, 76, 132, 0.88);

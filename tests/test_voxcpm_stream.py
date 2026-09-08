@@ -111,6 +111,17 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server.sys, "platform", "darwin"):
             self.assertEqual(server._kwargs("hello")["inference_timesteps"], 10)
 
+    def test_companion_http_stream_uses_six_steps_without_changing_realtime(self):
+        server = _load_server()
+        server._reference = lambda: (Path("/fake/ref.wav"), "reference")
+
+        with patch.object(server.sys, "platform", "darwin"):
+            self.assertEqual(
+                server._kwargs("hello", latency_mode="companion")["inference_timesteps"],
+                6,
+            )
+            self.assertEqual(server._kwargs("hello")["inference_timesteps"], 10)
+
     def test_prompt_cache_is_reused_until_the_reference_changes(self):
         server = _load_server()
         built = []
@@ -218,7 +229,7 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
 
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-voxcpm")
         server._model = FakeModel()
-        server._kwargs = lambda _text: {}
+        server._kwargs = lambda _text, _latency_mode="default": {}
         server._to_pcm24 = lambda chunk, **_kwargs: chunk
         server._gate = threading.BoundedSemaphore(1)
         server._pool = pool

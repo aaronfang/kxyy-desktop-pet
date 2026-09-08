@@ -7,7 +7,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/conversation-director.test.js tests/conversation-replay.test.js tests/chat-transcript.test.js tests/topic-preferences.test.js tests/topic-preferences-ui.test.js tests/settings-update-policy.test.js tests/chat-turn-error.test.js tests/deepseek-multimodal.test.js tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/fresh-association.test.js tests/fresh-exposure.test.js tests/fresh-idle.test.js tests/persona-context.test.js tests/persona-realtime.test.js tests/siriwave-modern.test.js",
+    "pretest": "node --test tests/tts-pcm-stream.test.js tests/shared-experience-grounding.test.js tests/shared-experience-evidence-window.test.js tests/shared-experience-report.test.js",
+    "test": "node --test tests/conversation-director.test.js tests/conversation-replay.test.js tests/chat-transcript.test.js tests/shared-experience.test.js tests/shared-experience-workspace.test.js tests/shared-experience-spool.test.js tests/shared-experience-inference.test.js tests/shared-experience-lifecycle.test.js tests/shared-experience-policy.test.js tests/shared-experience-client.test.js tests/shared-experience-acceptance.test.js tests/shared-experience-content-mode.test.js tests/shared-experience-question-planner.test.js tests/shared-experience-primer.test.js tests/shared-experience-character-tracker.test.js tests/shared-experience-dialogue-style.test.js tests/shared-experience-tts-receipt.test.js tests/shared-experience-voice-tracker.test.js tests/shared-experience-process-isolation.test.js tests/shared-experience-visual-identity.test.js tests/shared-experience-ui.test.js tests/topic-preferences.test.js tests/topic-preferences-ui.test.js tests/settings-update-policy.test.js tests/chat-turn-error.test.js tests/deepseek-multimodal.test.js tests/realtime-trace.test.js tests/realtime-audio-worklets.test.js tests/memory-ui.test.js tests/realtime-memory.test.js tests/workspace.test.js tests/observation.test.js tests/fresh-association.test.js tests/fresh-exposure.test.js tests/fresh-idle.test.js tests/persona-context.test.js tests/persona-realtime.test.js tests/siriwave-modern.test.js",
     "test:conversation": "node --test tests/conversation-replay.test.js",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:resources": "node scripts/verify-vad-resources.mjs",
@@ -21,6 +22,10 @@
     "sync-assets": "node scripts/sync-assets.mjs",
     "sync-ai": "node scripts/sync-ai.mjs",
     "encrypt-assets": "node scripts/build-persona-enc.mjs",
+    "mage-vl": "python3 scripts/mage-vl/server.py",
+    "mage-vl:window": "python3 scripts/mage-vl/watch_window.py",
+    "mage-vl:continuous": "python3 scripts/mage-vl/watch_window.py --continuous --rounds 5 --interval 3",
+    "mage-vl:monitor": "python3 scripts/mage-vl/monitor_window.py --interval 3",
     "distill": "cd scripts/persona-distill && python pipeline.py",
     "validate-card": "node scripts/run-python-tool.mjs scripts/persona-distill/tools/validate_card.py",
     "update-persona": "npm run validate-card -- persona-cards/kxyy-yuanyuan/persona-card.json && npm run encrypt-assets"

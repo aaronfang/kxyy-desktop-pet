@@ -5,6 +5,7 @@ mod memory;
 mod memory_core;
 mod persona_assets;
 mod realtime;
+mod shared_experience;
 
 mod voice_service;
 
@@ -160,7 +161,8 @@ struct Settings {
     #[serde(default)]
     tts_voice: String,
 
-    // ---- 实时语音通话（火山端到端实时语音大模型 / RealtimeDialog）----
+    // ---- 实时语音通话（默认：DeepSeek + 本地 SenseVoice + VoxCPM2）----
+    // 火山字段仅保留旧配置/兼容 adapter，不是共同体验或默认实时通话依赖。
     /// 实时语音 App ID（火山「语音技术」应用 ID；与 TTS 的 x-api-key 不同）。
     #[serde(default)]
     realtime_app_id: String,
@@ -254,6 +256,9 @@ struct Settings {
     /// 采样温度。
     #[serde(default = "default_temperature")]
     temperature: f64,
+    /// 单次共同体验的 DeepSeek 估算费用预算（USD）。
+    #[serde(default = "default_shared_experience_budget_usd")]
+    shared_experience_budget_usd: f64,
     /// 观众昵称（元元如何称呼你），空则默认「元宝」。
     #[serde(default)]
     user_name: String,
@@ -326,12 +331,26 @@ fn default_temperature() -> f64 {
     0.8
 }
 
+fn default_shared_experience_budget_usd() -> f64 {
+    1.0
+}
+
+fn normalize_shared_experience_budget_usd(value: f64) -> f64 {
+    if !value.is_finite() || value < 0.0 {
+        default_shared_experience_budget_usd()
+    } else {
+        value.min(100.0)
+    }
+}
+
 fn default_workspace_mode() -> String {
     "conservative".into()
 }
 
 fn default_realtime_backend() -> String {
-    "volc".into()
+    // 共同体验与本地实时通话默认走 DeepSeek + 本地 SenseVoice/VoxCPM2。
+    // Volcano 保留为显式兼容选项，不应成为新安装的隐式依赖。
+    "voxcpm".into()
 }
 
 fn default_asr_provider() -> String {
@@ -470,6 +489,7 @@ impl Settings {
             memory_workspace: false,
             memory_workspace_mode: default_workspace_mode(),
             temperature: default_temperature(),
+            shared_experience_budget_usd: default_shared_experience_budget_usd(),
             user_name: String::new(),
             pat_text: String::new(),
             persona_relationship: String::new(),
@@ -566,6 +586,22 @@ fn capsule_resized_x(x: f64, old_width: f64, new_width: f64, edge: CapsuleEdge) 
         CapsuleEdge::Left => x,
         CapsuleEdge::Right => x + old_width - new_width,
     }
+}
+
+fn bottom_centered_window_position(
+    work_x: f64,
+    work_y: f64,
+    work_width: f64,
+    work_height: f64,
+    window_width: f64,
+    window_height: f64,
+    bottom_offset: f64,
+) -> (f64, f64) {
+    let max_x_offset = (work_width - window_width).max(0.0);
+    let max_y_offset = (work_height - window_height).max(0.0);
+    let x = work_x + max_x_offset / 2.0;
+    let y_offset = (work_height - window_height - bottom_offset).clamp(0.0, max_y_offset);
+    (x, work_y + y_offset)
 }
 
 /// 持有托盘图标引用，防止 setup 结束后被 drop 移除。
@@ -743,6 +779,8 @@ fn load_settings(app: &AppHandle) -> Settings {
                 s.realtime_voice.clear();
                 s.reasoning_mode = normalize_reasoning_mode(&s.reasoning_mode, s.thinking).into();
                 s.thinking = s.reasoning_mode == "always";
+                s.shared_experience_budget_usd =
+                    normalize_shared_experience_budget_usd(s.shared_experience_budget_usd);
                 return s;
             }
         }
@@ -1315,6 +1353,10 @@ fn set_chat_compact_window(app: &AppHandle, compact: bool) {
         .chat_compact
         .store(compact, Ordering::Release);
     if let Some(win) = app.get_webview_window("chat") {
+        // The pet stage is click-through, but the chat WebView must always remain
+        // interactive when it is shown. Reassert this after every mode transition
+        // because transparent macOS windows can retain the previous event policy.
+        let _ = win.set_ignore_cursor_events(false);
         if compact {
             position_chat_capsule(app);
         } else {
@@ -1334,6 +1376,7 @@ fn set_chat_compact_window(app: &AppHandle, compact: bool) {
 /// 切换聊天窗口显隐（全局快捷键与托盘共用）。
 fn toggle_chat(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("chat") {
+        let _ = win.set_ignore_cursor_events(false);
         if win.is_visible().unwrap_or(false) {
             if app.state::<AppState>().chat_compact.load(Ordering::Acquire) {
                 set_chat_compact_window(app, false);
@@ -1908,6 +1951,8 @@ struct AiSettingsInput {
     #[serde(default = "default_workspace_mode")]
     memory_workspace_mode: String,
     temperature: f64,
+    #[serde(default = "default_shared_experience_budget_usd")]
+    shared_experience_budget_usd: f64,
     user_name: String,
     #[serde(default)]
     pat_text: String,
@@ -2147,6 +2192,8 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             _ => "conservative".into(),
         };
         s.temperature = settings.temperature;
+        s.shared_experience_budget_usd =
+            normalize_shared_experience_budget_usd(settings.shared_experience_budget_usd);
         s.user_name = settings.user_name.trim().to_string();
         s.pat_text = settings.pat_text.trim().to_string();
         s.persona_relationship = settings.persona_relationship.trim().to_string();
@@ -2353,6 +2400,7 @@ pub fn run() {
                 });
             let realtime_port = realtime::start(handle.clone(), realtime_provider).unwrap_or(0);
             app.manage(voice_service::VoiceServiceManager::new());
+            app.manage(shared_experience::SharedExperienceManager::new());
             let memory_state = memory::MemoryState::open(&handle);
             app.manage(memory_state);
             let fresh_topics_path = handle
@@ -2386,6 +2434,9 @@ pub fn run() {
                 let _ = ctrlc::set_handler(move || {
                     eprintln!("[lib] 收到终止信号，清理本地语音子进程后退出…");
                     voice_service::stop(&sig_handle);
+                    sig_handle
+                        .state::<shared_experience::SharedExperienceManager>()
+                        .stop();
                     std::process::exit(0);
                 });
             }
@@ -2500,6 +2551,131 @@ pub fn run() {
                 });
             }
 
+            // Development-only acceptance hook. Normal tray launches keep the chat
+            // window hidden; setting this environment variable makes the WebView
+            // visible for automated local end-to-end checks without changing release UX.
+            if cfg!(debug_assertions)
+                && std::env::var("KXYY_SHOW_CHAT_ON_START").ok().as_deref() == Some("1")
+            {
+                let debug_handle = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let ui_handle = debug_handle.clone();
+                    let _ = debug_handle.run_on_main_thread(move || {
+                        match ui_handle.get_webview_window("chat") {
+                            Some(chat_win) => {
+                                eprintln!("[debug] chat window found; showing acceptance window");
+                                const DEBUG_WIDTH: f64 = 820.0;
+                                const DEBUG_HEIGHT: f64 = 620.0;
+                                let (monitor_id, bottom_offset) = ui_handle
+                                    .state::<AppState>()
+                                    .settings
+                                    .lock()
+                                    .ok()
+                                    .map(|value| {
+                                        (
+                                            value.monitor_id.clone(),
+                                            value.chat_bottom_offset as f64,
+                                        )
+                                    })
+                                    .unwrap_or((None, 24.0));
+                                if let Some(monitor) = resolve_monitor(&chat_win, &monitor_id) {
+                                    #[cfg(windows)]
+                                    {
+                                        let wa = monitor.work_area();
+                                        let scale = chat_win
+                                            .scale_factor()
+                                            .unwrap_or_else(|_| monitor.scale_factor())
+                                            .max(0.1);
+                                        let width = DEBUG_WIDTH * scale;
+                                        let height = DEBUG_HEIGHT * scale;
+                                        let (x, y) = bottom_centered_window_position(
+                                            wa.position.x as f64,
+                                            wa.position.y as f64,
+                                            wa.size.width as f64,
+                                            wa.size.height as f64,
+                                            width,
+                                            height,
+                                            bottom_offset * scale,
+                                        );
+                                        let _ = chat_win.set_size(tauri::PhysicalSize::new(
+                                            width.round() as u32,
+                                            height.round() as u32,
+                                        ));
+                                        let _ = chat_win.set_position(tauri::PhysicalPosition::new(
+                                            x.round() as i32,
+                                            y.round() as i32,
+                                        ));
+                                    }
+                                    #[cfg(not(windows))]
+                                    {
+                                        let (work_x, work_y, work_width, work_height) =
+                                            work_area_logical(&monitor);
+                                        let (x, y) = bottom_centered_window_position(
+                                            work_x,
+                                            work_y,
+                                            work_width,
+                                            work_height,
+                                            DEBUG_WIDTH,
+                                            DEBUG_HEIGHT,
+                                            bottom_offset,
+                                        );
+                                        let _ = chat_win.set_size(tauri::LogicalSize::new(
+                                            DEBUG_WIDTH,
+                                            DEBUG_HEIGHT,
+                                        ));
+                                        let _ = chat_win.set_position(tauri::LogicalPosition::new(x, y));
+                                    }
+                                } else {
+                                    let _ = chat_win.set_size(tauri::LogicalSize::new(
+                                        DEBUG_WIDTH,
+                                        DEBUG_HEIGHT,
+                                    ));
+                                }
+                                let _ = chat_win.set_ignore_cursor_events(false);
+                                eprintln!("[debug] show={:?} focus={:?}", chat_win.show(), chat_win.set_focus());
+                                if let Ok(raw_id) = std::env::var("KXYY_START_SHARED_EXPERIENCE_WINDOW_ID") {
+                                    if let Ok(window_id) = raw_id.trim().parse::<u32>() {
+                                        let _ = ui_handle.emit(
+                                            "debug-start-shared-experience",
+                                            serde_json::json!({
+                                                "windowId": window_id,
+                                                "prompt": std::env::var("KXYY_SHARED_EXPERIENCE_TEST_PROMPT").ok().unwrap_or_default(),
+                                                "showDebug": std::env::var("KXYY_SHARED_EXPERIENCE_TEST_DEBUG").ok().as_deref() == Some("1"),
+                                                "segmentDurationMs": std::env::var("KXYY_SHARED_EXPERIENCE_SEGMENT_MS")
+                                                    .ok()
+                                                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                                                    .map(|value| value.clamp(1_000, 1_800_000)),
+                                                "userViewingStatement": std::env::var("KXYY_SHARED_EXPERIENCE_USER_STATEMENT").ok().unwrap_or_default(),
+                                                "actions": std::env::var("KXYY_SHARED_EXPERIENCE_TEST_ACTIONS").ok()
+                                                    .map(|raw| raw.split(',').enumerate().filter_map(|(index, name)| {
+                                                        let name = name.trim();
+                                                        (!name.is_empty()).then(|| serde_json::json!({
+                                                            "name": name,
+                                                            "delayMs": (index as u64) * 7000,
+                                                        }))
+                                                    }).collect::<Vec<_>>())
+                                                    .unwrap_or_default(),
+                                                "acceptancePlan": std::env::var("KXYY_SHARED_EXPERIENCE_TEST_PLAN_JSON")
+                                                    .ok()
+                                                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()),
+                                                "acceptanceReportUrl": std::env::var("KXYY_SHARED_EXPERIENCE_REPORT_URL")
+                                                    .ok()
+                                                    .filter(|url| url.starts_with("http://127.0.0.1:")),
+                                                "buildKind": "debug",
+                                                "executable": std::env::current_exe().ok().map(|path| path.display().to_string()),
+                                            }),
+                                        );
+                                        eprintln!("[debug] requested shared experience window id={window_id}");
+                                    }
+                                }
+                            }
+                            None => eprintln!("[debug] chat window missing during acceptance hook"),
+                        }
+                    });
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2543,6 +2719,14 @@ pub fn run() {
             pull_local_text_model,
             install_vad_shadow_runtime,
             install_sensevoice_runtime,
+            shared_experience::list_shared_experience_windows,
+            shared_experience::start_shared_experience,
+            shared_experience::stop_shared_experience,
+            shared_experience::capture_shared_experience_frame,
+            shared_experience::capture_shared_experience_audio,
+            shared_experience::observe_shared_experience_frame,
+            shared_experience::transcribe_shared_experience_audio,
+            shared_experience::observe_shared_experience,
             memory::memory_status,
             memory::memory_integrity_check,
             memory::memory_export,
@@ -2557,6 +2741,7 @@ pub fn run() {
             memory::memory_graph,
             memory::memory_recall,
             memory::memory_enqueue_session,
+            memory::memory_record_shared_experience,
             memory::memory_list,
             memory::memory_update,
             memory::memory_delete,
@@ -2566,7 +2751,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
-            tauri::RunEvent::Exit => voice_service::stop(app),
+            tauri::RunEvent::Exit => {
+                voice_service::stop(app);
+                app.state::<shared_experience::SharedExperienceManager>()
+                    .stop();
+            }
             #[cfg(all(target_os = "macos", debug_assertions))]
             tauri::RunEvent::Reopen { .. } => handle_macos_dock_reopen(app),
             _ => {}
@@ -2576,12 +2765,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        capsule_collapsed_width, capsule_drag_result, capsule_resized_x, normalize_asr_provider,
-        normalize_local_voice_preset, normalize_realtime_conversation_mode,
-        normalize_reasoning_mode, normalize_topic_preferences, normalize_turn_pause_tolerance,
-        normalize_vl_provider, voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference,
-        CAPSULE_HEIGHT, CAPSULE_WIDTH,
+        bottom_centered_window_position, capsule_collapsed_width, capsule_drag_result,
+        capsule_resized_x, default_realtime_backend, default_shared_experience_budget_usd,
+        normalize_asr_provider, normalize_local_voice_preset, normalize_realtime_conversation_mode,
+        normalize_reasoning_mode, normalize_shared_experience_budget_usd,
+        normalize_topic_preferences, normalize_turn_pause_tolerance, normalize_vl_provider,
+        voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT,
+        CAPSULE_WIDTH,
     };
+
+    #[test]
+    fn enlarged_acceptance_window_stays_inside_the_monitor_work_area() {
+        assert_eq!(
+            bottom_centered_window_position(0.0, 25.0, 1440.0, 875.0, 820.0, 620.0, 24.0),
+            (310.0, 256.0)
+        );
+        assert_eq!(
+            bottom_centered_window_position(0.0, 25.0, 700.0, 500.0, 820.0, 620.0, 24.0),
+            (0.0, 25.0)
+        );
+    }
 
     #[test]
     fn reasoning_mode_migrates_legacy_boolean_and_preserves_fixed_preferences() {
@@ -2673,6 +2876,22 @@ mod tests {
         settings.vad_shadow_enabled = true;
         let enabled = voice_config_fingerprint(&settings);
         assert_ne!(disabled, enabled);
+    }
+
+    #[test]
+    fn new_settings_default_to_local_voxcpm_realtime_chain() {
+        assert_eq!(default_realtime_backend(), "voxcpm");
+        assert_eq!(Settings::defaults().realtime_backend, "voxcpm");
+    }
+
+    #[test]
+    fn shared_experience_budget_is_finite_and_bounded() {
+        assert_eq!(default_shared_experience_budget_usd(), 1.0);
+        assert_eq!(normalize_shared_experience_budget_usd(-1.0), 1.0);
+        assert_eq!(normalize_shared_experience_budget_usd(f64::NAN), 1.0);
+        assert_eq!(normalize_shared_experience_budget_usd(0.0), 0.0);
+        assert_eq!(normalize_shared_experience_budget_usd(2.5), 2.5);
+        assert_eq!(normalize_shared_experience_budget_usd(999.0), 100.0);
     }
 
     #[test]

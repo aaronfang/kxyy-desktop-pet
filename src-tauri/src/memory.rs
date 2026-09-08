@@ -922,6 +922,24 @@ pub struct MemoryEnqueueResponse {
     pub job_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedExperienceEpisodeRequest {
+    pub card_id: String,
+    pub nickname: String,
+    pub session_id: String,
+    pub summary: String,
+    pub occurred_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedExperienceEpisodeResponse {
+    pub stored: bool,
+    pub duplicate: bool,
+    pub episode_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRecallRequest {
@@ -3008,6 +3026,129 @@ pub fn memory_enqueue_session(
     };
     trigger_worker(&app);
     Ok(response)
+}
+
+#[tauri::command]
+pub fn memory_record_shared_experience(
+    state: State<'_, MemoryState>,
+    request: SharedExperienceEpisodeRequest,
+) -> Result<SharedExperienceEpisodeResponse, String> {
+    let mut guard = state.conn.lock().unwrap();
+    let conn = guard
+        .as_mut()
+        .ok_or_else(|| "记忆数据库不可用".to_string())?;
+    record_shared_experience_episode(conn, &request)
+}
+
+fn record_shared_experience_episode(
+    conn: &mut Connection,
+    request: &SharedExperienceEpisodeRequest,
+) -> Result<SharedExperienceEpisodeResponse, String> {
+    let nickname = request.nickname.trim();
+    let session_id = truncate_chars(request.session_id.trim(), 120);
+    let summary = truncate_chars(request.summary.trim(), 1000);
+    if nickname.is_empty() || session_id.is_empty() || summary.is_empty() {
+        return Err("共同体验记忆缺少用户、会话或总结".into());
+    }
+    if request.occurred_at <= 0 {
+        return Err("共同体验记忆时间无效".into());
+    }
+    if is_sensitive(&summary) {
+        return Err("共同体验总结包含敏感信息，未写入记忆".into());
+    }
+    let user_id =
+        get_or_create_user(conn, &request.card_id, nickname).map_err(|error| error.to_string())?;
+    let idempotency_key = format!("shared-experience:{user_id}:{session_id}");
+    let existing = conn
+        .query_row(
+            "SELECT item_id FROM memory_events WHERE idempotency_key=?1 LIMIT 1",
+            [&idempotency_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some(episode_id) = existing {
+        return Ok(SharedExperienceEpisodeResponse {
+            stored: true,
+            duplicate: true,
+            episode_id,
+        });
+    }
+
+    let episode_id = Uuid::new_v4().to_string();
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO memory_episodes(
+            id,user_id,session_id,summary,importance,topics_json,entities_json,
+            occurred_at,created_at,updated_at
+         ) VALUES(?1,?2,?3,?4,0.8,'[]','[]',?5,?5,?5)",
+        params![
+            episode_id,
+            user_id,
+            session_id,
+            summary,
+            request.occurred_at
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let payload = serde_json::json!({
+        "summary": summary,
+        "importance": 0.8,
+        "topics": [],
+        "entities": [],
+    })
+    .to_string();
+    let event_id = append_event(
+        &tx,
+        &MemoryEventInput {
+            user_id: &user_id,
+            card_id: &request.card_id,
+            item_kind: "episode",
+            item_id: &episode_id,
+            event_type: "episode.created",
+            source_type: "shared-experience-summary",
+            source_id: Some(&session_id),
+            modality: "text",
+            observed_at: request.occurred_at,
+            trust: 0.8,
+            consent: "allowed",
+            idempotency_key: &idempotency_key,
+            payload_json: &payload,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    append_evidence(
+        &tx,
+        &event_id,
+        "episode",
+        &episode_id,
+        "summarized_from",
+        &[],
+        None,
+        request.occurred_at,
+    )
+    .map_err(|error| error.to_string())?;
+    index_item(
+        &tx,
+        &episode_id,
+        "episode",
+        &request.card_id,
+        &user_id,
+        &summary,
+        "共同体验",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE memory_users SET total_sessions=total_sessions+1,last_seen_at=?1 WHERE id=?2",
+        params![request.occurred_at, user_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(SharedExperienceEpisodeResponse {
+        stored: true,
+        duplicate: false,
+        episode_id,
+    })
 }
 
 fn enqueue_session(
@@ -5507,6 +5648,87 @@ mod tests {
             importance: 0.6,
             valid_from: None,
             source_message_ids: vec!["user-1".into()],
+        }
+    }
+
+    #[test]
+    fn shared_experience_episode_is_idempotent_and_recallable() {
+        let mut conn = test_db();
+        let request = SharedExperienceEpisodeRequest {
+            card_id: "card".into(),
+            nickname: "小明".into(),
+            session_id: "shared-session-1".into(),
+            summary: "我们一起看了一段古风短剧，两人在药铺相识，最后在雨中告别。".into(),
+            occurred_at: 1_788_624_000,
+        };
+
+        let first = record_shared_experience_episode(&mut conn, &request).unwrap();
+        let second = record_shared_experience_episode(&mut conn, &request).unwrap();
+        assert!(first.stored);
+        assert!(!first.duplicate);
+        assert!(second.stored);
+        assert!(second.duplicate);
+        assert_eq!(first.episode_id, second.episode_id);
+
+        let recalled = recall_memory(
+            &mut conn,
+            &MemoryRecallRequest {
+                card_id: "card".into(),
+                nickname: "小明".into(),
+                query: "古风短剧药铺".into(),
+                reason: String::new(),
+                image_caption: String::new(),
+                max_items: Some(6),
+            },
+        )
+        .unwrap();
+        let episode = recalled
+            .items
+            .iter()
+            .find(|item| item.kind == "episode")
+            .unwrap();
+        assert_eq!(episode.id, first.episode_id);
+        assert_eq!(episode.text, request.summary);
+    }
+
+    #[test]
+    fn shared_experience_episode_request_rejects_raw_media_fields() {
+        let result = serde_json::from_value::<SharedExperienceEpisodeRequest>(serde_json::json!({
+            "cardId": "card",
+            "nickname": "小明",
+            "sessionId": "shared-session-1",
+            "summary": "一起看了短剧",
+            "occurredAt": 1_788_624_000,
+            "wavBase64": "raw-audio-must-not-cross-this-boundary"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn shared_experience_episode_rejects_invalid_or_sensitive_summaries() {
+        let mut conn = test_db();
+        let valid = SharedExperienceEpisodeRequest {
+            card_id: "card".into(),
+            nickname: "小明".into(),
+            session_id: "shared-session-2".into(),
+            summary: "一起看了短剧".into(),
+            occurred_at: 1_788_624_000,
+        };
+        for request in [
+            SharedExperienceEpisodeRequest {
+                summary: String::new(),
+                ..valid.clone()
+            },
+            SharedExperienceEpisodeRequest {
+                occurred_at: 0,
+                ..valid.clone()
+            },
+            SharedExperienceEpisodeRequest {
+                summary: "我的身份证号是 110101199001011234".into(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(record_shared_experience_episode(&mut conn, &request).is_err());
         }
     }
 

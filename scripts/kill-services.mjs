@@ -4,6 +4,7 @@ import { platform } from "node:os";
 import { existsSync, rmSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stopForbiddenInstalledApps } from "./shared-experience/process-isolation.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -110,6 +111,16 @@ console.log("正在检查旧服务...");
 
 let killedAny = false;
 const isWin = platform() === "win32";
+
+// `npm run dev` must never share GPU/audio services with the installed app.
+// Match the complete executable path so the freshly built debug binary is untouched.
+if (!isWin) {
+  const installed = stopForbiddenInstalledApps();
+  if (installed.length) {
+    killedAny = true;
+    process.stdout.write(`已停止安装版桌宠进程 (PID: ${installed.map((item) => item.pid).join(",")})\n`);
+  }
+}
 
 if (killStaleDevApp(isWin)) killedAny = true;
 

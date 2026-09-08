@@ -37,6 +37,10 @@
       <button id="attach" type="button" title="发图（截图可直接粘贴 Ctrl+V）" aria-label="发送图片">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.6"/><path d="M21 15l-5-5L5 21"/></svg>
       </button>
+      <button id="shared-experience-btn" type="button" title="选择窗口并持续观察" aria-label="共同体验窗口">▣</button>
+      <button id="shared-experience-pause-btn" type="button" title="暂停观看" aria-label="暂停观看" hidden>Ⅱ</button>
+      <button id="shared-experience-stop-btn" type="button" title="停止观察" aria-label="停止观察" hidden>■</button>
+      <button id="shared-experience-debug-btn" type="button" title="查看视觉观察调试信息" aria-label="视觉观察调试信息">≡</button>
       <input id="file" type="file" accept="image/*" hidden />
       <input id="input" type="text" placeholder="和元元说点什么…（Esc 收起）" />
       <button id="stickers-btn" type="button" title="表情库" aria-label="表情库">
@@ -44,6 +48,21 @@
       </button>
       <button id="send" type="submit" title="发送">发送</button>
     </form>
+    <div id="shared-experience-status" aria-live="polite" hidden></div>
+    <div id="shared-experience-picker" hidden>
+      <div id="shared-experience-picker-panel" role="dialog" aria-modal="true" aria-labelledby="shared-experience-picker-title">
+        <div id="shared-experience-picker-title">选择要一起看的窗口</div>
+        <div id="shared-experience-window-list"></div>
+        <button id="shared-experience-picker-cancel" type="button">取消</button>
+      </div>
+    </div>
+    <div id="shared-experience-debug" hidden>
+      <div id="shared-experience-debug-panel" role="dialog" aria-modal="false">
+        <div id="shared-experience-debug-head"><span>Mage-VL 观察调试</span><button id="shared-experience-debug-close" type="button" aria-label="关闭">×</button></div>
+        <div id="shared-experience-debug-meta">尚未收到观察结果</div>
+        <pre id="shared-experience-debug-output"></pre>
+      </div>
+    </div>
     <div id="voice-debug" aria-hidden="true">
       <div id="voice-debug-label">语音 · …</div>
       <div id="persona-debug-meta"></div>

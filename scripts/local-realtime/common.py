@@ -1854,6 +1854,8 @@ _tts_pool: Executor | None = None
 _synth_tts: Callable[[str], bytes | tuple] | None = None
 # 可选的 provider 原生 PCM async iterator；只在显式双向协商后使用。
 _synth_tts_stream = None
+# 可选的 HTTP 朗读适配器；与 realtime WebSocket 分开，避免低延迟朗读参数污染通话。
+_synth_tts_http_stream = None
 # 朗读专用：返回 (audio_bytes, mime)。CosyVoice 直接回 MP3，避免 ffmpeg+24k WAV 失真。
 # 返回 (audio, mime) 或 (audio, mime, usage_dict)；usage 含 characters / provider。
 _synth_tts_http: Callable[[str], tuple] | None = None
@@ -2297,6 +2299,7 @@ HTTP_TTS_TIMEOUT_S = 60
 HTTP_TTS_MAX_TASKS = 2
 HTTP_TTS_BUSY_MESSAGE = "TTS 服务繁忙，请稍后重试"
 _http_tts_slots = threading.BoundedSemaphore(HTTP_TTS_MAX_TASKS)
+_http_tts_stream_slots = threading.BoundedSemaphore(1)
 
 
 def clip_speech_text(text: str, max_chars: int = HTTP_TTS_MAX_CHARS) -> str:
@@ -2368,8 +2371,9 @@ def _submit_bounded_http_tts(pool, synth, text: str, *, slots=None):
 
 
 def start_tts_http(port: int) -> None:
-    """在 port+100 起 HTTP POST /tts，供桌面端文字朗读走同一本地后端。"""
+    """在 port+100 起 HTTP POST /tts 和内部 /asr。"""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import io
     import threading
 
     http_port = port + 100
@@ -2393,7 +2397,11 @@ def start_tts_http(port: int) -> None:
             self.wfile.write(data)
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path.split("?", 1)[0] != "/tts":
+            route = self.path.split("?", 1)[0]
+            if route == "/asr":
+                self._handle_asr(io)
+                return
+            if route not in ("/tts", "/tts-stream"):
                 self.send_error(404)
                 return
             # 共享 secret 鉴权：由桌宠启动本服务时经 KXYY_TTS_SECRET 注入，并在代理转发时带 X-Tts-Secret。
@@ -2414,6 +2422,14 @@ def start_tts_http(port: int) -> None:
             text = clip_speech_text((body.get("text") or "").strip())
             if not text:
                 self._json_err(400, "text 不能为空")
+                return
+            if route == "/tts-stream":
+                latency_mode = (
+                    "companion"
+                    if body.get("latencyMode") == "companion"
+                    else "default"
+                )
+                self._handle_tts_stream(text, latency_mode)
                 return
             if _synth_tts is None and _synth_tts_http is None:
                 self._json_err(503, "TTS 未就绪")
@@ -2474,6 +2490,127 @@ def start_tts_http(port: int) -> None:
             self.end_headers()
             self.wfile.write(audio)
 
+        def _handle_tts_stream(self, text: str, latency_mode: str = "default") -> None:
+            if _synth_tts_stream is None and _synth_tts_http_stream is None:
+                self._json_err(404, "当前语音后端不支持流式朗读")
+                return
+            if not _http_tts_stream_slots.acquire(blocking=False):
+                self._json_err(503, HTTP_TTS_BUSY_MESSAGE)
+                return
+
+            headers_sent = False
+
+            async def send_stream() -> None:
+                nonlocal headers_sent
+                stream = (
+                    _synth_tts_http_stream(text, latency_mode)
+                    if _synth_tts_http_stream is not None
+                    else _synth_tts_stream(text)
+                )
+                try:
+                    async for event in stream:
+                        if event.get("type") != "audio":
+                            continue
+                        pcm = bytes(event.get("pcm") or b"")
+                        if not pcm:
+                            continue
+                        if not headers_sent:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "audio/L16; rate=24000; channels=1; endian=little")
+                            self.send_header("Cache-Control", "no-store")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                            headers_sent = True
+                        self.wfile.write(pcm)
+                        self.wfile.flush()
+                    if not headers_sent:
+                        self._json_err(502, "TTS 未返回音频")
+                finally:
+                    await stream.aclose()
+
+            t0 = time.perf_counter()
+            try:
+                try:
+                    asyncio.run(send_stream())
+                    log(f"HTTP TTS stream {time.perf_counter()-t0:.2f}s chars={len(list(text))}")
+                except (BrokenPipeError, ConnectionResetError):
+                    log("HTTP TTS stream 客户端已取消")
+                except Exception as e:
+                    detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                    log(f"HTTP TTS stream 失败: {detail}")
+                    if not headers_sent and not self.wfile.closed:
+                        try:
+                            self._json_err(502, f"TTS 流式合成失败：{detail}")
+                        except Exception:
+                            pass
+                    else:
+                        self.close_connection = True
+            finally:
+                _http_tts_stream_slots.release()
+
+        def _handle_asr(self, io_module) -> None:
+            """Transcribe one bounded 16 kHz mono WAV without retaining media bytes."""
+            secret = os.environ.get("KXYY_TTS_SECRET") or ""
+            if secret and (self.headers.get("X-Tts-Secret") or "") != secret:
+                self._json_err(401, "unauthorized")
+                return
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                n = 0
+            if n <= 0 or n > 4 * 1024 * 1024:
+                self._json_err(413, "audio too large")
+                return
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                encoded = str(body.get("wavBase64") or "")
+                wav_bytes = base64.b64decode(encoded, validate=True)
+                with wave.open(io_module.BytesIO(wav_bytes), "rb") as wav:
+                    if (
+                        wav.getnchannels() != 1
+                        or wav.getsampwidth() != 2
+                        or wav.getframerate() != INPUT_RATE
+                        or wav.getnframes() <= 0
+                        or wav.getnframes() > INPUT_RATE * 30
+                    ):
+                        raise ValueError("unsupported audio format")
+                    pcm = wav.readframes(wav.getnframes())
+            except Exception:
+                self._json_err(400, "audio format invalid")
+                return
+            if _asr_adapter_instance is None or _asr_backend == "none":
+                self._json_err(503, "ASR unavailable")
+                return
+            if not _asr_slots.acquire(blocking=False):
+                self._json_err(503, "ASR busy")
+                return
+            try:
+                future = _mlx_pool.submit(transcribe, pcm)
+            except BaseException:
+                _asr_slots.release()
+                self._json_err(503, "ASR unavailable")
+                return
+            future.add_done_callback(lambda _done: _asr_slots.release())
+            try:
+                result = future.result(timeout=60)
+                text = str(getattr(result, "text", "") or "").strip()[:512]
+                response = {
+                    "status": "ok",
+                    "text": text,
+                    "language": str(getattr(result, "language", "unknown")),
+                    "emotion": str(getattr(result, "emotion", "unknown")),
+                    "event": str(getattr(result, "event", "unknown")),
+                }
+                data = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self._json_err(502, "ASR inference failed")
+
         def _json_err(self, status: int, msg: str) -> None:
             data = json.dumps({"error": msg}, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
@@ -2486,6 +2623,7 @@ def start_tts_http(port: int) -> None:
     t = threading.Thread(target=server.serve_forever, name=f"tts-http-{http_port}", daemon=True)
     t.start()
     log(f"朗读 HTTP http://127.0.0.1:{http_port}/tts")
+    return server
 
 
 def pcm16_to_float32(pcm16: bytes):
@@ -5727,13 +5865,15 @@ def run(
     system_suffix: str = "",
     synth_tts_http: Callable[[str], tuple] | None = None,
     synth_tts_stream=None,
+    synth_tts_http_stream=None,
     vad_shadow_pipeline_factory=None,
     vad_shadow_start_status="disabled",
     vad_shadow_mode="shadow-v1",
     vad_shadow_config_revision="none",
 ) -> None:
     """prepare() 在监听前调用（加载模型等）。"""
-    global _log_prefix, _synth_tts, _synth_tts_http, _synth_tts_stream, _tts_pool
+    global _log_prefix, _synth_tts, _synth_tts_http, _synth_tts_stream
+    global _synth_tts_http_stream, _tts_pool
     global _tts_parallelism, _tts_prefetch_while_playing, _system_suffix
     global _vad_shadow_pipeline_factory, _vad_shadow_service
     global _vad_shadow_start_status, _vad_shadow_mode, _vad_shadow_config_revision
@@ -5741,6 +5881,7 @@ def run(
     _synth_tts = synth_tts
     _synth_tts_http = synth_tts_http
     _synth_tts_stream = synth_tts_stream
+    _synth_tts_http_stream = synth_tts_http_stream
     _tts_pool = tts_pool
     _tts_parallelism = max(1, min(TTS_PARALLELISM_MAX, int(tts_parallelism)))
     _tts_prefetch_while_playing = bool(tts_prefetch_while_playing)

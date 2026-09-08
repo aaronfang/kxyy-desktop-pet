@@ -26,6 +26,7 @@ const WEB_RESPONSE_MAX_BYTES: u64 = 256 * 1024;
 const WEB_RESULT_MAX_ITEMS: usize = 4;
 const WEB_RESULT_TEXT_MAX_CHARS: usize = 700;
 const CHAT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const TTS_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
 fn normalize_deepseek_model(configured: &str) -> &'static str {
@@ -250,6 +251,9 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         // 阶段 2·D：火山引擎语音合成，前端 tts.js POST 文本，回 audio/mpeg。
         (Method::Post, "/api/tts") => {
             proxy_tts(app, client, request);
+        }
+        (Method::Post, "/api/tts-stream") => {
+            proxy_tts_stream(app, client, request);
         }
         (Method::Get, "/api/assets") => match crate::persona_assets::decrypted_json() {
             Ok(body) => respond_json(request, 200, body),
@@ -892,6 +896,25 @@ fn req_header<'a>(request: &'a tiny_http::Request, name: &str) -> Option<&'a str
     })
 }
 
+fn read_bounded_text<R: Read + ?Sized>(
+    reader: &mut R,
+    announced_len: Option<usize>,
+    max_bytes: usize,
+) -> Result<String, ()> {
+    if announced_len.is_some_and(|len| len > max_bytes) {
+        return Err(());
+    }
+    let mut raw = String::new();
+    reader
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_string(&mut raw)
+        .map_err(|_| ())?;
+    if raw.len() > max_bytes {
+        return Err(());
+    }
+    Ok(raw)
+}
+
 fn internal_secret_matches(provided: Option<&str>, expected: &str) -> bool {
     !expected.is_empty() && provided == Some(expected)
 }
@@ -1311,10 +1334,10 @@ mod tests {
         apply_selected_deepseek_generation_options, buffered_sse_is_complete,
         build_isolated_chat_client, build_native_ollama_realtime_payload, header,
         internal_secret_matches, memory_completion_content, normalize_deepseek_model,
-        normalize_tavily_items, online_vision_route, req_header, safe_web_source_url,
-        should_passthrough_internal_sse, should_use_native_ollama_realtime, web_observation_status,
-        DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL, QWEN_VL_BASE_URL,
-        QWEN_VL_MODEL, TEXT_BASE_URL,
+        normalize_tavily_items, online_vision_route, read_bounded_text, req_header,
+        safe_web_source_url, should_passthrough_internal_sse, should_use_native_ollama_realtime,
+        web_observation_status, DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL,
+        QWEN_VL_BASE_URL, QWEN_VL_MODEL, TEXT_BASE_URL,
     };
     use std::io::{Cursor, Read};
     use std::net::TcpListener;
@@ -1361,6 +1384,21 @@ mod tests {
         assert!(!buffered_sse_is_complete(
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
         ));
+    }
+
+    #[test]
+    fn bounded_text_reader_accepts_the_limit_and_rejects_announced_or_streamed_overflow() {
+        let mut exact = Cursor::new(vec![b'a'; 8]);
+        assert_eq!(
+            read_bounded_text(&mut exact, Some(8), 8).unwrap(),
+            "aaaaaaaa"
+        );
+
+        let mut announced_too_large = Cursor::new(vec![b'a'; 8]);
+        assert!(read_bounded_text(&mut announced_too_large, Some(9), 8).is_err());
+
+        let mut streamed_too_large = Cursor::new(vec![b'a'; 9]);
+        assert!(read_bounded_text(&mut streamed_too_large, None, 8).is_err());
     }
 
     #[test]
@@ -1938,6 +1976,59 @@ fn proxy_local_tts(
         None
     };
     respond_audio(request, bytes, &ct, usage);
+}
+
+fn proxy_tts_stream(
+    app: &AppHandle,
+    client: &reqwest::blocking::Client,
+    mut request: tiny_http::Request,
+) {
+    let announced_len =
+        req_header(&request, "Content-Length").and_then(|value| value.parse::<usize>().ok());
+    let raw = match read_bounded_text(request.as_reader(), announced_len, TTS_BODY_MAX_BYTES) {
+        Ok(raw) => raw,
+        Err(_) => return error_json(request, 400, "读取请求体失败或请求过大"),
+    };
+    let cfg = crate::ai_config(app);
+    let Some(port) = crate::local_tts_http_port(&cfg.voice_backend) else {
+        return error_json(request, 404, "当前语音后端不支持流式朗读");
+    };
+    let url = format!("http://127.0.0.1:{port}/tts-stream");
+    let upstream = match client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Tts-Secret", crate::voice_service::tts_secret())
+        .body(raw.clone())
+        .timeout(tts_timeout_from_text(&raw))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return error_json(
+                request,
+                503,
+                &format!("本地流式语音服务未启动或不可达（{url}）：{error}"),
+            );
+        }
+    };
+    let status = upstream.status().as_u16();
+    if !(200..300).contains(&status) {
+        let detail = upstream.text().unwrap_or_default();
+        let body = serde_json::json!({
+            "error": "TTS 流式合成失败（本地服务）",
+            "detail": detail.chars().take(300).collect::<String>(),
+        })
+        .to_string();
+        return respond_json(request, status, body);
+    }
+    let mut headers = cors_headers();
+    headers.push(header(
+        "Content-Type",
+        "audio/L16; rate=24000; channels=1; endian=little",
+    ));
+    headers.push(header("Cache-Control", "no-store"));
+    let response = Response::new(StatusCode(200), headers, upstream, None, None);
+    let _ = request.respond(response);
 }
 
 fn proxy_volc_tts(

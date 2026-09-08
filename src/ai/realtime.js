@@ -3,7 +3,7 @@
 // 与本地 Rust 桥接（realtime.rs）的私有协议：
 //   连上后先发 {type:"start", systemRole, botName, initialHistory?}；随后：
 //     上行 binary = 麦克风 PCM16 mono 16k（worklet 产出）；
-//     下行 binary = 火山/旧服务为 PCM16 mono 24k；本地/Cosy 可协商 managed-v1 envelope；
+//     下行 binary = 本地 VoxCPM2/Qwen/CosyVoice 为 PCM16 mono 24k；旧火山兼容服务也可返回 raw PCM；
 //     下行 text  = 事件 JSON：
 //       {type:"session",state} / {type:"asr_start"} /
 //       {type:"speech_candidate|speech_confirmed|speech_rejected"} /
