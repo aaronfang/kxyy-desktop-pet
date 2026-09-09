@@ -259,6 +259,12 @@ struct Settings {
     /// 单次共同体验的 DeepSeek 估算费用预算（USD）。
     #[serde(default = "default_shared_experience_budget_usd")]
     shared_experience_budget_usd: f64,
+    /// 是否允许共同体验在出现新内容时主动评论；默认关闭，避免意外发言和费用。
+    #[serde(default)]
+    shared_experience_proactive_enabled: bool,
+    /// 主动评论频率：`low` / `standard` / `frequent`。
+    #[serde(default = "default_shared_experience_proactive_frequency")]
+    shared_experience_proactive_frequency: String,
     /// 观众昵称（元元如何称呼你），空则默认「元宝」。
     #[serde(default)]
     user_name: String,
@@ -340,6 +346,18 @@ fn normalize_shared_experience_budget_usd(value: f64) -> f64 {
         default_shared_experience_budget_usd()
     } else {
         value.min(100.0)
+    }
+}
+
+fn default_shared_experience_proactive_frequency() -> String {
+    "standard".into()
+}
+
+fn normalize_shared_experience_proactive_frequency(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "frequent" => "frequent",
+        _ => "standard",
     }
 }
 
@@ -490,6 +508,8 @@ impl Settings {
             memory_workspace_mode: default_workspace_mode(),
             temperature: default_temperature(),
             shared_experience_budget_usd: default_shared_experience_budget_usd(),
+            shared_experience_proactive_enabled: false,
+            shared_experience_proactive_frequency: default_shared_experience_proactive_frequency(),
             user_name: String::new(),
             pat_text: String::new(),
             persona_relationship: String::new(),
@@ -781,6 +801,11 @@ fn load_settings(app: &AppHandle) -> Settings {
                 s.thinking = s.reasoning_mode == "always";
                 s.shared_experience_budget_usd =
                     normalize_shared_experience_budget_usd(s.shared_experience_budget_usd);
+                s.shared_experience_proactive_frequency =
+                    normalize_shared_experience_proactive_frequency(
+                        &s.shared_experience_proactive_frequency,
+                    )
+                    .into();
                 return s;
             }
         }
@@ -1953,6 +1978,10 @@ struct AiSettingsInput {
     temperature: f64,
     #[serde(default = "default_shared_experience_budget_usd")]
     shared_experience_budget_usd: f64,
+    #[serde(default)]
+    shared_experience_proactive_enabled: bool,
+    #[serde(default = "default_shared_experience_proactive_frequency")]
+    shared_experience_proactive_frequency: String,
     user_name: String,
     #[serde(default)]
     pat_text: String,
@@ -2194,6 +2223,11 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.temperature = settings.temperature;
         s.shared_experience_budget_usd =
             normalize_shared_experience_budget_usd(settings.shared_experience_budget_usd);
+        s.shared_experience_proactive_enabled = settings.shared_experience_proactive_enabled;
+        s.shared_experience_proactive_frequency = normalize_shared_experience_proactive_frequency(
+            &settings.shared_experience_proactive_frequency,
+        )
+        .into();
         s.user_name = settings.user_name.trim().to_string();
         s.pat_text = settings.pat_text.trim().to_string();
         s.persona_relationship = settings.persona_relationship.trim().to_string();
@@ -2646,6 +2680,19 @@ pub fn run() {
                                                     .ok()
                                                     .and_then(|raw| raw.trim().parse::<u64>().ok())
                                                     .map(|value| value.clamp(1_000, 1_800_000)),
+                                                "proactiveEnabled": std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_ENABLED")
+                                                    .ok()
+                                                    .as_deref() == Some("1")
+                                                    || std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_FIRST_MS").is_ok()
+                                                    || std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_INTERVAL_MS").is_ok(),
+                                                "proactiveFirstDelayMs": std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_FIRST_MS")
+                                                    .ok()
+                                                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                                                    .map(|value| value.clamp(1_000, 600_000)),
+                                                "proactiveMinIntervalMs": std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_INTERVAL_MS")
+                                                    .ok()
+                                                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                                                    .map(|value| value.clamp(5_000, 600_000)),
                                                 "userViewingStatement": std::env::var("KXYY_SHARED_EXPERIENCE_USER_STATEMENT").ok().unwrap_or_default(),
                                                 "actions": std::env::var("KXYY_SHARED_EXPERIENCE_TEST_ACTIONS").ok()
                                                     .map(|raw| raw.split(',').enumerate().filter_map(|(index, name)| {
@@ -2767,11 +2814,12 @@ mod tests {
     use super::{
         bottom_centered_window_position, capsule_collapsed_width, capsule_drag_result,
         capsule_resized_x, default_realtime_backend, default_shared_experience_budget_usd,
-        normalize_asr_provider, normalize_local_voice_preset, normalize_realtime_conversation_mode,
+        default_shared_experience_proactive_frequency, normalize_asr_provider,
+        normalize_local_voice_preset, normalize_realtime_conversation_mode,
         normalize_reasoning_mode, normalize_shared_experience_budget_usd,
-        normalize_topic_preferences, normalize_turn_pause_tolerance, normalize_vl_provider,
-        voice_config_fingerprint, CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT,
-        CAPSULE_WIDTH,
+        normalize_shared_experience_proactive_frequency, normalize_topic_preferences,
+        normalize_turn_pause_tolerance, normalize_vl_provider, voice_config_fingerprint,
+        CapsuleEdge, Settings, TopicPreference, CAPSULE_HEIGHT, CAPSULE_WIDTH,
     };
 
     #[test]
@@ -2892,6 +2940,30 @@ mod tests {
         assert_eq!(normalize_shared_experience_budget_usd(0.0), 0.0);
         assert_eq!(normalize_shared_experience_budget_usd(2.5), 2.5);
         assert_eq!(normalize_shared_experience_budget_usd(999.0), 100.0);
+    }
+
+    #[test]
+    fn shared_experience_initiative_is_opt_in_with_an_allowlisted_frequency() {
+        let settings = Settings::defaults();
+        assert!(!settings.shared_experience_proactive_enabled);
+        assert_eq!(
+            settings.shared_experience_proactive_frequency,
+            default_shared_experience_proactive_frequency()
+        );
+        assert_eq!(
+            normalize_shared_experience_proactive_frequency(" low "),
+            "low"
+        );
+        assert_eq!(
+            normalize_shared_experience_proactive_frequency("FREQUENT"),
+            "frequent"
+        );
+        for value in ["", "custom", "5ms"] {
+            assert_eq!(
+                normalize_shared_experience_proactive_frequency(value),
+                "standard"
+            );
+        }
     }
 
     #[test]

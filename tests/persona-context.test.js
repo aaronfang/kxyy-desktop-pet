@@ -20,6 +20,7 @@ import {
   detectDeepIntent,
   detectShortTermConversationMood,
   getFollowupUserTrigger,
+  getProactiveUserTrigger,
 } from "../src/ai/persona.js";
 
 const LORE = {
@@ -200,6 +201,32 @@ test("proactive daily prompts contain no livestream-room topic seeds", () => {
     const prompt = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
     assert.doesNotMatch(prompt, /直播间|开播|下播|福袋|礼物|人气票|弹幕/, proactiveKind);
   }
+});
+
+test("co-viewing proactive prompt comments on evidence without auditing it or questioning the viewer", () => {
+  const trigger = getProactiveUserTrigger("shared-experience");
+  const messages = buildMessages({
+    systemPrompt: "persona\n# 当前共同观看证据\n[ev-8] 解说说先打开两盏灯拖住丧尸。",
+    fewShot: [],
+    history: [
+      { role: "user", content: "我们在看游戏解说。" },
+      { role: "user", content: trigger },
+    ],
+    maxTurns: 4,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+    proactiveKind: "shared-experience",
+  });
+  const system = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
+  assert.match(system, /正在一起看/);
+  assert.match(system, /不要提问/);
+  assert.match(system, /不要复述.*声音说.*画面/);
+  assert.match(system, /有依据的态度|自然判断/);
+  assert.match(system, /主动发现|分享/);
+  assert.match(system, /不是在回答问题/);
+  assert.equal(messages.at(-1)?.role, "user");
+  assert.equal(messages.at(-1)?.content, trigger);
 });
 
 test("follow-up request ends with an explicit user-role continuation directive", () => {

@@ -128,6 +128,20 @@
           </label>
           <p class="hint">达到预算后，30 分钟阶段总结改用本地有界压缩；停止时仍会尝试生成一次最终总结。实际账单以 DeepSeek 为准。</p>
 
+          <label>
+            <span>主动陪看<small>有值得分享的新内容时，角色会主动说话</small></span>
+            <input id="sharedExperienceProactiveEnabled" type="checkbox" />
+          </label>
+          <label>
+            <span>主动陪看频率<small>只控制最短间隔，不会为了凑次数强行开口</small></span>
+            <select id="sharedExperienceProactiveFrequency">
+              <option value="low">低频（约 2 分钟）</option>
+              <option value="standard" selected>标准（约 1 分钟）</option>
+              <option value="frequent">高频（约 30 秒）</option>
+            </select>
+          </label>
+          <p class="hint">主动发言仍需出现新的 ASR 内容或连续画面变化；用户输入、暂停、隐藏窗口和语音播放期间会自动让路。</p>
+
           <div class="memory-actions">
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
             <span id="clearMemoryStatus" class="hint"></span>
