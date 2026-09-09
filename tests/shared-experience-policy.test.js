@@ -39,7 +39,9 @@ test("shared experience keeps persona conversation but isolates unrelated contex
 test("shared experience bounds spoken replies while normal chat keeps its token budget", () => {
   assert.equal(sharedExperienceReplyMaxTokens(true, 4096), 320);
   assert.equal(sharedExperienceReplyMaxTokens(true, 120), 120);
+  assert.equal(sharedExperienceReplyMaxTokens(true, 800, { deliberate: true }), 1400);
   assert.equal(sharedExperienceReplyMaxTokens(false, 4096), 4096);
+  assert.equal(sharedExperienceReplyMaxTokens(false, 800, { deliberate: true }), 800);
 });
 
 test("only shared-experience text speech requests the companion latency mode", () => {
@@ -57,7 +59,7 @@ test("chat request, idle sharing, and follow-up paths consume the shared-experie
   assert.match(chat, /earlierRecap: requestPolicy\.sessionRecap \? sessionRecap : ""/);
   assert.match(chat, /if \(!sharedExperienceRequestPolicy\(sharedExperience\.active\)\.idleProactive\) return/);
   assert.match(chat, /requestPolicy\.automaticFollowup && shouldDoFollowup/);
-  assert.match(chat, /sharedExperienceReplyMaxTokens\(\s*sharedExperience\.active,/);
+  assert.match(chat, /sharedExperienceReplyMaxTokens\(\s*sharedExperience\.active,[\s\S]*\{\s*deliberate\s*\}/);
   assert.match(chat, /if \(!review\) \{[\s\S]*requestGroundedReplyRepair\(/);
   assert.match(chat, /requestGroundedReplyRepair\(\{[\s\S]*evidence:reviewSources,[\s\S]*isCurrent:groundingIsCurrent/);
   assert.match(chat, /latencyMode:\s*sharedExperienceTtsLatencyMode\(sharedExperience\.active\)/);

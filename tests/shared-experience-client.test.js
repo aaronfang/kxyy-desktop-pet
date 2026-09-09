@@ -3,6 +3,32 @@ import assert from "node:assert/strict";
 
 import { requestSharedExperienceSummary, requestSharedExperienceQuestion } from "../src/ai/shared-experience-client.js";
 
+test("summary prompts weight raw evidence for narrated, cinematic, livestream, and low-speech game", async () => {
+  const cases = [
+    ["narrated", /ASR.*主线.*画面.*补充/],
+    ["cinematic", /连续画面.*对白.*共同/],
+    ["livestream", /实时画面.*零散语音/],
+    ["low-speech-game", /游戏动作.*场景变化.*主线/],
+  ];
+  for (const [contentMode, expected] of cases) {
+    let prompt = "";
+    await requestSharedExperienceSummary({
+      apiBase: "http://127.0.0.1:1234",
+      kind: "evidence",
+      contentMode,
+      evidence: [
+        { id: "ev-1", kind: "visual", text: "人物向门口移动。", atMs: 1000 },
+        { id: "ev-2", kind: "audio", text: "有人说小心。", atMs: 1200 },
+      ],
+      fetchImpl: async (_url, init) => {
+        prompt = JSON.parse(init.body).messages[1].content;
+        return { ok: true, json: async () => ({ choices: [{ finish_reason: "stop", message: { content: '{"events":[]}' } }] }) };
+      },
+    });
+    assert.match(prompt, expected, contentMode);
+  }
+});
+
 test("final recap generation reads original audio omitted by previous summaries", async () => {
   const evidence = [
     {id:"ev-95",kind:"audio",atMs:1000,text:"They took the girl to the base chief for interrogation."},
@@ -107,6 +133,22 @@ test("final memory excludes visual-only screen text even when the reviewer appro
   assert.match(result.summary,/旁白提出关电闸/);
   assert.doesNotMatch(result.summary,/小红|冰岛|发电厂/);
   assert.match(result.summary,/画面模型线索（未独立核实）：昏暗的地下通道/);
+});
+
+test("low-speech game final recap retains directly visible actions as unverified visual evidence", async () => {
+  const evidence = [{ id: "ev-1", kind: "visual", text: "玩家举枪后退并躲到木箱后。", atMs: 1000 }];
+  let calls = 0;
+  const result = await requestSharedExperienceSummary({
+    apiBase: "http://127.0.0.1:1234",
+    kind: "final",
+    contentMode: "low-speech-game",
+    evidence,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(++calls === 1
+      ? { events: [{ text: "玩家举枪后退并躲到木箱后。", claimType: "visual-action", status: "observed", supports: [{ id: "ev-1", quote: evidence[0].text }] }] }
+      : { parts: [{ text: "玩家举枪后退并躲到木箱后。", verdict: "supported", supports: [{ id: "ev-1", quote: evidence[0].text }] }] }) } }] }) }),
+  });
+  assert.equal(result.summary, "画面模型线索（未独立核实）：玩家举枪后退并躲到木箱后。");
+  assert.equal(calls, 2);
 });
 
 test("final recap omits player controls without removing an adjacent scene or spoken instructions", async () => {
@@ -373,6 +415,8 @@ test("final summary prompt forbids turning identity references into watched even
   const prompt = body.messages[1].content;
   assert.match(prompt, /identity-only.*不能证明.*视频/);
   assert.match(prompt, /剧情.*媒体证据/);
+  assert.match(prompt, /"claimType":"speech/);
+  assert.match(prompt, /每条只引用同一种来源/);
 });
 
 test("all summary levels preserve narration timing and uncertain names without inventing a mixed work", async () => {

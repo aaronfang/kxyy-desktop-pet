@@ -282,6 +282,36 @@ test("due shared-experience segment is summarized and the same session continues
   assert.equal(lifecycle.snapshot().status, "active");
 });
 
+test("segment rollover sends original evidence and content mode instead of recursively summarizing blocks", async () => {
+  let now = 0;
+  const workspace = createSharedExperienceWorkspace({
+    contentMode: "cinematic",
+    segmentDurationMs: 1_000,
+    nowMs: () => now,
+  });
+  workspace.addVisualObservation({ summary: "短发女子进入病房", capturedAtMs: 100 });
+  workspace.addAudioObservation({ text: "有人说门已经锁上了。", startedAtMs: 200, endedAtMs: 300 });
+  workspace.commitEvidenceBlock({ eventIds: ["ev-1", "ev-2"], summary: "错误旧摘要：女子已经逃走。" });
+  let request;
+  const lifecycle = createSharedExperienceLifecycle({
+    workspace,
+    summarize: async (value) => {
+      request = value;
+      return { summary: "本阶段保留原始证据。" };
+    },
+  });
+
+  now = 1_001;
+  await lifecycle.maybeRollSegment(now);
+  assert.equal(request.kind, "segment");
+  assert.equal(request.contentMode, "cinematic");
+  assert.deepEqual(request.evidence.map(({ id, kind, text }) => ({ id, kind, text })), [
+    { id: "ev-1", kind: "visual", text: "短发女子进入病房" },
+    { id: "ev-2", kind: "audio", text: "有人说门已经锁上了。" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(request.evidence), /错误旧摘要|block-/);
+});
+
 test("concurrent rollover checks share one summary request", async () => {
   let release;
   let calls = 0;

@@ -161,7 +161,7 @@ export async function requestGroundingReview({apiBase,kind,text,question="",evid
             ? "审核证据摘要：draft 每行是一个完整条目，parts 必须逐行原样保留，不拆句、不改写。只对照 sources 本批原始观察，不继承之前的总结或角色回复。每条的所有含义都必须有依据；重点检查谁对谁说、请求与承诺、计划与完成、前后相邻与因果。Promise me 是要求对方保证，不是说话者自己承诺；音频不能仅凭同期画面认定说话者身份。残缺 ASR 不能补全成确定剧情。明确说明残缺或歧义的条目可有依据，但不能用不确定措辞掩盖新增事件。任一含义无支持则整条 unsupported；不得使用 nonfactual。"
             : "审核角色回复：保留直接回答和有依据的自然判断，删除添油加醋的因果、人物关系、未来行动、来源审计式废话。问题本身不是证据，不可被问题的错误前提诱导。scope=current 是本轮最近观察，scope=history 只能证明以前发生过；ageMs 是距本轮取证的毫秒数。问当前场景、物品或行动，不能只引用过去的火堆、物品或人物；新近画面没看清时，不假设旧状态持续。回顾和比较可以结合历史，但不能把新旧角色/物品误接到一起。",
           question:question.slice(0,200),draft:text,...(sentences.length ? {sentences} : {}),
-          ...(kind === "summary" ? {claimSources:claimSources.slice(0,8),claimTypes:claimTypes.slice(0,8),sourceRule:"每行仅能由对应 claimSources 中的来源支持，不得从其他镜头借用对象或场景。按 atMs 判断时间，不把不同镜头的同类物品或人物认定为同一个。kind=identity 仅支持作品名称，不支持已播放剧情。kind=user 才能支持真实用户的观点/感受，audio 中的我们/我不是用户；用户的疑问不等于用户认同问题前提。visual 是单帧模型描述，不能独自证明声音、语气、动机、字幕中的名字或任务。claimTypes=appearance 只能描述外观/场景；若含字幕语义、任务、声音、剧情因果或人物身份，即使原始视觉描述如此写也判 unsupported。播放按钮等播放器状态不是观看内容。"} : {}),
+          ...(kind === "summary" ? {claimSources:claimSources.slice(0,8),claimTypes:claimTypes.slice(0,8),sourceRule:"每行仅能由对应 claimSources 中的来源支持，不得从其他镜头借用对象或场景。按 atMs 判断时间，不把不同镜头的同类物品或人物认定为同一个。kind=identity 仅支持作品名称，不支持已播放剧情。kind=user 才能支持真实用户的观点/感受，audio 中的我们/我不是用户；用户的疑问不等于用户认同问题前提。visual 是单帧模型描述，不能独自证明声音、语气、动机、字幕中的名字或任务。claimTypes=appearance 只能描述外观/场景；claimTypes=visual-action 只能描述画面直接可见的移动、交互或战斗动作。两者若含字幕语义、任务、声音、剧情因果、不可见结果或人物身份，即使原始视觉描述如此写也判 unsupported。播放按钮等播放器状态不是观看内容。"} : {}),
           sources:sources.map(({references,...source})=>source)})},
       ]})});
     if (!response.ok) return null;

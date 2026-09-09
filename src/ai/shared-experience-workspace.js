@@ -1,5 +1,5 @@
 import { buildCurrentEvidenceWindow } from "./shared-experience-evidence-window.js";
-import { sharedExperienceEvidenceEmphasis } from "./shared-experience-content-mode.js";
+import { SHARED_EXPERIENCE_CONTENT_MODES, sharedExperienceEvidenceEmphasis } from "./shared-experience-content-mode.js";
 
 const DEFAULT_MAX_EVENTS = 24;
 const DEFAULT_MAX_AUDIO_EVENTS = 24;
@@ -49,6 +49,18 @@ function renderAudioRecall(journal, nowMs) {
   }).join("\n");
 }
 
+function renderVisualRecall(journal, nowMs) {
+  return (Array.isArray(journal) ? journal : [])
+    .filter((event) => event?.kind === "visual" && typeof event.text === "string" && event.text.trim())
+    .slice(-24)
+    .map((event) => {
+      const atMs = Number(event.atMs);
+      const age = Number.isFinite(atMs) ? Math.max(0, nowMs - atMs) : null;
+      return `- [${event.id}；${age === null ? "时间未知" : `约${age}ms前`}] ${event.text.trim().slice(0, 360)}`;
+    })
+    .join("\n");
+}
+
 export function createSharedExperienceWorkspace({
   sessionId = `shared-${Date.now()}`,
   windowId = null,
@@ -63,7 +75,7 @@ export function createSharedExperienceWorkspace({
 } = {}) {
   const safeSegmentDurationMs = Math.max(1, Number(segmentDurationMs) || DEFAULT_SEGMENT_DURATION_MS);
   const initialSegmentStartedAtMs = normalizeTime(nowMs(), Date.now());
-  const safeContentMode = ["narrated", "direct"].includes(contentMode) ? contentMode : "unknown";
+  const safeContentMode = SHARED_EXPERIENCE_CONTENT_MODES.includes(contentMode) ? contentMode : "unknown";
   const state = {
     sessionId: cleanText(sessionId, 80),
     windowId: Number.isInteger(Number(windowId)) ? Number(windowId) : null,
@@ -161,6 +173,7 @@ export function createSharedExperienceWorkspace({
         role: safeRole,
         content: text,
         atMs: normalizeTime(atMs, nowMs()),
+        segmentId: state.segmentId,
         confirmed: confirmed === true,
         includeInSummary: includeInSummary !== false,
       };
@@ -197,7 +210,7 @@ export function createSharedExperienceWorkspace({
     },
 
     setContentMode(mode) {
-      if (["narrated", "direct"].includes(mode)) state.contentMode = mode;
+      if (SHARED_EXPERIENCE_CONTENT_MODES.includes(mode)) state.contentMode = mode;
       return state.contentMode;
     },
 
@@ -300,11 +313,12 @@ export function createSharedExperienceWorkspace({
       return [...identity, ...blocks, ...evidence, ...userContext].join("\n");
     },
 
-    buildSummaryEvidence() {
+    buildSummaryEvidence({ scope = "session" } = {}) {
+      const inScope = (segmentId) => scope === "session" || segmentId === state.segmentId;
       return [
-        ...state.evidenceJournal.filter((event)=>["audio","visual"].includes(event.kind)).map((event)=>({...event})),
+        ...state.evidenceJournal.filter((event)=>["audio","visual"].includes(event.kind) && inScope(event.segmentId)).map((event)=>({...event})),
         ...state.discussionJournal.map((turn,index)=>({turn,id:`discussion-${index + 1}`}))
-          .filter(({turn})=>turn.role === "user" && turn.includeInSummary !== false)
+          .filter(({turn})=>turn.role === "user" && turn.includeInSummary !== false && inScope(turn.segmentId))
           .map(({turn,id})=>({id,kind:"user",atMs:turn.atMs,text:turn.content})),
         ...(state.primer?.title ? [{id:"identity-only",kind:"identity",text:`用户确认标题：${state.primer.title}`}] : []),
       ];
@@ -372,6 +386,12 @@ export function createSharedExperienceWorkspace({
           "相邻画面的字幕或 OCR 出现细小字词差异时，优先视为识别噪声，不能据此声称剧情、台词或事件发生变化；只有连续多帧或 ASR 证实后才能采用。",
           "回答时自然综合内容，不要机械复述‘声音说了什么、画面又显示什么’；只有用户追问依据或确有会改变判断的重要冲突时才说明证据来源。",
         );
+      } else if (snapshot.contentMode === "cinematic") {
+        lines.push("当前内容是普通电影或剧集：对白与连续画面变化共同构成事件链；人物继续使用匿名外观标签，除非名字已由对白、字幕或用户确认。单帧外观不能独自证明人物身份或动机。");
+      } else if (snapshot.contentMode === "livestream") {
+        lines.push("当前内容是直播：以连续画面的实时动作和状态变化为主，结合零散语音；不要把短暂静止当作事件结束，也不要用较早场景替代当前状态。");
+      } else if (snapshot.contentMode === "low-speech-game") {
+        lines.push("当前内容是低语音游戏：优先串联连续画面里的移动、交互、战斗和场景切换，零散解说或对白只补充明确目标与判断；不要从游戏界面猜作品名或角色名。");
       }
       if (snapshot.rollingSummary) lines.push(`\n【基于证据生成的阶段概述】\n${snapshot.rollingSummary}`);
       if (snapshot.evidenceBlocks.length) {
@@ -391,10 +411,19 @@ export function createSharedExperienceWorkspace({
         snapshot.audioEvents.forEach((event) => lines.push(`- ${observationAge(event.startedAtMs)} ${new Date(event.startedAtMs).toLocaleTimeString()} · ${event.text}`));
       }
       if (isHistoryRecallQuestion(question)) {
-        const recall = renderAudioRecall(snapshot.evidenceJournal, renderedAtMs);
-        if (recall) {
-          lines.push("\n【离开期间可回顾的连续语音片段】", recall);
-          lines.push("这是按相邻 ASR 原文拼接的有限回顾，只能转述其中明确内容；中间有空档或残句时直接说明缺失，不补全剧情。回答‘刚才讲了什么’时优先概括这段回顾，不要只描述当前画面。");
+        const audioRecall = renderAudioRecall(snapshot.evidenceJournal, renderedAtMs);
+        const visualRecall = renderVisualRecall(snapshot.evidenceJournal, renderedAtMs);
+        if (evidenceEmphasis === "audio-led" && audioRecall) {
+          lines.push("\n【离开期间可回顾的连续语音片段】", audioRecall);
+          if (visualRecall) lines.push("\n【离开期间可回顾的辅助画面变化】", visualRecall);
+          lines.push("这是按相邻 ASR 原文拼接的有限回顾，以解说主线为准，画面只补充动作和场景；中间有空档或残句时直接说明缺失，不补全剧情。回答‘刚才讲了什么’时优先概括这段回顾，不要只描述当前画面。");
+        } else if (visualRecall) {
+          lines.push("\n【离开期间可回顾的连续画面变化】", visualRecall);
+          if (audioRecall) lines.push("\n【离开期间可回顾的零散语音】", audioRecall);
+          lines.push("这段回顾以连续画面变化为主，并用零散对白或解说补充明确内容；只概括实际出现、消失、移动、交互和场景变化。单帧无法确定的身份、原因和结果必须保留不确定性。");
+        } else if (audioRecall) {
+          lines.push("\n【离开期间可回顾的连续语音片段】", audioRecall);
+          lines.push("当前没有足够连续画面，只能有限转述 ASR 中明确说出的内容；中间有空档或残句时不补全剧情。");
         }
       }
       if (snapshot.chatTurns.length) {

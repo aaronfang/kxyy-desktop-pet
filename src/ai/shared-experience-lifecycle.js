@@ -187,7 +187,12 @@ export function createSharedExperienceLifecycle({
           return `- [${event.id}] ${new Date(event.atMs).toISOString()} ${label}：${event.text}`;
         }).join("\n");
         try {
-          const response = await summarize({ kind: "evidence", source, evidence: batch.events });
+          const response = await summarize({
+            kind: "evidence",
+            source,
+            evidence: batch.events,
+            contentMode: workspace.snapshot().contentMode,
+          });
           const summary = cleanText(response?.summary, 2400);
           if (!summary) throw new Error("证据块总结为空");
           recordUsage("evidenceSummary", response?.usage, {
@@ -241,6 +246,8 @@ export function createSharedExperienceLifecycle({
           const response = await summarize({
             kind: "segment",
             source: evidenceSource(workspace, snapshot, "segment"),
+            evidence: workspace.buildSummaryEvidence?.({ scope: "segment" }) || [],
+            contentMode: snapshot.contentMode,
           });
           const summary = cleanText(response?.summary, SUMMARY_MAX_CHARS);
           if (!summary) throw new Error("阶段总结为空");
@@ -316,6 +323,7 @@ export function createSharedExperienceLifecycle({
             kind: "final",
             source: evidenceSource(workspace, snapshot, "session", true) || renderFinalSource(snapshot),
             evidence: workspace.buildSummaryEvidence?.() || [],
+            contentMode: snapshot.contentMode,
           });
           summary = cleanText(response?.summary, SUMMARY_MAX_CHARS);
           if (!summary) throw new Error("最终总结为空");

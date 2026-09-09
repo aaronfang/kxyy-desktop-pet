@@ -71,6 +71,32 @@ test("history recall prompt joins adjacent ASR fragments for a missed interval",
   assert.match(prompt, /不补全剧情/);
 });
 
+test("cinematic history recall combines visual changes with sparse dialogue", () => {
+  const workspace = createSharedExperienceWorkspace({ contentMode: "cinematic", nowMs: () => 20_000 });
+  workspace.addVisualObservation({ summary: "短发女子从走廊进入病房", capturedAtMs: 2_000 });
+  workspace.addAudioObservation({ text: "有人说门已经锁上了。", startedAtMs: 4_000, endedAtMs: 5_000 });
+  workspace.addVisualObservation({ summary: "同一名短发女子转身照向墙后的暗门", capturedAtMs: 8_000 });
+  const prompt = workspace.renderPrompt({ question: "我刚才离开了一会，发生了什么？" });
+  assert.match(prompt, /离开期间可回顾的连续画面变化/);
+  assert.match(prompt, /进入病房[\s\S]*照向墙后的暗门/);
+  assert.match(prompt, /门已经锁上/);
+  assert.match(prompt, /画面变化为主.*零散对白/);
+});
+
+test("livestream and low-speech game prompts keep visual continuity when ASR is sparse", () => {
+  for (const contentMode of ["livestream", "low-speech-game"]) {
+    const workspace = createSharedExperienceWorkspace({ contentMode, nowMs: () => 30_000 });
+    workspace.addVisualObservation({ summary: "玩家进入昏暗仓库", capturedAtMs: 10_000 });
+    workspace.addVisualObservation({ summary: "玩家举枪后退并躲到木箱后", capturedAtMs: 15_000 });
+    workspace.addAudioObservation({ text: "小心。", startedAtMs: 16_000, endedAtMs: 16_500 });
+    workspace.addVisualObservation({ summary: "门口出现敌人，玩家向右侧移动", capturedAtMs: 20_000 });
+    const prompt = workspace.renderPrompt({ question: "刚才我没看到，发生了什么？" });
+    assert.match(prompt, /当前证据重点：画面事件更密集/);
+    assert.match(prompt, /连续画面变化/);
+    assert.match(prompt, /举枪后退[\s\S]*门口出现敌人/);
+  }
+});
+
 test("narrated-video prompt treats ASR as narrative evidence without forcing frame alignment", () => {
   const workspace = createSharedExperienceWorkspace({ contentMode: "narrated", nowMs: () => 1000 });
   workspace.addAudioObservation({ text: "解说介绍主角参加猎人考核", startedAtMs: 1000 });
@@ -97,7 +123,9 @@ test("workspace can adopt narrated mode after an explicit viewing declaration", 
   assert.equal(workspace.snapshot().contentMode, "unknown");
   assert.equal(workspace.setContentMode("narrated"), "narrated");
   assert.equal(workspace.snapshot().contentMode, "narrated");
-  assert.equal(workspace.setContentMode("invalid"), "narrated");
+  assert.equal(workspace.setContentMode("livestream"), "livestream");
+  assert.equal(workspace.setContentMode("low-speech-game"), "low-speech-game");
+  assert.equal(workspace.setContentMode("invalid"), "low-speech-game");
 });
 
 test("workspace clear releases visual, audio, chat, and summary state", () => {

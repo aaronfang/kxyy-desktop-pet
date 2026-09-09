@@ -90,7 +90,7 @@ import {
   createSharedExperiencePrimerGate,
   parseSharedExperienceViewingStatement,
 } from "./ai/shared-experience-primer.js";
-import { viewingStatementContentMode } from "./ai/shared-experience-content-mode.js";
+import { classifySharedExperienceContentMode, viewingStatementContentMode } from "./ai/shared-experience-content-mode.js";
 import {
   extractVisualCharacterDescriptors,
   filterVisualIdentityClaims,
@@ -2217,6 +2217,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
             lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
             deep,
           }),
+          { deliberate },
         ),
       }),
     });
@@ -3851,7 +3852,7 @@ async function connectSharedExperience(selected, { segmentDurationMs } = {}) {
   sharedExperience.contentTitle = "";
   sharedExperience.workspace = createSharedExperienceWorkspace({
     windowId: sharedExperience.windowId,
-    contentMode: "unknown",
+    contentMode: classifySharedExperienceContentMode(selected.title),
     ...(Number.isFinite(Number(segmentDurationMs))
       ? { segmentDurationMs: Number(segmentDurationMs) }
       : {}),
