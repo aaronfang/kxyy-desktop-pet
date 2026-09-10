@@ -1,9 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+
+test("stress report requires explicit input and output paths", () => {
+  const result = spawnSync(process.execPath, ["scripts/shared-experience/generate-stress-report.mjs"], {
+    cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."),
+    encoding: "utf8",
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Usage: generate-stress-report\.mjs raw\.json report\.md/);
+  assert.doesNotMatch(result.stderr, /ENOENT/);
+});
 
 test("fixed-question report uses its captured review sources, never the final scene", () => {
   const directory = mkdtempSync(path.join(tmpdir(), "shared-experience-report-"));

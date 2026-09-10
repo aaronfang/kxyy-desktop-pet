@@ -283,17 +283,17 @@ test("browser debug chrome cannot become a video question even when the model se
   let supplied;
   const result = await requestSharedExperienceQuestion({
     apiBase: "http://127.0.0.1:1234",
-    evidence: [{ id: "v", kind: "visual", text: "ChatGPT 正在调试浏览器。角色拿着手电走进隧道。" }],
+    evidence: [{ id: "v", kind: "visual", text: "AI 助手正在调试浏览器。角色拿着手电走进隧道。" }],
     fetchImpl: async (_url, init) => {
       supplied = JSON.parse(init.body).messages[1].content;
       return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
-        prompt: "这个ChatGPT在调试浏览器时，具体在操作哪个页面或功能？",
-        topic: "ChatGPT", anchorEventIds: ["v"],
+        prompt: "这个AI助手在调试浏览器时，具体在操作哪个页面或功能？",
+        topic: "AI助手", anchorEventIds: ["v"],
       }) } }] }) };
     },
   });
   assert.equal(result, null);
-  assert.doesNotMatch(supplied, /ChatGPT/);
+  assert.doesNotMatch(supplied, /AI 助手/);
   assert.match(supplied, /手电/);
 });
 

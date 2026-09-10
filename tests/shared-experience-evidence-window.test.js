@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { buildCurrentEvidenceWindow, isQuestionEvidenceUsable, videoQuestionEvidence } from "../src/ai/shared-experience-evidence-window.js";
 
 test("video evidence discards browser loading and debug chrome while preserving game action", () => {
-  const result = videoQuestionEvidence({id:"v",kind:"visual",text:"ChatGPT started debugging this browser. 网页正在加载，显示加载提示。角色拿着枪走进车厢。"});
+  const result = videoQuestionEvidence({id:"v",kind:"visual",text:"An assistant started debugging this browser. 网页正在加载，显示加载提示。角色拿着枪走进车厢。"});
   assert.equal(result.text,"角色拿着枪走进车厢。");
   assert.equal(videoQuestionEvidence({kind:"audio",text:"解说说这里正在加载下一关。"}).text,"解说说这里正在加载下一关。");
 });

@@ -8,10 +8,10 @@ import { parseSharedExperienceViewingStatement } from "../../src/ai/shared-exper
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(scriptDir, "../..");
-const defaultRaw = "docs/test-reports/shared-experience-30min-stress-2026-09-06-v2.raw.json";
-const defaultReport = "docs/test-reports/shared-experience-30min-stress-2026-09-06-v2.md";
-const rawPath = path.resolve(rootDir, process.argv[2] || defaultRaw);
-const reportPath = path.resolve(rootDir, process.argv[3] || defaultReport);
+const [input, output] = process.argv.slice(2);
+if (!input || !output) throw new Error("Usage: generate-stress-report.mjs raw.json report.md");
+const rawPath = path.resolve(rootDir, input);
+const reportPath = path.resolve(rootDir, output);
 const report = JSON.parse(await readFile(rawPath, "utf8"));
 
 function number(value) {
