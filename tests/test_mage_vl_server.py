@@ -6,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PIL import Image
+try:
+    from PIL import Image
+except ModuleNotFoundError:  # Mage-VL's optional image dependency is not in every CI runner.
+    Image = None
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "mage-vl" / "server.py"
@@ -21,6 +24,7 @@ def image_data_url(color):
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode()
 
 
+@unittest.skipUnless(Image is not None, "Pillow is required for Mage-VL server tests")
 class MageVlFrameWindowTests(unittest.TestCase):
     def test_observe_frames_sends_one_time_aware_video_to_mage(self):
         calls = []
