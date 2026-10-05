@@ -61,6 +61,15 @@ function renderVisualRecall(journal, nowMs) {
     .join("\n");
 }
 
+function renderStoryThread(journal, focusEvidenceIds = []) {
+  const focused = new Set(Array.isArray(focusEvidenceIds) ? focusEvidenceIds : []);
+  return (Array.isArray(journal) ? journal : [])
+    .filter((event) => ["audio", "visual"].includes(event?.kind) && !focused.has(event.id))
+    .slice(-10)
+    .map((event) => `- [${event.id}] ${event.kind === "audio" ? "剧情语音" : "辅助画面"}：${cleanText(event.text, 240)}`)
+    .join("\n");
+}
+
 export function createSharedExperienceWorkspace({
   sessionId = `shared-${Date.now()}`,
   windowId = null,
@@ -92,6 +101,7 @@ export function createSharedExperienceWorkspace({
     segmentId: 0,
     segmentStartedAtMs: initialSegmentStartedAtMs,
     contentMode: safeContentMode,
+    initialOrientationPending: true,
   };
 
   return {
@@ -184,6 +194,11 @@ export function createSharedExperienceWorkspace({
       return turn;
     },
 
+    markInitialOrientationComplete() {
+      state.initialOrientationPending = false;
+      return true;
+    },
+
     addPrimer(primer = {}) {
       const title = cleanText(primer.title, 160);
       const facts = (Array.isArray(primer.facts) ? primer.facts : [])
@@ -256,6 +271,7 @@ export function createSharedExperienceWorkspace({
         segmentStartedAtMs: state.segmentStartedAtMs,
         segmentDurationMs: safeSegmentDurationMs,
         contentMode: state.contentMode,
+        initialOrientationPending: state.initialOrientationPending,
       };
     },
 
@@ -373,13 +389,19 @@ export function createSharedExperienceWorkspace({
         `当前证据重点：${evidenceEmphasis === "visual-led" ? "画面事件更密集，优先依据连续画面中的出现、消失、位置和动作变化；稀疏声音只作补充。" : evidenceEmphasis === "audio-led" ? "声音信息更密集，优先依据连续 ASR；画面用于补充场景和动作。" : evidenceEmphasis === "audio-supported" ? "声音是主要线索，画面用于确认场景、人物外观和动作变化。" : "声音和画面都要结合，优先采用时间上较新的明确变化。"}`,
         "这是边看边聊的口播回复：最多 5 句。有足够上下文时通常说 2–4 句。第一句用独立短句轻松自然地接住用户真正想聊的点并直接回答，再从已有内容里补一个具体观察，并给出自然的感受、判断或对接下来发展的轻度猜测。不要像答题，也不要用‘关于你的问题’‘答案是’这类问答模板。只有证据确实只够回答一个简单事实时才用一句结束。补充必须推进交流，不能换词复述答案，也不能为凑长度编造动作、动机或前情。像朋友一起看那样直接聊内容，不要复述问题、逐项报告证据或展开背景百科。",
         "不要用‘这句是……’、‘具体是什么还没揭晓’、‘还得再等等看’、‘等后面揭晓’、‘声音说……画面显示……’这类解说审计或脚本话术。资料不足时用自然的判断表达，例如‘目前更像是……，后面怎么走还不好说’，不要每轮固定声明未知。只有用户追问依据或出现会改变判断的重要冲突时，才说明声音、画面等来源。",
-        maturity === "shallow"
+        snapshot.contentMode === "short-video"
+          ? "短视频的观看时长不代表单条内容形成长剧情；仅对当前有证据的片段作局部判断，不把跨视频的累计观察推成同一主线。"
+          : maturity === "shallow"
           ? "当前仍在建立证据：只回答人物、动作、场景、台词等局部事实，不总结主线、人物动机、幕后关系或完整因果。"
           : maturity === "connecting"
             ? "当前可以连接多个已确认事件，但必须把事实与推断分开，不能把剪辑重复误判为剧情发展。"
           : "当前已有较长证据链，可以讨论剧情和人物变化；每个关键判断仍须能回指证据，不得为追求连贯而补全缺失情节。",
       ];
-      if (snapshot.contentMode === "narrated") {
+      if (snapshot.contentMode === "short-video") {
+        lines.push("当前是连续短视频：不同视频可能完全无关，不要把前一条的人物、场景和行动连成同一剧情；除非用户明确要求回顾，只围绕最近24秒内的明确内容给一两句短评。不从单次画面变化断言已切换视频；只有新证据支持时才自然接新内容。");
+      } else if (snapshot.contentMode === "game-narrated") {
+        lines.push("当前内容是游戏解说：用 ASR 中明确的目标、策略和判断串联游戏进展，画面补充实际操作和结果；不要把解说中的预期当作已经完成的操作。");
+      } else if (snapshot.contentMode === "narrated") {
         lines.push(
           "当前内容是解说视频：SenseVoice2 ASR 是剧情进展、人物关系和因果的主证据；画面描述只是场景、动作、字幕和视觉变化的辅助证据。",
           "解说和剪辑画面不要求逐秒同步，单帧对不上不构成冲突；只有跨多条证据持续出现的明确矛盾才标为待核验。",
@@ -393,8 +415,19 @@ export function createSharedExperienceWorkspace({
       } else if (snapshot.contentMode === "low-speech-game") {
         lines.push("当前内容是低语音游戏：优先串联连续画面里的移动、交互、战斗和场景切换，零散解说或对白只补充明确目标与判断；不要从游戏界面猜作品名或角色名。");
       }
-      if (snapshot.rollingSummary) lines.push(`\n【基于证据生成的阶段概述】\n${snapshot.rollingSummary}`);
-      if (snapshot.evidenceBlocks.length) {
+      if (snapshot.initialOrientationPending && snapshot.contentMode !== "short-video") {
+        const opening = snapshot.evidenceJournal
+          .filter((event) => ["audio", "visual"].includes(event.kind))
+          .slice(0, 8)
+          .map((event) => `- [${event.id}] ${event.kind === "audio" ? "剧情语音" : "开头画面"}：${cleanText(event.text, 300)}`)
+          .join("\n");
+        if (opening) {
+          lines.push("\n【本次陪看的开头线索】", opening);
+          lines.push("这是本次重新开始陪看的第一次主动回应：先用一两句概括从开头已经确认的内容，再把它和当前焦点连接起来。只概括实际证据，不要为了完整而补剧情；证据不足时明确保留不确定性。不要只解释当前一帧。");
+        }
+      }
+      if (snapshot.rollingSummary && snapshot.contentMode !== "short-video") lines.push(`\n【基于证据生成的阶段概述】\n${snapshot.rollingSummary}`);
+      if (snapshot.evidenceBlocks.length && snapshot.contentMode !== "short-video") {
         lines.push("\n【较早内容的证据块】");
         snapshot.evidenceBlocks.slice(-6).forEach((block) => lines.push(`- [${block.id}] ${block.summary}`));
       }
@@ -402,13 +435,21 @@ export function createSharedExperienceWorkspace({
       if (primer) {
         lines.push(`\n【用户确认的无剧透身份参考】\n${primer.text}\n这里只用于名称校正和开场基础设定，不代表视频已经演到相关内容。`);
       }
-      if (snapshot.visualEvents.length) {
-        lines.push("\n【按时间排列的最近画面】");
-        snapshot.visualEvents.forEach((event) => lines.push(`- ${observationAge(event.capturedAtMs)} ${new Date(event.capturedAtMs).toLocaleTimeString()} · ${event.summary}`));
+      const recentWindow = snapshot.contentMode === "short-video" && !isHistoryRecallQuestion(question);
+      const visibleVisual = recentWindow ? snapshot.visualEvents.filter((event) => event.capturedAtMs >= renderedAtMs - 24_000) : snapshot.visualEvents;
+      const visibleAudio = recentWindow ? snapshot.audioEvents.filter((event) => event.startedAtMs >= renderedAtMs - 24_000) : snapshot.audioEvents;
+      if (visibleVisual.length) {
+        lines.push(recentWindow ? "\n【本轮短视频最近画面】" : "\n【按时间排列的最近画面】");
+        visibleVisual.forEach((event) => lines.push(`- ${observationAge(event.capturedAtMs)} ${new Date(event.capturedAtMs).toLocaleTimeString()} · ${event.summary}`));
       }
-      if (snapshot.audioEvents.length) {
+      if (visibleAudio.length) {
         lines.push("\n【最近声音时间线（SenseVoice2 ASR）】");
-        snapshot.audioEvents.forEach((event) => lines.push(`- ${observationAge(event.startedAtMs)} ${new Date(event.startedAtMs).toLocaleTimeString()} · ${event.text}`));
+        visibleAudio.forEach((event) => lines.push(`- ${observationAge(event.startedAtMs)} ${new Date(event.startedAtMs).toLocaleTimeString()} · ${event.text}`));
+      }
+      const storyThread = snapshot.contentMode === "short-video" ? "" : renderStoryThread(snapshot.evidenceJournal, focusEvidenceIds);
+      if (storyThread) {
+        lines.push("\n【截至本轮的剧情脉络】", storyThread);
+        lines.push("先用这条按时间积累的脉络理解当前局势，再用本轮新证据补充、修正或撤销旧判断；不要把当前单帧孤立解说，也不要为了连贯补全缺失情节。");
       }
       if (isHistoryRecallQuestion(question)) {
         const audioRecall = renderAudioRecall(snapshot.evidenceJournal, renderedAtMs);
@@ -453,6 +494,7 @@ export function createSharedExperienceWorkspace({
       state.rollingSummary = "";
       state.segmentId = 0;
       state.segmentStartedAtMs = normalizeTime(nowMs(), Date.now());
+      state.initialOrientationPending = true;
     },
   };
 }

@@ -79,13 +79,13 @@ test("an oversized final summary falls back to a bounded degraded memory recap",
   assert.match(result.summary, /降级回顾/);
 });
 
-test("visual text without independent support cannot create a final memory episode", async () => {
+test("visual-only stop stores an explicitly unverified model clue instead of an actionable claim", async () => {
   for (const claimType of [undefined,"screen-text","speech","interpretation"]) {
     const workspace = createSharedExperienceWorkspace({nowMs:()=>0});
     workspace.addVisualObservation({summary:"画面文字提示去见小红。",capturedAtMs:1});
     let calls = 0;
     const lifecycle = createSharedExperienceLifecycle({workspace,
-      persistEpisode:async()=>assert.fail("unconfirmed visual task reached memory"),
+      persistEpisode:async(episode)=>({stored:/画面模型线索（未独立核实）/.test(episode.summary)}),
       summarize:(request)=>requestSharedExperienceSummary({...request,apiBase:"http://127.0.0.1:1234",
         fetchImpl:async()=>{
           calls++;
@@ -95,8 +95,9 @@ test("visual text without independent support cannot create a final memory episo
         }}),
     });
     const result = await lifecycle.finalize({endedAtMs:2});
-    assert.equal(result.stored,false);
-    assert.equal(result.reason,"summary-failed");
+    assert.equal(result.stored,true);
+    assert.equal(result.reason,"summary-fallback");
+    assert.match(result.summary,/画面模型线索（未独立核实）/);
     assert.equal(calls,1);
     assert.equal(lifecycle.snapshot().usage.finalSummary.completion,20);
   }
@@ -130,7 +131,7 @@ test("semantic review failure retains evidence for retry and counts both paid re
   assert.equal(lifecycle.snapshot().usage.evidenceSummary.completion,120);
 });
 
-test("final memory summary is reviewed against original evidence, not a mistaken compacted claim", async () => {
+test("failed final review falls back to original evidence instead of a mistaken compacted claim", async () => {
   const workspace = createSharedExperienceWorkspace();
   workspace.addAudioObservation({text:"Promise me this was the last time.",startedAtMs:1000});
   workspace.commitEvidenceBlock({eventIds:["ev-1"],summary:"老者承诺这是最后一次。"});
@@ -144,11 +145,13 @@ test("final memory summary is reviewed against original evidence, not a mistaken
     }),
   });
   const result = await lifecycle.finalize({endedAtMs:2000});
-  assert.equal(result.reason,"summary-failed");
-  assert.equal(stored,false);
-  assert.equal(calls,2);
-  assert.equal(lifecycle.snapshot().usage.finalSummary.requests,2);
-  assert.equal(lifecycle.snapshot().usage.finalSummary.completion,60);
+  assert.equal(result.reason,"summary-fallback");
+  assert.equal(stored,true);
+  assert.match(result.summary,/声音记录：Promise me this was the last time/);
+  assert.doesNotMatch(result.summary,/老者承诺/);
+  assert.equal(calls,3);
+  assert.equal(lifecycle.snapshot().usage.finalSummary.requests,3);
+  assert.equal(lifecycle.snapshot().usage.finalSummary.completion,90);
 });
 
 test("reviewed final memory retains media and actual user opinion with bounded raw sources", async () => {
@@ -208,13 +211,13 @@ test("test question generation costs are separate from role conversation and spe
 
 test("DeepSeek cost estimate separates cached input, uncached input, and output", () => {
   // Sunday 12:00 UTC is off-peak. Flash rates per 1M tokens are
-  // $0.007 cache hit, $0.22 cache miss, and $0.66 output.
+  // $0.003 cache hit, $0.15 cache miss, and $0.60 output.
   const atMs = Date.UTC(2026, 8, 6, 12, 0, 0);
   assert.equal(estimateDeepseekCostUsd({
     model: "deepseek-v4-flash",
     usage: { prompt: 1_000_000, cachedPrompt: 250_000, completion: 100_000 },
     atMs,
-  }), 0.23275);
+  }), 0.17325);
   assert.equal(estimateDeepseekCostUsd({
     model: "unknown-model",
     usage: { prompt: 1_000, completion: 100 },
@@ -386,7 +389,7 @@ test("exhausted budget rolls with a local fallback without another DeepSeek requ
   assert.doesNotMatch(result.summary, /角色猜测/);
   assert.deepEqual(lifecycle.snapshot().budget, {
     limitUsd: 0.001,
-    estimatedCostUsd: 0.00286,
+    estimatedCostUsd: 0.0021,
     exhausted: true,
   });
   assert.equal(lifecycle.snapshot().status, "budget-saving");
@@ -649,6 +652,20 @@ test("final summary with a title conflicting with the confirmed primer is not pe
   assert.equal(persistCalls, 0);
 });
 
+test("final summary failure audit retains only an allow-listed reason", async () => {
+  for (const [code, expected] of [["invalid-structure", "invalid-structure"], ["private provider output", "unknown"]]) {
+    const workspace = createSharedExperienceWorkspace({ sessionId: "failure-audit", nowMs: () => 0 });
+    workspace.addAudioObservation({ text: "队伍来到门前。", startedAtMs: 1, endedAtMs: 2 });
+    const lifecycle = createSharedExperienceLifecycle({ workspace,
+      summarize: async () => { const error = new Error("private content"); error.summaryFailureCode = code; throw error; },
+      persistEpisode: async () => ({ stored: true }),
+    });
+    const result = await lifecycle.finalize({ endedAtMs: 3 });
+    assert.equal(result.completionAudit.finalSummaryFailureCode, expected);
+    assert.doesNotMatch(JSON.stringify(result.completionAudit), /private/);
+  }
+});
+
 test("failed final summary persists a bounded degraded recap instead of losing the session", async () => {
   const workspace = createSharedExperienceWorkspace({ sessionId: "shared-summary-failure", nowMs: () => 0 });
   workspace.addAudioObservation({
@@ -676,4 +693,26 @@ test("failed final summary persists a bounded degraded recap instead of losing t
   assert.equal(persistCalls, 1);
   assert.match(result.summary, /降级回顾/);
   assert.equal(lifecycle.snapshot().status, "finalized");
+});
+
+test("semantic review failure still persists a bounded recap from visual-only evidence", async () => {
+  const workspace = createSharedExperienceWorkspace({ sessionId: "shared-visual-stop", nowMs: () => 0 });
+  workspace.addVisualObservation({ summary: "女子走进药铺并关上门。", capturedAtMs: 1 });
+  const stored = [];
+  const lifecycle = createSharedExperienceLifecycle({
+    workspace,
+    summarize: async () => {
+      const error = new Error("review unavailable");
+      error.summaryFailureCode = "review-unavailable";
+      error.summaryUsage = { usage: { prompt: 20, completion: 0, total: 20 }, requestCount: 2 };
+      throw error;
+    },
+    persistEpisode: async (episode) => { stored.push(episode); return { stored: true, duplicate: false }; },
+  });
+  const result = await lifecycle.finalize({ endedAtMs: 2 });
+  assert.equal(result.reason, "summary-fallback");
+  assert.equal(result.stored, true);
+  assert.equal(stored.length, 1);
+  assert.match(result.summary, /女子走进药铺并关上门/);
+  assert.equal(result.completionAudit.finalSummaryFailureCode, "review-unavailable");
 });

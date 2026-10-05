@@ -4,9 +4,45 @@ import assert from "node:assert/strict";
 import {
   buildAcceptanceEvidenceFallbackQuestion,
   buildSharedExperienceCleanupReceipt,
+  createSharedExperienceRuntimeReceipts,
   normalizeSharedExperienceAcceptancePlan,
   runSharedExperienceAcceptancePlan,
 } from "../src/ai/shared-experience-acceptance.js";
+
+test("runtime receipts require successful model responses, not requested settings", () => {
+  const receipts = createSharedExperienceRuntimeReceipts();
+  receipts.recordVision({ status: "ok", summary: "画面", provider: "mage-vl", model: "mlx-community/Mage-VL-8bit" });
+  receipts.recordAsr({ status: "ok", text: "旁白", asrRuntime: { active: "whisper", status: "active" } });
+  receipts.recordText({ provider: "DeepSeek", model: "deepseek-v4-flash", completed: true, responseChars: 12, usage: { total: 30 } });
+  assert.equal(receipts.snapshot().vision.successfulResponses, 1);
+  assert.equal(receipts.snapshot().asr.provider, "whisper");
+  assert.equal(receipts.snapshot().text.provider, "deepseek");
+  receipts.recordAsr({ status: "error", text: "" });
+  receipts.recordFailure("vision");
+  assert.equal(receipts.snapshot().asr.failedResponses, 1);
+  assert.equal(receipts.snapshot().vision.failedResponses, 1);
+  assert.doesNotMatch(JSON.stringify(receipts.snapshot()), /画面|旁白/);
+  const sensevoice = createSharedExperienceRuntimeReceipts();
+  sensevoice.recordAsr({ status: "ok", text: "", asrRuntime: { active: "sensevoice-sherpa-onnx", status: "active" } });
+  assert.equal(sensevoice.snapshot().asr.provider, "sensevoice");
+  sensevoice.recordAsr({ status: "ok", text: "", asrRuntime: { active: "whisper-mlx", status: "active" } });
+  assert.equal(sensevoice.snapshot().asr.provider, "mixed-or-unknown");
+});
+
+test("runtime receipts do not count headers, empty text, or non-running ASR as completed model work", () => {
+  const receipts = createSharedExperienceRuntimeReceipts();
+  receipts.recordText({ provider: "DeepSeek" });
+  receipts.recordText({ provider: "DeepSeek", completed: true, responseChars: 0 });
+  receipts.recordAsr({ status: "ok", text: "", asrRuntime: { active: "sensevoice-sherpa-onnx", status: "warming" } });
+  receipts.recordVision({ status: "ok", provider: "mage-vl", summary: "" });
+  const snapshot = receipts.snapshot();
+  assert.equal(snapshot.text.successfulResponses, 0);
+  assert.equal(snapshot.text.completedResponses, 0);
+  assert.equal(snapshot.asr.successfulResponses, 0);
+  assert.equal(snapshot.vision.successfulResponses, 0);
+  receipts.recordText({ provider: "DeepSeek", completed: true, responseChars: 4 });
+  assert.equal(receipts.snapshot().text.completedResponses, 1);
+});
 
 test("acceptance fallback anchors a simple question to the newest useful real event", () => {
   const snapshot = { workspace: { evidenceJournal: [

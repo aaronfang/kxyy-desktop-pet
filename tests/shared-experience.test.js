@@ -9,6 +9,19 @@ test("queued visual evidence retains capture time instead of pretending inferenc
   assert.equal(renderVisualContext(result,{nowMs:300000}),"");
 });
 
+test("queued frame results remain valid when model latency pushes service expiry past the capture TTL", () => {
+  const result = bindVisualObservationToCapture({
+    status: "ok",
+    summary: "玩家从走廊进入房间",
+    capturedAtMs: 1_000,
+    expiresAtMs: 121_500,
+    source: "frame-window",
+  }, 1_000, { nowMs: 2_000 });
+  assert.equal(result?.summary, "玩家从走廊进入房间");
+  assert.equal(result?.capturedAtMs, 1_000);
+  assert.equal(result?.expiresAtMs, 121_000);
+});
+
 test("visual context is bounded and expires", () => {
   const safe = sanitizeVisualContext({ summary: "画面里有字幕", capturedAtMs: 1000, expiresAtMs: 5000, source: "image" }, { nowMs: 2000 });
   assert.equal(safe.summary, "画面里有字幕");

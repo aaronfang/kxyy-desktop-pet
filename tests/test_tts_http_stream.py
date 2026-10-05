@@ -7,11 +7,13 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "local-realtime"))
 
 import common  # noqa: E402
+from test_voxcpm_stream import _load_server  # noqa: E402
 
 
 class TtsHttpStreamTests(unittest.TestCase):
@@ -163,6 +165,49 @@ class TtsHttpStreamTests(unittest.TestCase):
                 self.assertEqual(modes[-1], expected)
         finally:
             self._stop_server(server, old_stream, old_http_stream, old_secret)
+
+    def test_voxcpm_cleanup_survives_finished_http_request_loop(self):
+        provider = _load_server()
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        provider._pool = pool
+        provider._gate = threading.BoundedSemaphore(1)
+        provider._provider_stream = lambda _text, _mode: iter((b"\x01\x00",))
+        provider._to_pcm24 = lambda chunk, **_kwargs: chunk
+        provider.PROVIDER_CLEANUP_WAIT_SECONDS = 0.02
+
+        def close_stream(_generator):
+            cleanup_started.set()
+            if not release_cleanup.wait(timeout=2):
+                raise RuntimeError("test cleanup release timed out")
+
+        provider._close_stream = close_stream
+        http_port, server, old_stream, old_http_stream, old_secret = self._start_server(
+            provider._synth_stream, provider._synth_http_stream
+        )
+
+        def request_stream():
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{http_port}/tts-stream",
+                data=b'{"text":"hello"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                return response.read()
+
+        try:
+            self.assertEqual(request_stream(), b"\x01\x00")
+            self.assertTrue(cleanup_started.wait(2))
+            release_cleanup.set()
+            pool.submit(lambda: None).result(timeout=2)
+            self.assertEqual(request_stream(), b"\x01\x00")
+        finally:
+            release_cleanup.set()
+            self._stop_server(server, old_stream, old_http_stream, old_secret)
+            pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":

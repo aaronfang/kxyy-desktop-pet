@@ -90,6 +90,10 @@ body {
 #shared-experience-stop-btn:hover { color: #ffd0ce; }
 #shared-experience-pause-btn { border: 0; background: transparent; color: #f5c86b; cursor: pointer; font-size: 13px; padding: 0 4px; }
 #shared-experience-pause-btn:hover { color: #ffe1a0; }
+#shared-experience-mode { max-width: 112px; border: 1px solid rgba(255,255,255,.14); border-radius: 5px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.82); font-size: 11px; padding: 3px 4px; }
+#shared-experience-frequency { max-width: 64px; border: 1px solid rgba(255,255,255,.14); border-radius: 5px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.82); font-size: 11px; padding: 3px 4px; }
+#shared-experience-frequency:hover, #shared-experience-frequency:focus-visible { border-color: rgba(255,255,255,.35); outline: none; }
+#shared-experience-mode:hover, #shared-experience-mode:focus-visible { border-color: rgba(255,255,255,.35); outline: none; }
 #shared-experience-debug-btn { border: 0; background: transparent; color: rgba(244,242,251,.62); cursor: pointer; font-size: 16px; padding: 0 4px; }
 #shared-experience-debug-btn:hover { color: var(--text); }
 #shared-experience-status { flex: 0 0 auto; margin: 3px 8px 0; color: rgba(255,255,255,.58); font-size: 11px; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -387,6 +391,7 @@ body {
   color: var(--accent);
   animation: blink 1s steps(2, start) infinite;
 }
+.row.proactive-pending { display: none; }
 @keyframes blink {
   to {
     visibility: hidden;

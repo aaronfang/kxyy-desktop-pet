@@ -1,12 +1,13 @@
 const SUMMARY_SOURCE_MAX_CHARS = 48_000;
 const SUMMARY_MAX_CHARS = 1_800;
 
-// https://api-docs.deepseek.com/quick_start/pricing, verified 2026-09-06.
+// https://api-docs.deepseek.com/quick_start/pricing, verified 2026-10-05.
 // Values are USD per 1M tokens; off-peak is half price.
 const DEEPSEEK_PEAK_USD_PER_MILLION = Object.freeze({
-  "deepseek-v4-flash": { cached: 0.014, uncached: 0.44, output: 1.32 },
+  "deepseek-flash": { cached: 0.006, uncached: 0.3, output: 1.2 },
+  "deepseek-v4-flash": { cached: 0.006, uncached: 0.3, output: 1.2 },
   "deepseek-v4-pro": { cached: 0.044, uncached: 1.32, output: 3.96 },
-  "deepseek-v4-flash-vision-exp": { cached: 0.014, uncached: 0.44, output: 1.32 },
+  "deepseek-v4-flash-vision-exp": { cached: 0.006, uncached: 0.3, output: 1.2 },
 });
 
 function cleanText(value, maxChars) {
@@ -80,17 +81,21 @@ function fallbackFinalSummary(snapshot) {
     if (!text || lines.includes(text)) return;
     lines.push(text);
   };
-  // Prefer previously reviewed segment summaries; they are bounded and safer than
-  // copying a large, fragmented ASR timeline into long-term memory.
-  for (const block of snapshot.evidenceBlocks || []) add(block.summary);
-  if (snapshot.rollingSummary) add(snapshot.rollingSummary);
-  // If no reviewed block exists, retain only complete-looking audio statements and
-  // explicitly mark the result as an unverified degraded recap.
-  if (!lines.length) {
-    for (const event of (snapshot.audioEvents || []).slice(-12)) {
-      if (/[。！？.!?]$/u.test(String(event.text || "").trim())) add(`声音记录：${event.text}`);
-      if (lines.length >= 6) break;
-    }
+  // A failed semantic review must not promote a prior model summary. Rebuild the
+  // degraded recap from original media evidence and preserve its uncertainty.
+  const events = [
+    ...(snapshot.audioEvents || []).map((event) => ({
+      atMs: event.startedAtMs,
+      text: /[。！？.!?]$/u.test(String(event.text || "").trim()) ? `声音记录：${event.text}` : "",
+    })),
+    ...(snapshot.visualEvents || []).map((event) => ({
+      atMs: event.capturedAtMs,
+      text: `画面模型线索（未独立核实）：${event.summary}`,
+    })),
+  ].sort((left, right) => Number(left.atMs) - Number(right.atMs));
+  for (const event of events.slice(-12)) {
+    add(event.text);
+    if (lines.length >= 8) break;
   }
   if (!lines.length) return "本次共同观看的降级回顾（最终核对未完成）：已取得声音或画面记录，但具体内容未核实。";
   return cleanText(`本次共同观看的降级回顾（最终核对未完成）：${lines.slice(-8).join("；")}`, SUMMARY_MAX_CHARS);
@@ -125,6 +130,7 @@ export function createSharedExperienceLifecycle({
     },
     balance: { currency: "", starting: null, current: null, delta: null },
     summaryFailures: 0,
+    finalSummaryFailureCode: "none",
     usage: {
       conversation: emptyUsage(),
       questionGeneration: emptyUsage(),
@@ -139,7 +145,7 @@ export function createSharedExperienceLifecycle({
     if (!Object.hasOwn(state.usage, kind)) throw new TypeError("unknown usage kind");
     const usage = normalizeUsage(value || {});
     const bucket = state.usage[kind];
-    bucket.requests += Number.isInteger(requestCount) && requestCount >= 1 && requestCount <= 2 ? requestCount : 1;
+    bucket.requests += Number.isInteger(requestCount) && requestCount >= 1 && requestCount <= (kind === "finalSummary" ? 6 : 2) ? requestCount : 1;
     bucket.prompt += usage.prompt;
     bucket.completion += usage.completion;
     bucket.total += usage.total;
@@ -164,6 +170,7 @@ export function createSharedExperienceLifecycle({
         segmentId: Math.max(0, Number(workspaceSnapshot.segmentId) || 0),
         segmentSummaryRequests: state.usage.segmentSummary.requests,
         finalSummaryRequests: state.usage.finalSummary.requests,
+        finalSummaryFailureCode: state.finalSummaryFailureCode,
         lifecycle: {
           budget: { ...state.budget },
           balance: { ...state.balance },
@@ -337,10 +344,15 @@ export function createSharedExperienceLifecycle({
           if (error?.summaryUsage) recordUsage("finalSummary", error.summaryUsage.usage, error.summaryUsage);
           if (state.cancelled) return { cancelled: true, stored: false, reason: "cancelled" };
           state.summaryFailures += 1;
+          state.finalSummaryFailureCode = ["transport", "timeout", "output-truncated", "empty-output",
+            "invalid-structure", "review-unavailable", "no-supported-events"].includes(error?.summaryFailureCode)
+            ? error.summaryFailureCode : "unknown";
           const fallbackSnapshot = workspace.snapshot();
-          const fallbackEvidence = fallbackSnapshot.audioEvents.length > 0 || fallbackSnapshot.evidenceBlocks.length > 0;
-          const semanticReviewFailed = Number(error?.summaryUsage?.requestCount) >= 2;
-          if (!fallbackEvidence || semanticReviewFailed) {
+          const fallbackEvidence = fallbackSnapshot.visualEvents.length > 0
+            || fallbackSnapshot.audioEvents.length > 0
+            || fallbackSnapshot.evidenceBlocks.length > 0
+            || Boolean(fallbackSnapshot.rollingSummary);
+          if (!fallbackEvidence) {
             state.status = "finalized-without-memory";
             return withCompletionAudit({ stored: false, duplicate: false, reason: "summary-failed" });
           }

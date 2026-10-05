@@ -1,22 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { classifySharedExperienceContentMode, viewingStatementContentMode, sharedExperienceEvidenceEmphasis } from "../src/ai/shared-experience-content-mode.js";
+import { classifySharedExperienceContentMode, normalizeSharedExperienceContentMode, viewingStatementContentMode, sharedExperienceEvidenceEmphasis } from "../src/ai/shared-experience-content-mode.js";
 
-test("content titles classify narrated videos conservatively", () => {
-  assert.equal(classifySharedExperienceContentMode("漫画《雾城旅人》解说"), "narrated");
-  assert.equal(classifySharedExperienceContentMode("十分钟看完电影剧情"), "narrated");
-  assert.equal(classifySharedExperienceContentMode("电影正片"), "cinematic");
-  assert.equal(classifySharedExperienceContentMode("某主播的视频直播间"), "livestream");
-  assert.equal(classifySharedExperienceContentMode("某恐怖游戏实况"), "low-speech-game");
-  assert.equal(classifySharedExperienceContentMode("普通视频"), "direct");
+test("content context is never inferred from window metadata", () => {
+  assert.equal(classifySharedExperienceContentMode("漫画《雾城旅人》解说"), "unknown");
+  assert.equal(classifySharedExperienceContentMode("电影正片", "抖音"), "unknown");
   assert.equal(classifySharedExperienceContentMode(""), "unknown");
+  assert.equal(normalizeSharedExperienceContentMode("short-video"), "short-video");
+  assert.equal(normalizeSharedExperienceContentMode("电影解说"), "unknown");
 });
 
-test("a generic user declaration selects narration without requiring a work title", () => {
-  assert.equal(viewingStatementContentMode("我们在看游戏解说视频"), "narrated");
-  assert.equal(viewingStatementContentMode("我们一起看《星海纪事》电影"), "cinematic");
-  assert.equal(viewingStatementContentMode("我们在看游戏直播"), "livestream");
+test("viewing statements no longer change the selected context", () => {
+  assert.equal(viewingStatementContentMode("我们在看游戏解说视频"), "unknown");
+  assert.equal(viewingStatementContentMode("我们一起看《星海纪事》电影"), "unknown");
   assert.equal(viewingStatementContentMode("我觉得这个解说很有趣"), null);
   assert.equal(viewingStatementContentMode("这个窗口标题叫解说"), null);
 });

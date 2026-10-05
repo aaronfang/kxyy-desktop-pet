@@ -118,6 +118,16 @@ test("narrated-video prompt treats ASR as narrative evidence without forcing fra
   assert.match(prompt, /多帧.*ASR.*证实/);
 });
 
+test("short-video workspace keeps recent evidence local and treats earlier clips as separate", () => {
+  const workspace = createSharedExperienceWorkspace({ contentMode: "short-video", nowMs: () => 60_000 });
+  workspace.addVisualObservation({ summary: "旧视频中演员进入房间", capturedAtMs: 1_000 });
+  workspace.addVisualObservation({ summary: "新视频中厨师端出菜肴", capturedAtMs: 55_000 });
+  const prompt = workspace.renderPrompt();
+  assert.match(prompt, /短视频.*不同视频.*不要.*同一剧情/);
+  assert.match(prompt, /新视频中厨师端出菜肴/);
+  assert.doesNotMatch(prompt.match(/【本轮短视频[^]*?(?=【|$)/u)?.[0] || "", /旧视频中演员/);
+});
+
 test("workspace can adopt narrated mode after an explicit viewing declaration", () => {
   const workspace = createSharedExperienceWorkspace({ nowMs: () => 1000 });
   assert.equal(workspace.snapshot().contentMode, "unknown");
@@ -125,7 +135,9 @@ test("workspace can adopt narrated mode after an explicit viewing declaration", 
   assert.equal(workspace.snapshot().contentMode, "narrated");
   assert.equal(workspace.setContentMode("livestream"), "livestream");
   assert.equal(workspace.setContentMode("low-speech-game"), "low-speech-game");
-  assert.equal(workspace.setContentMode("invalid"), "low-speech-game");
+  assert.equal(workspace.setContentMode("short-video"), "short-video");
+  assert.equal(workspace.setContentMode("game-narrated"), "game-narrated");
+  assert.equal(workspace.setContentMode("invalid"), "game-narrated");
 });
 
 test("workspace clear releases visual, audio, chat, and summary state", () => {
@@ -312,4 +324,36 @@ test("simple viewer questions allow a short self-contained answer without paddin
   assert.match(prompt,/第一句.*独立.*直接回答/);
   assert.doesNotMatch(prompt,/控制在 60 到 100/);
   assert.match(prompt,/当前；距本轮8000ms.*玩家手持枪械/);
+});
+
+test("proactive analysis receives a bounded story thread before the current focus", () => {
+  let now = 120_000;
+  const workspace = createSharedExperienceWorkspace({ nowMs: () => now, contentMode: "narrated" });
+  workspace.addAudioObservation({ text: "解说说米娅失踪了三年。", startedAtMs: 1_000, endedAtMs: 8_000 });
+  workspace.addVisualObservation({ summary: "男子沿着林间小路走向一栋旧屋。", capturedAtMs: 20_000 });
+  workspace.addAudioObservation({ text: "解说说地上的驾照证明米娅来过这里。", startedAtMs: 90_000, endedAtMs: 98_000 });
+  const latest = workspace.snapshot().evidenceJournal.at(-1).id;
+  const prompt = workspace.renderPrompt({
+    question: "请根据本轮焦点证据主动分享你的分析。",
+    focusEvidenceIds: [latest],
+  });
+  assert.match(prompt, /【截至本轮的剧情脉络】/);
+  assert.match(prompt, /米娅失踪了三年/);
+  assert.match(prompt, /林间小路.*旧屋/);
+  assert.ok(prompt.indexOf("【截至本轮的剧情脉络】") < prompt.indexOf("【本轮当前焦点证据】"));
+  assert.match(prompt, /新证据.*修正/);
+});
+
+test("restarted sessions put opening evidence before the first proactive focus", () => {
+  const workspace = createSharedExperienceWorkspace({ nowMs: () => 30_000, contentMode: "narrated" });
+  workspace.addAudioObservation({ text: "解说介绍队伍刚刚进入地下城。", startedAtMs: 1_000 });
+  workspace.addVisualObservation({ summary: "队伍在石门前停下", capturedAtMs: 2_000 });
+  const prompt = workspace.renderPrompt({ focusEvidenceIds: ["ev-2"] });
+  assert.equal(workspace.snapshot().initialOrientationPending, true);
+  assert.match(prompt, /本次陪看的开头线索/);
+  assert.match(prompt, /刚刚进入地下城[\s\S]*石门前停下/);
+  assert.match(prompt, /第一次主动回应.*概括从开头/);
+  workspace.markInitialOrientationComplete();
+  assert.equal(workspace.snapshot().initialOrientationPending, false);
+  assert.doesNotMatch(workspace.renderPrompt(), /本次陪看的开头线索/);
 });

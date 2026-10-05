@@ -13,6 +13,7 @@ const candidates =
 
 const testFiles = [
   "tests/test_mage_vl.py",
+  "tests/test_mage_vl_server.py",
   "tests/test_local_realtime_events.py",
   "tests/test_qwen_mlx_stream.py",
   "tests/test_voxcpm_stream.py",

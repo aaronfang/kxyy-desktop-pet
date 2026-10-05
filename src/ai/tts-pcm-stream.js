@@ -1,4 +1,5 @@
 const DEFAULT_STARTUP_SAMPLES = 5760; // 240 ms at 24 kHz, matching realtime playback.
+const DEFAULT_COMPANION_STARTUP_SAMPLES = 8640; // 360 ms: absorb short local TTS generation stalls.
 const DEFAULT_MAX_SCHEDULED_SAMPLES = 72000; // 3 seconds at 24 kHz.
 
 function decodePcm16(bytes, carry) {
@@ -64,13 +65,19 @@ export async function consumePcm16Stream(response, {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     }
     const arrivedAtSeconds = Number(nowSeconds()) || 0;
-    if (suppliedUntilSeconds !== null && arrivedAtSeconds > suppliedUntilSeconds) {
+    const scheduled = schedule(samples);
+    const hasPlaybackTiming = Number.isFinite(scheduled?.startAtSeconds)
+      && Number.isFinite(scheduled?.endAtSeconds)
+      && scheduled.endAtSeconds >= scheduled.startAtSeconds;
+    const startAtSeconds = hasPlaybackTiming ? scheduled.startAtSeconds : arrivedAtSeconds;
+    if (suppliedUntilSeconds !== null && startAtSeconds > suppliedUntilSeconds) {
       underrunCount += 1;
-      maxGapMs = Math.max(maxGapMs, (arrivedAtSeconds - suppliedUntilSeconds) * 1000);
+      maxGapMs = Math.max(maxGapMs, (startAtSeconds - suppliedUntilSeconds) * 1000);
     }
-    suppliedUntilSeconds = Math.max(suppliedUntilSeconds ?? arrivedAtSeconds, arrivedAtSeconds)
+    suppliedUntilSeconds = hasPlaybackTiming ? scheduled.endAtSeconds
+      : Math.max(suppliedUntilSeconds ?? arrivedAtSeconds, arrivedAtSeconds)
       + samples.length / Math.max(1, Number(sampleRate) || 24000);
-    const completion = schedule(samples);
+    const completion = hasPlaybackTiming ? scheduled.completion : scheduled;
     if (completion && typeof completion.then === "function") {
       pendingPlayback.push({ samples: samples.length, completion: Promise.resolve(completion) });
       pendingSamples += samples.length;
@@ -118,4 +125,4 @@ export async function consumePcm16Stream(response, {
   }
 }
 
-export { DEFAULT_MAX_SCHEDULED_SAMPLES, DEFAULT_STARTUP_SAMPLES };
+export { DEFAULT_COMPANION_STARTUP_SAMPLES, DEFAULT_MAX_SCHEDULED_SAMPLES, DEFAULT_STARTUP_SAMPLES };

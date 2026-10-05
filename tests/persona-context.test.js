@@ -220,13 +220,34 @@ test("co-viewing proactive prompt comments on evidence without auditing it or qu
   });
   const system = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
   assert.match(system, /正在一起看/);
-  assert.match(system, /不要提问/);
+  assert.match(system, /偶尔可以.*问/);
   assert.match(system, /不要复述.*声音说.*画面/);
   assert.match(system, /有依据的态度|自然判断/);
   assert.match(system, /主动发现|分享/);
   assert.match(system, /不是在回答问题/);
+  assert.match(system, /人物|处境/);
+  assert.match(system, /关键|转折/);
+  assert.match(system, /判断|分析/);
+  assert.doesNotMatch(system, /最多 2 句/);
   assert.equal(messages.at(-1)?.role, "user");
   assert.equal(messages.at(-1)?.content, trigger);
+});
+
+test("a viewer can answer an unsolicited co-viewing comment without inheriting its hidden trigger", () => {
+  const trigger = getProactiveUserTrigger("shared-experience");
+  const messages = buildMessages({
+    systemPrompt: "persona\n# 当前共同观看证据\n[ev-8] 侧门打开了。",
+    fewShot: [],
+    history: [
+      { role: "user", content: trigger },
+      { role: "assistant", content: "这下侧门终于打开了。" },
+      { role: "user", content: "对，不过里面好像还有动静。" },
+    ],
+    maxTurns: 6, useLive: false, lore: {}, cardId: "kxyy-yuanyuan",
+  });
+  assert.equal(messages.at(-1).content, "对，不过里面好像还有动静。");
+  assert.ok(messages.some((message) => message.role === "assistant" && message.content === "这下侧门终于打开了。"));
+  assert.ok(messages.every((message) => message.content !== trigger));
 });
 
 test("follow-up request ends with an explicit user-role continuation directive", () => {

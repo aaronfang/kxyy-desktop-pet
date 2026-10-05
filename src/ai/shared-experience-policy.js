@@ -22,14 +22,14 @@ export function sharedExperienceRequestPolicy(active) {
   return active ? { ...ENABLED_POLICY } : { ...DEFAULT_POLICY };
 }
 
-export function sharedExperienceReplyMaxTokens(active, requested, { deliberate = false } = {}) {
+export function sharedExperienceReplyMaxTokens(active, requested, { deliberate = false, proactiveKind = null } = {}) {
   const normalized = Math.max(1, Math.floor(Number(requested) || 1));
   // DeepSeek reasoning shares max_tokens with the visible answer. The Rust proxy
   // multiplies this request budget by six when thinking is enabled, so reserve
   // enough room for reasoning without making ordinary companion replies longer.
   if (active && deliberate) return Math.max(1400, normalized);
   // Keep room for a natural companion reply while retaining a bounded TTS job.
-  return active ? Math.min(320, normalized) : normalized;
+  return active ? Math.min(proactiveKind === "shared-experience" ? 480 : 320, normalized) : normalized;
 }
 
 export function sharedExperienceTtsLatencyMode(active) {
@@ -37,5 +37,7 @@ export function sharedExperienceTtsLatencyMode(active) {
 }
 
 export function sharedExperienceCaptureDelay({ kind, failed = false } = {}) {
-  return kind === "audio" && !failed ? 0 : 3000;
+  if (kind === "audio" && !failed) return 0;
+  if (kind === "visual") return failed ? 1500 : 500;
+  return 3000;
 }

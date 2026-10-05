@@ -3,6 +3,43 @@ const MAX_DURATION_MS = 2 * 60 * 60 * 1000;
 const MAX_TURNS = 200;
 const MAX_PROMPT_CHARS = 500;
 
+export function createSharedExperienceRuntimeReceipts() {
+  const state = Object.fromEntries(["vision", "asr", "text"].map((kind) => [kind, {
+    provider: null, successfulResponses: 0, failedResponses: 0, completedResponses: 0,
+  }]));
+  const record = (kind, provider, valid, completed = valid) => {
+    const entry = state[kind];
+    if (!valid || !completed) { entry.failedResponses += 1; return; }
+    const allowed = { vision: ["mage-vl"], asr: ["sensevoice", "whisper"], text: ["deepseek", "ollama", "local"] };
+    const normalized = String(provider || "").toLowerCase();
+    const observed = allowed[kind].includes(normalized) ? normalized : "mixed-or-unknown";
+    entry.provider = entry.provider === null || entry.provider === observed ? observed : "mixed-or-unknown";
+    entry.successfulResponses += 1;
+    entry.completedResponses += 1;
+  };
+  return {
+    recordVision(value) {
+      record("vision", value?.provider, value?.status === "ok" && !!value?.summary,
+        typeof value?.summary === "string" && value.summary.trim().length > 0);
+    },
+    recordAsr(value) {
+      const active = value?.asrRuntime?.active;
+      const provider = active === "sensevoice-sherpa-onnx" ? "sensevoice"
+        : ["whisper-mlx", "whisper-openai"].includes(active) ? "whisper" : active;
+      // Silence is a valid inference result, but only a response explicitly
+      // marked complete proves that the selected ASR backend actually ran.
+      record("asr", provider, value?.status === "ok" && typeof value?.text === "string",
+        value?.status === "ok" && value?.asrRuntime?.status === "active");
+    },
+    recordText(value) {
+      record("text", value?.provider, !!value?.provider,
+        value?.completed === true && Number(value?.responseChars) > 0);
+    },
+    recordFailure(kind) { if (state[kind]) state[kind].failedResponses += 1; },
+    snapshot() { return Object.fromEntries(Object.entries(state).map(([kind, value]) => [kind, { ...value }])); },
+  };
+}
+
 function boundedNumber(value, fallback, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;

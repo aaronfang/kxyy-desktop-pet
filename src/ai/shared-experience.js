@@ -2,9 +2,20 @@ export const VISUAL_CONTEXT_MAX_CHARS = 900;
 export const VISUAL_CONTEXT_TTL_MS = 2 * 60_000;
 
 export function bindVisualObservationToCapture(value, capturedAtMs, {nowMs=Date.now()} = {}) {
-  const safe=sanitizeVisualContext(value,{nowMs});
   const captured=Number(capturedAtMs);
-  if (!safe || !Number.isFinite(captured) || captured<0 || captured>nowMs) return null;
+  if (!value || typeof value !== "object" || (value.status !== undefined && value.status !== "ok")
+    || !Number.isFinite(captured) || captured < 0 || captured > nowMs) return null;
+  const summary = String(value.summary || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, VISUAL_CONTEXT_MAX_CHARS);
+  if (!summary) return null;
+  // The service expiry is measured from response time and therefore includes
+  // model latency. Rebind queued frame evidence to its original capture time
+  // before applying the bounded context TTL.
+  const safe = {
+    summary,
+    capturedAtMs: captured,
+    expiresAtMs: captured + VISUAL_CONTEXT_TTL_MS,
+    source: ["image", "window", "screen"].includes(value.source) ? value.source : "image",
+  };
   // Old queued frames remain historical evidence, but cannot become a fresh single-image context.
   return {...safe,capturedAtMs:captured,expiresAtMs:captured+VISUAL_CONTEXT_TTL_MS};
 }

@@ -6,6 +6,7 @@ mod memory_core;
 mod persona_assets;
 mod realtime;
 mod shared_experience;
+mod shared_experience_visual;
 
 mod voice_service;
 
@@ -212,7 +213,7 @@ struct Settings {
     /// 用户可编辑的话题偏好；仅保存结构化标签，不保存网络正文或聊天原文。
     #[serde(default)]
     topic_preferences: Vec<TopicPreference>,
-    /// 文字模型；空串表示自动使用 Flash（thinking 独立控制），也可显式选择 Pro 或 Vision 实验模型。
+    /// 文字模型；空串表示自动使用 Flash（thinking 独立控制），也可显式选择 Pro 或原生多模态 Flash。
     #[serde(default)]
     text_model: String,
     /// 文字服务商：`deepseek`（在线）/ `local`（本地 Ollama，离线可用）。
@@ -238,7 +239,7 @@ struct Settings {
     /// 本地看图 VL 模型 tag（Ollama），空则用推荐默认 `minicpm-v:8b`。
     #[serde(default)]
     local_vl_model: String,
-    /// 视觉模型服务商：`qwen` / `deepseek`（在线）/ `local`（本地 Ollama VL）。
+    /// 视觉模型服务商：`qwen` / `deepseek`（V4.1 Flash）/ `local`（本地 Ollama VL）。
     #[serde(default = "default_vl_provider")]
     vl_provider: String,
     /// 思考模式（DeepSeek thinking.type / 本地 Qwen reasoning_effort）。
@@ -2682,9 +2683,9 @@ pub fn run() {
                                                     .map(|value| value.clamp(1_000, 1_800_000)),
                                                 "proactiveEnabled": std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_ENABLED")
                                                     .ok()
-                                                    .as_deref() == Some("1")
-                                                    || std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_FIRST_MS").is_ok()
-                                                    || std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_INTERVAL_MS").is_ok(),
+                                                    .map(|value| value == "1")
+                                                    .or_else(|| (std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_FIRST_MS").is_ok()
+                                                        || std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_INTERVAL_MS").is_ok()).then_some(true)),
                                                 "proactiveFirstDelayMs": std::env::var("KXYY_SHARED_EXPERIENCE_PROACTIVE_FIRST_MS")
                                                     .ok()
                                                     .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -2769,9 +2770,11 @@ pub fn run() {
             shared_experience::list_shared_experience_windows,
             shared_experience::start_shared_experience,
             shared_experience::stop_shared_experience,
+            shared_experience::stop_shared_experience_frame_stream,
             shared_experience::capture_shared_experience_frame,
             shared_experience::capture_shared_experience_audio,
             shared_experience::observe_shared_experience_frame,
+            shared_experience::observe_shared_experience_frames,
             shared_experience::transcribe_shared_experience_audio,
             shared_experience::observe_shared_experience,
             memory::memory_status,

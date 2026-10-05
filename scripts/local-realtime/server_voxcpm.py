@@ -276,7 +276,9 @@ async def _synth_stream(text: str, latency_mode: str = "default"):
             # Close on the same single worker and keep the model gate held until the
             # provider iterator is no longer executing.
             try:
-                cleanup = loop.run_in_executor(_pool, _close_stream, generator)
+                # HTTP asyncio.run loops may close before this worker finishes.
+                # The gate callback must belong to the executor, not that loop.
+                cleanup = _pool.submit(_close_stream, generator)
             except Exception:
                 _gate.release()
                 raise

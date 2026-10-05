@@ -13,7 +13,8 @@ import { shouldScheduleFreshIdle } from "../src/ai/fresh-idle.js";
 test("audio capture resumes without an intentional recording gap but failures back off", () => {
   assert.equal(sharedExperienceCaptureDelay({ kind: "audio", failed: false }), 0);
   assert.equal(sharedExperienceCaptureDelay({ kind: "audio", failed: true }), 3000);
-  assert.equal(sharedExperienceCaptureDelay({ kind: "visual", failed: false }), 3000);
+  assert.equal(sharedExperienceCaptureDelay({ kind: "visual", failed: false }), 500);
+  assert.equal(sharedExperienceCaptureDelay({ kind: "visual", failed: true }), 1500);
 });
 
 test("shared experience keeps persona conversation but isolates unrelated context sources", () => {
@@ -44,6 +45,7 @@ test("ordinary idle sharing is not scheduled across a shared-experience session 
 
 test("shared experience bounds spoken replies while normal chat keeps its token budget", () => {
   assert.equal(sharedExperienceReplyMaxTokens(true, 4096), 320);
+  assert.equal(sharedExperienceReplyMaxTokens(true, 480, { proactiveKind: "shared-experience" }), 480);
   assert.equal(sharedExperienceReplyMaxTokens(true, 120), 120);
   assert.equal(sharedExperienceReplyMaxTokens(true, 800, { deliberate: true }), 1400);
   assert.equal(sharedExperienceReplyMaxTokens(false, 4096), 4096);
@@ -67,7 +69,7 @@ test("chat request, idle sharing, and follow-up paths consume the shared-experie
   assert.match(chat, /shouldScheduleFreshIdle\(\{ sharedExperienceActive: sharedExperience\.active \}\)/);
   assert.match(chat, /sharedExperience\.active = true;[\s\S]*resetFreshIdleTimer\(\)/);
   assert.match(chat, /requestPolicy\.automaticFollowup && shouldDoFollowup/);
-  assert.match(chat, /sharedExperienceReplyMaxTokens\(\s*sharedExperience\.active,[\s\S]*\{\s*deliberate\s*\}/);
+  assert.match(chat, /sharedExperienceReplyMaxTokens\(\s*sharedExperience\.active,[\s\S]*\{\s*deliberate,\s*proactiveKind\s*\}/);
   assert.match(chat, /if \(!review\) \{[\s\S]*requestGroundedReplyRepair\(/);
   assert.match(chat, /requestGroundedReplyRepair\(\{[\s\S]*evidence:reviewSources,[\s\S]*isCurrent:groundingIsCurrent/);
   assert.match(chat, /latencyMode:\s*sharedExperienceTtsLatencyMode\(sharedExperience\.active\)/);

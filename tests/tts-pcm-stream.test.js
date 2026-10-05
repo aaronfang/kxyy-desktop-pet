@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { consumePcm16Stream } from "../src/ai/tts-pcm-stream.js";
+import { consumePcm16Stream, DEFAULT_COMPANION_STARTUP_SAMPLES, DEFAULT_STARTUP_SAMPLES } from "../src/ai/tts-pcm-stream.js";
+
+test("companion streaming uses a larger startup reservoir than normal playback", () => {
+  assert.ok(DEFAULT_COMPANION_STARTUP_SAMPLES > DEFAULT_STARTUP_SAMPLES);
+  assert.equal(DEFAULT_COMPANION_STARTUP_SAMPLES, 8640);
+});
 
 test("PCM stream starts playback before the response finishes", async () => {
   let releaseSecond;
@@ -135,4 +140,27 @@ test("PCM stream reports when provider delivery cannot sustain playback", async 
     schedule() {},
   });
   assert.deepEqual(metrics, { underrunCount: 1, maxGapMs: 700 });
+});
+
+test("PCM continuity uses scheduled playback boundaries including startup lead and scheduler delay", async () => {
+  for (const [secondStart, expectedGap] of [[0.22, 0], [0.302, 82]]) {
+    const response = new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new Uint8Array([1, 0, 2, 0]));
+      controller.enqueue(new Uint8Array([3, 0, 4, 0]));
+      controller.close();
+    } }));
+    const arrival = [0, 0.21];
+    let count = 0;
+    let completed = 0;
+    const result = await consumePcm16Stream(response, {
+      startupSamples: 2, sampleRate: 10, nowSeconds: () => arrival.shift(),
+      schedule() {
+        const startAtSeconds = count++ === 0 ? 0.02 : secondStart;
+        return { startAtSeconds, endAtSeconds: startAtSeconds + 0.2,
+          completion: new Promise((resolve) => setTimeout(() => { completed++; resolve(); }, 5)) };
+      },
+    });
+    assert.deepEqual(result, { underrunCount: expectedGap ? 1 : 0, maxGapMs: expectedGap });
+    assert.equal(completed, 2, "wait for actual playback completion");
+  }
 });

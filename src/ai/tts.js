@@ -13,7 +13,7 @@
 
 import { getStoredVlApiKey, getStoredVolcKey } from "./persona.js";
 import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
-import { consumePcm16Stream } from "./tts-pcm-stream.js";
+import { consumePcm16Stream, DEFAULT_COMPANION_STARTUP_SAMPLES } from "./tts-pcm-stream.js";
 
 // ── 播放状态 ──
 let currentToken = null; // 标记当前正在播放/请求的来源，用于 toggle 判断
@@ -86,6 +86,8 @@ let volUnsub = null;
 let activeBufferSource = null;
 let activeStreamAbort = null;
 const activeStreamSources = new Map();
+let companionAudioActive = false;
+let companionKeepAlive = null;
 
 /** 解析（结束）当前 playSpeechBlob 的等待 Promise，并清空引用。 */
 function resolveSpeechBlob() {
@@ -140,6 +142,37 @@ function ensureAudioContext() {
   } catch {
     return false;
   }
+}
+
+function stopCompanionKeepAlive() {
+  if (!companionKeepAlive) return;
+  const { oscillator, gain } = companionKeepAlive;
+  companionKeepAlive = null;
+  try { oscillator.stop(); } catch { /* already stopped */ }
+  try { oscillator.disconnect(); } catch { /* ignore */ }
+  try { gain.disconnect(); } catch { /* ignore */ }
+}
+
+/** Keep the user-unlocked Web Audio output alive while a hidden chat continues co-viewing. */
+export function setCompanionAudioActive(active) {
+  companionAudioActive = active === true;
+  if (!companionAudioActive) {
+    stopCompanionKeepAlive();
+    return;
+  }
+  if (!ensureAudioContext()) return;
+  if (outCtx.state === "suspended") void outCtx.resume().catch(() => {});
+  if (companionKeepAlive?.context === outCtx) return;
+  stopCompanionKeepAlive();
+  try {
+    const oscillator = outCtx.createOscillator();
+    const gain = outCtx.createGain();
+    gain.gain.value = 0;
+    oscillator.connect(gain);
+    gain.connect(outCtx.destination);
+    oscillator.start();
+    companionKeepAlive = { context: outCtx, oscillator, gain };
+  } catch { /* Web Audio may be unavailable in older WebViews */ }
 }
 
 /** 把共享 <audio> 接到 GainNode（移动端加持 / MP3 回退）；自动朗读优先走 BufferSource。 */
@@ -230,6 +263,7 @@ export function unlockAudio() {
  *  避免旧 AudioContext 挂起或 MediaElementSource 绑死导致「有合成无声音」。 */
 export function resetPlaybackPipeline() {
   stopSpeak();
+  stopCompanionKeepAlive();
   try {
     if (outCtx && outCtx.state !== "closed") outCtx.close();
   } catch { /* ignore */ }
@@ -241,6 +275,7 @@ export function resetPlaybackPipeline() {
   currentUrl = null;
   blessed = false;
   audioCache.clear();
+  if (companionAudioActive) setCompanionAudioActive(true);
 }
 
 // 合成结果缓存：同一「音色|model|文本」只请求上游一次，重复回放直接复用，省额度。
@@ -671,14 +706,19 @@ export async function synthesizeSpeech(text, { voice = null, model = null } = {}
 }
 
 /** Stream local PCM16LE speech and schedule chunks as they arrive. */
-export async function streamSpeech(text, { latencyMode = "default", onAdmit, onStart, onStreamMetrics, onError } = {}) {
+export async function streamSpeech(text, { latencyMode = "default", onAdmit, onStart, onStreamMetrics, onBackend, onError } = {}) {
   const clean = textForSpeech(text);
   if (!clean) return false;
   stopSpeak();
   externalStop?.();
-  if (!ensureAudioContext()) throw new Error("Web Audio 不可用");
-  if (outCtx.state === "suspended") await outCtx.resume().catch(() => {});
-  if (outCtx.state !== "running") throw new Error("AudioContext 仍挂起");
+  try {
+    if (!ensureAudioContext()) throw Object.assign(new Error("Web Audio 不可用"), { code: "audio-context-unavailable" });
+    if (outCtx.state !== "running" && outCtx.state !== "closed") await outCtx.resume().catch(() => {});
+    if (outCtx.state !== "running") throw Object.assign(new Error("AudioContext 仍挂起"), { code: "audio-context-suspended" });
+  } catch (error) {
+    onError?.(error);
+    return false;
+  }
 
   const controller = new AbortController();
   activeStreamAbort = controller;
@@ -699,9 +739,12 @@ export async function streamSpeech(text, { latencyMode = "default", onAdmit, onS
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`TTS 流式请求失败 ${response.status}`);
+    const backend = response.headers.get("X-Kxyy-Tts-Backend");
+    onBackend?.(["voxcpm", "local", "cosyvoice"].includes(backend) ? backend : "mixed-or-unknown");
     onAdmit?.();
     const streamMetrics = await consumePcm16Stream(response, {
       signal: controller.signal,
+      ...(latencyMode === "companion" ? { startupSamples: DEFAULT_COMPANION_STARTUP_SAMPLES, maxScheduledSamples: 96_000 } : {}),
       schedule(samples) {
         if (myGen !== playGen || controller.signal.aborted) return Promise.resolve();
         const buffer = outCtx.createBuffer(1, samples.length, 24000);
@@ -727,7 +770,7 @@ export async function streamSpeech(text, { latencyMode = "default", onAdmit, onS
           playing = true;
           onStart?.(buffer.duration);
         }
-        return completion;
+        return { completion, startAtSeconds: startAt, endAtSeconds: playHead };
       },
     });
     onStreamMetrics?.(streamMetrics);

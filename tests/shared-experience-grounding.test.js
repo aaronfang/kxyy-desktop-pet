@@ -7,6 +7,14 @@ const good = "他们要求把面罩还回去。";
 const bad = "这些人被抢了装备才翻脸的。";
 const part = {text:good, verdict:"supported", supports:[{id:"a",quote:"give them the masks back"}]};
 
+test("summary review exposes a valid all-rejected verdict without treating it as unavailable", () => {
+  const review = { parts: [{ text: bad, verdict: "unsupported", supports: [] }] };
+  const result = applyGroundingReview({ kind: "summary", text: bad, evidence, review });
+  assert.equal(result?.text, "");
+  assert.equal(result?.parts[0].verdict, "unsupported");
+  assert.equal(applyGroundingReview({ kind: "reply", text: bad, evidence, review }), null);
+});
+
 test("review binds verdicts to caller-owned whole sentences instead of provider comma splits", async () => {
   const text="他们要求把面罩还回去，其他打算还没听清。";
   let submitted;

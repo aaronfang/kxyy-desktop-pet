@@ -1,16 +1,29 @@
-const NARRATED_TITLE = /(?:解说|讲解|盘点|速看|看完|剧情梳理|故事梳理|一口气|分钟看)/;
-const LIVESTREAM_TITLE = /(?:直播|直播间|live\s*stream|livestream)/i;
-const CINEMATIC_TITLE = /(?:电影|正片|剧集|电视剧|动画|番剧|纪录片)/;
-const GAME_TITLE = /(?:游戏|实况|通关|试玩|攻略)/;
-
 export const SHARED_EXPERIENCE_CONTENT_MODES = Object.freeze([
   "unknown",
   "narrated",
+  "game-narrated",
   "cinematic",
   "livestream",
+  "short-video",
   "low-speech-game",
   "direct",
 ]);
+
+export const SHARED_EXPERIENCE_CONTENT_MODE_LABELS = Object.freeze({
+  unknown: "未选择",
+  cinematic: "电影原片 / 剧集",
+  narrated: "电影解说",
+  "game-narrated": "游戏解说",
+  livestream: "直播",
+  "short-video": "短视频",
+  "low-speech-game": "低语音游戏",
+  direct: "其他内容",
+});
+
+export function normalizeSharedExperienceContentMode(value = "") {
+  const mode = String(value || "").trim();
+  return SHARED_EXPERIENCE_CONTENT_MODES.includes(mode) ? mode : "unknown";
+}
 
 export function viewingStatementContentMode(value = "") {
   const statement = String(value || "").trim().slice(0, 240);
@@ -18,20 +31,18 @@ export function viewingStatementContentMode(value = "") {
   return classifySharedExperienceContentMode(statement);
 }
 
-export function classifySharedExperienceContentMode(title = "") {
-  const normalized = String(title || "").replace(/\s+/g, " ").trim().slice(0, 160);
-  if (!normalized) return "unknown";
-  if (NARRATED_TITLE.test(normalized)) return "narrated";
-  if (LIVESTREAM_TITLE.test(normalized)) return "livestream";
-  if (CINEMATIC_TITLE.test(normalized)) return "cinematic";
-  if (GAME_TITLE.test(normalized)) return "low-speech-game";
-  return "direct";
+export function classifySharedExperienceContentMode(title = "", owner = "") {
+  // Window metadata is intentionally not a content classification signal.
+  // The user chooses the viewing context explicitly from the chat controls.
+  void title;
+  void owner;
+  return "unknown";
 }
 
 export function sharedExperienceEvidenceEmphasis({ contentMode = "unknown", audioEvents = [], visualEvents = [] } = {}) {
   const audio = Array.isArray(audioEvents) ? audioEvents.filter((event) => String(event?.text || "").trim()).length : 0;
   const visual = Array.isArray(visualEvents) ? visualEvents.filter((event) => String(event?.summary || event?.text || "").trim()).length : 0;
-  if (contentMode === "narrated") return audio > 0 ? "audio-led" : visual > 0 ? "visual-led" : "balanced";
+  if (["narrated", "game-narrated"].includes(contentMode)) return audio > 0 ? "audio-led" : visual > 0 ? "visual-led" : "balanced";
   if (audio === 0 && visual > 0) return "visual-led";
   if (contentMode === "low-speech-game" && visual > 0) return "visual-led";
   if (visual >= audio * 2) return "visual-led";

@@ -60,7 +60,7 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { synthesizeSpeech, playSpeechBlob, streamSpeech, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks, detectEmotion } from "./ai/tts.js";
+import { synthesizeSpeech, playSpeechBlob, streamSpeech, stopSpeak, unlockAudio, resetPlaybackPipeline, setCompanionAudioActive, onTtsProgress, splitSpeechChunks, detectEmotion } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { formatChatTranscript } from "./ai/chat-transcript.js";
 import { asksNotToRemember } from "./memory-ui.js";
@@ -74,15 +74,17 @@ import {
   sharedExperienceReplyMaxTokens,
   sharedExperienceRequestPolicy,
   sharedExperienceTtsLatencyMode,
+  sharedExperienceCaptureDelay,
 } from "./ai/shared-experience-policy.js";
 import { createSharedExperienceLifecycle } from "./ai/shared-experience-lifecycle.js";
 import { requestSharedExperienceSummary, requestSharedExperienceQuestion } from "./ai/shared-experience-client.js";
 import { buildCurrentEvidenceWindow, videoQuestionEvidence } from "./ai/shared-experience-evidence-window.js";
 import { groundingEvidence, requestGroundingReview, requestGroundedReplyRepair } from "./ai/shared-experience-grounding.js";
-import { sharedExperienceCaptureDelay } from "./ai/shared-experience-policy.js";
+import { normalizeSharedExperienceVisualCapture } from "./ai/shared-experience-visual-window.js";
 import {
   buildAcceptanceEvidenceFallbackQuestion,
   buildSharedExperienceCleanupReceipt,
+  createSharedExperienceRuntimeReceipts,
   runSharedExperienceAcceptancePlan,
 } from "./ai/shared-experience-acceptance.js";
 import { planEvidenceAnchoredQuestion } from "./ai/shared-experience-question-planner.js";
@@ -90,7 +92,7 @@ import {
   createSharedExperiencePrimerGate,
   parseSharedExperienceViewingStatement,
 } from "./ai/shared-experience-primer.js";
-import { classifySharedExperienceContentMode, viewingStatementContentMode } from "./ai/shared-experience-content-mode.js";
+import { normalizeSharedExperienceContentMode } from "./ai/shared-experience-content-mode.js";
 import {
   extractVisualCharacterDescriptors,
   filterVisualIdentityClaims,
@@ -104,6 +106,8 @@ import {
   createSharedExperienceProactiveRunner,
   isSharedExperienceProactiveReply,
   resolveSharedExperienceProactiveConfig,
+  sharedExperienceProactiveDiagnostics,
+  sharedExperienceProactiveGroundingPrompt,
 } from "./ai/shared-experience-proactive.js";
 import {
   buildRecommendationLinkPrompt,
@@ -219,6 +223,7 @@ function makeBubbleRevealer(parts, firstBubble, firstRow) {
       const i = next++;
       if (i === 0) {
         firstRow?.classList.remove("streaming");
+        firstRow?.classList.remove("proactive-pending");
         renderTextWithSafeLinks(firstBubble, parts[0]);
       } else {
         addBubble("assistant", parts[i]);
@@ -255,20 +260,25 @@ async function speakPartsSynced(parts, { revealer, voice, gen, speakParts, recei
       task: async () => {
         for (let i = 0; i < audioParts.length; i += 1) {
           if (gen !== ttsQueueGen) {
-            for (let pending = i; pending < audioParts.length; pending += 1) receipt?.fail();
+            for (let pending = i; pending < audioParts.length; pending += 1) receipt?.fail("queue-reset");
             break;
           }
           let started = false;
+          let failureReason = "stream-error";
           const displayedIndex = altAudio && audioParts.length !== parts.length ? parts.length - 1 : i;
           const ok = await streamSpeech(audioParts[i], {
             latencyMode: sharedExperienceTtsLatencyMode(sharedExperience.active),
             onAdmit: () => receipt?.admit(),
+            onBackend: (backend) => receipt?.observeBackend(backend),
             onStart: () => { started = true; receipt?.start(); revealer.revealUpTo(displayedIndex); },
             onStreamMetrics: (metrics) => receipt?.observeStream(metrics),
-            onError: () => revealer.revealUpTo(displayedIndex),
+            onError: (error) => {
+              failureReason = error?.code || "stream-error";
+              revealer.revealUpTo(displayedIndex);
+            },
           });
           if (ok && started) receipt?.complete();
-          else receipt?.fail();
+          else receipt?.fail(gen !== ttsQueueGen ? "queue-reset" : failureReason);
           revealer.revealUpTo(displayedIndex);
         }
       },
@@ -392,7 +402,7 @@ function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, sticker
         // 入队前已被打断：直接补全文字，不再合成。
         revealer.revealAll();
         finishSticker();
-        for (let index = 0; index < requestedParts; index += 1) receipt.fail();
+        for (let index = 0; index < requestedParts; index += 1) receipt.fail("queue-reset");
         return receipt.finish();
       }
       await speakPartsSynced(parts, { revealer, voice: voiceOpt, gen, speakParts, receipt });
@@ -543,6 +553,8 @@ const attachBtn = document.getElementById("attach");
 const sharedExperienceBtn = document.getElementById("shared-experience-btn");
 const sharedExperiencePauseBtn = document.getElementById("shared-experience-pause-btn");
 const sharedExperienceStopBtn = document.getElementById("shared-experience-stop-btn");
+const sharedExperienceFrequency = document.getElementById("shared-experience-frequency");
+const sharedExperienceMode = document.getElementById("shared-experience-mode");
 const sharedExperienceStatus = document.getElementById("shared-experience-status");
 const sharedExperiencePicker = document.getElementById("shared-experience-picker");
 const sharedExperienceWindowList = document.getElementById("shared-experience-window-list");
@@ -574,7 +586,13 @@ const capsuleWaveRenderer = createSiriWaveModernRenderer(capsuleWaveCanvas);
 const callCapsuleOpenBtn = document.getElementById("call-capsule-open");
 const callCapsuleHangupBtn = document.getElementById("call-capsule-hangup");
 let activeVisualContext = null;
-const sharedExperience = { active: false, paused: false, generation: 0, windowId: null, windowLabel: "", contentTitle: "", timer: 0, captureTimer: 0, audioTimer: 0, processing: false, observing: false, transcribing: false, capturing: false, capturingAudio: false, pendingObservation: null, pendingAudio: null, debugEntries: [], typingUntil: 0, capturedVisual: 0, capturedAudio: 0, processedVisual: 0, processedAudio: 0, filteredVisualIdentities: 0, lastAudioCaptureEndMs: 0, workspace: null, spool: null, lifecycle: null, voiceTracker: null, primerGate: null, characterTracker: null, proactiveRunner: null, proactivePromise: null, stopPromise: null };
+const sharedExperience = { active: false, paused: false, generation: 0, windowId: null, windowLabel: "", contentTitle: "", timer: 0, captureTimer: 0, audioTimer: 0, processing: false, observing: false, transcribing: false, capturing: false, capturingAudio: false, visualWindowQueued: false, visualDiagnostics: null, pendingObservation: null, pendingAudio: null, debugEntries: [], typingUntil: 0, capturedVisual: 0, capturedAudio: 0, processedVisual: 0, processedAudio: 0, captureTimeline: { visual: [], audio: [] }, filteredVisualIdentities: 0, lastAudioCaptureEndMs: 0, workspace: null, spool: null, lifecycle: null, voiceTracker: null, primerGate: null, proactiveRunner: null, proactivePromise: null, stopPromise: null };
+
+function recordSharedExperienceCapture(kind, capturedAtMs = Date.now()) {
+  const timeline = sharedExperience.captureTimeline[kind];
+  timeline.push(Number.isFinite(Number(capturedAtMs)) ? Number(capturedAtMs) : Date.now());
+  if (timeline.length > 1024) timeline.shift();
+}
 
 function sharedExperienceSpoolStats() {
   const snapshot = sharedExperience.spool?.snapshot?.() || {};
@@ -699,6 +717,14 @@ function setMoodVisual(mood = "neutral") {
   messagesEl?.querySelectorAll(".row.assistant .avatar").forEach((avatar) => {
     avatar.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
     avatar.classList.add(`mood-${next}`);
+  });
+}
+
+function clearMoodVisual() {
+  chatEl?.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
+  chatEl?.removeAttribute("data-mood");
+  messagesEl?.querySelectorAll(".row.assistant .avatar").forEach((avatar) => {
+    avatar.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
   });
 }
 
@@ -1159,7 +1185,7 @@ function noteApiUsage(
     apiDebug.sessionTotal += usage.total || 0;
     if (provider === "DeepSeek" && sharedExperience.active && sharedExperience.lifecycle) {
       sharedExperience.lifecycle.recordUsage("conversation", usage, {
-        model: model || settings.textModel || "deepseek-v4-flash",
+        model: model || settings.textModel || "deepseek-flash",
       });
       renderSharedExperienceDebug();
     }
@@ -1540,13 +1566,19 @@ function addStickerBubble(sticker, { linkedMid } = {}) {
   scrollBottom();
 }
 
+let restoringComposerFocus = false;
+
 function setBusy(next, { allowTextInput = false, focusInput = true } = {}) {
   busy = next;
   sendBtn.disabled = next && !allowTextInput;
   inputEl.disabled = next && !allowTextInput;
   attachBtn.disabled = next;
   stickersBtn.disabled = next;
-  if (!next && focusInput) inputEl.focus();
+  if (!next && focusInput) {
+    restoringComposerFocus = true;
+    try { inputEl.focus(); }
+    finally { restoringComposerFocus = false; }
+  }
 }
 
 // ---- 待发送图片 ----
@@ -2214,10 +2246,6 @@ async function streamAssistantReply(streamBubble, streamRow, {
     if (groundingSession) reviewSources = groundingEvidence(groundingSession.workspace?.snapshot(), {
       question: reviewQuestion,
     });
-    if (proactiveKind === "shared-experience" && Array.isArray(focusEvidenceIds) && focusEvidenceIds.length) {
-      const focused = new Set(focusEvidenceIds);
-      reviewSources = reviewSources.filter((event) => focused.has(event.id));
-    }
     if (usesDeepseekMultimodalModel(settings)) {
       requestMessages = buildDeepseekMultimodalMessages(
         requestMessages,
@@ -2241,7 +2269,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
             lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
             deep,
           }),
-          { deliberate },
+          { deliberate, proactiveKind },
         ),
       }),
     });
@@ -2315,7 +2343,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
       : 0;
     noteApiUsage(isLocalText ? "本地模型" : "DeepSeek", usage, {
       refreshBalance: !isLocalText,
-      model: isLocalText ? localTextModelLabel() : responseModel || settings.textModel || "deepseek-v4-flash",
+      model: isLocalText ? localTextModelLabel() : responseModel || settings.textModel || "deepseek-flash",
       elapsedMs,
     });
     localGenStarted = false;
@@ -2335,6 +2363,17 @@ async function streamAssistantReply(streamBubble, streamRow, {
         console.warn("[chat] 回复为空", { finishReason, hasReasoning: !!reasoning, sawData, fullLen: full.length });
       }
       throw new Error(emptyReplyReason({ finishReason, hasReasoning: !!reasoning, sawData }));
+    }
+    // Count the text backend only after a non-empty model response has been
+    // parsed. Headers alone are not evidence: a truncated/filtered response
+    // can carry the provider header while producing no usable reply.
+    if (groundingSession && groundingIsCurrent()) {
+      sharedExperience.runtimeReceipts?.recordText({
+        provider: resp.headers.get("X-Kxyy-Text-Provider"),
+        completed: true,
+        responseChars: normalized.length,
+        model: responseModel,
+      });
     }
 
     if (groundingSession) {
@@ -2360,7 +2399,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
       if (!groundingIsCurrent()) { streamRow.remove(); return {skipped:true}; }
       if (!review && proactiveKind === "shared-experience") {
         streamRow.remove();
-        return { skipped: true };
+        return { skipped: true, failureReason: "grounding-rejected" };
       }
       const recallQuestion = /(?:刚才|刚刚|离开(?:了一会|一阵)?|漏听|之前|这段时间)/u.test(lastRealUserMessage()?.content || "");
       const cautiousDraft = !review && recallQuestion && draft.length <= 240
@@ -2394,7 +2433,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
     }
     if (proactiveKind === "shared-experience" && !isSharedExperienceProactiveReply(reply)) {
       streamRow.remove();
-      return { skipped: true };
+      return { skipped: true, failureReason: "style-rejected" };
     }
 
     history.push({
@@ -2453,6 +2492,10 @@ async function streamAssistantReply(streamBubble, streamRow, {
       if (replySticker) addStickerBubble(replySticker, { linkedMid: replyId });
     }
 
+    if (proactiveKind === "shared-experience" && (!syncParts || !syncParts.length || skipSpeakMissingEn)) {
+      streamRow.classList.remove("proactive-pending");
+    }
+
     if (!sharedExperience.active) void maybeUpdateRecap();
     return { skipped: false, speechDone, groundingAudit };
   } catch (e) {
@@ -2488,8 +2531,6 @@ async function send(text, opts = {}) {
   const image = pendingImage;
   const sticker = opts.sticker || pendingSticker || null;
   if ((!text && !image && !sticker) || busy) return;
-  const declaredMode = sharedExperience.active ? viewingStatementContentMode(text) : null;
-  if (declaredMode) sharedExperience.workspace?.setContentMode(declaredMode);
   if (viewingStatement) {
     sharedExperience.contentTitle = viewingStatement.title;
     void (async () => {
@@ -3515,16 +3556,32 @@ function setSharedExperienceStatus(text, { error = false } = {}) {
   sharedExperienceStatus.classList.toggle("error", error);
 }
 
-async function summarizeSharedExperience({ kind, source, evidence }) {
+function setSharedExperienceContentMode(mode, { announce = true } = {}) {
+  if (!sharedExperience.active || !sharedExperience.workspace) return false;
+  const nextMode = normalizeSharedExperienceContentMode(mode);
+  const previousMode = sharedExperience.workspace.snapshot().contentMode;
+  if (nextMode === previousMode) return false;
+  sharedExperience.workspace.setContentMode(nextMode);
+  if (sharedExperienceMode) sharedExperienceMode.value = nextMode;
+  syncSharedExperienceProactive();
+  if (announce) {
+    const label = sharedExperienceMode?.selectedOptions?.[0]?.textContent || "未选择";
+    setSharedExperienceStatus(`共同体验 · 已切换情境：${label}`);
+  }
+  renderSharedExperienceDebug();
+  return true;
+}
+
+async function summarizeSharedExperience({ kind, source, evidence, contentMode }) {
   if (!apiBase || !apiBase.startsWith("http://")) {
     const ready = await ensureApiBase();
     if (!ready) throw new Error("DeepSeek 代理未就绪");
   }
-  const result = await requestSharedExperienceSummary({ apiBase, kind, source, evidence });
+  const result = await requestSharedExperienceSummary({ apiBase, kind, source, evidence, contentMode });
   void fetchDeepSeekBalance(sharedExperience.lifecycle);
   return {
     ...result,
-    model: result.model || settings.textModel || "deepseek-v4-flash",
+    model: result.model || settings.textModel || "deepseek-flash",
     atMs: Date.now(),
   };
 }
@@ -3545,6 +3602,8 @@ async function persistSharedExperienceEpisode(episode) {
 
 function stopSharedExperienceCapture() {
   void cancelSharedExperienceProactive("stopped", { stopAudio: true, stopAudioWhenIdle: true });
+  if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+  sharedExperience.proactiveTimer = 0;
   if (sharedExperience.timer) window.clearTimeout(sharedExperience.timer);
   if (sharedExperience.captureTimer) window.clearTimeout(sharedExperience.captureTimer);
   if (sharedExperience.audioTimer) window.clearTimeout(sharedExperience.audioTimer);
@@ -3558,11 +3617,21 @@ function stopSharedExperienceCapture() {
   sharedExperience.transcribing = false;
   sharedExperience.capturing = false;
   sharedExperience.capturingAudio = false;
+  sharedExperience.visualWindowQueued = false;
   activeVisualContext = null;
+  clearMoodVisual();
   void invoke("stop_shared_experience").catch(() => {});
   if (sharedExperienceBtn) sharedExperienceBtn.classList.remove("on");
   if (sharedExperiencePauseBtn) sharedExperiencePauseBtn.hidden = true;
   if (sharedExperienceStopBtn) sharedExperienceStopBtn.hidden = true;
+  if (typeof sharedExperienceMode !== "undefined" && sharedExperienceMode) {
+    sharedExperienceMode.hidden = true;
+    sharedExperienceMode.value = "unknown";
+  }
+  if (typeof sharedExperienceFrequency !== "undefined" && sharedExperienceFrequency) {
+    sharedExperienceFrequency.hidden = true;
+    sharedExperienceFrequency.value = "standard";
+  }
 }
 
 function scheduleSharedExperienceRollover() {
@@ -3588,6 +3657,7 @@ function clearSharedExperienceData() {
   sharedExperience.workspace = null;
   sharedExperience.lifecycle = null;
   sharedExperience.voiceTracker = null;
+  sharedExperience.runtimeReceipts = null;
   sharedExperience.primerGate = null;
   sharedExperience.characterTracker?.clear();
   sharedExperience.characterTracker = null;
@@ -3598,10 +3668,13 @@ function clearSharedExperienceData() {
   sharedExperience.contentTitle = "";
   sharedExperience.capturedVisual = 0;
   sharedExperience.capturedAudio = 0;
+  sharedExperience.captureTimeline = { visual: [], audio: [] };
   sharedExperience.processedVisual = 0;
   sharedExperience.processedAudio = 0;
   sharedExperience.filteredVisualIdentities = 0;
   sharedExperience.lastAudioCaptureEndMs = 0;
+  sharedExperience.visualWindowQueued = false;
+  sharedExperience.visualDiagnostics = null;
 }
 
 function stopSharedExperience({ silent = false, finalize = true } = {}) {
@@ -3612,6 +3685,7 @@ function stopSharedExperience({ silent = false, finalize = true } = {}) {
   if (!sharedExperience.active && !sharedExperience.lifecycle) return Promise.resolve(null);
   const lifecycle = sharedExperience.lifecycle;
   stopSharedExperienceCapture();
+  setCompanionAudioActive(false);
   if (!finalize) {
     lifecycle?.cancel();
     clearSharedExperienceData();
@@ -3649,6 +3723,8 @@ function stopSharedExperience({ silent = false, finalize = true } = {}) {
 
 function pauseSharedExperience() {
   if (!sharedExperience.active || sharedExperience.paused) return;
+  if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+  sharedExperience.proactiveTimer = 0;
   if (sharedExperience.timer) window.clearTimeout(sharedExperience.timer);
   sharedExperience.timer = 0;
   if (sharedExperience.captureTimer) window.clearTimeout(sharedExperience.captureTimer);
@@ -3656,6 +3732,7 @@ function pauseSharedExperience() {
   sharedExperience.captureTimer = 0;
   sharedExperience.audioTimer = 0;
   sharedExperience.paused = true;
+  void invoke("stop_shared_experience_frame_stream").catch(() => {});
   void cancelSharedExperienceProactive("paused", { stopAudio: true, stopAudioWhenIdle: true });
   sharedExperience.spool?.pauseInference("manual");
   if (sharedExperiencePauseBtn) { sharedExperiencePauseBtn.textContent = "▶"; sharedExperiencePauseBtn.title = "继续观看"; sharedExperiencePauseBtn.setAttribute("aria-label", "继续观看"); }
@@ -3669,6 +3746,7 @@ function resumeSharedExperience() {
   if (sharedExperiencePauseBtn) { sharedExperiencePauseBtn.textContent = "Ⅱ"; sharedExperiencePauseBtn.title = "暂停观看"; sharedExperiencePauseBtn.setAttribute("aria-label", "暂停观看"); }
   setSharedExperienceStatus(`共同体验 · ${sharedExperience.windowLabel}`);
   scheduleSharedExperienceRollover();
+  startSharedExperienceProactiveTicker();
   void captureSharedExperienceOnce();
   void captureSharedExperienceAudioOnce();
   void observeSharedExperienceOnce();
@@ -3697,26 +3775,66 @@ function cancelSharedExperienceProactive(reason, { stopAudio = false, stopAudioW
 
 function syncSharedExperienceProactive(overrides = {}) {
   if (!sharedExperience.active) return;
-  void cancelSharedExperienceProactive("settings-changed", { stopAudio: true });
-  sharedExperience.proactiveRunner = null;
-  const config = resolveSharedExperienceProactiveConfig(settings, overrides);
-  if (!config.enabled) return;
+  const config = resolveSharedExperienceProactiveConfig(settings, {
+    contentMode: sharedExperience.workspace?.snapshot().contentMode,
+    ...overrides,
+  });
+  if (!config.enabled) {
+    void cancelSharedExperienceProactive("settings-changed", { stopAudio: true });
+    if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+    sharedExperience.proactiveTimer = 0;
+    sharedExperience.proactiveRunner = null;
+    if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+    return;
+  }
+  if (sharedExperience.proactiveRunner?.reconfigure) {
+    void cancelSharedExperienceProactive("settings-changed", { stopAudio: true });
+    sharedExperience.proactiveRunner.reconfigure({
+      frequency: config.frequency,
+      firstDelayMs: config.firstDelayMs,
+      minIntervalMs: config.minIntervalMs,
+      jitterMs: config.jitterMs,
+      atMs: Date.now(),
+    });
+    if (sharedExperienceFrequency) sharedExperienceFrequency.value = config.frequency;
+    startSharedExperienceProactiveTicker();
+    if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+    return;
+  }
   const proactiveDirector = createSharedExperienceProactiveDirector({
     startedAtMs: Date.now(),
     firstDelayMs: config.firstDelayMs,
     minIntervalMs: config.minIntervalMs,
+    frequency: config.frequency,
+    earlyIntervalMs: null,
+    followOnWindowMs: 90_000,
+    jitterMs: config.jitterMs,
+    // Let the restarted session collect a small opening timeline before its
+    // first proactive request, avoiding grounding retries on one partial frame.
+    warmupMinEvents: 2,
+    initialOrientation: true,
   });
   sharedExperience.proactiveRunner = createSharedExperienceProactiveRunner({
     director: proactiveDirector,
     currentState: () => ({
       userActive: sharedExperience.typingUntil > Date.now() || Boolean(inputEl?.value?.trim()),
       paused: sharedExperience.paused,
-      hidden: document.visibilityState !== "visible",
       busy: busy || callActive,
       speaking: autoSpeechJobs.size > 0,
     }),
     generate: generateSharedExperienceProactive,
   });
+  startSharedExperienceProactiveTicker();
+}
+
+function startSharedExperienceProactiveTicker() {
+  if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+  sharedExperience.proactiveTimer = 0;
+  if (!sharedExperience.active || sharedExperience.paused || !sharedExperience.proactiveRunner) return;
+  sharedExperience.proactiveTimer = window.setInterval(() => {
+    maybeTriggerSharedExperienceProactive();
+    renderSharedExperienceDebug();
+  }, 1_000);
 }
 
 async function generateSharedExperienceProactive({ reason, evidenceIds, signal }) {
@@ -3729,6 +3847,7 @@ async function generateSharedExperienceProactive({ reason, evidenceIds, signal }
   const streamBubble = addBubble("assistant", "", { mid: replyId });
   const streamRow = streamBubble.closest(".row");
   streamRow.classList.add("streaming");
+  streamRow.classList.add("proactive-pending");
   petSignal("thinking");
   setBusy(true, { allowTextInput: true });
   try {
@@ -3736,27 +3855,53 @@ async function generateSharedExperienceProactive({ reason, evidenceIds, signal }
       proactiveKind: "shared-experience",
       replyId,
       focusEvidenceIds: evidenceIds,
-      groundingQuestion: "请根据本轮焦点证据自然评论当前内容。",
+      groundingQuestion: sharedExperienceProactiveGroundingPrompt(reason, sharedExperience.workspace?.snapshot().contentMode),
       captureGroundingAudit: true,
       abortSignal: signal,
     });
     if (signal.aborted || result?.skipped || !sharedExperience.active || sharedExperience.generation !== generation) {
-      return { emitted: false };
+      if (result?.failureReason && sharedExperience.active && sharedExperience.generation === generation) {
+        sharedExperience.debugEntries ||= [];
+        sharedExperience.debugEntries.push({
+          at: new Date().toLocaleTimeString(),
+          proactive: `${reason} · ${evidenceIds.join(",")} · 失败：${result.failureReason}`,
+        });
+        sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+        if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+      }
+      return { emitted: false, failureReason: result?.failureReason || "stale-session" };
     }
     const ttsReceipt = result?.speechDone ? await result.speechDone : null;
     if (signal.aborted || !sharedExperience.active || sharedExperience.generation !== generation) return { emitted: false, ttsReceipt };
     const text = history.findLast((message) => message?.id === replyId && message.role === "assistant")?.content || "";
+    if (ttsReceipt?.status === "completed") sharedExperience.workspace?.markInitialOrientationComplete?.();
     sharedExperience.debugEntries.push({
       at: new Date().toLocaleTimeString(),
-      proactive: `${reason} · ${evidenceIds.join(",")} · ${ttsReceipt?.status || "text"}`,
+      proactive: `${reason} · ${evidenceIds.join(",")} · ${ttsReceipt?.status || "text"}${ttsReceipt?.stream ? ` · 音频欠载${ttsReceipt.stream.underrunCount}次/最大空档${ttsReceipt.stream.maxGapMs}ms` : ""}`,
     });
     sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
     renderSharedExperienceDebug();
     return { emitted: Boolean(text), text, ttsReceipt };
+  } catch (error) {
+    streamRow.remove();
+    if (sharedExperience.active && sharedExperience.generation === generation) {
+      sharedExperience.debugEntries ||= [];
+      sharedExperience.debugEntries.push({
+        at: new Date().toLocaleTimeString(),
+        proactive: `${reason} · ${evidenceIds.join(",")} · 失败：${error?.message || "generation-failed"}`,
+      });
+      sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+      if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+    }
+    throw error;
   } finally {
     const triggerIndex = history.findIndex((message) => message?.id === triggerId);
     if (triggerIndex >= 0 && !history.slice(triggerIndex + 1).some((message) => message?.id === replyId)) history.splice(triggerIndex, 1);
-    setBusy(false, { focusInput: false });
+    // A cancelled request from the previous viewing session must not clear the
+    // busy state established by a newly connected session.
+    if (!sharedExperience.active || sharedExperience.generation === generation) {
+      setBusy(false, { focusInput: false });
+    }
     scrollBottom();
   }
 }
@@ -3783,6 +3928,7 @@ async function processSharedExperienceOnce() {
   if (!sharedExperience.active || sharedExperience.paused || sharedExperience.processing) return;
   const generation = sharedExperience.generation;
   sharedExperience.processing = true;
+  let inferenceKind = null;
   try {
     if (sharedExperience.typingUntil > Date.now()) {
       sharedExperience.spool?.pauseInference("typing");
@@ -3791,15 +3937,19 @@ async function processSharedExperienceOnce() {
     sharedExperience.spool?.resumeInference("typing");
     const next = sharedExperience.spool?.drain(1)?.[0];
     if (!next) return;
+    inferenceKind = next.kind === "visual" ? "vision" : "asr";
     if (next.kind === "visual") {
+      sharedExperience.visualWindowQueued = false;
       sharedExperience.observing = true;
       const requestStartedAt = performance.now();
-      const request = invoke("observe_shared_experience_frame", { imageDataUrl: next.payload });
+      const request = invoke("observe_shared_experience_frames", { frames: next.payload.frames });
       sharedExperience.pendingObservation = request;
       const payload = await request;
       if (!sharedExperience.active || sharedExperience.generation !== generation) return;
       const safe = bindVisualObservationToCapture(payload, next.capturedAtMs);
       if (!safe) throw new Error("视觉服务返回无效结果");
+      sharedExperience.runtimeReceipts?.recordVision(payload);
+      inferenceKind = null;
       const filtered = filterVisualIdentityClaims(safe.summary);
       if (filtered.identityFiltered) sharedExperience.filteredVisualIdentities += 1;
       const mediaText = videoQuestionEvidence({kind:"visual",text:filtered.summary}).text;
@@ -3825,6 +3975,7 @@ async function processSharedExperienceOnce() {
         latencyMs,
         summary: accepted?.summary || "身份猜测或非视频界面已过滤，本帧未进入证据链。",
         identityFiltered: filtered.identityFiltered,
+        visualWindow: `${next.payload.state}/${next.payload.reason} · ${next.payload.frames.length}/${next.payload.sampledFrames}`,
       });
       sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
       renderSharedExperienceDebug();
@@ -3836,6 +3987,8 @@ async function processSharedExperienceOnce() {
       const result = await request;
       if (!sharedExperience.active || sharedExperience.generation !== generation) return;
       const text = String(result?.text || "").trim();
+      sharedExperience.runtimeReceipts?.recordAsr(result);
+      inferenceKind = null;
       if (text) {
         sharedExperience.processedAudio += 1;
         await sharedExperience.lifecycle?.maybeRollSegment(next.capturedAtMs);
@@ -3853,6 +4006,7 @@ async function processSharedExperienceOnce() {
       }
     }
   } catch (error) {
+    if (sharedExperience.generation === generation) sharedExperience.runtimeReceipts?.recordFailure(inferenceKind);
     sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), error: error?.message || "共同体验推理失败" });
     sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
     renderSharedExperienceDebug();
@@ -3874,13 +4028,27 @@ async function captureSharedExperienceOnce() {
   if (!sharedExperience.active || sharedExperience.paused || sharedExperience.capturing) return;
   const generation = sharedExperience.generation;
   sharedExperience.capturing = true;
+  let failed = false;
   try {
+    if (sharedExperience.visualWindowQueued) return;
     const capture = await invoke("capture_shared_experience_frame", { windowId: sharedExperience.windowId });
     if (!sharedExperience.active || sharedExperience.generation !== generation) return;
-    const imageDataUrl = String(capture?.imageDataUrl || "");
-    if (!imageDataUrl.startsWith("data:image/")) throw new Error("窗口截图返回无效");
-    sharedExperience.spool?.push({ kind: "visual", capturedAtMs: capture?.capturedAtMs, payload: imageDataUrl });
+    const normalized = normalizeSharedExperienceVisualCapture(capture);
+    if (!normalized) throw new Error("窗口视觉采样返回无效");
+    sharedExperience.visualDiagnostics = normalized.diagnostics;
+    if (normalized.pending) {
+      renderSharedExperienceDebug();
+      return;
+    }
+    const item = sharedExperience.spool?.push({
+      kind: "visual",
+      capturedAtMs: normalized.window.capturedAtMs,
+      payload: normalized.window,
+    });
+    if (!item) throw new Error("视觉窗口超过临时队列容量");
+    sharedExperience.visualWindowQueued = true;
     sharedExperience.capturedVisual += 1;
+    recordSharedExperienceCapture("visual", normalized.window.capturedAtMs);
     renderSharedExperienceDebug();
     if (sharedExperience.typingUntil > Date.now()) {
       sharedExperience.spool?.pauseInference("typing");
@@ -3890,6 +4058,7 @@ async function captureSharedExperienceOnce() {
       void processSharedExperienceOnce();
     }
   } catch (error) {
+    failed = true;
     sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), error: error?.message || "采集失败" });
     sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
     renderSharedExperienceDebug();
@@ -3897,7 +4066,10 @@ async function captureSharedExperienceOnce() {
   } finally {
     sharedExperience.capturing = false;
     if (sharedExperience.active && !sharedExperience.paused) {
-      sharedExperience.captureTimer = window.setTimeout(captureSharedExperienceOnce, 3000);
+      sharedExperience.captureTimer = window.setTimeout(
+        captureSharedExperienceOnce,
+        sharedExperienceCaptureDelay({ kind: "visual", failed }),
+      );
     }
   }
 }
@@ -3926,6 +4098,7 @@ async function captureSharedExperienceAudioOnce() {
       : 0;
     sharedExperience.lastAudioCaptureEndMs = endedAtMs;
     sharedExperience.capturedAudio += 1;
+    recordSharedExperienceCapture("audio");
     sharedExperience.debugEntries.push({
       at: new Date().toLocaleTimeString(),
       audioCapture: `${new Date(startedAtMs).toLocaleTimeString()}–${new Date(endedAtMs).toLocaleTimeString()}${audioGapMs > 0 ? ` · 空档 ${audioGapMs}ms` : ""}`,
@@ -3962,7 +4135,7 @@ function renderSharedExperienceDebug() {
       ? `[${entry.at}] 无剧透身份参考\n${entry.primer}`
     : entry.proactive
       ? `[${entry.at}] 主动评论\n${entry.proactive}`
-      : `[${entry.at}] ${entry.latencyMs} ms${entry.identityFiltered ? " · 身份猜测已过滤" : ""}\n${entry.summary}`).join("\n\n");
+      : `[${entry.at}] ${entry.latencyMs} ms${entry.visualWindow ? ` · 窗口 ${entry.visualWindow}` : ""}${entry.identityFiltered ? " · 身份猜测已过滤" : ""}\n${entry.summary}`).join("\n\n");
   if (sharedExperienceDebugMeta) {
     const lifecycle = sharedExperience.lifecycle?.snapshot();
     const usage = lifecycle?.usage;
@@ -3973,9 +4146,42 @@ function renderSharedExperienceDebug() {
     const balanceText = balance?.current === null
       ? ""
       : ` · 余额 ${balance.currency} ${balance.starting.toFixed(2)}→${balance.current.toFixed(2)}（${balance.delta.toFixed(2)}）`;
+    const proactive = sharedExperienceProactiveDiagnostics(sharedExperience.proactiveRunner?.snapshot(), Date.now());
+    const frequencyLabel = { low: "低频", standard: "标准", frequent: "高频" }[proactive.frequency];
+    const countdown = proactive.pending
+      ? "处理中"
+      : proactive.nextEligibleInMs > 0
+        ? `${Math.ceil(proactive.nextEligibleInMs / 1000)}s`
+        : "可尝试";
+    const suppressed = Object.entries(proactive.suppressions)
+      .filter(([, count]) => Number(count) > 0)
+      .sort((left, right) => Number(right[1]) - Number(left[1]))[0];
+    const lastSpoken = proactive.lastSpokenAgoMs === null
+      ? "尚未发言"
+      : `上次${Math.ceil(proactive.lastSpokenAgoMs / 1000)}s前`;
+    const actualGap = proactive.lastCompletedIntervalMs === null
+      ? ""
+      : ` · 实际间隔${Math.ceil(proactive.lastCompletedIntervalMs / 1000)}s/最长${Math.ceil(proactive.maxCompletedIntervalMs / 1000)}s`;
+    const turnDuration = proactive.lastTurnDurationMs === null
+      ? ""
+      : ` · 上轮生成播放${(proactive.lastTurnDurationMs / 1000).toFixed(1)}s`;
+    const waiting = proactive.currentSuppressionReason
+      ? ` · 当前等待 ${proactive.currentSuppressionReason} ${Math.ceil(proactive.currentSuppressionForMs / 1000)}s`
+      : "";
+    const proactiveText = sharedExperience.proactiveRunner
+      ? ` · 情境${({ "game-narrated": "游戏解说", "short-video": "短视频", narrated: "解说", cinematic: "影视", livestream: "直播", "low-speech-game": "游戏", direct: "直接观看" })[sharedExperience.workspace?.snapshot().contentMode] || "待识别"} · 主动${frequencyLabel} 完成${proactive.completed}/失败${proactive.failed}/取消${proactive.cancelled} · ${lastSpoken}${actualGap}${turnDuration} · 下次最早 ${countdown}${waiting}${suppressed ? ` · 主要等待 ${suppressed[0]}×${suppressed[1]}` : ""}`
+      : " · 主动关闭";
+    const visual = sharedExperience.visualDiagnostics;
+    const visualState = { quiet: "慢速", normal: "普通", intense: "快速" }[visual?.state] || "准备中";
+    const visualText = visual
+      ? ` · 视觉${visualState} 原始${visual.sampledFrames}/窗口${visual.emittedWindows}/合并${visual.coalescedFrames}/丢弃${visual.droppedFrames} · 变化${(visual.latestChangeScorePpm / 10_000).toFixed(1)}% · 下窗≤${Math.ceil(visual.nextWindowInMs / 1000)}s`
+      : " · 视觉准备中";
+    const currentMode = sharedExperience.workspace?.snapshot().contentMode || "unknown";
+    const configuredFrequency = ["low", "standard", "frequent"].includes(settings.sharedExperienceProactiveFrequency)
+      ? settings.sharedExperienceProactiveFrequency : "standard";
     sharedExperienceDebugMeta.textContent = sharedExperience.active
-      ? `窗口：${sharedExperience.windowLabel} · 采集 V${sharedExperience.capturedVisual}/A${sharedExperience.capturedAudio} · 处理 V${sharedExperience.processedVisual}/A${sharedExperience.processedAudio} · 积压 ${sharedExperience.spool?.snapshot().pending || 0} · DeepSeek 对话${usage?.conversation.requests || 0}/证据${usage?.evidenceSummary?.requests || 0}/段总结${usage?.segmentSummary.requests || 0}/最终${usage?.finalSummary.requests || 0}（共${totalRequests}次/${formatTokenCount(totalTokens)} tok）· 估算 $${cost.toFixed(4)}${balanceText}${lifecycle?.budget.exhausted ? " · 已进入节省模式" : ""}`
-      : "观察未启动";
+      ? `状态：${sharedExperience.paused ? "已暂停" : "运行中"} · 情境${({ "game-narrated": "游戏解说", "short-video": "短视频", narrated: "解说", cinematic: "影视", livestream: "直播", "low-speech-game": "游戏", direct: "其他" })[currentMode] || "未选择"} · 配置频率${({ low: "低频", standard: "标准", frequent: "高频" })[configuredFrequency]}${proactiveText} · 窗口：${sharedExperience.windowLabel} · 采集 V${sharedExperience.capturedVisual}/A${sharedExperience.capturedAudio} · 处理 V${sharedExperience.processedVisual}/A${sharedExperience.processedAudio} · 积压 ${sharedExperience.spool?.snapshot().pending || 0}${visualText} · DeepSeek 对话${usage?.conversation.requests || 0}/证据${usage?.evidenceSummary?.requests || 0}/段总结${usage?.segmentSummary.requests || 0}/最终${usage?.finalSummary.requests || 0}（共${totalRequests}次/${formatTokenCount(totalTokens)} tok）· 估算 $${cost.toFixed(4)}${balanceText}${lifecycle?.budget.exhausted ? " · 已进入节省模式" : ""}`
+      : `状态：未运行 · 配置频率${({ low: "低频", standard: "标准", frequent: "高频" })[configuredFrequency]}`;
   }
   sharedExperienceDebugOutput.scrollTop = sharedExperienceDebugOutput.scrollHeight;
 }
@@ -3988,6 +4194,7 @@ async function connectSharedExperience(selected, { segmentDurationMs, proactiveE
   if (sharedExperience.stopPromise) await sharedExperience.stopPromise;
   await invoke("start_shared_experience");
   sharedExperience.active = true;
+  setCompanionAudioActive(true);
   resetFreshIdleTimer();
   sharedExperience.generation += 1;
   sharedExperience.paused = false;
@@ -3996,12 +4203,16 @@ async function connectSharedExperience(selected, { segmentDurationMs, proactiveE
   sharedExperience.contentTitle = "";
   sharedExperience.workspace = createSharedExperienceWorkspace({
     windowId: sharedExperience.windowId,
-    contentMode: classifySharedExperienceContentMode(selected.title),
+    contentMode: "unknown",
     ...(Number.isFinite(Number(segmentDurationMs))
       ? { segmentDurationMs: Number(segmentDurationMs) }
       : {}),
   });
   sharedExperience.spool = createSharedExperienceSpool();
+  sharedExperience.captureTimeline = { visual: [], audio: [] };
+  sharedExperience.visualWindowQueued = false;
+  sharedExperience.visualDiagnostics = null;
+  sharedExperience.runtimeReceipts = createSharedExperienceRuntimeReceipts();
   sharedExperience.lifecycle = createSharedExperienceLifecycle({
     workspace: sharedExperience.workspace,
     summarize: summarizeSharedExperience,
@@ -4015,8 +4226,8 @@ async function connectSharedExperience(selected, { segmentDurationMs, proactiveE
   sharedExperience.characterTracker = createSharedExperienceCharacterTracker();
   syncSharedExperienceProactive({
     ...(typeof proactiveEnabled === "boolean" ? { enabled: proactiveEnabled } : {}),
-    ...(Number.isFinite(Number(proactiveFirstDelayMs)) ? { firstDelayMs: Number(proactiveFirstDelayMs) } : {}),
-    ...(Number.isFinite(Number(proactiveMinIntervalMs)) ? { minIntervalMs: Number(proactiveMinIntervalMs) } : {}),
+    ...(Number.isFinite(proactiveFirstDelayMs) ? { firstDelayMs: proactiveFirstDelayMs } : {}),
+    ...(Number.isFinite(proactiveMinIntervalMs) ? { minIntervalMs: proactiveMinIntervalMs } : {}),
   });
   try {
     sharedExperience.voiceTracker.record(await invoke("check_voice_service"));
@@ -4027,6 +4238,15 @@ async function connectSharedExperience(selected, { segmentDurationMs, proactiveE
   if (sharedExperienceBtn) sharedExperienceBtn.classList.add("on");
   if (sharedExperiencePauseBtn) sharedExperiencePauseBtn.hidden = false;
   if (sharedExperienceStopBtn) sharedExperienceStopBtn.hidden = false;
+  if (typeof sharedExperienceFrequency !== "undefined" && sharedExperienceFrequency) {
+    sharedExperienceFrequency.value = ["low", "standard", "frequent"].includes(settings.sharedExperienceProactiveFrequency)
+      ? settings.sharedExperienceProactiveFrequency : "standard";
+    sharedExperienceFrequency.hidden = false;
+  }
+  if (typeof sharedExperienceMode !== "undefined" && sharedExperienceMode) {
+    sharedExperienceMode.value = "unknown";
+    sharedExperienceMode.hidden = false;
+  }
   setSharedExperienceStatus(`共同体验已连接 · ${sharedExperience.windowLabel} · 首次画面分析中…`);
   void captureSharedExperienceOnce();
   void captureSharedExperienceAudioOnce();
@@ -4089,7 +4309,7 @@ formEl.addEventListener("submit", (e) => {
   send(text);
 });
 inputEl.addEventListener("focus", () => {
-  if (sharedExperience.active) {
+  if (sharedExperience.active && !restoringComposerFocus) {
     sharedExperience.typingUntil = Date.now() + 1500;
     void cancelSharedExperienceProactive("user-active", { stopAudio: true });
   }
@@ -4106,6 +4326,7 @@ inputEl.addEventListener("input", () => {
 attachBtn.addEventListener("click", () => fileEl.click());
 sharedExperienceBtn?.addEventListener("click", async () => {
   if (sharedExperience.active) return;
+  unlockAudio();
   sharedExperienceBtn.disabled = true;
   try {
     await startSharedExperience();
@@ -4119,6 +4340,15 @@ sharedExperienceStopBtn?.addEventListener("click", () => { void stopSharedExperi
 sharedExperiencePauseBtn?.addEventListener("click", () => {
   if (sharedExperience.paused) resumeSharedExperience();
   else pauseSharedExperience();
+});
+sharedExperienceMode?.addEventListener("change", () => {
+  setSharedExperienceContentMode(sharedExperienceMode.value);
+});
+sharedExperienceFrequency?.addEventListener("change", () => {
+  if (!sharedExperience.active) return;
+  settings.sharedExperienceProactiveFrequency = sharedExperienceFrequency.value;
+  syncSharedExperienceProactive();
+  setSharedExperienceStatus(`共同体验 · 已切换陪看频率：${sharedExperienceFrequency.selectedOptions?.[0]?.textContent || sharedExperienceFrequency.value}`);
 });
 sharedExperienceDebugBtn?.addEventListener("click", () => {
   if (!sharedExperienceDebug) return;
@@ -4408,6 +4638,8 @@ listen("debug-start-shared-experience", async ({ payload }) => {
         } else if (name === "pause") pauseSharedExperience();
         else if (name === "resume") resumeSharedExperience();
         else if (name === "stop") stopSharedExperience();
+        else if (name === "hide-chat" && sharedExperience.active) void invoke("hide_chat");
+        else if (name === "show-chat" && sharedExperience.active) void invoke("toggle_chat_window");
       }, delay);
     });
     const viewingStatement = String(payload?.userViewingStatement || "").trim();
@@ -4439,6 +4671,7 @@ listen("debug-start-shared-experience", async ({ payload }) => {
             if ((snapshot?.visualEvents?.length || 0) + (snapshot?.audioEvents?.length || 0) > 0) return;
             await new Promise((resolve) => window.setTimeout(resolve, 500));
           }
+          throw new Error("验收准备失败：未取得有效媒体证据或共同体验已中断");
         },
         questionForTurn: async ({ index, elapsedMs, category, snapshot }) => {
           const question = planEvidenceAnchoredQuestion({
@@ -4522,20 +4755,27 @@ listen("debug-start-shared-experience", async ({ payload }) => {
           lifecycle: sharedExperience.lifecycle?.snapshot() || null,
           voiceService: sharedExperience.voiceTracker?.snapshot() || null,
           proactive: sharedExperience.proactiveRunner?.snapshot() || null,
+          runtimeReceipts: sharedExperience.runtimeReceipts?.snapshot() || null,
           workspace: (() => {
             const workspace = sharedExperience.workspace?.snapshot();
             return workspace ? {
               sessionId: workspace.sessionId,
+              windowId: workspace.windowId,
               contentMode: workspace.contentMode,
               segmentId: workspace.segmentId,
               rollingSummary: workspace.rollingSummary,
               evidenceJournal: workspace.evidenceJournal,
               evidenceBlocks: workspace.evidenceBlocks,
+              discussionJournal: workspace.discussionJournal,
               visualEvents: workspace.visualEvents.length,
               audioEvents: workspace.audioEvents.length,
               chatTurns: workspace.chatTurns.length,
               capturedVisual: sharedExperience.capturedVisual,
               capturedAudio: sharedExperience.capturedAudio,
+              captureTimeline: {
+                visual: [...sharedExperience.captureTimeline.visual],
+                audio: [...sharedExperience.captureTimeline.audio],
+              },
               processedVisual: sharedExperience.processedVisual,
               processedAudio: sharedExperience.processedAudio,
               filteredVisualIdentities: sharedExperience.filteredVisualIdentities,
@@ -4560,13 +4800,18 @@ listen("debug-start-shared-experience", async ({ payload }) => {
           ...report,
           environment: {
             buildKind: payload.buildKind,
+            realServices: !!report.beforeFinalize?.runtimeReceipts,
             executable: payload.executable,
             selectedWindowId: id,
             selectedWindow: `${selected.owner || ""} · ${selected.title || ""}`,
-            textProvider: settings.textProvider,
-            textModel: settings.textModel || "deepseek-v4-flash",
-            voiceBackend: settings.realtimeBackend,
-            asrProvider: settings.asrProvider,
+            visionProvider: report.beforeFinalize?.runtimeReceipts?.vision?.provider,
+            textProvider: report.beforeFinalize?.runtimeReceipts?.text?.provider,
+            textModel: settings.textModel || "deepseek-flash",
+            voiceBackend: report.beforeFinalize?.voiceService?.backend === "voxcpm"
+              && report.beforeFinalize.voiceService.runningSeen === true
+              ? "voxcpm" : "mixed-or-unknown",
+            testMode: report.plannedTurns === 0 ? "proactive-only" : "scripted-questions",
+            asrProvider: report.beforeFinalize?.runtimeReceipts?.asr?.provider,
             autoSpeak: settings.autoSpeak,
             userViewingStatement: viewingStatement,
           },
@@ -4578,7 +4823,8 @@ listen("debug-start-shared-experience", async ({ payload }) => {
         });
         if (!response.ok) throw new Error(`验收报告写入失败 ${response.status}`);
         setSharedExperienceStatus(`30 分钟压力测试完成 · ${report.successfulTurns}/${report.plannedTurns} 轮成功`);
-      }).catch((error) => {
+      }).catch(async (error) => {
+        await stopSharedExperience({ silent: true, finalize: false });
         console.error("[shared-e2e] acceptance failed", error);
         setSharedExperienceStatus(`压力测试失败：${error?.message || error}`, { error: true });
       });
@@ -4698,12 +4944,12 @@ listen("memory-cleared", ({ payload }) => {
   history.forEach((m) => { if (m?.id) memoryEnqueuedIds.add(m.id); });
 });
 
-/** 退出前挂断通话（把最后一轮写入 history）；收起窗口则保留通话。 */
+/** 退出前挂断通话；收起窗口则保留通话和共同体验。 */
 async function prepareAndFlushMemory({ hangup = true } = {}) {
   // 隐藏聊天窗口不是挂断电话：Rust 仍保持 realtime WebSocket，窗口重新显示
   // 后继续接收文字和音频。此时也不能提前巩固正在增长的可听助手句段，
   // 否则同一消息 ID 被标成已入队后，恢复窗口继续播放的尾段会永久漏记。
-  if (!hangup && callActive) return;
+  if (!hangup && (callActive || sharedExperience.active)) return;
   // 真正退出时才释放会话和音频设备，并在定稿后一次性入队。
   if (hangup && callActive) await endCall({ notice: false, reason: "app_quit" });
   if (!callActive) {
@@ -4713,14 +4959,20 @@ async function prepareAndFlushMemory({ hangup = true } = {}) {
   await enqueueMemory();
 }
 
-// 聊天窗口收起时：停掉朗读，并把本次对话增量写入持久化队列。
+// 隐藏只改变界面可见性，不能暂停陪看或覆盖用户手动暂停的状态。
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    pauseSharedExperience();
+    if (sharedExperience.active) {
+      // WKWebView/WebView2 可能在窗口隐藏瞬间挂起 AudioContext；重新断言保活，
+      // 让正在排队或随后完成的 VoxCPM 音频仍能进入输出链。
+      setCompanionAudioActive(true);
+    }
     void prepareAndFlushMemory({ hangup: false });
     return;
   }
-  resumeSharedExperience();
+  if (document.visibilityState === "visible" && sharedExperience.active) {
+    setCompanionAudioActive(true);
+  }
   if (document.visibilityState === "visible" && callActive) {
     // macOS/WKWebView 常在隐藏窗口时挂起 Web Audio；恢复时只 resume，
     // 不重建节点、不清空已排队的 PCM。

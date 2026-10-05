@@ -8,8 +8,10 @@ export function createTtsReceipt({ requestedParts = 0, nowMs = () => performance
     failedParts: 0,
     firstAudioAtMs: null,
     streamObserved: false,
+    streamInvalid: false,
     streamUnderruns: 0,
     streamMaxGapMs: 0,
+    failureReasons: {},
   };
   return {
     admit() { state.admittedParts += 1; },
@@ -18,13 +20,27 @@ export function createTtsReceipt({ requestedParts = 0, nowMs = () => performance
       if (state.firstAudioAtMs === null) state.firstAudioAtMs = Number(nowMs()) || startedAtMs;
     },
     complete() { state.completedParts += 1; },
-    fail() { state.failedParts += 1; },
+    fail(reason) {
+      state.failedParts += 1;
+      const fixed = ["audio-context-suspended", "audio-context-unavailable", "queue-reset", "stream-error"].includes(reason)
+        ? reason : "unknown";
+      state.failureReasons[fixed] = (state.failureReasons[fixed] || 0) + 1;
+    },
+    observeBackend(value) {
+      const backend = ["voxcpm", "local", "cosyvoice"].includes(value) ? value : "mixed-or-unknown";
+      state.backend = state.backend === undefined || state.backend === backend ? backend : "mixed-or-unknown";
+    },
     observeStream(value = {}) {
+      if (!Number.isSafeInteger(value?.underrunCount) || value.underrunCount < 0
+        || typeof value?.maxGapMs !== "number" || !Number.isFinite(value.maxGapMs) || value.maxGapMs < 0) {
+        state.streamInvalid = true;
+        return;
+      }
       state.streamObserved = true;
-      state.streamUnderruns += Math.min(10_000, Math.max(0, Math.floor(Number(value.underrunCount) || 0)));
+      state.streamUnderruns += Math.min(10_000, value.underrunCount);
       state.streamMaxGapMs = Math.max(
         state.streamMaxGapMs,
-        Math.min(60_000, Math.max(0, Math.round(Number(value.maxGapMs) || 0))),
+        Math.min(60_000, Math.round(value.maxGapMs)),
       );
     },
     finish() {
@@ -44,12 +60,14 @@ export function createTtsReceipt({ requestedParts = 0, nowMs = () => performance
         firstAudioMs: state.firstAudioAtMs === null ? null : Math.max(0, state.firstAudioAtMs - startedAtMs),
         totalMs,
       };
-      if (state.streamObserved) {
+      if (state.streamObserved && !state.streamInvalid) {
         receipt.stream = {
           underrunCount: state.streamUnderruns,
           maxGapMs: state.streamMaxGapMs,
         };
       }
+      if (state.failedParts) receipt.failureReasons = { ...state.failureReasons };
+      if (state.backend !== undefined) receipt.backend = state.backend;
       return receipt;
     },
   };

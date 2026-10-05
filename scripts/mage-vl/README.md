@@ -3,11 +3,13 @@
 这是一个仅监听回环地址的图片观察服务，供桌宠的共同体验模式调用。窗口截图和媒体音频由 Tauri 按用户选择的 window ID 捕获；原始数据只在内存/临时文件中短暂存在，不写入聊天、Memory 或诊断。
 
 ```bash
-pip install git+https://github.com/Blaizzy/mlx-vlm.git@main gradio opencv-python pillow
+pip install "mlx-vlm==0.7.4" gradio opencv-python pillow
 python server.py
 ```
 
-服务地址为 `http://127.0.0.1:7861`，POST `/observe` 接收 `{imageDataUrl, question}`，返回短期 `summary`（默认 120 秒后过期）。首次运行会下载 `mlx-community/Mage-VL-8bit`（约 5GB）。
+服务地址为 `http://127.0.0.1:7861`。`POST /observe` 接收单图；主动陪看使用 `POST /observe-frames` 接收 2--4 张严格按时间递增的 JPEG，并通过 Mage-VL 的 video processor 保留时间位置。`mlx-vlm 0.7.1` 才开始支持该路径，项目固定到已验证的 `0.7.4`。首次运行会下载 `mlx-community/Mage-VL-8bit`（约 5GB）。
+
+桌面应用使用会话级 `ScreenCaptureKit` helper 以 2 fps 维护最多 24 帧的内存缓冲。本地变化门控只把静态约 8 秒、普通约 4 秒、快速约 2 秒的代表窗口交给 Mage-VL；原始候选帧不会进入聊天或 Memory。
 
 ## 短视频窗口实测
 

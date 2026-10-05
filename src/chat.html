@@ -40,6 +40,21 @@
       <button id="shared-experience-btn" type="button" title="选择窗口并持续观察" aria-label="共同体验窗口">▣</button>
       <button id="shared-experience-pause-btn" type="button" title="暂停观看" aria-label="暂停观看" hidden>Ⅱ</button>
       <button id="shared-experience-stop-btn" type="button" title="停止观察" aria-label="停止观察" hidden>■</button>
+      <select id="shared-experience-frequency" title="调整陪看频率" aria-label="调整陪看频率" hidden>
+        <option value="low">低频</option>
+        <option value="standard">标准</option>
+        <option value="frequent">高频</option>
+      </select>
+      <select id="shared-experience-mode" title="选择陪看情境" aria-label="选择陪看情境" hidden>
+        <option value="unknown">选择情境</option>
+        <option value="cinematic">电影原片 / 剧集</option>
+        <option value="narrated">电影解说</option>
+        <option value="game-narrated">游戏解说</option>
+        <option value="livestream">直播</option>
+        <option value="short-video">短视频</option>
+        <option value="low-speech-game">低语音游戏</option>
+        <option value="direct">其他内容</option>
+      </select>
       <button id="shared-experience-debug-btn" type="button" title="查看视觉观察调试信息" aria-label="视觉观察调试信息">≡</button>
       <input id="file" type="file" accept="image/*" hidden />
       <input id="input" type="text" placeholder="和元元说点什么…（Esc 收起）" />

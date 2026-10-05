@@ -3,11 +3,109 @@ import assert from "node:assert/strict";
 
 import { requestSharedExperienceSummary, requestSharedExperienceQuestion } from "../src/ai/shared-experience-client.js";
 
-test("summary prompts weight raw evidence for narrated, cinematic, livestream, and low-speech game", async () => {
+test("long final recap independently verifies all chronological thirds from raw evidence", async () => {
+  const evidence = Array.from({ length: 90 }, (_, i) => ({ id: `ev-${i}`, kind: "audio", atMs: i * 20000, text: `第${i}次开门。` }));
+  const batches = [];
+  let current;
+  const result = await requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final", evidence,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      let content;
+      if (body.messages[0].content.startsWith("你是共同观看记录整理器")) {
+        const prompt = body.messages[1].content;
+        assert.doesNotMatch(prompt, /8条/);
+        assert.match(prompt, /最多2条/);
+        assert.match(body.messages[0].content, /先选.*引用.*text.*引用/);
+        const batch = evidence.filter((e) => prompt.includes(`\"id\":\"${e.id}\"`));
+        assert.ok(batch.length <= 30, "each request must reserve space for a chronological third");
+        batches.push(batch);
+        current = batch.at(-1);
+        content = { events: [{ text: current.text, status: "observed", claimType: "speech", supports: [{ id: current.id, quote: current.text }] }] };
+      } else content = { parts: [{ index: 0, verdict: "supported", supports: [{ id: current.id, quote: current.text }] }] };
+      return { ok: true, json: async () => ({ model: "deepseek-flash", usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [{ message: { content: JSON.stringify(content) } }] }) };
+    },
+  });
+  assert.deepEqual(batches.flat().map((e) => e.id), evidence.map((e) => e.id));
+  assert.equal(result.summary, "第29次开门。\n第59次开门。\n第89次开门。");
+  assert.equal(result.requestCount, 6);
+  assert.equal(result.usage.total, 90);
+});
+
+test("long recap rejects partial success and retains usage when a later third fails", async () => {
+  const evidence = Array.from({ length: 90 }, (_, i) => ({ id: `ev-${i}`, kind: "audio", atMs: i * 20000, text: `第${i}次开门。` }));
+  let calls = 0;
+  const prompts = [];
+  await assert.rejects(requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final", evidence,
+    fetchImpl: async () => {
+      calls++;
+      const content = calls === 1 ? { events: [{ text: evidence[0].text, status: "observed", claimType: "speech", supports: [{ id: "ev-0", quote: evidence[0].text }] }] }
+        : calls === 2 ? { parts: [{ index: 0, verdict: "supported", supports: [{ id: "ev-0", quote: evidence[0].text }] }] } : { events: [] };
+      return { ok: true, json: async () => ({ usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [{ message: { content: JSON.stringify(content) } }] }) };
+    },
+  }), (error) => {
+    assert.equal(error.summaryFailureCode, "no-supported-events");
+    assert.equal(error.summaryUsage.requestCount, 3);
+    assert.equal(error.summaryUsage.usage.total, 45);
+    return true;
+  });
+  assert.equal(calls, 3);
+});
+
+test("summary failure codes distinguish length, malformed JSON, empty and transport without exporting content", async () => {
+  for (const [content, finish_reason, expected] of [["private", "length", "output-truncated"],
+    ["private", "stop", "invalid-structure"], ['{"events":[]}', "stop", "no-supported-events"]]) {
+    await assert.rejects(requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final",
+      fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ finish_reason, message: { content } }] }) }),
+    }), (error) => {
+      assert.equal(error.summaryFailureCode, expected);
+      assert.doesNotMatch(error.message, /private/);
+      assert.equal(error.summaryUsage.requestCount, 1);
+      return true;
+    });
+  }
+  await assert.rejects(requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final",
+    fetchImpl: async () => { throw new Error("private provider error"); },
+  }), (error) => error.summaryFailureCode === "transport" && !error.message.includes("private"));
+});
+
+test("final summary retries a fully rejected draft from the same raw evidence", async () => {
+  const evidence = [{ id: "ev-1", kind: "audio", atMs: 1000, text: "有人打开了铁门。" }];
+  let calls = 0;
+  const result = await requestSharedExperienceSummary({
+    apiBase: "http://127.0.0.1:1234",
+    kind: "final",
+    evidence,
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      const body = JSON.parse(init.body);
+      if (body.messages[0].content.startsWith("你是共同观看记录整理器")) {
+        const retry = body.messages[1].content.includes("这是一次证据约束重试");
+        assert.match(body.messages[1].content, /有人打开了铁门/);
+        const content = retry
+          ? { events: [{ text: "有人打开了铁门。", status: "observed", claimType: "speech", supports: [{ id: "ev-1", quote: "有人打开了铁门。" }] }] }
+          : { events: [{ text: "有人打开铁门后准备进入。", status: "observed", claimType: "interpretation", supports: [{ id: "ev-1", quote: "有人打开了铁门。" }] }] };
+        return { ok: true, json: async () => ({ model: "deepseek-v4-flash", usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [{ message: { content: JSON.stringify(content) } }] }) };
+      }
+      const retry = calls >= 4;
+      const content = retry
+        ? { parts: [{ index: 0, text: "有人打开了铁门。", verdict: "supported", supports: [{ id: "ev-1", quote: "有人打开了铁门。" }] }] }
+        : { parts: [{ index: 0, text: "有人打开铁门后准备进入。", verdict: "unsupported", supports: [] }] };
+      return { ok: true, json: async () => ({ model: "deepseek-v4-flash", usage: { prompt_tokens: 10, completion_tokens: 5 }, choices: [{ message: { content: JSON.stringify(content) } }] }) };
+    },
+  });
+  assert.equal(result.summary, "有人打开了铁门。");
+  assert.equal(result.requestCount, 4);
+  assert.equal(result.usage.total, 60);
+  assert.equal(calls, 4);
+});
+
+test("summary prompts weight raw evidence for viewing contexts", async () => {
   const cases = [
     ["narrated", /ASR.*主线.*画面.*补充/],
+    ["game-narrated", /游戏解说.*目标.*策略.*操作/],
     ["cinematic", /连续画面.*对白.*共同/],
     ["livestream", /实时画面.*零散语音/],
+    ["short-video", /短视频.*不同片段.*不把.*无关.*同一剧情/],
     ["low-speech-game", /游戏动作.*场景变化.*主线/],
   ];
   for (const [contentMode, expected] of cases) {
@@ -50,6 +148,70 @@ test("final recap generation reads original audio omitted by previous summaries"
     },
   });
   assert.equal(result.summary,"有人提出先关电闸。");
+});
+
+test("final recap guides chronological coverage without dropping raw sources or inventing empty stages", async () => {
+  const evidence = [
+    { id: "ev-1", kind: "audio", atMs: 0, text: "开场决定寻找出口。" },
+    { id: "ev-2", kind: "visual", atMs: 900000, text: "人物打开一道铁门。" },
+    { id: "ev-3", kind: "audio", atMs: 1800000, text: "最后终于走出了房屋。" },
+  ];
+  await assert.rejects(requestSharedExperienceSummary({
+    apiBase: "http://127.0.0.1:1234", kind: "final", evidence,
+    fetchImpl: async (_url, init) => {
+      const prompt = JSON.parse(init.body).messages[1].content;
+      assert.doesNotMatch(prompt, /不必覆盖每个阶段/);
+      assert.match(prompt, /前段：ev-1/);
+      assert.match(prompt, /中段：ev-2/);
+      assert.match(prompt, /后段：ev-3/);
+      assert.match(prompt, /没有完整事件的时段可以省略/);
+      for (const event of evidence) assert.ok(prompt.includes(event.text));
+      return { ok: true, json: async () => ({ choices: [{ message: { content: '{"events":[]}' } }] }) };
+    },
+  }), /共同体验总结不完整/);
+});
+
+test("long final recap retries when the first draft covers too little of the timeline", async () => {
+  const evidence = Array.from({ length: 9 }, (_, index) => ({
+    id: `ev-${index + 1}`,
+    kind: "audio",
+    atMs: index * 60_000,
+    text: `第${index + 1}段发生了明确行动。`,
+  }));
+  let calls = 0;
+  const prompts = [];
+  let generatedIds = [];
+  const result = await requestSharedExperienceSummary({
+    apiBase: "http://127.0.0.1:1234",
+    kind: "final",
+    evidence,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      prompts.push(body.messages[1].content);
+      calls += 1;
+      if (body.messages[0].content.startsWith("你是共同观看记录整理器")) {
+        const retry = body.messages[1].content.includes("覆盖不足重试");
+        const ids = retry ? ["ev-1", "ev-5", "ev-9"] : ["ev-1"];
+        generatedIds = ids;
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+          events: ids.map((id) => ({
+            text: evidence.find((event) => event.id === id).text,
+            status: "observed",
+            claimType: "speech",
+            supports: [{ id, quote: evidence.find((event) => event.id === id).text }],
+          })),
+        }) } }] }) };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        parts: generatedIds.map((id, index) => ({ index, text: evidence.find((event) => event.id === id).text, verdict: "supported", supports: [{ id, quote: evidence.find((event) => event.id === id).text }] })),
+      }) } }] }) };
+    },
+  });
+  assert.equal(calls, 4);
+  assert.match(prompts[2], /覆盖不足重试/);
+  assert.match(result.summary, /第1段/);
+  assert.match(result.summary, /第5段/);
+  assert.match(result.summary, /第9段/);
 });
 
 test("final recap accepts eight valid sourced events when citation rendering exceeds the segment limit", async () => {
@@ -95,17 +257,29 @@ test("final recap keeps bounded original fields without leaking prior claims or 
     {id:"block-1",kind:"summary",text:"旧摘要假设有时间循环。"},
     {id:"assistant-1",kind:"assistant",text:"角色猜测有人失踪。"}];
   let calls = 0;
-  await assert.rejects(requestSharedExperienceSummary({apiBase:"http://127.0.0.1:1234",kind:"final",evidence,
+  const prompts = [];
+  const result = await requestSharedExperienceSummary({apiBase:"http://127.0.0.1:1234",kind:"final",evidence,
     fetchImpl:async(_url,init)=>{
       calls++;
       const prompt = JSON.parse(init.body).messages[1].content;
-      assert.ok(prompt.includes(first.text));
-      assert.ok(prompt.includes(last.text));
-      assert.match(prompt,/这个结局让我松了口气/);
       assert.doesNotMatch(prompt,/not-for-provider|时间循环|有人失踪/);
-      return {ok:true,json:async()=>({choices:[{message:{content:'{"events":[]}'}}]})};
-    }}),/总结不完整/);
-  assert.equal(calls,1);
+      if (prompt.trimStart().startsWith("{")) {
+        const review = JSON.parse(prompt);
+        const source = review.sources?.find((item) => ["audio", "visual"].includes(item.kind));
+        return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({parts:(review.sentences || []).map((sentence)=>({text:sentence.text,verdict:"supported",supports:source ? [{id:source.id,quote:source.text.slice(0,120)}] : []}))})}}]})};
+      }
+      prompts.push(prompt);
+      const match = prompt.match(/\{"id":"([^\"]+)","kind":"(audio|visual|user|identity)","text":"([^\"]*)"/);
+      const source = match ? {id:match[1],kind:match[2],text:match[3]} : null;
+      const claimType = source?.kind === "audio" ? "speech" : source?.kind === "user" ? "user" : "appearance";
+      const content = source ? {events:[{text:source.text.slice(0,120),status:"observed",claimType,supports:[{id:source.id,quote:source.text.slice(0,120)}]}]} : {events:[]};
+      return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(content)}}]})};
+    }});
+  assert.ok(calls > 1);
+  assert.ok(result.summary);
+  assert.ok(prompts.some((prompt) => prompt.includes(first.text)));
+  assert.ok(prompts.some((prompt) => prompt.includes(last.text)));
+  assert.ok(prompts.some((prompt) => prompt.includes("这个结局让我松了口气")));
   for (const invalid of [Array(2306).fill(first),[{...first,text:"字".repeat(501)}],[{...first,id:""}]]) {
     await assert.rejects(requestSharedExperienceSummary({apiBase:"http://127.0.0.1:1234",kind:"final",evidence:invalid,
       fetchImpl:async()=>assert.fail("invalid evidence must not spend tokens")}),/最终总结证据/);

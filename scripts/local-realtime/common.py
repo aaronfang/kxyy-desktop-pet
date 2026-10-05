@@ -2597,6 +2597,7 @@ def start_tts_http(port: int) -> None:
                 response = {
                     "status": "ok",
                     "text": text,
+                    "asrRuntime": asr_runtime_summary(),
                     "language": str(getattr(result, "language", "unknown")),
                     "emotion": str(getattr(result, "emotion", "unknown")),
                     "event": str(getattr(result, "event", "unknown")),

@@ -8,7 +8,10 @@ import {
   TOPIC_PREFERENCE_STATUSES,
 } from "./ai/topic-preferences.js";
 import { memoryHealthState } from "./memory-ui.js";
-import { DEEPSEEK_VISION_MODEL } from "./deepseek-multimodal.js";
+import {
+  DEEPSEEK_VISION_MODEL,
+  normalizeDeepseekTextModel,
+} from "./deepseek-multimodal.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -571,7 +574,7 @@ function fill(s) {
   el("webGroundingProvider").value = s.webGroundingProvider === "tavily" ? "tavily" : "none";
   el("tavilyApiKey").value = s.tavilyApiKey || "";
   syncWebGroundingFields();
-  el("textModel").value = s.textModel || "";
+  el("textModel").value = s.textModel ? normalizeDeepseekTextModel(s.textModel) : "";
   el("localTextModel").value = s.localTextModel || "";
   el("localVlModel").value = s.localVlModel || "";
   el("vlProvider").value = ["deepseek", "local"].includes(s.vlProvider) ? s.vlProvider : "qwen";

@@ -76,12 +76,11 @@
               <span>文字模型</span>
               <select id="textModel">
                 <option value="">自动（Flash，思考独立）</option>
-                <option value="deepseek-v4-flash">deepseek-v4-flash（快）</option>
+                <option value="deepseek-flash">deepseek-flash（V4.1，支持图片）</option>
                 <option value="deepseek-v4-pro">deepseek-v4-pro（强）</option>
-                <option value="deepseek-v4-flash-vision-exp">deepseek-v4-flash-vision-exp（实验多模态）</option>
               </select>
             </label>
-            <p class="hint">选择 Vision 实验模型后，文字与图片都由它直接回复，并跳过下方视觉模型；图片仅在最近 6 轮实时上下文内重发。</p>
+            <p class="hint">显式选择 Flash 后，文字与图片都由 V4.1 Flash 直接回复，并跳过下方视觉模型；图片仅在最近 6 轮实时上下文内重发。</p>
           </div>
 
           <div id="textFieldsLocal" class="text-provider-fields" hidden>
@@ -133,14 +132,14 @@
             <input id="sharedExperienceProactiveEnabled" type="checkbox" />
           </label>
           <label>
-            <span>主动陪看频率<small>只控制最短间隔，不会为了凑次数强行开口</small></span>
+            <span>主动陪看频率<small>设定两次主动发言之间的最短间隔；到点后根据内容择机分享</small></span>
             <select id="sharedExperienceProactiveFrequency">
               <option value="low">低频（约 2 分钟）</option>
               <option value="standard" selected>标准（约 1 分钟）</option>
               <option value="frequent">高频（约 30 秒）</option>
             </select>
           </label>
-          <p class="hint">主动发言仍需出现新的 ASR 内容或连续画面变化；用户输入、暂停、隐藏窗口和语音播放期间会自动让路。</p>
+          <p class="hint">频率是两次发言之间的最短间隔，不是固定闹钟：高频至少间隔 30 秒，内容足够有意思时才主动分享；没有新内容、用户输入、暂停或语音播放期间会延后。隐藏聊天窗口时仍可继续陪看。</p>
 
           <div class="memory-actions">
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
@@ -156,13 +155,13 @@
             <span>看图服务商<small>发图时用来识别图片内容</small></span>
             <select id="vlProvider">
               <option value="qwen">通义千问（在线）</option>
-              <option value="deepseek">DeepSeek V4 Flash Vision（实验性）</option>
+              <option value="deepseek">DeepSeek V4.1 Flash（原生多模态）</option>
               <option value="local">本地模型（Ollama，离线可用）</option>
             </select>
           </label>
 
           <div id="vlFieldsDeepseek" class="vl-provider-fields" hidden>
-            <p class="hint">使用 <code>deepseek-v4-flash-vision-exp</code> 和上方同一枚 DeepSeek API Key。该模型目前为实验性版本。</p>
+            <p class="hint">使用原生多模态 <code>deepseek-flash</code> 和上方同一枚 DeepSeek API Key。</p>
           </div>
 
           <div id="vlFieldsQwen" class="vl-provider-fields">

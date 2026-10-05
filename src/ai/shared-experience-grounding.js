@@ -116,7 +116,12 @@ export function applyGroundingReview({kind, text, question = "", evidence = [], 
   // An ungrounded aside after a removed premise may still refer to that invented action.
   const kept = parts.filter((part, index) => part.verdict !== "unsupported"
     && !(part.verdict === "nonfactual" && parts.slice(0, index).some((earlier) => earlier.verdict === "unsupported")));
-  if (!kept.length || (kind === "question" && (review.answerable !== true || kept.length !== parts.length))) return null;
+  if (!kept.length) {
+    if (kind === "summary") return { text: "", removedParts: parts.length,
+      supports: [], parts: parts.map((part) => ({ text: part.text, verdict: part.verdict, supports: part.supports || [] })) };
+    return null;
+  }
+  if (kind === "question" && (review.answerable !== true || kept.length !== parts.length)) return null;
   const currentQuestion = /现在|此刻|这会儿|当前|这段操作/u.test(question)
     && !/刚开始|一开始|之前|先前|从.+(?:到|看)/u.test(question);
   if (kind === "reply" && currentQuestion && evidence.some((event) => event.scope)
