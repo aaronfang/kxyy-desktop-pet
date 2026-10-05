@@ -4,10 +4,13 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test("stress report requires explicit input and output paths", () => {
   const result = spawnSync(process.execPath, ["scripts/shared-experience/generate-stress-report.mjs"], {
-    cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."),
+    cwd: REPO_ROOT,
     encoding: "utf8",
   });
 
@@ -77,7 +80,7 @@ test("stress report uses the service lifecycle fields that the runner records", 
       isolation: { checks: 1, violations: [] },
     }));
     execFileSync(process.execPath, ["scripts/shared-experience/generate-stress-report.mjs", rawPath, reportPath], {
-      cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."),
+      cwd: REPO_ROOT,
       stdio: "pipe",
     });
     const markdown = readFileSync(reportPath, "utf8");
