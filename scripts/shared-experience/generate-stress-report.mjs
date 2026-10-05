@@ -5,13 +5,14 @@ import { fileURLToPath } from "node:url";
 import { filterVisualIdentityClaims } from "../../src/ai/shared-experience-visual-identity.js";
 import { findSharedExperienceAuditStyle } from "../../src/ai/shared-experience-dialogue-style.js";
 import { parseSharedExperienceViewingStatement } from "../../src/ai/shared-experience-primer.js";
+import { assertExternalReportPath, positiveProactiveCompletion, validateRealStressReport } from "./run-30min.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(scriptDir, "../..");
 const [input, output] = process.argv.slice(2);
 if (!input || !output) throw new Error("Usage: generate-stress-report.mjs raw.json report.md");
 const rawPath = path.resolve(rootDir, input);
-const reportPath = path.resolve(rootDir, output);
+const reportPath = assertExternalReportPath(output);
 const report = JSON.parse(await readFile(rawPath, "utf8"));
 
 function number(value) {
@@ -80,9 +81,12 @@ function receiptMetric(receipt, keys) {
 }
 
 const turns = Array.isArray(report.turns) ? report.turns : [];
+const proactiveOnly = report.environment?.testMode === "proactive-only";
 const before = report.beforeFinalize || {};
 const lifecycle = before.lifecycle || {};
 const workspace = before.workspace || {};
+const discussion = Array.isArray(workspace.discussionJournal) ? workspace.discussionJournal : [];
+const proactive = before.proactive || {};
 const completionAudit = report.finalize?.completionAudit || {};
 const finalLifecycle = completionAudit.lifecycle || lifecycle;
 const usage = finalLifecycle.usage || lifecycle.usage || {};
@@ -99,6 +103,12 @@ const maturities = countBy(turns, (turn) => turn.maturity);
 const evidenceKinds = countBy(evidence, (event) => event.kind);
 const visualIdentityLeaks = evidence.filter((event) => event.kind === "visual" && filterVisualIdentityClaims(event.text).identityFiltered);
 const evidenceById = new Map(evidence.map((event) => [event.id, event]));
+// Early anchors may have left the bounded journal; use the same-turn captured sources.
+for (const turn of turns) {
+  for (const event of turn.groundingAudit?.evidence || []) {
+    if (event?.id && !evidenceById.has(event.id)) evidenceById.set(event.id, event);
+  }
+}
 const skippedTurnDetails = Array.isArray(report.skippedTurnDetails) ? report.skippedTurnDetails : [];
 const anchorKinds = countBy(
   turns.flatMap((turn) => Array.isArray(turn.anchorEventIds) ? turn.anchorEventIds : []),
@@ -123,10 +133,12 @@ const auditStyleTurns = turns
   .map((turn) => ({ index: turn.index, findings: findSharedExperienceAuditStyle(turn.assistant) }))
   .filter((turn) => turn.findings.length);
 const durationOk = number(report.durationMs) >= 30 * 60 * 1000;
-const turnsOk = turns.length > 0 && number(report.successfulTurns) === turns.length && number(report.failedTurns) === 0;
-const anchorsOk = turns.length > 0 && anchoredTurns.length === turns.length
-  && turns.every((turn) => turn.anchorEventIds.every((id) => evidenceById.has(id)));
-const isolationOk = number(isolation.checks) > 0 && isolationViolations.length === 0;
+const turnsOk = proactiveOnly
+  ? turns.length === 0 && number(report.plannedTurns) === 0 && positiveProactiveCompletion(proactive)
+  : turns.length > 0 && number(report.successfulTurns) === turns.length && number(report.failedTurns) === 0;
+const anchorsOk = proactiveOnly || (turns.length > 0 && anchoredTurns.length === turns.length
+  && turns.every((turn) => turn.anchorEventIds.every((id) => evidenceById.has(id))));
+const isolationOk = isolation.supported === true && number(isolation.checks) > 0 && isolationViolations.length === 0;
 const finalSegmentId = Number.isFinite(Number(completionAudit.segmentId))
   ? Number(completionAudit.segmentId)
   : number(workspace.segmentId);
@@ -134,16 +146,20 @@ const segmentSummaryRequests = Number.isFinite(Number(completionAudit.segmentSum
   ? Number(completionAudit.segmentSummaryRequests)
   : number(usage.segmentSummary?.requests);
 const rolloverOk = finalSegmentId >= 1 && segmentSummaryRequests >= 1;
-const receiptsOk = turns.length > 0 && !receiptCounts.missing && !receiptCounts.failed && !receiptCounts.partial;
-const ttsPartsOk = ttsParts.requestedParts > 0
+const receiptsOk = proactiveOnly
+  ? positiveProactiveCompletion(proactive)
+    && number(proactive.totals?.ttsFailed) === 0 && number(proactive.totals?.ttsPartial) === 0
+    && number(proactive.totals?.ttsIncomplete) === 0
+  : turns.length > 0 && !receiptCounts.missing && !receiptCounts.failed && !receiptCounts.partial;
+const ttsPartsOk = proactiveOnly ? receiptsOk : ttsParts.requestedParts > 0
   && ttsParts.requestedParts === ttsParts.admittedParts
   && ttsParts.admittedParts === ttsParts.startedParts
   && ttsParts.startedParts === ttsParts.completedParts
   && ttsParts.failedParts === 0;
-const streamContinuityOk = turns.length > 0
+const streamContinuityOk = proactiveOnly ? receiptsOk : (turns.length > 0
   && turns.every((turn) => Number.isFinite(Number(turn.ttsReceipt?.stream?.underrunCount)))
   && underrunCounts.every((count) => count === 0)
-  && streamGapValues.every((gap) => gap === 0);
+  && streamGapValues.every((gap) => gap === 0));
 const restartsOk = number(voice.unexpectedRestarts) === 0;
 const visualIdentityOk = visualIdentityLeaks.length === 0;
 const dialogueStyleOk = auditStyleTurns.length === 0;
@@ -153,7 +169,20 @@ const cleanupOk = cleanup.complete === true
   && cleanup.workspaceReleased === true
   && cleanup.spoolReleased === true
   && number(cleanup.pending) === 0;
-const overallOk = durationOk && turnsOk && anchorsOk && isolationOk && rolloverOk && receiptsOk && ttsPartsOk
+let runtimeGateError = "";
+try { validateRealStressReport(report); } catch (error) { runtimeGateError = error.message; }
+const captureMinutes = (kind) => new Set((Array.isArray(workspace.captureTimeline?.[kind])
+  ? workspace.captureTimeline[kind] : [])
+  .filter((atMs) => Number.isFinite(atMs) && atMs >= report.startedAtMs && atMs < report.startedAtMs + 1_800_000)
+  .map((atMs) => Math.floor((atMs - report.startedAtMs) / 60_000))).size;
+const maxCaptureGapMs = (kind) => {
+  const samples = (Array.isArray(workspace.captureTimeline?.[kind]) ? workspace.captureTimeline[kind] : [])
+    .filter((atMs) => Number.isFinite(atMs) && atMs >= report.startedAtMs && atMs <= report.startedAtMs + 1_800_000)
+    .sort((a, b) => a - b);
+  const boundaries = [report.startedAtMs, ...samples, report.startedAtMs + 1_800_000];
+  return boundaries.reduce((max, atMs, index) => index ? Math.max(max, atMs - boundaries[index - 1]) : max, 0);
+};
+const overallOk = !runtimeGateError && durationOk && turnsOk && anchorsOk && isolationOk && rolloverOk && receiptsOk && ttsPartsOk
   && streamContinuityOk && restartsOk
   && visualIdentityOk && primerAuthorizationOk && dialogueStyleOk && cleanupOk;
 
@@ -184,6 +213,10 @@ ${turn.prompt || "（无问题）"}
 ${turn.assistant || "（无回复）"}
 `;
 }).join("\n");
+const proactiveTranscript = discussion.map((turn) => `### ${elapsed(number(turn.atMs) - number(report.startedAtMs))} · ${turn.role === "user" ? "用户" : "元元"}
+
+${String(turn.content || "").trim()}
+`).join("\n");
 
 const markdown = `# 共同体验 30 分钟压力测试报告
 
@@ -202,16 +235,17 @@ const markdown = `# 共同体验 30 分钟压力测试报告
 
 | 门槛 | 实际 | 判定 |
 | --- | --- | --- |
+| 运行回执、素材与总结统一校验 | ${runtimeGateError || "真实链路、素材零丢弃、总结入库已验证"} | ${runtimeGateError ? "不通过" : "通过"} |
 | 真实持续不少于 30 分钟 | ${seconds(report.durationMs)} | ${durationOk ? "通过" : "不通过"} |
-| 30 分钟内已完成轮次全部成功 | ${number(report.successfulTurns)}/${turns.length} 完成，计划 ${number(report.plannedTurns)}，deadline 跳过 ${number(report.skippedTurns)} | ${turnsOk ? "通过" : "不通过"} |
-| 每轮动态问题均有可解析证据锚点 | ${anchoredTurns.length}/${turns.length} | ${anchorsOk ? "通过" : "不通过"} |
+| ${proactiveOnly ? "主动发言完成" : "30 分钟内已完成轮次全部成功"} | ${proactiveOnly ? `${number(proactive.totals?.completed)} 次` : `${number(report.successfulTurns)}/${turns.length} 完成，计划 ${number(report.plannedTurns)}，deadline 跳过 ${number(report.skippedTurns)}`} | ${turnsOk ? "通过" : "不通过"} |
+| 每轮动态问题均有可解析证据锚点 | ${proactiveOnly ? "不适用（零预设问题）" : `${anchoredTurns.length}/${turns.length}`} | ${anchorsOk ? "通过" : "不通过"} |
 | 锚点来源 | ${inlineCounts(anchorKinds)} | 记录 |
 | 问题成熟度演进 | ${inlineCounts(maturities)} | 记录 |
 | 30 分钟 rollover | segmentId=${finalSegmentId}；segment summary=${segmentSummaryRequests} | ${rolloverOk ? "通过" : "不通过"} |
 | dev/安装版隔离 | ${number(isolation.checks)} 次检查；${isolationViolations.length} 次违规 | ${isolationOk ? "通过" : "不通过"} |
-| 每个已完成轮次都有 TTS 回执 | ${inlineCounts(receiptCounts)} | ${receiptsOk ? "通过" : "不通过"} |
-| VoxCPM2 admission/完成闭环 | requested=${ttsParts.requestedParts}；admitted=${ttsParts.admittedParts}；started=${ttsParts.startedParts}；completed=${ttsParts.completedParts}；failed=${ttsParts.failedParts} | ${ttsPartsOk ? "通过" : "不通过"} |
-| VoxCPM2 流式连续性 | underrun=${underrunCounts.reduce((sum, value) => sum + value, 0)}；maxGap=${Math.max(0, ...streamGapValues)} ms | ${streamContinuityOk ? "通过" : "不通过"} |
+| ${proactiveOnly ? "主动发言 TTS 回执" : "每个已完成轮次都有 TTS 回执"} | ${proactiveOnly ? `完成=${number(proactive.totals?.completed)}；失败=${number(proactive.totals?.ttsFailed)}；部分=${number(proactive.totals?.ttsPartial)}` : inlineCounts(receiptCounts)} | ${receiptsOk ? "通过" : "不通过"} |
+| VoxCPM2 admission/完成闭环 | ${proactiveOnly ? `主动完成=${number(proactive.totals?.completed)}；不完整=${number(proactive.totals?.ttsIncomplete)}` : `requested=${ttsParts.requestedParts}；admitted=${ttsParts.admittedParts}；started=${ttsParts.startedParts}；completed=${ttsParts.completedParts}；failed=${ttsParts.failedParts}`} | ${ttsPartsOk ? "通过" : "不通过"} |
+| VoxCPM2 流式连续性 | ${proactiveOnly ? `主动不完整=${number(proactive.totals?.ttsIncomplete)}` : `underrun=${underrunCounts.reduce((sum, value) => sum + value, 0)}；maxGap=${Math.max(0, ...streamGapValues)} ms`} | ${streamContinuityOk ? "通过" : "不通过"} |
 | VoxCPM2 非预期重启 | ${number(voice.unexpectedRestarts)} 次；失败 ${number(voice.failures)} 次 | ${restartsOk ? "通过" : "不通过"} |
 | 停止后媒体与工作区释放 | capture=${cleanup.captureStopped === true}；spool=${cleanup.spoolReleased === true}；workspace=${cleanup.workspaceReleased === true}；pending=${number(cleanup.pending)} | ${cleanupOk ? "通过" : "不通过"} |
 | 视觉身份猜测漏入 Evidence | ${visualIdentityLeaks.length} 条 | ${visualIdentityOk ? "通过" : "不通过"} |
@@ -229,9 +263,13 @@ const markdown = `# 共同体验 30 分钟压力测试报告
 | TTS admission/播放分段 | requested=${ttsParts.requestedParts}；admitted=${ttsParts.admittedParts}；started=${ttsParts.startedParts}；completed=${ttsParts.completedParts}；failed=${ttsParts.failedParts} |
 | TTS 流式断流 | 总 underrun ${underrunCounts.reduce((sum, value) => sum + value, 0)}；单轮最大 gap ${Math.max(0, ...streamGapValues)} ms |
 | 画面采集/处理 | ${number(workspace.capturedVisual)} / ${number(workspace.processedVisual)} |
+| 画面逐分钟采集覆盖 | ${captureMinutes("visual")}/30 分钟 |
+| 画面最大采集间隔（含首尾） | ${maxCaptureGapMs("visual")} ms；门槛 15000 ms |
 | 视觉身份猜测过滤 | ${number(workspace.filteredVisualIdentities)} 条 |
 | 匿名人物轨迹 | ${number(workspace.characters)} 条 |
 | 音频采集/处理 | ${number(workspace.capturedAudio)} / ${number(workspace.processedAudio)} |
+| 音频逐分钟采集覆盖 | ${captureMinutes("audio")}/30 分钟 |
+| 音频最大采集间隔（含首尾） | ${maxCaptureGapMs("audio")} ms；门槛 30000 ms |
 | 推理积压峰值 | ${number(workspace.peakPending)} 条；${number(workspace.peakBytes)} bytes |
 | 截止瞬间媒体积压 | ${number(workspace.pending)} 条；${number(workspace.bytes)} bytes |
 | spool 丢弃 | ${number(workspace.dropped)} 条；${JSON.stringify(workspace.droppedByKind || {})} |
@@ -247,6 +285,7 @@ const markdown = `# 共同体验 30 分钟压力测试报告
 - 分段总结：${usageLine(usage.segmentSummary)}。
 - 最终总结：${usageLine(usage.finalSummary)}。
 - 估算费用：$${number(budget.estimatedCostUsd).toFixed(8)} / $${number(budget.limitUsd).toFixed(2)}；budget exhausted=${Boolean(budget.exhausted)}。
+${number(budget.estimatedCostUsd) > 0 ? "" : "- 估算未确认，不能据此认定免费；可能没有用量、未匹配价格或缺少记录。以账户余额差辅助核对，余额差也可能含其它请求。\n"}
 - 账户余额：${balance.currency || "未记录"} ${balance.starting ?? "未记录"} -> ${balance.current ?? "未记录"}，变化 ${balance.delta ?? "未记录"}。
 
 ## 隔离、Rollover 与收尾
@@ -275,11 +314,11 @@ const markdown = `# 共同体验 30 分钟压力测试报告
 
 存储状态：stored=${Boolean(report.finalize?.stored)}，duplicate=${Boolean(report.finalize?.duplicate)}，reason=${report.finalize?.reason || "无"}。
 
-## 完整 ${turns.length} 轮对话记录
+## ${proactiveOnly ? "主动陪看最近对话记录（最多 256 条）" : `完整 ${turns.length} 轮对话记录`}
 
-以下内容逐字来自 raw JSON；时间为相对测试开始时间。
+以下内容逐字来自 raw JSON；时间为相对测试开始时间。${proactiveOnly ? "讨论日志仅保留最近 256 条，超过上限的早期发言不在此快照中。" : ""}
 
-${transcript}`;
+${proactiveOnly ? proactiveTranscript || "（验收快照没有讨论日志）" : transcript}`;
 
 await writeFile(reportPath, markdown, "utf8");
 console.log(`wrote ${path.relative(rootDir, reportPath)} (${turns.length} turns, ${overallOk ? "PASS" : "FAIL"})`);

@@ -4,7 +4,7 @@ import { platform } from "node:os";
 import { existsSync, rmSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { stopForbiddenInstalledApps } from "./shared-experience/process-isolation.mjs";
+import { assertNoInstalledAppConflict, findProjectVoiceProcesses } from "./shared-experience/process-isolation.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -89,21 +89,16 @@ function killPortWin(port) {
   return false;
 }
 
-function killPortUnix(port) {
-  try {
-    const pids = execSync(`lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null || true`, { encoding: "utf8", timeout: 3000 })
-      .trim()
-      .split(/\n/)
-      .filter(Boolean);
-    if (pids.length > 0) {
-      try { execSync(`kill ${pids.join(" ")}`, { timeout: 3000 }); } catch {}
-      // force-kill any survivors after a short sleep
-      try { execSync(`sleep 0.2 && lsof -tiTCP:${port} -sTCP:LISTEN | xargs -r kill -9`, { timeout: 3000 }); } catch {}
-      process.stdout.write(`已停止 :${port} (PID: ${pids.join(",")})\n`);
-      return true;
+function killProjectVoiceProcesses() {
+  const table = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8", timeout: 3000 });
+  const matches = findProjectVoiceProcesses(table, PROJECT_ROOT);
+  for (const { pid } of matches) {
+    try { process.kill(pid, "SIGTERM"); } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
     }
-  } catch { /* no lsof or no match */ }
-  return false;
+  }
+  if (matches.length) process.stdout.write(`已停止本仓库旧语音服务 (PID: ${matches.map(({ pid }) => pid).join(",")})\n`);
+  return matches.length > 0;
 }
 
 // --- main ---
@@ -113,13 +108,9 @@ let killedAny = false;
 const isWin = platform() === "win32";
 
 // `npm run dev` must never share GPU/audio services with the installed app.
-// Match the complete executable path so the freshly built debug binary is untouched.
+// Leave user-owned app processes alone and fail before touching ports or dev binaries.
 if (!isWin) {
-  const installed = stopForbiddenInstalledApps();
-  if (installed.length) {
-    killedAny = true;
-    process.stdout.write(`已停止安装版桌宠进程 (PID: ${installed.map((item) => item.pid).join(",")})\n`);
-  }
+  assertNoInstalledAppConflict();
 }
 
 if (killStaleDevApp(isWin)) killedAny = true;
@@ -134,10 +125,9 @@ try {
   throw new Error(`无法删除旧 dev 可执行文件 ${DEBUG_EXE}：${e.message}`);
 }
 
-for (const port of PORTS) {
-  const killed = isWin ? killPortWin(port) : killPortUnix(port);
-  if (killed) killedAny = true;
-}
+if (isWin) {
+  for (const port of PORTS) if (killPortWin(port)) killedAny = true;
+} else if (killProjectVoiceProcesses()) killedAny = true;
 
 // also kill any stale python processes that are our servers
 try {
@@ -160,10 +150,6 @@ try {
           }
         }
       }
-    } catch {}
-  } else {
-    try {
-      execSync("pkill -f 'server.py|server_cosyvoice.py|server_voxcpm.py' 2>/dev/null || true", { timeout: 3000 });
     } catch {}
   }
 } catch {}
