@@ -147,4 +147,3 @@ codec 加速。`0.7.1` 之后另有一个 OptiQ 权重键映射修复，与当�
 - MLX 8-bit 模型卡及其能力边界：<https://huggingface.co/mlx-community/Mage-VL-8bit>
 - `mlx-vlm` Mage-VL video support 提交：<https://github.com/Blaizzy/mlx-vlm/commit/1715afa011cf34a0682514b77bb7e1ca10ecef0e>
 - `mlx-vlm` PyPI 发布信息：<https://pypi.org/project/mlx-vlm/>
-
