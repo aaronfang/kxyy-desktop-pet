@@ -10,6 +10,13 @@ try:
     from PIL import Image
 except ModuleNotFoundError:  # Mage-VL's optional image dependency is not in every CI runner.
     Image = None
+if Image is None:
+    raise unittest.SkipTest("Mage-VL's optional Pillow dependency is unavailable")
+
+try:
+    import cv2  # noqa: F401
+except ModuleNotFoundError:
+    raise unittest.SkipTest("Mage-VL's optional OpenCV dependency is unavailable")
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "mage-vl" / "server.py"
