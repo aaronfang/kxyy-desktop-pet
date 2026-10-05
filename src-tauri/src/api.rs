@@ -10,11 +10,12 @@ use tauri::AppHandle;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 const TEXT_BASE_URL: &str = "https://api.deepseek.com";
-const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
+const DEEPSEEK_FLASH_MODEL: &str = "deepseek-flash";
 const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const QWEN_VL_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const QWEN_VL_MODEL: &str = "qwen3-vl-plus";
-const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
+// V4.1 Flash 原生支持图片；旧 Vision Exp 名仅用于本地设置迁移。
+const DEEPSEEK_VISION_MODEL: &str = DEEPSEEK_FLASH_MODEL;
 // 本地文字模型：Ollama 的 OpenAI 兼容端点，无需 Key（Authorization 头会被忽略）。
 const OLLAMA_CHAT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 const OLLAMA_NATIVE_CHAT_URL: &str = "http://127.0.0.1:11434/api/chat";
@@ -26,13 +27,16 @@ const WEB_RESPONSE_MAX_BYTES: u64 = 256 * 1024;
 const WEB_RESULT_MAX_ITEMS: usize = 4;
 const WEB_RESULT_TEXT_MAX_CHARS: usize = 700;
 const CHAT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const TTS_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// DeepSeek 只接受当前公开模型名。旧设置和未知持久化值在本地迁移，绝不原样上送。
 fn normalize_deepseek_model(configured: &str) -> &'static str {
     match configured.trim() {
-        "deepseek-v4-flash" | "deepseek-chat" => DEEPSEEK_FLASH_MODEL,
+        "deepseek-flash"
+        | "deepseek-v4-flash"
+        | "deepseek-v4-flash-vision-exp"
+        | "deepseek-chat" => DEEPSEEK_FLASH_MODEL,
         "deepseek-v4-pro" | "deepseek-reasoner" => DEEPSEEK_PRO_MODEL,
-        "deepseek-v4-flash-vision-exp" => DEEPSEEK_VISION_MODEL,
         _ => DEEPSEEK_FLASH_MODEL,
     }
 }
@@ -56,19 +60,6 @@ fn apply_deepseek_generation_options(
     });
     if !thinking {
         payload["temperature"] = serde_json::json!(temperature);
-    }
-}
-
-fn apply_selected_deepseek_generation_options(
-    payload: &mut serde_json::Value,
-    model: &str,
-    thinking: bool,
-    temperature: f64,
-) {
-    if model == DEEPSEEK_VISION_MODEL {
-        payload["temperature"] = serde_json::json!(temperature);
-    } else {
-        apply_deepseek_generation_options(payload, thinking, temperature);
     }
 }
 
@@ -165,7 +156,7 @@ fn cors_headers() -> Vec<Header> {
         // 前端需读 TTS 计费字符头（CosyVoice / 火山）。
         header(
             "Access-Control-Expose-Headers",
-            "X-Tts-Usage-Characters, X-Tts-Usage-Provider, X-Kxyy-Text-Provider",
+            "X-Tts-Usage-Characters, X-Tts-Usage-Provider, X-Kxyy-Text-Provider, X-Kxyy-Tts-Backend",
         ),
     ]
 }
@@ -250,6 +241,9 @@ fn handle(app: &AppHandle, client: &reqwest::blocking::Client, request: tiny_htt
         // 阶段 2·D：火山引擎语音合成，前端 tts.js POST 文本，回 audio/mpeg。
         (Method::Post, "/api/tts") => {
             proxy_tts(app, client, request);
+        }
+        (Method::Post, "/api/tts-stream") => {
+            proxy_tts_stream(app, client, request);
         }
         (Method::Get, "/api/assets") => match crate::persona_assets::decrypted_json() {
             Ok(body) => respond_json(request, 200, body),
@@ -532,9 +526,6 @@ fn proxy_chat(
 
     let is_local_text = !use_vision && cfg.text_provider == "local";
     let is_local_vl = use_vision && cfg.vl_provider == "local";
-    let is_deepseek_multimodal_text =
-        !use_vision && !is_local_text && normalized_text_model == DEEPSEEK_VISION_MODEL;
-
     let (base_url, model, api_key, provider_name) = if is_local_vl {
         let model = if !cfg.local_vl_model.is_empty() {
             cfg.local_vl_model.clone()
@@ -593,9 +584,9 @@ fn proxy_chat(
         return error_json(request, 401, msg);
     }
 
-    let deepseek_thinking =
-        !use_vision && !is_local_text && !is_deepseek_multimodal_text && thinking;
+    let deepseek_thinking = !use_vision && !is_local_text && thinking;
     let reasoning_enabled = deepseek_thinking || (is_local_text && thinking);
+    let is_deepseek_api = base_url == TEXT_BASE_URL;
     let temperature = body
         .get("temperature")
         .and_then(|v| v.as_f64())
@@ -636,13 +627,8 @@ fn proxy_chat(
         payload["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     // 思考模式由当前 DeepSeek API 的 thinking.type 显式控制；思考时不下发 temperature。
-    if !use_vision && !is_local_text {
-        apply_selected_deepseek_generation_options(
-            &mut payload,
-            normalized_text_model,
-            deepseek_thinking,
-            temperature,
-        );
+    if is_deepseek_api {
+        apply_deepseek_generation_options(&mut payload, deepseek_thinking, temperature);
     } else if !reasoning_enabled {
         payload["temperature"] = serde_json::json!(temperature);
     }
@@ -802,12 +788,20 @@ fn proxy_chat(
     if is_local_text && !thinking && !body.is_empty() {
         body = rewrite_reasoning_to_content(&body);
     }
-    let bytes = body.into_bytes();
+    let provider = if is_local_text { "Ollama" } else { "DeepSeek" };
+    let _ = request.respond(buffered_webview_sse_response(body.into_bytes(), provider));
+}
+
+fn buffered_webview_sse_response(
+    bytes: Vec<u8>,
+    provider: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     let len = bytes.len();
     let mut headers = cors_headers();
     headers.push(header("Content-Type", "text/event-stream; charset=utf-8"));
     headers.push(header("Cache-Control", "no-cache, no-transform"));
-    let resp = Response::new(
+    headers.push(header("X-Kxyy-Text-Provider", provider));
+    Response::new(
         StatusCode(200),
         headers,
         std::io::Cursor::new(bytes),
@@ -816,8 +810,7 @@ fn proxy_chat(
     )
     // tiny_http 默认在 >=32KiB 时即使已知长度也改用 chunked；显式关闭该阈值，
     // 保证普通 WebView2 始终收到稳定的 Content-Length 缓冲响应。
-    .with_chunked_threshold(usize::MAX);
-    let _ = request.respond(resp);
+    .with_chunked_threshold(usize::MAX)
 }
 
 /// 本地模型安全网：当 `think: false` 被 qwen3 等模型忽略时，
@@ -890,6 +883,25 @@ fn req_header<'a>(request: &'a tiny_http::Request, name: &str) -> Option<&'a str
             None
         }
     })
+}
+
+fn read_bounded_text<R: Read + ?Sized>(
+    reader: &mut R,
+    announced_len: Option<usize>,
+    max_bytes: usize,
+) -> Result<String, ()> {
+    if announced_len.is_some_and(|len| len > max_bytes) {
+        return Err(());
+    }
+    let mut raw = String::new();
+    reader
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_string(&mut raw)
+        .map_err(|_| ())?;
+    if raw.len() > max_bytes {
+        return Err(());
+    }
+    Ok(raw)
 }
 
 fn internal_secret_matches(provided: Option<&str>, expected: &str) -> bool {
@@ -1307,11 +1319,11 @@ fn proxy_web_observations(
 #[cfg(test)]
 mod tests {
     use super::{
-        adapt_ollama_native_stream, apply_deepseek_generation_options,
-        apply_selected_deepseek_generation_options, buffered_sse_is_complete,
-        build_isolated_chat_client, build_native_ollama_realtime_payload, header,
-        internal_secret_matches, memory_completion_content, normalize_deepseek_model,
-        normalize_tavily_items, online_vision_route, req_header, safe_web_source_url,
+        adapt_ollama_native_stream, apply_deepseek_generation_options, buffered_sse_is_complete,
+        buffered_webview_sse_response, build_isolated_chat_client,
+        build_native_ollama_realtime_payload, header, internal_secret_matches,
+        memory_completion_content, normalize_deepseek_model, normalize_tavily_items,
+        online_vision_route, read_bounded_text, req_header, safe_web_source_url,
         should_passthrough_internal_sse, should_use_native_ollama_realtime, web_observation_status,
         DEEPSEEK_FLASH_MODEL, DEEPSEEK_PRO_MODEL, DEEPSEEK_VISION_MODEL, QWEN_VL_BASE_URL,
         QWEN_VL_MODEL, TEXT_BASE_URL,
@@ -1361,6 +1373,34 @@ mod tests {
         assert!(!buffered_sse_is_complete(
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
         ));
+    }
+
+    #[test]
+    fn buffered_webview_sse_exposes_actual_provider_without_chunking() {
+        for provider in ["DeepSeek", "Ollama"] {
+            for length in [0, 40 * 1024] {
+                let wire = raw_headers(buffered_webview_sse_response(vec![b'x'; length], provider));
+                assert!(wire.contains(&format!("X-Kxyy-Text-Provider: {provider}\r\n")));
+                assert!(wire.contains(&format!("Content-Length: {length}\r\n")));
+                assert!(!wire.contains("Transfer-Encoding: chunked"));
+                assert!(wire.contains("X-Kxyy-Text-Provider, X-Kxyy-Tts-Backend"));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_text_reader_accepts_the_limit_and_rejects_announced_or_streamed_overflow() {
+        let mut exact = Cursor::new(vec![b'a'; 8]);
+        assert_eq!(
+            read_bounded_text(&mut exact, Some(8), 8).unwrap(),
+            "aaaaaaaa"
+        );
+
+        let mut announced_too_large = Cursor::new(vec![b'a'; 8]);
+        assert!(read_bounded_text(&mut announced_too_large, Some(9), 8).is_err());
+
+        let mut streamed_too_large = Cursor::new(vec![b'a'; 9]);
+        assert!(read_bounded_text(&mut streamed_too_large, None, 8).is_err());
     }
 
     #[test]
@@ -1563,9 +1603,10 @@ mod tests {
 
     #[test]
     fn deepseek_models_are_allowlisted_and_legacy_values_migrate() {
+        assert_eq!(normalize_deepseek_model("deepseek-flash"), "deepseek-flash");
         assert_eq!(
             normalize_deepseek_model("deepseek-v4-flash"),
-            DEEPSEEK_FLASH_MODEL
+            "deepseek-flash"
         );
         assert_eq!(
             normalize_deepseek_model("deepseek-v4-pro"),
@@ -1581,7 +1622,7 @@ mod tests {
         );
         assert_eq!(
             normalize_deepseek_model("deepseek-v4-flash-vision-exp"),
-            DEEPSEEK_VISION_MODEL
+            "deepseek-flash"
         );
         assert_eq!(normalize_deepseek_model(""), DEEPSEEK_FLASH_MODEL);
         assert_eq!(normalize_deepseek_model("qwen3:8b"), DEEPSEEK_FLASH_MODEL);
@@ -1613,10 +1654,10 @@ mod tests {
         assert_eq!(disabled["thinking"]["type"], "disabled");
         assert_eq!(disabled["temperature"], 0.7);
 
-        let mut vision = serde_json::json!({});
-        apply_selected_deepseek_generation_options(&mut vision, DEEPSEEK_VISION_MODEL, true, 0.2);
-        assert!(vision.get("thinking").is_none());
-        assert_eq!(vision["temperature"], 0.2);
+        let mut multimodal = serde_json::json!({});
+        apply_deepseek_generation_options(&mut multimodal, true, 0.2);
+        assert_eq!(multimodal["thinking"]["type"], "enabled");
+        assert!(multimodal.get("temperature").is_none());
     }
 
     #[test]
@@ -1938,6 +1979,60 @@ fn proxy_local_tts(
         None
     };
     respond_audio(request, bytes, &ct, usage);
+}
+
+fn proxy_tts_stream(
+    app: &AppHandle,
+    client: &reqwest::blocking::Client,
+    mut request: tiny_http::Request,
+) {
+    let announced_len =
+        req_header(&request, "Content-Length").and_then(|value| value.parse::<usize>().ok());
+    let raw = match read_bounded_text(request.as_reader(), announced_len, TTS_BODY_MAX_BYTES) {
+        Ok(raw) => raw,
+        Err(_) => return error_json(request, 400, "读取请求体失败或请求过大"),
+    };
+    let cfg = crate::ai_config(app);
+    let Some(port) = crate::local_tts_http_port(&cfg.voice_backend) else {
+        return error_json(request, 404, "当前语音后端不支持流式朗读");
+    };
+    let url = format!("http://127.0.0.1:{port}/tts-stream");
+    let upstream = match client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Tts-Secret", crate::voice_service::tts_secret())
+        .body(raw.clone())
+        .timeout(tts_timeout_from_text(&raw))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return error_json(
+                request,
+                503,
+                &format!("本地流式语音服务未启动或不可达（{url}）：{error}"),
+            );
+        }
+    };
+    let status = upstream.status().as_u16();
+    if !(200..300).contains(&status) {
+        let detail = upstream.text().unwrap_or_default();
+        let body = serde_json::json!({
+            "error": "TTS 流式合成失败（本地服务）",
+            "detail": detail.chars().take(300).collect::<String>(),
+        })
+        .to_string();
+        return respond_json(request, status, body);
+    }
+    let mut headers = cors_headers();
+    headers.push(header(
+        "Content-Type",
+        "audio/L16; rate=24000; channels=1; endian=little",
+    ));
+    headers.push(header("Cache-Control", "no-store"));
+    headers.push(header("X-Kxyy-Tts-Backend", &cfg.voice_backend));
+    let response = Response::new(StatusCode(200), headers, upstream, None, None);
+    let _ = request.respond(response);
 }
 
 fn proxy_volc_tts(

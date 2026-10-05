@@ -111,6 +111,17 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server.sys, "platform", "darwin"):
             self.assertEqual(server._kwargs("hello")["inference_timesteps"], 10)
 
+    def test_companion_http_stream_uses_six_steps_without_changing_realtime(self):
+        server = _load_server()
+        server._reference = lambda: (Path("/fake/ref.wav"), "reference")
+
+        with patch.object(server.sys, "platform", "darwin"):
+            self.assertEqual(
+                server._kwargs("hello", latency_mode="companion")["inference_timesteps"],
+                6,
+            )
+            self.assertEqual(server._kwargs("hello")["inference_timesteps"], 10)
+
     def test_prompt_cache_is_reused_until_the_reference_changes(self):
         server = _load_server()
         built = []
@@ -218,7 +229,7 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
 
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-voxcpm")
         server._model = FakeModel()
-        server._kwargs = lambda _text: {}
+        server._kwargs = lambda _text, _latency_mode="default": {}
         server._to_pcm24 = lambda chunk, **_kwargs: chunk
         server._gate = threading.BoundedSemaphore(1)
         server._pool = pool
@@ -266,6 +277,52 @@ class VoxCpmStreamTests(unittest.IsolatedAsyncioTestCase):
                 await stream.__anext__()
         finally:
             server._gate.release()
+
+    def test_http_loop_close_after_cancellation_does_not_poison_next_stream(self):
+        server = _load_server()
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def provider(text, _latency_mode="default"):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError("test provider release timed out")
+            yield text.encode()
+
+        async def cancel_first():
+            stream = server._synth_stream("old")
+            task = asyncio.create_task(stream.__anext__())
+            while not started.is_set():
+                await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        async def read_next():
+            return [event async for event in server._synth_stream("new")]
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        server._provider_stream = provider
+        server._to_pcm24 = lambda chunk, **_kwargs: chunk
+        server._gate = threading.BoundedSemaphore(1)
+        server._pool = pool
+        server.PROVIDER_CLEANUP_WAIT_SECONDS = 0.02
+        try:
+            # HTTP requests each own an asyncio.run loop; cleanup finishes only
+            # after the cancelled request's loop has already been closed.
+            asyncio.run(cancel_first())
+            release.set()
+            pool.submit(lambda: None).result(timeout=2)
+            self.assertEqual(
+                asyncio.run(read_next()), [{"type": "audio", "pcm": b"new"}]
+            )
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":

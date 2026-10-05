@@ -76,12 +76,11 @@
               <span>文字模型</span>
               <select id="textModel">
                 <option value="">自动（Flash，思考独立）</option>
-                <option value="deepseek-v4-flash">deepseek-v4-flash（快）</option>
+                <option value="deepseek-flash">deepseek-flash（V4.1，支持图片）</option>
                 <option value="deepseek-v4-pro">deepseek-v4-pro（强）</option>
-                <option value="deepseek-v4-flash-vision-exp">deepseek-v4-flash-vision-exp（实验多模态）</option>
               </select>
             </label>
-            <p class="hint">选择 Vision 实验模型后，文字与图片都由它直接回复，并跳过下方视觉模型；图片仅在最近 6 轮实时上下文内重发。</p>
+            <p class="hint">显式选择 Flash 后，文字与图片都由 V4.1 Flash 直接回复，并跳过下方视觉模型；图片仅在最近 6 轮实时上下文内重发。</p>
           </div>
 
           <div id="textFieldsLocal" class="text-provider-fields" hidden>
@@ -122,6 +121,26 @@
             <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.8" />
           </label>
 
+          <label>
+            <span>共同体验费用预算<small>每次会话的 DeepSeek 估算上限（美元）</small></span>
+            <input id="sharedExperienceBudgetUsd" type="number" min="0" max="100" step="0.05" value="1" />
+          </label>
+          <p class="hint">达到预算后，30 分钟阶段总结改用本地有界压缩；停止时仍会尝试生成一次最终总结。实际账单以 DeepSeek 为准。</p>
+
+          <label>
+            <span>主动陪看<small>有值得分享的新内容时，角色会主动说话</small></span>
+            <input id="sharedExperienceProactiveEnabled" type="checkbox" />
+          </label>
+          <label>
+            <span>主动陪看频率<small>设定两次主动发言之间的最短间隔；到点后根据内容择机分享</small></span>
+            <select id="sharedExperienceProactiveFrequency">
+              <option value="low">低频（约 2 分钟）</option>
+              <option value="standard" selected>标准（约 1 分钟）</option>
+              <option value="frequent">高频（约 30 秒）</option>
+            </select>
+          </label>
+          <p class="hint">频率是两次发言之间的最短间隔，不是固定闹钟：高频至少间隔 30 秒，内容足够有意思时才主动分享；没有新内容、用户输入、暂停或语音播放期间会延后。隐藏聊天窗口时仍可继续陪看。</p>
+
           <div class="memory-actions">
             <button id="clearMemory" type="button" class="danger">清空长期记忆</button>
             <span id="clearMemoryStatus" class="hint"></span>
@@ -136,13 +155,13 @@
             <span>看图服务商<small>发图时用来识别图片内容</small></span>
             <select id="vlProvider">
               <option value="qwen">通义千问（在线）</option>
-              <option value="deepseek">DeepSeek V4 Flash Vision（实验性）</option>
+              <option value="deepseek">DeepSeek V4.1 Flash（原生多模态）</option>
               <option value="local">本地模型（Ollama，离线可用）</option>
             </select>
           </label>
 
           <div id="vlFieldsDeepseek" class="vl-provider-fields" hidden>
-            <p class="hint">使用 <code>deepseek-v4-flash-vision-exp</code> 和上方同一枚 DeepSeek API Key。该模型目前为实验性版本。</p>
+            <p class="hint">使用原生多模态 <code>deepseek-flash</code> 和上方同一枚 DeepSeek API Key。</p>
           </div>
 
           <div id="vlFieldsQwen" class="vl-provider-fields">
@@ -200,6 +219,7 @@
               </optgroup>
             </select>
           </label>
+          <p class="hint">当前产品默认实时通话链路：DeepSeek 在线文字模型 + 本地 SenseVoice final ASR + 本地 VoxCPM2 语音合成。火山选项仅保留为旧配置兼容，不属于共同体验或默认实时通话链路。</p>
           <p id="voicePlatformHint" class="hint" hidden>当前为 macOS：本地语音请使用 Qwen3-TTS（该后端也支持 Windows / Linux）。</p>
 
           <div id="voiceFieldsRef" class="voice-backend-fields" hidden>
@@ -302,7 +322,7 @@
                 <option value="ai-leads">元元带聊（实验）</option>
               </select>
             </label>
-            <p class="hint">第一版会在接通后由元元主动打招呼并抛出轻松话题；你一开口，主动生成会立即让路。火山实时通话暂时保持跟随用户。</p>
+            <p class="hint">第一版会在接通后由元元主动打招呼并抛出轻松话题；你一开口，主动生成会立即让路。该主动性设置仅作用于本地 DeepSeek + SenseVoice + VoxCPM2/CosyVoice 链路。</p>
           </div>
 
           <div id="asrFields" hidden>

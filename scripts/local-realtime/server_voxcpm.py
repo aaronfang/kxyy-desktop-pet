@@ -22,6 +22,7 @@ OUTPUT_RATE = 48000
 FIXED_SEED = 424242
 WINDOWS_STREAMING_INFERENCE_STEPS = 6
 DEFAULT_INFERENCE_STEPS = 10
+COMPANION_INFERENCE_STEPS = 6
 _model = None
 _ref_wav = None
 _ref_text = ""
@@ -112,17 +113,21 @@ def _to_pcm24(
     return (np.clip(values, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
 
-def _kwargs(text: str) -> dict:
+def _inference_steps(latency_mode: str = "default") -> int:
+    if latency_mode == "companion":
+        return COMPANION_INFERENCE_STEPS
+    if sys.platform == "win32":
+        return WINDOWS_STREAMING_INFERENCE_STEPS
+    return DEFAULT_INFERENCE_STEPS
+
+
+def _kwargs(text: str, latency_mode: str = "default") -> dict:
     global _ref_wav, _ref_text
     _ref_wav, _ref_text = _reference()
     return dict(text=_spoken(text), prompt_wav_path=str(_ref_wav),
                 prompt_text=_ref_text, reference_wav_path=str(_ref_wav),
                 cfg_value=2.0,
-                inference_timesteps=(
-                    WINDOWS_STREAMING_INFERENCE_STEPS
-                    if sys.platform == "win32"
-                    else DEFAULT_INFERENCE_STEPS
-                ),
+                inference_timesteps=_inference_steps(latency_mode),
                 seed=FIXED_SEED)
 
 
@@ -153,8 +158,8 @@ def _ensure_prompt_cache():
     return built
 
 
-def _cached_generation_kwargs(text: str) -> dict:
-    steps = WINDOWS_STREAMING_INFERENCE_STEPS if sys.platform == "win32" else DEFAULT_INFERENCE_STEPS
+def _cached_generation_kwargs(text: str, latency_mode: str = "default") -> dict:
+    steps = _inference_steps(latency_mode)
     return {
         "target_text": _spoken(text),
         "prompt_cache": _ensure_prompt_cache(),
@@ -181,15 +186,15 @@ def _audio_to_numpy(audio):
     return value
 
 
-def _provider_stream(text: str):
+def _provider_stream(text: str, latency_mode: str = "default"):
     # Refresh the hot-selectable reference before resolving its cache identity.
-    fallback_kwargs = _kwargs(text)
+    fallback_kwargs = _kwargs(text, latency_mode)
     tts_model = getattr(_model, "tts_model", None)
     generate = getattr(tts_model, "generate_with_prompt_cache_streaming", None)
     if callable(generate):
         emitted = False
         try:
-            for result in generate(**_cached_generation_kwargs(text)):
+            for result in generate(**_cached_generation_kwargs(text, latency_mode)):
                 audio = result[0] if isinstance(result, tuple) else result
                 converted = _audio_to_numpy(audio)
                 emitted = True
@@ -239,7 +244,7 @@ def _close_stream(generator) -> None:
     generator.close()
 
 
-async def _synth_stream(text: str):
+async def _synth_stream(text: str, latency_mode: str = "default"):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + PROVIDER_CLEANUP_WAIT_SECONDS
     while not _gate.acquire(blocking=False):
@@ -251,7 +256,7 @@ async def _synth_stream(text: str):
     generator = None
     resampler = _Pcm48To24Resampler()
     try:
-        generator = _provider_stream(text)
+        generator = _provider_stream(text, latency_mode)
         while True:
             chunk = await loop.run_in_executor(_pool, _pull, generator)
             if chunk is _DONE:
@@ -271,7 +276,9 @@ async def _synth_stream(text: str):
             # Close on the same single worker and keep the model gate held until the
             # provider iterator is no longer executing.
             try:
-                cleanup = loop.run_in_executor(_pool, _close_stream, generator)
+                # HTTP asyncio.run loops may close before this worker finishes.
+                # The gate callback must belong to the executor, not that loop.
+                cleanup = _pool.submit(_close_stream, generator)
             except Exception:
                 _gate.release()
                 raise
@@ -294,6 +301,10 @@ async def _synth_stream(text: str):
             # close will run there and the callback keeps the gate held until it is
             # actually finished.  This lets the caller's bounded gate wait decide
             # whether a last-resort service recovery is needed.
+
+
+def _synth_http_stream(text: str, latency_mode: str):
+    return _synth_stream(text, latency_mode)
 
 
 def _prepare() -> None:
@@ -322,6 +333,7 @@ if __name__ == "__main__":
     common.run(
         port=PORT, name="local-voxcpm", synth_tts=_synth,
         synth_tts_stream=_synth_stream, prepare=_prepare, tts_pool=_pool,
+        synth_tts_http_stream=_synth_http_stream,
         tts_parallelism=1, tts_prefetch_while_playing=False,
         system_suffix=common.CONTINUE_CONVERSATION_SUFFIX,
         vad_shadow_pipeline_factory=cap.pipeline_factory(),

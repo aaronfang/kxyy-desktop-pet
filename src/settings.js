@@ -8,7 +8,10 @@ import {
   TOPIC_PREFERENCE_STATUSES,
 } from "./ai/topic-preferences.js";
 import { memoryHealthState } from "./memory-ui.js";
-import { DEEPSEEK_VISION_MODEL } from "./deepseek-multimodal.js";
+import {
+  DEEPSEEK_VISION_MODEL,
+  normalizeDeepseekTextModel,
+} from "./deepseek-multimodal.js";
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
@@ -43,6 +46,9 @@ const FIELDS = [
   "localVlModel",
   "vlProvider",
   "temperature",
+  "sharedExperienceBudgetUsd",
+  "sharedExperienceProactiveEnabled",
+  "sharedExperienceProactiveFrequency",
   "personaCardId",
   "userName",
   "patText",
@@ -61,6 +67,13 @@ const FIELDS = [
 const el = (id) => document.getElementById(id);
 const statusEl = el("status");
 const saveBtn = el("save");
+
+function updateSharedExperienceProactiveFields() {
+  const enabled = el("sharedExperienceProactiveEnabled")?.checked === true;
+  if (el("sharedExperienceProactiveFrequency")) {
+    el("sharedExperienceProactiveFrequency").disabled = !enabled;
+  }
+}
 
 // 头像 data URL 缓存（空串表示用默认；保存时也存空串，前端渲染时兜底默认）。
 let aiAvatar = "";
@@ -544,6 +557,11 @@ function fill(s) {
   syncVoiceFields();
   el("autoSpeak").checked = !!s.autoSpeak;
   el("showChatDebug").checked = s.showChatDebug === true;
+  el("sharedExperienceProactiveEnabled").checked = s.sharedExperienceProactiveEnabled === true;
+  el("sharedExperienceProactiveFrequency").value = ["low", "standard", "frequent"].includes(s.sharedExperienceProactiveFrequency)
+    ? s.sharedExperienceProactiveFrequency
+    : "standard";
+  updateSharedExperienceProactiveFields();
   el("vadShadowEnabled").checked = s.vadShadowEnabled === true;
   el("personaCardId").value = s.personaCardId || "";
   if (el("memoryCardId")) el("memoryCardId").value = s.personaCardId || "";
@@ -556,7 +574,7 @@ function fill(s) {
   el("webGroundingProvider").value = s.webGroundingProvider === "tavily" ? "tavily" : "none";
   el("tavilyApiKey").value = s.tavilyApiKey || "";
   syncWebGroundingFields();
-  el("textModel").value = s.textModel || "";
+  el("textModel").value = s.textModel ? normalizeDeepseekTextModel(s.textModel) : "";
   el("localTextModel").value = s.localTextModel || "";
   el("localVlModel").value = s.localVlModel || "";
   el("vlProvider").value = ["deepseek", "local"].includes(s.vlProvider) ? s.vlProvider : "qwen";
@@ -578,6 +596,9 @@ function fill(s) {
   if (el("memoryWorkspace")) el("memoryWorkspace").checked = s.memoryWorkspace === true;
   if (el("memoryWorkspaceMode")) el("memoryWorkspaceMode").value = ["conservative", "balanced", "exploratory"].includes(s.memoryWorkspaceMode) ? s.memoryWorkspaceMode : "conservative";
   el("temperature").value = s.temperature ?? 0.8;
+  el("sharedExperienceBudgetUsd").value = Number.isFinite(Number(s.sharedExperienceBudgetUsd))
+    ? Math.max(0, Math.min(100, Number(s.sharedExperienceBudgetUsd)))
+    : 1;
   el("userName").value = s.userName || "";
   el("patText").value = s.patText || "";
   el("personaRelationship").value = s.personaRelationship || "";
@@ -961,6 +982,8 @@ function collect() {
     ),
     autoSpeak: el("autoSpeak").checked,
     showChatDebug: el("showChatDebug").checked,
+    sharedExperienceProactiveEnabled: el("sharedExperienceProactiveEnabled").checked,
+    sharedExperienceProactiveFrequency: el("sharedExperienceProactiveFrequency").value,
     vadShadowEnabled: el("vadShadowEnabled").checked,
     textProvider: currentTextProvider(),
     onlinePromptMode: el("onlinePromptMode").value === "abstract" ? "abstract" : "original",
@@ -977,6 +1000,10 @@ function collect() {
     memoryWorkspace: el("memoryWorkspace")?.checked === true,
     memoryWorkspaceMode: el("memoryWorkspaceMode")?.value || "conservative",
     temperature: Number(el("temperature").value) || 0.8,
+    sharedExperienceBudgetUsd: Math.max(
+      0,
+      Math.min(100, Number(el("sharedExperienceBudgetUsd").value) || 0),
+    ),
     personaCardId: el("personaCardId").value.trim(),
     userName: el("userName").value.trim(),
     patText: el("patText").value.trim(),
@@ -1383,6 +1410,7 @@ FIELDS.forEach((id) => {
     if (e.key === "Enter" && node.tagName !== "TEXTAREA") save();
   });
 });
+el("sharedExperienceProactiveEnabled")?.addEventListener("change", updateSharedExperienceProactiveFields);
 
 listen("voice-service-status", ({ payload }) => applyVoiceServiceStatus(payload));
 listen("local-text-status", ({ payload }) => applyLocalTextStatus(payload));

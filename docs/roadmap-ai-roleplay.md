@@ -91,7 +91,7 @@ graph TD
 
 | 能力 | 云端选项 | 本地选项 | 代理落点 | 备注 |
 |---|---|---|---|---|
-| 文字对话 | DeepSeek (`deepseek-v4-flash`/`deepseek-v4-pro` + `thinking.type`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换；0.2.29 本地迁移旧模型名并拒绝透传未知值 |
+| 文字对话 | DeepSeek (`deepseek-flash`/`deepseek-v4-pro` + `thinking.type`) | Ollama (`qwen3:8b/14b/32b`) | `api.rs::proxy_chat` | 流式 SSE，`Settings.text_provider` 切换；旧模型名在本地迁移并拒绝透传未知值 |
 | 看图(VL) | 通义千问 VL (`qwen3-vl-plus`) | Ollama VL (`minicpm-v:8b` 等) | `api.rs` | 先识图转文字描述，再走文字模型人设化 |
 | 语音合成 | 火山引擎 / CosyVoice(通义云) | 本地 Qwen3-TTS (PyTorch/MLX) | `api.rs::/api/tts` 转发 | 三选一，`Settings.realtime_backend` |
 | 实时语音通话 | 火山端到端实时语音大模型 | 本地 Qwen3-TTS + 默认 Whisper / 可选 SenseVoice final ASR + 当前文字 provider；或 CosyVoice 通义云桥接 | `realtime.rs`（火山）或本机 Python WS（本地/CosyVoice） | 0.2.15 起复用 `textProvider`；0.2.18 起使用有界句级管线与严格有序播放；0.2.19 起本地/CosyVoice 协商 managed 下行身份；0.2.20 起 Worklet-only 本地/CosyVoice 支持 candidate-bound 临时提示；0.2.21 起 CosyVoice、0.2.22 起 macOS MLX Qwen 可独立协商 24k PCM 单路真流式，Windows CUDA Qwen 在固定 faster runtime 可用时也可协商生成期 PCM；0.2.23 起可复制隐私安全诊断 JSON；0.2.24–0.2.28 补齐 Silero shadow 的 adapter/worker/runtime/deadline/aggregate 观测，0.2.30 增加显式安装且启动期固定回退的 SenseVoice final ASR，主动带聊观测将诊断升至 v8，0.2.51 再以 v9 增加 managed 句段实际开播/播完与句间空隙分布；0.2.44 补充 IPv4 优先下载、阶段进度、1× PCM pacing 和隐藏窗口音频恢复，0.2.31 增加固定三档句中停顿容忍度与 30 字 TTS 稳定块，0.2.32 增加严格 pre-TTS 的未播回复撤回与一次性 continuation hint；线上 VAD/endpoint 仍只用 RMS 决策；Linux/官方 Qwen fallback、legacy 与火山保持原路径；朗读与通话**共用同一个语音后端选择** |
@@ -186,14 +186,14 @@ P1-D 的 connector 权限、认证、scope、审计与撤销原则复用 [Memory
 
 #### DeepSeek 自动模型与图片多模态路由
 
-当前实现已将模型档位与 reasoning 开关解耦：文字模型显式选择 `deepseek-v4-flash-vision-exp` 时，Vision Exp 处理纯文字和图片；文字模型选择“自动”时始终使用成本较低的 `deepseek-v4-flash`，本轮是否 reasoning 只由 `thinking.type` 控制，显式 Pro 或旧 `deepseek-reasoner` 设置仍保持 Pro。图片继续由独立的视觉链路先转描述。后续可评估把“自动 + 当前请求含图片”做成请求级临时路由：
+当前实现已将模型档位与 reasoning 开关解耦：文字模型显式选择 `deepseek-flash` 时，V4.1 Flash 直接处理纯文字和图片；文字模型选择“自动”时同样使用 Flash，但图片继续由独立视觉链路先转描述。本轮是否 reasoning 只由 `thinking.type` 控制，显式 Pro 或旧 `deepseek-reasoner` 设置仍保持 Pro；旧 Flash/Vision Exp 名称会迁移到 `deepseek-flash`。后续可评估把“自动 + 当前请求含图片”做成请求级临时路由：
 
-- 仅当当前用户轮次实际携带图片，并且文字模型为 DeepSeek 自动模式时，临时切换到 allow-listed `deepseek-v4-flash-vision-exp`；纯文字、拍一拍、续说和历史中残留图片不得触发该切换。
-- 图片轮次仍需沿用同一份 system/persona、bounded history、温度和输出清洗边界；不要把 Vision Exp 选择持久化为全局 `textModel`，下一轮恢复 Flash/Pro 自动策略。
+- 仅当当前用户轮次实际携带图片，并且文字模型为 DeepSeek 自动模式时，临时切换到 allow-listed `deepseek-flash` 直接多模态路径；纯文字、拍一拍、续说和历史中残留图片不得触发该切换。
+- 图片轮次仍需沿用同一份 system/persona、bounded history、温度和输出清洗边界；不要把请求级直接多模态路由持久化为全局 `textModel`，下一轮恢复 Flash/Pro 自动策略。
 - 已完成：自动模式不再因为开启 reasoning 而升级到 Pro；后续仍需用真实账户验证 Flash + `thinking.type=enabled` 的思考质量、长度上限、首 token 延迟和失败率，再决定是否增加显式的质量升级策略。
-- Vision Exp 的 reasoning 能力必须单独核验：若 API 无法可靠接受 `thinking.type=disabled`，图片短回复需要独立的 token 预算、正文可用性判定和 `finish_reason=length` 回退，不能复用普通拍一拍的 240-token 上限。
+- 图片短回复仍需独立的 token 预算、正文可用性判定和 `finish_reason=length` 回退，不能复用普通拍一拍的 240-token 上限。
 - 若图片路由失败、模型不支持或账户能力不足，应 fail closed 并给出固定错误，不静默把图片伪装成纯文字，也不改变后续文字轮次的模型选择。
-- 实施前补确定性请求构造测试，至少覆盖：自动+无图→Flash/Pro、自动+当前有图→Vision Exp、历史有图但当前无图→不切换、拍一拍→不切换、显式 Vision Exp→保持现有显式行为；再用真实账户验证模型能力、费用、首 token 延迟和正文产出率。
+- 实施前补确定性请求构造测试，至少覆盖：自动+无图→Flash/Pro、自动+当前有图→Flash 直接多模态、历史有图但当前无图→不切换、拍一拍→不切换、显式 Flash→保持现有显式行为；再用真实账户验证模型能力、费用、首 token 延迟和正文产出率。
 
 ### 2.4 生态/可扩展性
 
@@ -752,7 +752,7 @@ graph LR
 distill:
   engine: "deepseek"      # deepseek | ollama | llamacpp
   deepseek:
-    model: "deepseek-v4-flash"
+    model: "deepseek-flash"
     api_key: "${DEEPSEEK_API_KEY}"
   ollama:
     model: "qwen3:14b"

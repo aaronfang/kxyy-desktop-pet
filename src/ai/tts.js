@@ -1,4 +1,4 @@
-/** 前端朗读：把文本发给 /api/tts 合成为 mp3 并播放。
+/** 前端朗读：远端后端经 /api/tts 合成后播放，本地 VoxCPM2 经 /api/tts-stream 边生成边播放。
  *  全局只允许一个音频在放，重复点击同一段会停止（toggle）。
  *
  *  移动端（手机 Chrome / Safari）自动播放策略（实测要点）：
@@ -13,6 +13,7 @@
 
 import { getStoredVlApiKey, getStoredVolcKey } from "./persona.js";
 import { getVoiceGain, onVoiceGainChange } from "./voice-volume.js";
+import { consumePcm16Stream, DEFAULT_COMPANION_STARTUP_SAMPLES } from "./tts-pcm-stream.js";
 
 // ── 播放状态 ──
 let currentToken = null; // 标记当前正在播放/请求的来源，用于 toggle 判断
@@ -83,6 +84,10 @@ let outSource = null; // 可选：<audio> 元素接入（手动朗读 / 移动�
 let volUnsub = null;
 /** 当前 decodeAudioData → BufferSource 播放（自动朗读队列专用，避免 WKWebView 播长 WAV 提前结束）。 */
 let activeBufferSource = null;
+let activeStreamAbort = null;
+const activeStreamSources = new Map();
+let companionAudioActive = false;
+let companionKeepAlive = null;
 
 /** 解析（结束）当前 playSpeechBlob 的等待 Promise，并清空引用。 */
 function resolveSpeechBlob() {
@@ -137,6 +142,37 @@ function ensureAudioContext() {
   } catch {
     return false;
   }
+}
+
+function stopCompanionKeepAlive() {
+  if (!companionKeepAlive) return;
+  const { oscillator, gain } = companionKeepAlive;
+  companionKeepAlive = null;
+  try { oscillator.stop(); } catch { /* already stopped */ }
+  try { oscillator.disconnect(); } catch { /* ignore */ }
+  try { gain.disconnect(); } catch { /* ignore */ }
+}
+
+/** Keep the user-unlocked Web Audio output alive while a hidden chat continues co-viewing. */
+export function setCompanionAudioActive(active) {
+  companionAudioActive = active === true;
+  if (!companionAudioActive) {
+    stopCompanionKeepAlive();
+    return;
+  }
+  if (!ensureAudioContext()) return;
+  if (outCtx.state === "suspended") void outCtx.resume().catch(() => {});
+  if (companionKeepAlive?.context === outCtx) return;
+  stopCompanionKeepAlive();
+  try {
+    const oscillator = outCtx.createOscillator();
+    const gain = outCtx.createGain();
+    gain.gain.value = 0;
+    oscillator.connect(gain);
+    gain.connect(outCtx.destination);
+    oscillator.start();
+    companionKeepAlive = { context: outCtx, oscillator, gain };
+  } catch { /* Web Audio may be unavailable in older WebViews */ }
 }
 
 /** 把共享 <audio> 接到 GainNode（移动端加持 / MP3 回退）；自动朗读优先走 BufferSource。 */
@@ -227,6 +263,7 @@ export function unlockAudio() {
  *  避免旧 AudioContext 挂起或 MediaElementSource 绑死导致「有合成无声音」。 */
 export function resetPlaybackPipeline() {
   stopSpeak();
+  stopCompanionKeepAlive();
   try {
     if (outCtx && outCtx.state !== "closed") outCtx.close();
   } catch { /* ignore */ }
@@ -238,6 +275,7 @@ export function resetPlaybackPipeline() {
   currentUrl = null;
   blessed = false;
   audioCache.clear();
+  if (companionAudioActive) setCompanionAudioActive(true);
 }
 
 // 合成结果缓存：同一「音色|model|文本」只请求上游一次，重复回放直接复用，省额度。
@@ -277,6 +315,19 @@ function stopBufferPlayback() {
   activeBufferSource = null;
 }
 
+function stopStreamPlayback() {
+  activeStreamAbort?.abort();
+  activeStreamAbort = null;
+  for (const [source, settle] of activeStreamSources) {
+    try {
+      source.onended = null;
+      source.stop();
+    } catch { /* ignore */ }
+    settle();
+  }
+  activeStreamSources.clear();
+}
+
 /** 停掉共享 <audio> 元素并释放上一个 blob URL（保留加持态，不销毁元素）。 */
 function stopAudio() {
   stopBufferPlayback();
@@ -296,6 +347,7 @@ function stopAudio() {
 
 /** 停止当前朗读。 */
 export function stopSpeak() {
+  stopStreamPlayback();
   stopAudio();
   playGen++; // 使上一段播放挂的回调失效
   playing = false;
@@ -651,6 +703,91 @@ export async function synthesizeSpeech(text, { voice = null, model = null } = {}
   if (!clean) return null;
   const { emotion, params, instruction } = speechMeta(text);
   return synthOnce(clean, voice, model, params, instruction, emotion);
+}
+
+/** Stream local PCM16LE speech and schedule chunks as they arrive. */
+export async function streamSpeech(text, { latencyMode = "default", onAdmit, onStart, onStreamMetrics, onBackend, onError } = {}) {
+  const clean = textForSpeech(text);
+  if (!clean) return false;
+  stopSpeak();
+  externalStop?.();
+  try {
+    if (!ensureAudioContext()) throw Object.assign(new Error("Web Audio 不可用"), { code: "audio-context-unavailable" });
+    if (outCtx.state !== "running" && outCtx.state !== "closed") await outCtx.resume().catch(() => {});
+    if (outCtx.state !== "running") throw Object.assign(new Error("AudioContext 仍挂起"), { code: "audio-context-suspended" });
+  } catch (error) {
+    onError?.(error);
+    return false;
+  }
+
+  const controller = new AbortController();
+  activeStreamAbort = controller;
+  currentToken = "auto-stream";
+  const myGen = playGen;
+  const progress = beginSynthProgress([...clean].length);
+  let playHead = outCtx.currentTime;
+  let started = false;
+  let totalSamples = 0;
+  try {
+    const response = await fetch("/api/tts-stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: clean,
+        ...(latencyMode === "companion" ? { latencyMode: "companion" } : {}),
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`TTS 流式请求失败 ${response.status}`);
+    const backend = response.headers.get("X-Kxyy-Tts-Backend");
+    onBackend?.(["voxcpm", "local", "cosyvoice"].includes(backend) ? backend : "mixed-or-unknown");
+    onAdmit?.();
+    const streamMetrics = await consumePcm16Stream(response, {
+      signal: controller.signal,
+      ...(latencyMode === "companion" ? { startupSamples: DEFAULT_COMPANION_STARTUP_SAMPLES, maxScheduledSamples: 96_000 } : {}),
+      schedule(samples) {
+        if (myGen !== playGen || controller.signal.aborted) return Promise.resolve();
+        const buffer = outCtx.createBuffer(1, samples.length, 24000);
+        const channel = buffer.getChannelData(0);
+        for (let index = 0; index < samples.length; index += 1) channel[index] = samples[index] / 32768;
+        const source = outCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(outGain);
+        const startAt = Math.max(playHead, outCtx.currentTime + (started ? 0 : 0.02));
+        playHead = startAt + buffer.duration;
+        totalSamples += samples.length;
+        const completion = new Promise((resolve) => {
+          const finish = () => {
+            activeStreamSources.delete(source);
+            resolve();
+          };
+          source.onended = finish;
+          activeStreamSources.set(source, finish);
+        });
+        source.start(startAt);
+        if (!started) {
+          started = true;
+          playing = true;
+          onStart?.(buffer.duration);
+        }
+        return { completion, startAtSeconds: startAt, endAtSeconds: playHead };
+      },
+    });
+    onStreamMetrics?.(streamMetrics);
+    if (myGen !== playGen) return false;
+    playing = false;
+    currentToken = null;
+    progress.end({ phase: "done", cached: false, bytes: totalSamples * 2, provider: "VoxCPM2-stream" });
+    return started;
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      progress.end({ phase: "error", cached: false, error: error instanceof Error ? error.message : String(error) });
+      onError?.(error instanceof Error ? error : new Error(String(error)));
+    }
+    return false;
+  } finally {
+    if (activeStreamAbort === controller) activeStreamAbort = null;
+  }
 }
 
 /** 播放一段已合成的音频 Blob，返回一个在「播放结束 / 出错 / 被外部停止」时 resolve 的 Promise。

@@ -109,7 +109,7 @@ class OllamaEngine:
 class DeepSeekEngine:
     """DeepSeek API 引擎 (OpenAI 兼容协议)"""
 
-    def __init__(self, api_key: str, model: str = "deepseek-v4-flash",
+    def __init__(self, api_key: str, model: str = "deepseek-flash",
                  base_url: str = "https://api.deepseek.com",
                  frequency_penalty: float = 0.0):
         self.api_key = api_key
@@ -125,10 +125,11 @@ class DeepSeekEngine:
         # Allow per-call override of frequency_penalty
         fp = frequency_penalty if frequency_penalty is not None else self.frequency_penalty
 
-        url = f"{self.base_url}/v1/chat/completions"
+        url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
+            "thinking": {"type": "disabled"},
             "temperature": temperature,
             "max_tokens": 4096,
             "stream": False,
@@ -206,7 +207,7 @@ def create_engine(config: Dict) -> Callable:
             )
         engine = DeepSeekEngine(
             api_key=api_key,
-            model=cfg.get("model", "deepseek-v4-flash"),
+            model=cfg.get("model", "deepseek-flash"),
             base_url=cfg.get("base_url", "https://api.deepseek.com"),
             frequency_penalty=cfg.get("frequency_penalty", 0.15),
         )

@@ -3,11 +3,23 @@ import assert from "node:assert/strict";
 
 import {
   buildDeepseekMultimodalMessages,
+  DEEPSEEK_FLASH_MODEL,
   DEEPSEEK_VISION_MODEL,
+  normalizeDeepseekTextModel,
   usesDeepseekMultimodalModel,
 } from "../src/deepseek-multimodal.js";
 
 const IMAGE = "data:image/png;base64,AAAA";
+
+test("current and legacy Flash names normalize to the official V4.1 model", () => {
+  assert.equal(DEEPSEEK_FLASH_MODEL, "deepseek-flash");
+  assert.equal(DEEPSEEK_VISION_MODEL, DEEPSEEK_FLASH_MODEL);
+  assert.equal(normalizeDeepseekTextModel("deepseek-flash"), "deepseek-flash");
+  assert.equal(normalizeDeepseekTextModel("deepseek-v4-flash"), "deepseek-flash");
+  assert.equal(normalizeDeepseekTextModel("deepseek-v4-flash-vision-exp"), "deepseek-flash");
+  assert.equal(normalizeDeepseekTextModel("deepseek-v4-pro"), "deepseek-v4-pro");
+  assert.equal(normalizeDeepseekTextModel("unreviewed"), "");
+});
 
 test("multimodal behavior is selected by the DeepSeek text model, not the VL provider", () => {
   assert.equal(usesDeepseekMultimodalModel({
@@ -17,7 +29,7 @@ test("multimodal behavior is selected by the DeepSeek text model, not the VL pro
   }), true);
   assert.equal(usesDeepseekMultimodalModel({
     textProvider: "deepseek",
-    textModel: "deepseek-v4-flash",
+    textModel: "deepseek-v4-pro",
     vlProvider: "deepseek",
   }), false);
   assert.equal(usesDeepseekMultimodalModel({

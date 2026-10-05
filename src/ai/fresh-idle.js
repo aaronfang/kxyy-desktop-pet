@@ -13,6 +13,10 @@ export function recordFreshIdleActivity(state, nowMs = Date.now()) {
   state.lastActivityAt = Number.isFinite(nowMs) ? nowMs : Date.now();
 }
 
+export function shouldScheduleFreshIdle({ sharedExperienceActive = false } = {}) {
+  return sharedExperienceActive !== true;
+}
+
 export function shouldTriggerFreshIdle(state, {
   nowMs = Date.now(),
   enabled = false,

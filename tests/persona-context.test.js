@@ -20,6 +20,7 @@ import {
   detectDeepIntent,
   detectShortTermConversationMood,
   getFollowupUserTrigger,
+  getProactiveUserTrigger,
 } from "../src/ai/persona.js";
 
 const LORE = {
@@ -200,6 +201,53 @@ test("proactive daily prompts contain no livestream-room topic seeds", () => {
     const prompt = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
     assert.doesNotMatch(prompt, /直播间|开播|下播|福袋|礼物|人气票|弹幕/, proactiveKind);
   }
+});
+
+test("co-viewing proactive prompt comments on evidence without auditing it or questioning the viewer", () => {
+  const trigger = getProactiveUserTrigger("shared-experience");
+  const messages = buildMessages({
+    systemPrompt: "persona\n# 当前共同观看证据\n[ev-8] 解说说先打开两盏灯拖住丧尸。",
+    fewShot: [],
+    history: [
+      { role: "user", content: "我们在看游戏解说。" },
+      { role: "user", content: trigger },
+    ],
+    maxTurns: 4,
+    useLive: false,
+    lore: {},
+    cardId: "kxyy-yuanyuan",
+    proactiveKind: "shared-experience",
+  });
+  const system = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
+  assert.match(system, /正在一起看/);
+  assert.match(system, /偶尔可以.*问/);
+  assert.match(system, /不要复述.*声音说.*画面/);
+  assert.match(system, /有依据的态度|自然判断/);
+  assert.match(system, /主动发现|分享/);
+  assert.match(system, /不是在回答问题/);
+  assert.match(system, /人物|处境/);
+  assert.match(system, /关键|转折/);
+  assert.match(system, /判断|分析/);
+  assert.doesNotMatch(system, /最多 2 句/);
+  assert.equal(messages.at(-1)?.role, "user");
+  assert.equal(messages.at(-1)?.content, trigger);
+});
+
+test("a viewer can answer an unsolicited co-viewing comment without inheriting its hidden trigger", () => {
+  const trigger = getProactiveUserTrigger("shared-experience");
+  const messages = buildMessages({
+    systemPrompt: "persona\n# 当前共同观看证据\n[ev-8] 侧门打开了。",
+    fewShot: [],
+    history: [
+      { role: "user", content: trigger },
+      { role: "assistant", content: "这下侧门终于打开了。" },
+      { role: "user", content: "对，不过里面好像还有动静。" },
+    ],
+    maxTurns: 6, useLive: false, lore: {}, cardId: "kxyy-yuanyuan",
+  });
+  assert.equal(messages.at(-1).content, "对，不过里面好像还有动静。");
+  assert.ok(messages.some((message) => message.role === "assistant" && message.content === "这下侧门终于打开了。"));
+  assert.ok(messages.every((message) => message.content !== trigger));
 });
 
 test("follow-up request ends with an explicit user-role continuation directive", () => {

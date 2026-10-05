@@ -60,12 +60,55 @@ import {
   toSticker,
 } from "./ai/stickers.js";
 // 阶段 2·D：TTS 朗读（tts.js 内部相对 fetch("/api/tts") 由下方全局 fetch 改写转发到本地代理）。
-import { synthesizeSpeech, playSpeechBlob, stopSpeak, unlockAudio, resetPlaybackPipeline, onTtsProgress, splitSpeechChunks, detectEmotion } from "./ai/tts.js";
+import { synthesizeSpeech, playSpeechBlob, streamSpeech, stopSpeak, unlockAudio, resetPlaybackPipeline, setCompanionAudioActive, onTtsProgress, splitSpeechChunks, detectEmotion } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { formatChatTranscript } from "./ai/chat-transcript.js";
 import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
 import { fetchWebObservations, hasDirectWebSearchIntent, needsCurrentWebInformation, renderWebObservationBlock, renderWebObservationUnavailableBlock } from "./ai/web-observations.js";
+import { renderVisualContext, sanitizeVisualContext, bindVisualObservationToCapture } from "./ai/shared-experience.js";
+import { createSharedExperienceWorkspace } from "./ai/shared-experience-workspace.js";
+import { createSharedExperienceSpool } from "./ai/shared-experience-spool.js";
+import { withSharedExperienceInferencePaused } from "./ai/shared-experience-inference.js";
+import {
+  sharedExperienceReplyMaxTokens,
+  sharedExperienceRequestPolicy,
+  sharedExperienceTtsLatencyMode,
+  sharedExperienceCaptureDelay,
+} from "./ai/shared-experience-policy.js";
+import { createSharedExperienceLifecycle } from "./ai/shared-experience-lifecycle.js";
+import { requestSharedExperienceSummary, requestSharedExperienceQuestion } from "./ai/shared-experience-client.js";
+import { buildCurrentEvidenceWindow, videoQuestionEvidence } from "./ai/shared-experience-evidence-window.js";
+import { groundingEvidence, requestGroundingReview, requestGroundedReplyRepair } from "./ai/shared-experience-grounding.js";
+import { normalizeSharedExperienceVisualCapture } from "./ai/shared-experience-visual-window.js";
+import {
+  buildAcceptanceEvidenceFallbackQuestion,
+  buildSharedExperienceCleanupReceipt,
+  createSharedExperienceRuntimeReceipts,
+  runSharedExperienceAcceptancePlan,
+} from "./ai/shared-experience-acceptance.js";
+import { planEvidenceAnchoredQuestion } from "./ai/shared-experience-question-planner.js";
+import {
+  createSharedExperiencePrimerGate,
+  parseSharedExperienceViewingStatement,
+} from "./ai/shared-experience-primer.js";
+import { normalizeSharedExperienceContentMode } from "./ai/shared-experience-content-mode.js";
+import {
+  extractVisualCharacterDescriptors,
+  filterVisualIdentityClaims,
+} from "./ai/shared-experience-visual-identity.js";
+import { createSharedExperienceCharacterTracker } from "./ai/shared-experience-character-tracker.js";
+import { createTtsReceipt } from "./ai/shared-experience-tts-receipt.js";
+import { createSharedExperienceVoiceTracker } from "./ai/shared-experience-voice-tracker.js";
+import {
+  cancelSharedExperienceProactiveWork,
+  createSharedExperienceProactiveDirector,
+  createSharedExperienceProactiveRunner,
+  isSharedExperienceProactiveReply,
+  resolveSharedExperienceProactiveConfig,
+  sharedExperienceProactiveDiagnostics,
+  sharedExperienceProactiveGroundingPrompt,
+} from "./ai/shared-experience-proactive.js";
 import {
   buildRecommendationLinkPrompt,
   collectRecommendationLinks,
@@ -100,6 +143,7 @@ import {
   createFreshIdleState,
   markFreshIdleTriggered,
   recordFreshIdleActivity,
+  shouldScheduleFreshIdle,
   shouldTriggerFreshIdle,
 } from "./ai/fresh-idle.js";
 // 实时语音通话：经 Rust 本地 WS 桥接连火山端到端实时语音大模型。
@@ -150,10 +194,12 @@ const DELETABLE_SEL = ".bubble[data-mid], .pat-notice[data-mid]";
 // 自动朗读队列：主回复与 follow-up 等多条回复按顺序朗读，避免共用 token 时被误判为「关闭」。
 let ttsQueue = Promise.resolve();
 let ttsQueueGen = 0;
+const autoSpeechJobs = new Set();
 
 function resetTtsQueue() {
   ttsQueueGen++;
   ttsQueue = Promise.resolve();
+  autoSpeechJobs.clear();
 }
 
 /** 当前语音后端是否已具备自动朗读条件。 */
@@ -177,6 +223,7 @@ function makeBubbleRevealer(parts, firstBubble, firstRow) {
       const i = next++;
       if (i === 0) {
         firstRow?.classList.remove("streaming");
+        firstRow?.classList.remove("proactive-pending");
         renderTextWithSafeLinks(firstBubble, parts[0]);
       } else {
         addBubble("assistant", parts[i]);
@@ -195,7 +242,7 @@ function makeBubbleRevealer(parts, firstBubble, firstRow) {
  *  合成下一句，尽量消除句间空档。gen 变化（清空/通话/收起打断）或合成失败时，
  *  兜底把剩余文字直接补全，避免气泡永远停在闪烁光标。
  *  speakParts 与 parts 条数不一致时（双语）：按英文分段逐段朗读，开播时一次亮出全部中文气泡。 */
-async function speakPartsSynced(parts, { revealer, voice, gen, speakParts } = {}) {
+async function speakPartsSynced(parts, { revealer, voice, gen, speakParts, receipt } = {}) {
   const audioParts =
     Array.isArray(speakParts) && speakParts.length ? speakParts.filter(Boolean) : parts;
   if (!audioParts.length) {
@@ -204,6 +251,51 @@ async function speakPartsSynced(parts, { revealer, voice, gen, speakParts } = {}
   }
   // 显示句与朗读句无法一一对应：按朗读分段逐段合成（勿合并成一段，否则会被 160 字上限截断）。
   const altAudio = Array.isArray(speakParts) && speakParts.length > 0;
+  if ((settings.realtimeBackend || "").toLowerCase() === "voxcpm") {
+    const inferenceSpool = sharedExperience.active ? sharedExperience.spool : null;
+    await withSharedExperienceInferencePaused({
+      enabled: Boolean(inferenceSpool),
+      spool: inferenceSpool,
+      reason: "tts",
+      task: async () => {
+        for (let i = 0; i < audioParts.length; i += 1) {
+          if (gen !== ttsQueueGen) {
+            for (let pending = i; pending < audioParts.length; pending += 1) receipt?.fail("queue-reset");
+            break;
+          }
+          let started = false;
+          let failureReason = "stream-error";
+          const displayedIndex = altAudio && audioParts.length !== parts.length ? parts.length - 1 : i;
+          const ok = await streamSpeech(audioParts[i], {
+            latencyMode: sharedExperienceTtsLatencyMode(sharedExperience.active),
+            onAdmit: () => receipt?.admit(),
+            onBackend: (backend) => receipt?.observeBackend(backend),
+            onStart: () => { started = true; receipt?.start(); revealer.revealUpTo(displayedIndex); },
+            onStreamMetrics: (metrics) => receipt?.observeStream(metrics),
+            onError: (error) => {
+              failureReason = error?.code || "stream-error";
+              revealer.revealUpTo(displayedIndex);
+            },
+          });
+          if (ok && started) receipt?.complete();
+          else receipt?.fail(gen !== ttsQueueGen ? "queue-reset" : failureReason);
+          revealer.revealUpTo(displayedIndex);
+        }
+      },
+      onResumed: () => {
+        const spoolSnapshot = inferenceSpool?.snapshot();
+        if (
+          sharedExperience.active
+          && sharedExperience.spool === inferenceSpool
+          && !sharedExperience.paused
+          && !spoolSnapshot?.inferencePaused
+          && spoolSnapshot?.pending > 0
+        ) void processSharedExperienceOnce();
+      },
+    });
+    revealer.revealAll();
+    return;
+  }
   if (altAudio && audioParts.length !== parts.length) {
     let revealed = false;
     const revealOnce = () => {
@@ -212,26 +304,33 @@ async function speakPartsSynced(parts, { revealer, voice, gen, speakParts } = {}
         revealer.revealAll();
       }
     };
-    let nextSynth = synthesizeSpeech(audioParts[0], { voice }).catch(() => null);
+    let nextSynth = synthesizeSpeech(audioParts[0], { voice }).then((blob) => ({ blob }), (error) => ({ error }));
     for (let i = 0; i < audioParts.length; i++) {
       if (gen !== ttsQueueGen) {
         revealer.revealAll();
+        for (let pending = i; pending < audioParts.length; pending += 1) receipt?.fail();
         return;
       }
-      const blob = await nextSynth;
+      const synthesized = await nextSynth;
+      const blob = synthesized?.blob || null;
       nextSynth =
         i + 1 < audioParts.length
-          ? synthesizeSpeech(audioParts[i + 1], { voice }).catch(() => null)
+          ? synthesizeSpeech(audioParts[i + 1], { voice }).then((nextBlob) => ({ blob: nextBlob }), (error) => ({ error }))
           : null;
       if (!blob) {
+        receipt?.fail();
         revealOnce();
         continue;
       }
+      receipt?.admit();
       await new Promise((resolve) => {
+        let started = false;
+        let failed = false;
         playSpeechBlob(blob, {
-          onStart: revealOnce,
-          onError: revealOnce,
+          onStart: () => { started = true; receipt?.start(); revealOnce(); },
+          onError: () => { failed = true; receipt?.fail(); revealOnce(); },
         }).then(() => {
+          if (started && !failed) receipt?.complete();
           revealOnce();
           resolve();
         });
@@ -241,29 +340,36 @@ async function speakPartsSynced(parts, { revealer, voice, gen, speakParts } = {}
     return;
   }
 
-  let nextSynth = synthesizeSpeech(audioParts[0], { voice }).catch(() => null);
+  let nextSynth = synthesizeSpeech(audioParts[0], { voice }).then((blob) => ({ blob }), (error) => ({ error }));
   for (let i = 0; i < audioParts.length; i++) {
     if (gen !== ttsQueueGen) {
       revealer.revealAll();
+      for (let pending = i; pending < audioParts.length; pending += 1) receipt?.fail();
       return;
     }
-    const blob = await nextSynth;
+    const synthesized = await nextSynth;
+    const blob = synthesized?.blob || null;
     // 播放本句前先起下一句的合成，藏进本句播放时长里。
     nextSynth =
       i + 1 < audioParts.length
-        ? synthesizeSpeech(audioParts[i + 1], { voice }).catch(() => null)
+        ? synthesizeSpeech(audioParts[i + 1], { voice }).then((nextBlob) => ({ blob: nextBlob }), (error) => ({ error }))
         : null;
 
     if (!blob) {
+      receipt?.fail();
       // 合成失败：无音频，直接把这句显示出来，继续下一句。
       revealer.revealUpTo(i);
       continue;
     }
+    receipt?.admit();
     await new Promise((resolve) => {
+      let started = false;
+      let failed = false;
       playSpeechBlob(blob, {
-        onStart: () => revealer.revealUpTo(i),
-        onError: () => revealer.revealUpTo(i),
+        onStart: () => { started = true; receipt?.start(); revealer.revealUpTo(i); },
+        onError: () => { failed = true; receipt?.fail(); revealer.revealUpTo(i); },
       }).then(() => {
+        if (started && !failed) receipt?.complete();
         revealer.revealUpTo(i);
         resolve();
       });
@@ -276,6 +382,8 @@ async function speakPartsSynced(parts, { revealer, voice, gen, speakParts } = {}
  *  首句复用流式气泡 firstBubble。 */
 function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, stickerMid, speakParts } = {}) {
   const gen = ttsQueueGen;
+  const job = Symbol("auto-speech");
+  autoSpeechJobs.add(job);
   const backend = (settings.realtimeBackend || "").toLowerCase();
   // 火山才传 voice；本地 / CosyVoice(云/开源) 由后端按设置合成。
   const voiceOpt =
@@ -283,6 +391,8 @@ function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, sticker
       ? (settings.ttsVoice || "").trim() || null
       : null;
   const revealer = makeBubbleRevealer(parts, firstBubble, firstRow);
+  const requestedParts = Array.isArray(speakParts) && speakParts.length ? speakParts.filter(Boolean).length : parts.length;
+  const receipt = createTtsReceipt({ requestedParts });
   const finishSticker = () => {
     if (sticker) addStickerBubble(sticker, { linkedMid: stickerMid });
   };
@@ -292,16 +402,21 @@ function enqueueAutoSpeakSynced(parts, { firstBubble, firstRow, sticker, sticker
         // 入队前已被打断：直接补全文字，不再合成。
         revealer.revealAll();
         finishSticker();
-        return;
+        for (let index = 0; index < requestedParts; index += 1) receipt.fail("queue-reset");
+        return receipt.finish();
       }
-      await speakPartsSynced(parts, { revealer, voice: voiceOpt, gen, speakParts });
+      await speakPartsSynced(parts, { revealer, voice: voiceOpt, gen, speakParts, receipt });
       revealer.revealAll();
       finishSticker();
+      return receipt.finish();
     })
     .catch(() => {
       revealer.revealAll();
       finishSticker();
-    });
+      receipt.fail();
+      return receipt.finish();
+    })
+    .finally(() => autoSpeechJobs.delete(job));
   // 返回「本条朗读全部完成」的 promise：供 followup 等第一行文字+语音出现后再出第二行。
   return ttsQueue;
 }
@@ -376,6 +491,8 @@ function shouldSampleAmbientFreshTopics(query, proactiveKind = "") {
 function resetFreshIdleTimer() {
   recordFreshIdleActivity(freshIdleState);
   if (freshIdleTimer) clearTimeout(freshIdleTimer);
+  freshIdleTimer = null;
+  if (!shouldScheduleFreshIdle({ sharedExperienceActive: sharedExperience.active })) return;
   freshIdleTimer = setTimeout(() => {
     freshIdleTimer = null;
     void maybeTriggerFreshIdleShare();
@@ -383,6 +500,7 @@ function resetFreshIdleTimer() {
 }
 
 async function maybeTriggerFreshIdleShare() {
+  if (!sharedExperienceRequestPolicy(sharedExperience.active).idleProactive) return;
   const eligible = shouldTriggerFreshIdle(freshIdleState, {
     enabled: settings.webGroundingEnabled === true,
     participation: settings.freshTopicParticipation || "relevant",
@@ -432,6 +550,20 @@ const inputEl = document.getElementById("input");
 const formEl = document.getElementById("composer");
 const sendBtn = document.getElementById("send");
 const attachBtn = document.getElementById("attach");
+const sharedExperienceBtn = document.getElementById("shared-experience-btn");
+const sharedExperiencePauseBtn = document.getElementById("shared-experience-pause-btn");
+const sharedExperienceStopBtn = document.getElementById("shared-experience-stop-btn");
+const sharedExperienceFrequency = document.getElementById("shared-experience-frequency");
+const sharedExperienceMode = document.getElementById("shared-experience-mode");
+const sharedExperienceStatus = document.getElementById("shared-experience-status");
+const sharedExperiencePicker = document.getElementById("shared-experience-picker");
+const sharedExperienceWindowList = document.getElementById("shared-experience-window-list");
+const sharedExperiencePickerCancel = document.getElementById("shared-experience-picker-cancel");
+const sharedExperienceDebugBtn = document.getElementById("shared-experience-debug-btn");
+const sharedExperienceDebug = document.getElementById("shared-experience-debug");
+const sharedExperienceDebugClose = document.getElementById("shared-experience-debug-close");
+const sharedExperienceDebugMeta = document.getElementById("shared-experience-debug-meta");
+const sharedExperienceDebugOutput = document.getElementById("shared-experience-debug-output");
 const fileEl = document.getElementById("file");
 const previewEl = document.getElementById("attach-preview");
 const thumbEl = document.getElementById("attach-thumb");
@@ -453,6 +585,26 @@ const capsuleWaveCanvas = document.getElementById("capsule-wave-canvas");
 const capsuleWaveRenderer = createSiriWaveModernRenderer(capsuleWaveCanvas);
 const callCapsuleOpenBtn = document.getElementById("call-capsule-open");
 const callCapsuleHangupBtn = document.getElementById("call-capsule-hangup");
+let activeVisualContext = null;
+const sharedExperience = { active: false, paused: false, generation: 0, windowId: null, windowLabel: "", contentTitle: "", timer: 0, captureTimer: 0, audioTimer: 0, processing: false, observing: false, transcribing: false, capturing: false, capturingAudio: false, visualWindowQueued: false, visualDiagnostics: null, pendingObservation: null, pendingAudio: null, debugEntries: [], typingUntil: 0, capturedVisual: 0, capturedAudio: 0, processedVisual: 0, processedAudio: 0, captureTimeline: { visual: [], audio: [] }, filteredVisualIdentities: 0, lastAudioCaptureEndMs: 0, workspace: null, spool: null, lifecycle: null, voiceTracker: null, primerGate: null, proactiveRunner: null, proactivePromise: null, stopPromise: null };
+
+function recordSharedExperienceCapture(kind, capturedAtMs = Date.now()) {
+  const timeline = sharedExperience.captureTimeline[kind];
+  timeline.push(Number.isFinite(Number(capturedAtMs)) ? Number(capturedAtMs) : Date.now());
+  if (timeline.length > 1024) timeline.shift();
+}
+
+function sharedExperienceSpoolStats() {
+  const snapshot = sharedExperience.spool?.snapshot?.() || {};
+  return {
+    pending: Number(snapshot.pending) || 0,
+    bytes: Number(snapshot.bytes) || 0,
+    dropped: Number(snapshot.dropped) || 0,
+    droppedByKind: snapshot.droppedByKind || { visual: 0, audio: 0, unknown: 0 },
+    peakPending: Number(snapshot.peakPending) || 0,
+    peakBytes: Number(snapshot.peakBytes) || 0,
+  };
+}
 let callCapsuleEdge = null;
 let callCapsuleCollapseTimer = 0;
 let callCapsuleHovered = false;
@@ -565,6 +717,14 @@ function setMoodVisual(mood = "neutral") {
   messagesEl?.querySelectorAll(".row.assistant .avatar").forEach((avatar) => {
     avatar.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
     avatar.classList.add(`mood-${next}`);
+  });
+}
+
+function clearMoodVisual() {
+  chatEl?.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
+  chatEl?.removeAttribute("data-mood");
+  messagesEl?.querySelectorAll(".row.assistant .avatar").forEach((avatar) => {
+    avatar.classList.remove("mood-neutral", "mood-bright", "mood-low", "mood-tense", "mood-sleepy");
   });
 }
 
@@ -745,7 +905,10 @@ function updateWebDebug({ state, source = webDebug.source, count = webDebug.coun
   webDebugMetaEl.title = webDebugMetaEl.textContent;
 }
 function showWebSearchLead(query) {
-  if (settings.webGroundingEnabled === true && settings.webGroundingProvider === "tavily" && hasDirectWebSearchIntent(query)) {
+  if (sharedExperienceRequestPolicy(sharedExperience.active).webObservations
+      && settings.webGroundingEnabled === true
+      && settings.webGroundingProvider === "tavily"
+      && hasDirectWebSearchIntent(query)) {
     addBubble("assistant", "我去查一下，马上回来。");
   }
 }
@@ -805,8 +968,9 @@ function extractUsage(obj) {
   const prompt = Number(u.prompt_tokens) || 0;
   const completion = Number(u.completion_tokens) || 0;
   const total = Number(u.total_tokens) || prompt + completion;
+  const cachedPrompt = Math.min(prompt, Math.max(0, Number(u.prompt_tokens_details?.cached_tokens) || 0));
   if (!prompt && !completion && !total) return null;
-  return { prompt, completion, total };
+  return { prompt, cachedPrompt, completion, total };
 }
 
 function formatUsageLine(usage) {
@@ -1019,6 +1183,12 @@ function noteApiUsage(
   if (usage) {
     apiDebug.last = usage;
     apiDebug.sessionTotal += usage.total || 0;
+    if (provider === "DeepSeek" && sharedExperience.active && sharedExperience.lifecycle) {
+      sharedExperience.lifecycle.recordUsage("conversation", usage, {
+        model: model || settings.textModel || "deepseek-flash",
+      });
+      renderSharedExperienceDebug();
+    }
   }
   if (elapsedMs > 0) apiDebug.lastElapsedMs = elapsedMs;
   updateApiDebug();
@@ -1037,8 +1207,8 @@ function formatBalanceText(data) {
 }
 
 /** 拉取 DeepSeek 账户余额（金额；API 不提供「剩余 token」）。 */
-async function fetchDeepSeekBalance() {
-  if (!apiBase || !chatDebugEnabled()) return;
+async function fetchDeepSeekBalance(targetLifecycle = sharedExperience.lifecycle) {
+  if (!apiBase || (!chatDebugEnabled() && !targetLifecycle)) return;
   const seq = ++balanceFetchSeq;
   try {
     const resp = await fetch(`${apiBase}/api/balance`);
@@ -1046,6 +1216,9 @@ async function fetchDeepSeekBalance() {
     const data = await resp.json();
     if (seq !== balanceFetchSeq) return;
     apiDebug.balanceText = formatBalanceText(data);
+    if (targetLifecycle?.recordBalance(data)) {
+      renderSharedExperienceDebug();
+    }
     updateApiDebug();
   } catch (_) {
     /* 余额查询失败静默，不影响聊天 */
@@ -1393,13 +1566,19 @@ function addStickerBubble(sticker, { linkedMid } = {}) {
   scrollBottom();
 }
 
-function setBusy(next) {
+let restoringComposerFocus = false;
+
+function setBusy(next, { allowTextInput = false, focusInput = true } = {}) {
   busy = next;
-  sendBtn.disabled = next;
-  inputEl.disabled = next;
+  sendBtn.disabled = next && !allowTextInput;
+  inputEl.disabled = next && !allowTextInput;
   attachBtn.disabled = next;
   stickersBtn.disabled = next;
-  if (!next) inputEl.focus();
+  if (!next && focusInput) {
+    restoringComposerFocus = true;
+    try { inputEl.focus(); }
+    finally { restoringComposerFocus = false; }
+  }
 }
 
 // ---- 待发送图片 ----
@@ -1720,6 +1899,7 @@ async function enqueueMemory() {
 
 async function buildRequestMessages(opts = {}) {
   if (!assets) throw new Error("语料尚未加载");
+  const requestPolicy = sharedExperienceRequestPolicy(sharedExperience.active);
   const name = (settings.userName || "").trim();
   // 画像来源：本人 ππ → 打包个人画像；其它 → 设置里自填的字段（refreshIdentity 已解析好）。
   // 是否把画像注入 system prompt 由「对话时加载观众画像」开关控制（默认开）。
@@ -1742,9 +1922,21 @@ async function buildRequestMessages(opts = {}) {
     detectShortTermConversationMood(lastRealUserMessage()?.content || ""),
     history,
   );
+  const currentQuestion = opts.question ?? lastRealUserMessage()?.content ?? "";
   let memoryPrompt = "";
+  const visualPrompt = sharedExperience.active && sharedExperience.workspace
+    ? [
+        sharedExperience.workspace.renderPrompt({
+          question: currentQuestion,
+          focusEvidenceIds: opts.focusEvidenceIds,
+        }),
+        sharedExperience.characterTracker?.renderPrompt() || "",
+      ].filter(Boolean).join("\n\n")
+    : renderVisualContext(activeVisualContext);
+  // 普通单图观察只服务于下一次请求；共同体验则由有界工作区持续维护。
+  if (!sharedExperience.active && visualPrompt) activeVisualContext = null;
   let recalledMemoryItems = [];
-  if (!opts.proactiveKind && activeName) {
+  if (requestPolicy.memoryRecall && !opts.proactiveKind && activeName) {
     const last = lastRealUserMessage();
     try {
       const recalled = await invoke("memory_recall", {
@@ -1797,7 +1989,7 @@ async function buildRequestMessages(opts = {}) {
   let webPrompt = "";
   const query = lastRealUserMessage()?.content || "";
   if (isBilibiliRecommendationQuery(query)) recentRecommendationLinks = [];
-  if (settings.webGroundingEnabled === true) {
+  if (requestPolicy.freshTopics && settings.webGroundingEnabled === true) {
     await syncFreshTopicLocations();
     updateFreshAssociationContext(freshAssociationSessionState, query);
     const feedback = applyFreshAssociationFeedback(freshAssociationSessionState, query);
@@ -1881,8 +2073,10 @@ async function buildRequestMessages(opts = {}) {
       }
     }
   }
-  webPrompt += buildRecommendationLinkPrompt(query, recentRecommendationLinks);
-  if (!opts.proactiveKind && settings.webGroundingEnabled === true) {
+  if (requestPolicy.freshTopics) {
+    webPrompt += buildRecommendationLinkPrompt(query, recentRecommendationLinks);
+  }
+  if (requestPolicy.webObservations && !opts.proactiveKind && settings.webGroundingEnabled === true) {
     const query = lastRealUserMessage()?.content || "";
     const source = settings.webGroundingProvider || "none";
     const startedAt = performance.now();
@@ -1908,8 +2102,8 @@ async function buildRequestMessages(opts = {}) {
   console.log("[buildRequestMessages]", reqDebug);
   if (apiDebugMetaEl) { apiDebugMetaEl.textContent = "REQ " + reqDebug; apiDebugMetaEl.title = reqDebug; }
   return buildMessages({
-    systemPrompt: systemPrompt + relationshipMoodPrompt + memoryPrompt + webPrompt,
-    fewShot,
+    systemPrompt: systemPrompt + relationshipMoodPrompt + memoryPrompt + visualPrompt + webPrompt,
+    fewShot: requestPolicy.fewShot ? fewShot : [],
     history,
     maxTurns,
     useLive: true,
@@ -1920,7 +2114,7 @@ async function buildRequestMessages(opts = {}) {
     proactiveKind: opts.proactiveKind,
     patAction: opts.patAction || "",
     who: proactiveWhoLabel(name || userDisplayName() || "你"),
-    earlierRecap: sessionRecap,
+    earlierRecap: requestPolicy.sessionRecap ? sessionRecap : "",
     deep: opts.deep || false,
     tts: assets.tts,
   });
@@ -1997,7 +2191,22 @@ function emptyReplyReason({ finishReason, hasReasoning, sawData } = {}) {
 }
 
 /** 流式请求元元回复（普通聊天 / 拍一拍共用）。调用前须已把本轮 user 消息写入 history。 */
-async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, patAction, replyId } = {}) {
+async function streamAssistantReply(streamBubble, streamRow, {
+  proactiveKind,
+  patAction,
+  replyId,
+  focusEvidenceIds,
+  captureGroundingAudit = false,
+  groundingQuestion,
+  abortSignal,
+} = {}) {
+  const groundingSession = sharedExperience.active ? {
+    generation: sharedExperience.generation, workspace: sharedExperience.workspace, lifecycle: sharedExperience.lifecycle,
+  } : null;
+  const groundingIsCurrent = () => !abortSignal?.aborted && (!groundingSession || (sharedExperience.active
+    && sharedExperience.generation === groundingSession.generation && sharedExperience.workspace === groundingSession.workspace));
+  let reviewSources = [];
+  let groundingAudit = null;
   let full = "";
   let speaking = false;
   // 是否会自动朗读本条回复。会朗读时，流式期间**不**实时灌字进气泡（保持闪烁光标），
@@ -2032,7 +2241,11 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       localGenStarted = true;
     }
     if (!proactiveKind) showWebSearchLead(lastRealUserMessage()?.content || "");
-    let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep });
+    const reviewQuestion = groundingQuestion ?? lastRealUserMessage()?.content ?? "";
+    let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep, focusEvidenceIds, question: reviewQuestion });
+    if (groundingSession) reviewSources = groundingEvidence(groundingSession.workspace?.snapshot(), {
+      question: reviewQuestion,
+    });
     if (usesDeepseekMultimodalModel(settings)) {
       requestMessages = buildDeepseekMultimodalMessages(
         requestMessages,
@@ -2042,17 +2255,22 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     const resp = await fetch(`${apiBase}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: abortSignal,
       body: JSON.stringify({
         messages: requestMessages,
         stream: true,
         provider: "text",
         temperature: settings.temperature ?? 0.8,
         thinking: deliberate,
-        max_tokens: replyMaxTokens({
-          proactiveKind,
-          lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
-          deep,
-        }),
+        max_tokens: sharedExperienceReplyMaxTokens(
+          sharedExperience.active,
+          replyMaxTokens({
+            proactiveKind,
+            lastUserMessage: proactiveKind ? null : lastRealUserMessage(),
+            deep,
+          }),
+          { deliberate, proactiveKind },
+        ),
       }),
     });
 
@@ -2073,6 +2291,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
     const decoder = new TextDecoder();
     let buffer = "";
     let usage = null;
+    let responseModel = "";
     // 排查「回复为空」用的线索：是否真收到过 SSE 数据、是否只有思考内容、上游给的结束原因。
     let reasoning = "";
     let finishReason = "";
@@ -2090,6 +2309,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         if (payload === "[DONE]") continue;
         try {
           const chunk = JSON.parse(payload);
+          if (chunk?.model) responseModel = String(chunk.model);
           const chunkUsage = extractUsage(chunk);
           if (chunkUsage) usage = chunkUsage;
           const choice = chunk.choices?.[0];
@@ -2105,7 +2325,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
               petSignal("speaking");
             }
             // 会朗读时先不显示文字，等对应句音频开始播放再显示（同步出现）。
-            if (!willSync) {
+            if (!willSync && !groundingSession) {
               renderTextWithSafeLinks(streamBubble, stripStickerForDisplay(
                 stripSpeakBlockForDisplay(normalizeModelNewlines(full))
               ));
@@ -2123,7 +2343,7 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       : 0;
     noteApiUsage(isLocalText ? "本地模型" : "DeepSeek", usage, {
       refreshBalance: !isLocalText,
-      model: isLocalText ? localTextModelLabel() : "",
+      model: isLocalText ? localTextModelLabel() : responseModel || settings.textModel || "deepseek-flash",
       elapsedMs,
     });
     localGenStarted = false;
@@ -2137,12 +2357,64 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       bilingual.bilingual &&
       speakText &&
       speakText !== raw;
-    const { text: reply, emotion } = extractSticker(raw);
+    let { text: reply, emotion } = extractSticker(raw);
     if (!reply && !emotion) {
       if (chatDebugEnabled()) {
         console.warn("[chat] 回复为空", { finishReason, hasReasoning: !!reasoning, sawData, fullLen: full.length });
       }
       throw new Error(emptyReplyReason({ finishReason, hasReasoning: !!reasoning, sawData }));
+    }
+    // Count the text backend only after a non-empty model response has been
+    // parsed. Headers alone are not evidence: a truncated/filtered response
+    // can carry the provider header while producing no usable reply.
+    if (groundingSession && groundingIsCurrent()) {
+      sharedExperience.runtimeReceipts?.recordText({
+        provider: resp.headers.get("X-Kxyy-Text-Provider"),
+        completed: true,
+        responseChars: normalized.length,
+        model: responseModel,
+      });
+    }
+
+    if (groundingSession) {
+      if (!groundingIsCurrent()) { streamRow.remove(); return {skipped:true}; }
+      const draft = reply;
+      const reviewStarted = performance.now();
+      let review = groundingSession.lifecycle?.snapshot().budget.exhausted ? null : await requestGroundingReview({
+        apiBase, kind:"reply", text:draft, question:reviewQuestion, evidence:reviewSources, signal:abortSignal,
+        onUsage:(usage,model)=>groundingSession.lifecycle?.recordUsage("groundingReview",usage,{model}),
+      });
+      if (!groundingIsCurrent()) { streamRow.remove(); return {skipped:true}; }
+      const initialAccepted = Boolean(review);
+      let repairAttempted = false;
+      if (!review) {
+        repairAttempted = !groundingSession.lifecycle?.snapshot().budget.exhausted;
+        review = await requestGroundedReplyRepair({
+          apiBase, question:reviewQuestion, evidence:reviewSources, signal:abortSignal,
+          botName:assets?.displayName || "角色", isCurrent:groundingIsCurrent,
+          canSpend:()=>!groundingSession.lifecycle?.snapshot().budget.exhausted,
+          onUsage:(usage,model,kind)=>groundingSession.lifecycle?.recordUsage(kind,usage,{model}),
+        });
+      }
+      if (!groundingIsCurrent()) { streamRow.remove(); return {skipped:true}; }
+      if (!review && proactiveKind === "shared-experience") {
+        streamRow.remove();
+        return { skipped: true, failureReason: "grounding-rejected" };
+      }
+      const recallQuestion = /(?:刚才|刚刚|离开(?:了一会|一阵)?|漏听|之前|这段时间)/u.test(lastRealUserMessage()?.content || "");
+      const cautiousDraft = !review && recallQuestion && draft.length <= 240
+        && /(?:可能|好像|似乎|看起来|我猜|感觉|不太确定|大概|听得不算全|有点碎)/u.test(draft)
+        ? draft
+        : "";
+      // Historical recall benefits from a useful, explicitly hedged answer even
+      // when sentence-level citation review cannot match every ASR fragment.
+      // Keep it bounded and visibly uncertain; current-state questions remain fail-closed.
+      reply = review?.text || cautiousDraft || "这点我还没看明白，先不乱猜。";
+      emotion = null;
+      groundingAudit = {accepted:Boolean(review),removedParts:review?.removedParts ?? null,reviewMs:Math.round(performance.now()-reviewStarted),
+        initialAccepted,repairAttempted,repaired:Boolean(review?.draft),
+        ...(cautiousDraft ? {softAccepted:true} : {}),
+        ...(captureGroundingAudit ? {draft,repairedDraft:review?.draft || "",evidence:reviewSources,supports:review?.supports || []} : {})};
     }
 
     if (proactiveKind === "followup") {
@@ -2159,14 +2431,25 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         return { skipped: true };
       }
     }
+    if (proactiveKind === "shared-experience" && !isSharedExperienceProactiveReply(reply)) {
+      streamRow.remove();
+      return { skipped: true, failureReason: "style-rejected" };
+    }
 
     history.push({
       role: "assistant",
       content: reply,
       id: replyId,
-      ...(currentTurnDoNotRemember ? { doNotRemember: true } : {}),
+      ...(currentTurnDoNotRemember || sharedExperience.active ? { doNotRemember: true } : {}),
       ...(emotion ? { sticker: { emotion } } : {}),
     });
+    if (sharedExperience.active) memoryEnqueuedIds.add(replyId);
+    if (sharedExperience.active && (!proactiveKind || proactiveKind === "shared-experience")) {
+      await sharedExperience.lifecycle?.maybeRollSegment();
+      sharedExperience.workspace?.addChatTurn("assistant", reply, Date.now(), {
+        includeInSummary: proactiveKind !== "shared-experience",
+      });
+    }
 
     petSignal("reply", emotion);
     updateMoodFromReply(raw, emotion);
@@ -2178,12 +2461,12 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
         ? splitReply(reply).filter(Boolean)
         : null;
     const speakParts =
-      syncParts && useSpeakAlt
+      syncParts && useSpeakAlt && !groundingSession
         ? splitSpeechChunks(speakText)
         : null;
-    // 双语卡若模型漏了 [[speak]]：只显示中文，别用英文参考音硬读中文。
+    // 未审查的双语备稿不能绕过事实审查，也不能用英文参考音硬读中文。
     const skipSpeakMissingEn =
-      needsBilingualTts(assets?.tts) && !useSpeakAlt;
+      needsBilingualTts(assets?.tts) && (Boolean(groundingSession) || !useSpeakAlt);
     if (skipSpeakMissingEn && chatDebugEnabled()) {
       console.warn("[chat] 双语卡缺 [[speak]] 英文稿，跳过朗读", {
         bilingual: bilingual.bilingual,
@@ -2209,9 +2492,18 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
       if (replySticker) addStickerBubble(replySticker, { linkedMid: replyId });
     }
 
-    void maybeUpdateRecap();
-    return { skipped: false, speechDone };
+    if (proactiveKind === "shared-experience" && (!syncParts || !syncParts.length || skipSpeakMissingEn)) {
+      streamRow.classList.remove("proactive-pending");
+    }
+
+    if (!sharedExperience.active) void maybeUpdateRecap();
+    return { skipped: false, speechDone, groundingAudit };
   } catch (e) {
+    if (abortSignal?.aborted || e?.name === "AbortError") {
+      streamRow.remove();
+      petSignal("abort");
+      return { skipped: true, cancelled: true };
+    }
     if (localGenStarted) {
       finishLocalTextGen({ error: e.message || String(e) });
       localGenStarted = false;
@@ -2226,11 +2518,53 @@ async function streamAssistantReply(streamBubble, streamRow, { proactiveKind, pa
 
 async function send(text, opts = {}) {
   text = (text || "").trim();
+  if (text && sharedExperience.active && sharedExperience.proactivePromise) {
+    await cancelSharedExperienceProactive("user-active", { stopAudio: true });
+  }
+  const viewingStatement = sharedExperience.active
+    ? parseSharedExperienceViewingStatement(text)
+    : null;
+  const requestPolicy = sharedExperienceRequestPolicy(sharedExperience.active);
   resetFreshIdleTimer();
   currentTurnDoNotRemember = asksNotToRemember(text);
+  if (sharedExperience.active && looksLikeTemporaryPauseRequest(text)) pauseSharedExperience();
   const image = pendingImage;
   const sticker = opts.sticker || pendingSticker || null;
   if ((!text && !image && !sticker) || busy) return;
+  if (viewingStatement) {
+    sharedExperience.contentTitle = viewingStatement.title;
+    void (async () => {
+      if (!apiBase || !apiBase.startsWith("http://")) await ensureApiBase();
+      const primer = await sharedExperience.primerGate?.consider({
+        apiBase,
+        userStatement: viewingStatement.statement,
+        enabled: settings.webGroundingEnabled === true,
+        provider: settings.webGroundingProvider || "none",
+      });
+      if (!sharedExperience.active || !primer) return;
+      sharedExperience.workspace?.addPrimer(primer);
+      sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), primer: primer.facts.join("；") });
+      sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+      renderSharedExperienceDebug();
+    })();
+  }
+  // 共同体验提问必须先取得真实画面或声音证据。采集与推理解耦后，不能只等
+  // “恰好正在运行”的视觉请求，否则队列尚未开始处理时仍会空上下文回答。
+  if (sharedExperience.active && !sharedExperience.workspace?.hasEvidence()) {
+    const deadline = Date.now() + 12_000;
+    sharedExperience.typingUntil = 0;
+    sharedExperience.spool?.resumeInference("typing");
+    while (Date.now() < deadline && !sharedExperience.workspace?.hasEvidence()) {
+      await processSharedExperienceOnce();
+      if (sharedExperience.workspace?.hasEvidence()) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 120));
+    }
+  } else if (sharedExperience.pendingObservation) {
+    await Promise.race([
+      sharedExperience.pendingObservation.catch(() => {}),
+      new Promise((resolve) => window.setTimeout(resolve, 12_000)),
+    ]);
+  }
   setBusy(true);
   clearPendingImage();
   clearPendingSticker();
@@ -2249,6 +2583,7 @@ async function send(text, opts = {}) {
   streamRow.classList.add("streaming");
   petSignal("thinking");
 
+  let mainResult = null;
   try {
     let caption = "";
     if (image && !usesDeepseekMultimodalModel(settings)) {
@@ -2257,28 +2592,40 @@ async function send(text, opts = {}) {
       streamBubble.textContent = "";
     }
 
+    if (sharedExperience.active) await sharedExperience.lifecycle?.maybeRollSegment();
     history.push({
       role: "user",
       content: text,
       id: userId,
-      ...(currentTurnDoNotRemember ? { doNotRemember: true } : {}),
+      ...(currentTurnDoNotRemember || sharedExperience.active ? { doNotRemember: true } : {}),
       ...(caption ? { imageCaption: caption } : {}),
       ...(image ? { images: [image.dataUrl] } : {}),
       ...(sticker ? { sticker } : {}),
     });
+    if (sharedExperience.active) memoryEnqueuedIds.add(userId);
+    if (sharedExperience.active && text) {
+      sharedExperience.workspace?.addChatTurn("user", text, Date.now(), {
+        confirmed: Boolean(viewingStatement),
+        includeInSummary: opts.sharedExperienceTest !== true,
+      });
+    }
     const userMood = detectShortTermConversationMood(text);
     if (userMood === "low") setMoodVisual("low");
     else if (userMood === "tense") setMoodVisual("tense");
     else if (userMood === "bright") setMoodVisual("bright");
     const familiarityCandidate = prepareFamiliarity(text);
-    if (text && !currentTurnDoNotRemember) void inferAndPersistTopicPreferences(text);
+    if (!sharedExperience.active && text && !currentTurnDoNotRemember) void inferAndPersistTopicPreferences(text);
 
-    const mainResult = await streamAssistantReply(streamBubble, streamRow, { replyId });
+    mainResult = await streamAssistantReply(streamBubble, streamRow, {
+      replyId,
+      focusEvidenceIds: opts.sharedExperienceFocusEventIds,
+      captureGroundingAudit: opts.sharedExperienceTest === true,
+    });
     // 只有整轮回复成功后才结算关系变化；请求失败、取消或空回复不改变长期分数。
     commitFamiliarity(familiarityCandidate);
 
     const reply = history[history.length - 1]?.content || "";
-    if (shouldDoFollowup(text, reply, DEFAULT_FOLLOWUP_CHANCE)) {
+    if (requestPolicy.automaticFollowup && shouldDoFollowup(text, reply, DEFAULT_FOLLOWUP_CHANCE)) {
       // 先等主回复「文字+语音」同步出现完成，再出 followup 第二行，避免两行光标同时冒出。
       if (mainResult?.speechDone) {
         try {
@@ -2323,6 +2670,7 @@ async function send(text, opts = {}) {
     setBusy(false);
     scrollBottom();
   }
+  return mainResult;
 }
 
 /** 双击元元头像：拍一拍，触发俏皮主动回复。 */
@@ -3012,6 +3360,7 @@ async function startCall() {
     onTransportReset: () => callAudibleTurns.clear(),
     onAsrStart: () => {
       // 新一轮用户说话：定稿上一轮用户气泡（若有），并打断助手。
+      if (sharedExperience.active) sharedExperience.spool?.pauseInference("realtime-asr");
       finalizeCallUserBubble();
       finalizeCallAsstBubble();
       petSignal("user");
@@ -3023,6 +3372,10 @@ async function startCall() {
       if (meta?.interim === false) void inferAndPersistTopicPreferences(text);
     },
     onAsrEnd: () => {
+      if (sharedExperience.active) {
+        sharedExperience.spool?.resumeInference("realtime-asr");
+        void processSharedExperienceOnce();
+      }
       finalizeCallUserBubble();
       setCallCapsuleStatus("通话中");
     },
@@ -3196,6 +3549,756 @@ function toggleStickerPanel() {
   else closeStickerPanel();
 }
 
+function setSharedExperienceStatus(text, { error = false } = {}) {
+  if (!sharedExperienceStatus) return;
+  sharedExperienceStatus.hidden = !text;
+  sharedExperienceStatus.textContent = text || "";
+  sharedExperienceStatus.classList.toggle("error", error);
+}
+
+function setSharedExperienceContentMode(mode, { announce = true } = {}) {
+  if (!sharedExperience.active || !sharedExperience.workspace) return false;
+  const nextMode = normalizeSharedExperienceContentMode(mode);
+  const previousMode = sharedExperience.workspace.snapshot().contentMode;
+  if (nextMode === previousMode) return false;
+  sharedExperience.workspace.setContentMode(nextMode);
+  if (sharedExperienceMode) sharedExperienceMode.value = nextMode;
+  syncSharedExperienceProactive();
+  if (announce) {
+    const label = sharedExperienceMode?.selectedOptions?.[0]?.textContent || "未选择";
+    setSharedExperienceStatus(`共同体验 · 已切换情境：${label}`);
+  }
+  renderSharedExperienceDebug();
+  return true;
+}
+
+async function summarizeSharedExperience({ kind, source, evidence, contentMode }) {
+  if (!apiBase || !apiBase.startsWith("http://")) {
+    const ready = await ensureApiBase();
+    if (!ready) throw new Error("DeepSeek 代理未就绪");
+  }
+  const result = await requestSharedExperienceSummary({ apiBase, kind, source, evidence, contentMode });
+  void fetchDeepSeekBalance(sharedExperience.lifecycle);
+  return {
+    ...result,
+    model: result.model || settings.textModel || "deepseek-flash",
+    atMs: Date.now(),
+  };
+}
+
+async function persistSharedExperienceEpisode(episode) {
+  const nickname = activeName || userDisplayName();
+  if (!nickname) throw new Error("当前人设没有可用的记忆昵称");
+  return invoke("memory_record_shared_experience", {
+    request: {
+      cardId: settings.personaCardId || "",
+      nickname,
+      sessionId: episode.sessionId,
+      summary: episode.summary,
+      occurredAt: Math.max(1, Math.floor(episode.occurredAtMs / 1000)),
+    },
+  });
+}
+
+function stopSharedExperienceCapture() {
+  void cancelSharedExperienceProactive("stopped", { stopAudio: true, stopAudioWhenIdle: true });
+  if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+  sharedExperience.proactiveTimer = 0;
+  if (sharedExperience.timer) window.clearTimeout(sharedExperience.timer);
+  if (sharedExperience.captureTimer) window.clearTimeout(sharedExperience.captureTimer);
+  if (sharedExperience.audioTimer) window.clearTimeout(sharedExperience.audioTimer);
+  sharedExperience.timer = 0;
+  sharedExperience.captureTimer = 0;
+  sharedExperience.audioTimer = 0;
+  sharedExperience.active = false;
+  sharedExperience.generation += 1;
+  sharedExperience.paused = false;
+  sharedExperience.observing = false;
+  sharedExperience.transcribing = false;
+  sharedExperience.capturing = false;
+  sharedExperience.capturingAudio = false;
+  sharedExperience.visualWindowQueued = false;
+  activeVisualContext = null;
+  clearMoodVisual();
+  void invoke("stop_shared_experience").catch(() => {});
+  if (sharedExperienceBtn) sharedExperienceBtn.classList.remove("on");
+  if (sharedExperiencePauseBtn) sharedExperiencePauseBtn.hidden = true;
+  if (sharedExperienceStopBtn) sharedExperienceStopBtn.hidden = true;
+  if (typeof sharedExperienceMode !== "undefined" && sharedExperienceMode) {
+    sharedExperienceMode.hidden = true;
+    sharedExperienceMode.value = "unknown";
+  }
+  if (typeof sharedExperienceFrequency !== "undefined" && sharedExperienceFrequency) {
+    sharedExperienceFrequency.hidden = true;
+    sharedExperienceFrequency.value = "standard";
+  }
+}
+
+function scheduleSharedExperienceRollover() {
+  if (sharedExperience.timer) window.clearTimeout(sharedExperience.timer);
+  sharedExperience.timer = 0;
+  if (!sharedExperience.active || sharedExperience.paused || !sharedExperience.workspace) return;
+  const snapshot = sharedExperience.workspace.snapshot();
+  const dueAtMs = snapshot.segmentStartedAtMs + snapshot.segmentDurationMs;
+  const delayMs = Math.max(0, dueAtMs - Date.now());
+  sharedExperience.timer = window.setTimeout(async () => {
+    sharedExperience.timer = 0;
+    if (!sharedExperience.active || sharedExperience.paused) return;
+    await sharedExperience.lifecycle?.maybeRollSegment(Date.now());
+    scheduleSharedExperienceRollover();
+  }, delayMs);
+}
+
+function clearSharedExperienceData() {
+  sharedExperience.proactiveRunner?.cancel("stopped");
+  sharedExperience.spool?.clear();
+  sharedExperience.workspace?.clear();
+  sharedExperience.spool = null;
+  sharedExperience.workspace = null;
+  sharedExperience.lifecycle = null;
+  sharedExperience.voiceTracker = null;
+  sharedExperience.runtimeReceipts = null;
+  sharedExperience.primerGate = null;
+  sharedExperience.characterTracker?.clear();
+  sharedExperience.characterTracker = null;
+  sharedExperience.proactiveRunner = null;
+  sharedExperience.proactivePromise = null;
+  sharedExperience.windowId = null;
+  sharedExperience.windowLabel = "";
+  sharedExperience.contentTitle = "";
+  sharedExperience.capturedVisual = 0;
+  sharedExperience.capturedAudio = 0;
+  sharedExperience.captureTimeline = { visual: [], audio: [] };
+  sharedExperience.processedVisual = 0;
+  sharedExperience.processedAudio = 0;
+  sharedExperience.filteredVisualIdentities = 0;
+  sharedExperience.lastAudioCaptureEndMs = 0;
+  sharedExperience.visualWindowQueued = false;
+  sharedExperience.visualDiagnostics = null;
+}
+
+function stopSharedExperience({ silent = false, finalize = true } = {}) {
+  if (sharedExperience.stopPromise) {
+    if (!finalize) sharedExperience.lifecycle?.cancel();
+    return sharedExperience.stopPromise;
+  }
+  if (!sharedExperience.active && !sharedExperience.lifecycle) return Promise.resolve(null);
+  const lifecycle = sharedExperience.lifecycle;
+  stopSharedExperienceCapture();
+  setCompanionAudioActive(false);
+  if (!finalize) {
+    lifecycle?.cancel();
+    clearSharedExperienceData();
+    if (!silent) setSharedExperienceStatus("共同体验已停止");
+    return Promise.resolve({ cancelled: true });
+  }
+  if (!silent) setSharedExperienceStatus("共同体验已停止 · 正在整理观看总结…");
+  const promise = (async () => {
+    let result = null;
+    try {
+      result = await lifecycle?.finalize({ endedAtMs: Date.now() });
+      if (!silent) {
+        const suffix = result?.stored
+          ? "总结已写入记忆"
+          : result?.reason === "no-evidence"
+            ? "没有取得可用内容"
+          : result?.reason === "summary-failed"
+              ? "最终总结失败，未写入记忆"
+              : result?.reason === "summary-fallback"
+                ? "最终总结超时，已保存降级回顾"
+              : "总结完成，记忆写入失败";
+        setSharedExperienceStatus(`共同体验已停止 · ${suffix}`, {
+          error: Boolean(result && !result.stored && result.reason !== "no-evidence"),
+        });
+      }
+      return result;
+    } finally {
+      clearSharedExperienceData();
+      sharedExperience.stopPromise = null;
+    }
+  })();
+  sharedExperience.stopPromise = promise;
+  return promise;
+}
+
+function pauseSharedExperience() {
+  if (!sharedExperience.active || sharedExperience.paused) return;
+  if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+  sharedExperience.proactiveTimer = 0;
+  if (sharedExperience.timer) window.clearTimeout(sharedExperience.timer);
+  sharedExperience.timer = 0;
+  if (sharedExperience.captureTimer) window.clearTimeout(sharedExperience.captureTimer);
+  if (sharedExperience.audioTimer) window.clearTimeout(sharedExperience.audioTimer);
+  sharedExperience.captureTimer = 0;
+  sharedExperience.audioTimer = 0;
+  sharedExperience.paused = true;
+  void invoke("stop_shared_experience_frame_stream").catch(() => {});
+  void cancelSharedExperienceProactive("paused", { stopAudio: true, stopAudioWhenIdle: true });
+  sharedExperience.spool?.pauseInference("manual");
+  if (sharedExperiencePauseBtn) { sharedExperiencePauseBtn.textContent = "▶"; sharedExperiencePauseBtn.title = "继续观看"; sharedExperiencePauseBtn.setAttribute("aria-label", "继续观看"); }
+  setSharedExperienceStatus("共同体验已暂停（聊天窗口隐藏）");
+}
+
+function resumeSharedExperience() {
+  if (!sharedExperience.active || !sharedExperience.paused) return;
+  sharedExperience.paused = false;
+  sharedExperience.spool?.resumeInference("manual");
+  if (sharedExperiencePauseBtn) { sharedExperiencePauseBtn.textContent = "Ⅱ"; sharedExperiencePauseBtn.title = "暂停观看"; sharedExperiencePauseBtn.setAttribute("aria-label", "暂停观看"); }
+  setSharedExperienceStatus(`共同体验 · ${sharedExperience.windowLabel}`);
+  scheduleSharedExperienceRollover();
+  startSharedExperienceProactiveTicker();
+  void captureSharedExperienceOnce();
+  void captureSharedExperienceAudioOnce();
+  void observeSharedExperienceOnce();
+  void transcribeSharedExperienceOnce();
+}
+
+function looksLikeTemporaryPauseRequest(text) {
+  return /(?:等下|等一会|等会儿|等会|我去拿|我去取|马上回来|先暂停|暂停观看|暂停一下|暂时别看)/.test(String(text || ""));
+}
+
+function cancelSharedExperienceProactive(reason, { stopAudio = false, stopAudioWhenIdle = false } = {}) {
+  const pending = sharedExperience.proactivePromise;
+  cancelSharedExperienceProactiveWork({
+    runner: sharedExperience.proactiveRunner,
+    reason,
+    stopOutput: stopAudio
+      ? () => {
+          stopSpeak();
+          resetTtsQueue();
+        }
+      : null,
+    stopOutputWhenIdle: stopAudioWhenIdle,
+  });
+  return pending || Promise.resolve(null);
+}
+
+function syncSharedExperienceProactive(overrides = {}) {
+  if (!sharedExperience.active) return;
+  const config = resolveSharedExperienceProactiveConfig(settings, {
+    contentMode: sharedExperience.workspace?.snapshot().contentMode,
+    ...overrides,
+  });
+  if (!config.enabled) {
+    void cancelSharedExperienceProactive("settings-changed", { stopAudio: true });
+    if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+    sharedExperience.proactiveTimer = 0;
+    sharedExperience.proactiveRunner = null;
+    if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+    return;
+  }
+  if (sharedExperience.proactiveRunner?.reconfigure) {
+    void cancelSharedExperienceProactive("settings-changed", { stopAudio: true });
+    sharedExperience.proactiveRunner.reconfigure({
+      frequency: config.frequency,
+      firstDelayMs: config.firstDelayMs,
+      minIntervalMs: config.minIntervalMs,
+      jitterMs: config.jitterMs,
+      atMs: Date.now(),
+    });
+    if (sharedExperienceFrequency) sharedExperienceFrequency.value = config.frequency;
+    startSharedExperienceProactiveTicker();
+    if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+    return;
+  }
+  const proactiveDirector = createSharedExperienceProactiveDirector({
+    startedAtMs: Date.now(),
+    firstDelayMs: config.firstDelayMs,
+    minIntervalMs: config.minIntervalMs,
+    frequency: config.frequency,
+    earlyIntervalMs: null,
+    followOnWindowMs: 90_000,
+    jitterMs: config.jitterMs,
+    // Let the restarted session collect a small opening timeline before its
+    // first proactive request, avoiding grounding retries on one partial frame.
+    warmupMinEvents: 2,
+    initialOrientation: true,
+  });
+  sharedExperience.proactiveRunner = createSharedExperienceProactiveRunner({
+    director: proactiveDirector,
+    currentState: () => ({
+      userActive: sharedExperience.typingUntil > Date.now() || Boolean(inputEl?.value?.trim()),
+      paused: sharedExperience.paused,
+      busy: busy || callActive,
+      speaking: autoSpeechJobs.size > 0,
+    }),
+    generate: generateSharedExperienceProactive,
+  });
+  startSharedExperienceProactiveTicker();
+}
+
+function startSharedExperienceProactiveTicker() {
+  if (sharedExperience.proactiveTimer) window.clearInterval(sharedExperience.proactiveTimer);
+  sharedExperience.proactiveTimer = 0;
+  if (!sharedExperience.active || sharedExperience.paused || !sharedExperience.proactiveRunner) return;
+  sharedExperience.proactiveTimer = window.setInterval(() => {
+    maybeTriggerSharedExperienceProactive();
+    renderSharedExperienceDebug();
+  }, 1_000);
+}
+
+async function generateSharedExperienceProactive({ reason, evidenceIds, signal }) {
+  if (!sharedExperience.active || sharedExperience.paused || signal.aborted) return { emitted: false };
+  const generation = sharedExperience.generation;
+  const triggerId = genMsgId();
+  const replyId = genMsgId();
+  history.push({ role: "user", content: getProactiveUserTrigger("shared-experience"), id: triggerId, doNotRemember: true });
+  memoryEnqueuedIds.add(triggerId);
+  const streamBubble = addBubble("assistant", "", { mid: replyId });
+  const streamRow = streamBubble.closest(".row");
+  streamRow.classList.add("streaming");
+  streamRow.classList.add("proactive-pending");
+  petSignal("thinking");
+  setBusy(true, { allowTextInput: true });
+  try {
+    const result = await streamAssistantReply(streamBubble, streamRow, {
+      proactiveKind: "shared-experience",
+      replyId,
+      focusEvidenceIds: evidenceIds,
+      groundingQuestion: sharedExperienceProactiveGroundingPrompt(reason, sharedExperience.workspace?.snapshot().contentMode),
+      captureGroundingAudit: true,
+      abortSignal: signal,
+    });
+    if (signal.aborted || result?.skipped || !sharedExperience.active || sharedExperience.generation !== generation) {
+      if (result?.failureReason && sharedExperience.active && sharedExperience.generation === generation) {
+        sharedExperience.debugEntries ||= [];
+        sharedExperience.debugEntries.push({
+          at: new Date().toLocaleTimeString(),
+          proactive: `${reason} · ${evidenceIds.join(",")} · 失败：${result.failureReason}`,
+        });
+        sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+        if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+      }
+      return { emitted: false, failureReason: result?.failureReason || "stale-session" };
+    }
+    const ttsReceipt = result?.speechDone ? await result.speechDone : null;
+    if (signal.aborted || !sharedExperience.active || sharedExperience.generation !== generation) return { emitted: false, ttsReceipt };
+    const text = history.findLast((message) => message?.id === replyId && message.role === "assistant")?.content || "";
+    if (ttsReceipt?.status === "completed") sharedExperience.workspace?.markInitialOrientationComplete?.();
+    sharedExperience.debugEntries.push({
+      at: new Date().toLocaleTimeString(),
+      proactive: `${reason} · ${evidenceIds.join(",")} · ${ttsReceipt?.status || "text"}${ttsReceipt?.stream ? ` · 音频欠载${ttsReceipt.stream.underrunCount}次/最大空档${ttsReceipt.stream.maxGapMs}ms` : ""}`,
+    });
+    sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+    renderSharedExperienceDebug();
+    return { emitted: Boolean(text), text, ttsReceipt };
+  } catch (error) {
+    streamRow.remove();
+    if (sharedExperience.active && sharedExperience.generation === generation) {
+      sharedExperience.debugEntries ||= [];
+      sharedExperience.debugEntries.push({
+        at: new Date().toLocaleTimeString(),
+        proactive: `${reason} · ${evidenceIds.join(",")} · 失败：${error?.message || "generation-failed"}`,
+      });
+      sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+      if (typeof renderSharedExperienceDebug === "function") renderSharedExperienceDebug();
+    }
+    throw error;
+  } finally {
+    const triggerIndex = history.findIndex((message) => message?.id === triggerId);
+    if (triggerIndex >= 0 && !history.slice(triggerIndex + 1).some((message) => message?.id === replyId)) history.splice(triggerIndex, 1);
+    // A cancelled request from the previous viewing session must not clear the
+    // busy state established by a newly connected session.
+    if (!sharedExperience.active || sharedExperience.generation === generation) {
+      setBusy(false, { focusInput: false });
+    }
+    scrollBottom();
+  }
+}
+
+function maybeTriggerSharedExperienceProactive() {
+  if (!sharedExperience.active || !sharedExperience.proactiveRunner || sharedExperience.proactivePromise) return;
+  const runner = sharedExperience.proactiveRunner;
+  const promise = runner.consider(sharedExperience.workspace?.snapshot()).catch(() => ({ started: false, reason: "failed" }));
+  sharedExperience.proactivePromise = promise;
+  void promise.finally(() => {
+    if (sharedExperience.proactivePromise === promise) sharedExperience.proactivePromise = null;
+  });
+}
+
+async function observeSharedExperienceOnce() {
+  return processSharedExperienceOnce();
+}
+
+async function transcribeSharedExperienceOnce() {
+  return processSharedExperienceOnce();
+}
+
+async function processSharedExperienceOnce() {
+  if (!sharedExperience.active || sharedExperience.paused || sharedExperience.processing) return;
+  const generation = sharedExperience.generation;
+  sharedExperience.processing = true;
+  let inferenceKind = null;
+  try {
+    if (sharedExperience.typingUntil > Date.now()) {
+      sharedExperience.spool?.pauseInference("typing");
+      return;
+    }
+    sharedExperience.spool?.resumeInference("typing");
+    const next = sharedExperience.spool?.drain(1)?.[0];
+    if (!next) return;
+    inferenceKind = next.kind === "visual" ? "vision" : "asr";
+    if (next.kind === "visual") {
+      sharedExperience.visualWindowQueued = false;
+      sharedExperience.observing = true;
+      const requestStartedAt = performance.now();
+      const request = invoke("observe_shared_experience_frames", { frames: next.payload.frames });
+      sharedExperience.pendingObservation = request;
+      const payload = await request;
+      if (!sharedExperience.active || sharedExperience.generation !== generation) return;
+      const safe = bindVisualObservationToCapture(payload, next.capturedAtMs);
+      if (!safe) throw new Error("视觉服务返回无效结果");
+      sharedExperience.runtimeReceipts?.recordVision(payload);
+      inferenceKind = null;
+      const filtered = filterVisualIdentityClaims(safe.summary);
+      if (filtered.identityFiltered) sharedExperience.filteredVisualIdentities += 1;
+      const mediaText = videoQuestionEvidence({kind:"visual",text:filtered.summary}).text;
+      const accepted = mediaText ? { ...safe, summary: mediaText } : null;
+      await sharedExperience.lifecycle?.maybeRollSegment(safe.capturedAtMs);
+      if (accepted) {
+        activeVisualContext = accepted;
+        const evidence = sharedExperience.workspace?.addVisualObservation(accepted);
+        extractVisualCharacterDescriptors(accepted.summary).forEach((descriptor) => {
+          sharedExperience.characterTracker?.observe({
+            descriptor,
+            atMs: accepted.capturedAtMs,
+            evidenceId: evidence?.id,
+          });
+        });
+        void sharedExperience.lifecycle?.maybeCompactEvidence();
+        maybeTriggerSharedExperienceProactive();
+      }
+      sharedExperience.processedVisual += 1;
+      const latencyMs = Math.round(performance.now() - requestStartedAt);
+      sharedExperience.debugEntries.push({
+        at: new Date().toLocaleTimeString(),
+        latencyMs,
+        summary: accepted?.summary || "身份猜测或非视频界面已过滤，本帧未进入证据链。",
+        identityFiltered: filtered.identityFiltered,
+        visualWindow: `${next.payload.state}/${next.payload.reason} · ${next.payload.frames.length}/${next.payload.sampledFrames}`,
+      });
+      sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+      renderSharedExperienceDebug();
+      setSharedExperienceStatus(`共同体验 · ${sharedExperience.windowLabel} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
+    } else if (next.kind === "audio") {
+      sharedExperience.transcribing = true;
+      const request = invoke("transcribe_shared_experience_audio", { wavBase64: next.payload.wavBase64 });
+      sharedExperience.pendingAudio = request;
+      const result = await request;
+      if (!sharedExperience.active || sharedExperience.generation !== generation) return;
+      const text = String(result?.text || "").trim();
+      sharedExperience.runtimeReceipts?.recordAsr(result);
+      inferenceKind = null;
+      if (text) {
+        sharedExperience.processedAudio += 1;
+        await sharedExperience.lifecycle?.maybeRollSegment(next.capturedAtMs);
+        sharedExperience.workspace?.addAudioObservation({
+          text,
+          startedAtMs: next.capturedAtMs,
+          endedAtMs: next.capturedAtMs + Number(next.payload.durationMs || 0),
+          source: "sensevoice2",
+        });
+        void sharedExperience.lifecycle?.maybeCompactEvidence();
+        maybeTriggerSharedExperienceProactive();
+        sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), audio: text });
+        sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+        renderSharedExperienceDebug();
+      }
+    }
+  } catch (error) {
+    if (sharedExperience.generation === generation) sharedExperience.runtimeReceipts?.recordFailure(inferenceKind);
+    sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), error: error?.message || "共同体验推理失败" });
+    sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+    renderSharedExperienceDebug();
+  } finally {
+    sharedExperience.pendingAudio = null;
+    sharedExperience.pendingObservation = null;
+    sharedExperience.observing = false;
+    sharedExperience.transcribing = false;
+    sharedExperience.processing = false;
+    const spoolSnapshot = sharedExperience.spool?.snapshot();
+    const pending = spoolSnapshot?.pending || 0;
+    if (sharedExperience.active && !sharedExperience.paused && !spoolSnapshot?.inferencePaused && pending > 0) {
+      window.setTimeout(() => { void processSharedExperienceOnce(); }, 0);
+    }
+  }
+}
+
+async function captureSharedExperienceOnce() {
+  if (!sharedExperience.active || sharedExperience.paused || sharedExperience.capturing) return;
+  const generation = sharedExperience.generation;
+  sharedExperience.capturing = true;
+  let failed = false;
+  try {
+    if (sharedExperience.visualWindowQueued) return;
+    const capture = await invoke("capture_shared_experience_frame", { windowId: sharedExperience.windowId });
+    if (!sharedExperience.active || sharedExperience.generation !== generation) return;
+    const normalized = normalizeSharedExperienceVisualCapture(capture);
+    if (!normalized) throw new Error("窗口视觉采样返回无效");
+    sharedExperience.visualDiagnostics = normalized.diagnostics;
+    if (normalized.pending) {
+      renderSharedExperienceDebug();
+      return;
+    }
+    const item = sharedExperience.spool?.push({
+      kind: "visual",
+      capturedAtMs: normalized.window.capturedAtMs,
+      payload: normalized.window,
+    });
+    if (!item) throw new Error("视觉窗口超过临时队列容量");
+    sharedExperience.visualWindowQueued = true;
+    sharedExperience.capturedVisual += 1;
+    recordSharedExperienceCapture("visual", normalized.window.capturedAtMs);
+    renderSharedExperienceDebug();
+    if (sharedExperience.typingUntil > Date.now()) {
+      sharedExperience.spool?.pauseInference("typing");
+      setSharedExperienceStatus(`共同体验 · ${sharedExperience.windowLabel} · 输入期间持续采集`);
+    } else {
+      sharedExperience.spool?.resumeInference("typing");
+      void processSharedExperienceOnce();
+    }
+  } catch (error) {
+    failed = true;
+    sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), error: error?.message || "采集失败" });
+    sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+    renderSharedExperienceDebug();
+    setSharedExperienceStatus(`共同体验暂停：${error?.message || "采集失败"}`, { error: true });
+  } finally {
+    sharedExperience.capturing = false;
+    if (sharedExperience.active && !sharedExperience.paused) {
+      sharedExperience.captureTimer = window.setTimeout(
+        captureSharedExperienceOnce,
+        sharedExperienceCaptureDelay({ kind: "visual", failed }),
+      );
+    }
+  }
+}
+
+async function captureSharedExperienceAudioOnce() {
+  if (!sharedExperience.active || sharedExperience.paused || sharedExperience.capturingAudio) return;
+  const generation = sharedExperience.generation;
+  sharedExperience.capturingAudio = true;
+  let failed = false;
+  try {
+    // Longer chunks reduce ScreenCaptureKit helper restart gaps while keeping ASR latency bounded.
+    const capture = await invoke("capture_shared_experience_audio", { windowId: sharedExperience.windowId, durationMs: 10000 });
+    if (!sharedExperience.active || sharedExperience.generation !== generation) return;
+    const wavBase64 = String(capture?.wavBase64 || "");
+    if (!wavBase64) throw new Error("窗口音频返回为空");
+    sharedExperience.spool?.push({
+      kind: "audio",
+      capturedAtMs: capture?.capturedAtMs,
+      payload: { wavBase64, durationMs: Number(capture?.durationMs || 10000) },
+    });
+    const startedAtMs = Number(capture?.capturedAtMs || Date.now());
+    const durationMs = Number(capture?.durationMs || 10000);
+    const endedAtMs = startedAtMs + durationMs;
+    const audioGapMs = sharedExperience.lastAudioCaptureEndMs
+      ? Math.max(0, startedAtMs - sharedExperience.lastAudioCaptureEndMs)
+      : 0;
+    sharedExperience.lastAudioCaptureEndMs = endedAtMs;
+    sharedExperience.capturedAudio += 1;
+    recordSharedExperienceCapture("audio");
+    sharedExperience.debugEntries.push({
+      at: new Date().toLocaleTimeString(),
+      audioCapture: `${new Date(startedAtMs).toLocaleTimeString()}–${new Date(endedAtMs).toLocaleTimeString()}${audioGapMs > 0 ? ` · 空档 ${audioGapMs}ms` : ""}`,
+    });
+    sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+    renderSharedExperienceDebug();
+    if (sharedExperience.typingUntil > Date.now()) sharedExperience.spool?.pauseInference("typing");
+    else {
+      sharedExperience.spool?.resumeInference("typing");
+      void processSharedExperienceOnce();
+    }
+  } catch (error) {
+    failed = true;
+    sharedExperience.debugEntries.push({ at: new Date().toLocaleTimeString(), error: error?.message || "音频采集失败" });
+    sharedExperience.debugEntries = sharedExperience.debugEntries.slice(-20);
+    renderSharedExperienceDebug();
+  } finally {
+    sharedExperience.capturingAudio = false;
+    if (sharedExperience.active && !sharedExperience.paused) {
+      sharedExperience.audioTimer = window.setTimeout(captureSharedExperienceAudioOnce, sharedExperienceCaptureDelay({ kind: "audio", failed }));
+    }
+  }
+}
+
+function renderSharedExperienceDebug() {
+  if (!sharedExperienceDebugOutput) return;
+  sharedExperienceDebugOutput.textContent = sharedExperience.debugEntries.map((entry) => entry.error
+    ? `[${entry.at}] ERROR ${entry.error}`
+    : entry.audio
+      ? `[${entry.at}] ASR\n${entry.audio}`
+    : entry.audioCapture
+      ? `[${entry.at}] 音频采集\n${entry.audioCapture}`
+    : entry.primer
+      ? `[${entry.at}] 无剧透身份参考\n${entry.primer}`
+    : entry.proactive
+      ? `[${entry.at}] 主动评论\n${entry.proactive}`
+      : `[${entry.at}] ${entry.latencyMs} ms${entry.visualWindow ? ` · 窗口 ${entry.visualWindow}` : ""}${entry.identityFiltered ? " · 身份猜测已过滤" : ""}\n${entry.summary}`).join("\n\n");
+  if (sharedExperienceDebugMeta) {
+    const lifecycle = sharedExperience.lifecycle?.snapshot();
+    const usage = lifecycle?.usage;
+    const totalRequests = Object.values(usage || {}).reduce((total, bucket) => total + (bucket.requests || 0), 0);
+    const totalTokens = Object.values(usage || {}).reduce((total, bucket) => total + (bucket.total || 0), 0);
+    const cost = lifecycle?.budget.estimatedCostUsd || 0;
+    const balance = lifecycle?.balance;
+    const balanceText = balance?.current === null
+      ? ""
+      : ` · 余额 ${balance.currency} ${balance.starting.toFixed(2)}→${balance.current.toFixed(2)}（${balance.delta.toFixed(2)}）`;
+    const proactive = sharedExperienceProactiveDiagnostics(sharedExperience.proactiveRunner?.snapshot(), Date.now());
+    const frequencyLabel = { low: "低频", standard: "标准", frequent: "高频" }[proactive.frequency];
+    const countdown = proactive.pending
+      ? "处理中"
+      : proactive.nextEligibleInMs > 0
+        ? `${Math.ceil(proactive.nextEligibleInMs / 1000)}s`
+        : "可尝试";
+    const suppressed = Object.entries(proactive.suppressions)
+      .filter(([, count]) => Number(count) > 0)
+      .sort((left, right) => Number(right[1]) - Number(left[1]))[0];
+    const lastSpoken = proactive.lastSpokenAgoMs === null
+      ? "尚未发言"
+      : `上次${Math.ceil(proactive.lastSpokenAgoMs / 1000)}s前`;
+    const actualGap = proactive.lastCompletedIntervalMs === null
+      ? ""
+      : ` · 实际间隔${Math.ceil(proactive.lastCompletedIntervalMs / 1000)}s/最长${Math.ceil(proactive.maxCompletedIntervalMs / 1000)}s`;
+    const turnDuration = proactive.lastTurnDurationMs === null
+      ? ""
+      : ` · 上轮生成播放${(proactive.lastTurnDurationMs / 1000).toFixed(1)}s`;
+    const waiting = proactive.currentSuppressionReason
+      ? ` · 当前等待 ${proactive.currentSuppressionReason} ${Math.ceil(proactive.currentSuppressionForMs / 1000)}s`
+      : "";
+    const proactiveText = sharedExperience.proactiveRunner
+      ? ` · 情境${({ "game-narrated": "游戏解说", "short-video": "短视频", narrated: "解说", cinematic: "影视", livestream: "直播", "low-speech-game": "游戏", direct: "直接观看" })[sharedExperience.workspace?.snapshot().contentMode] || "待识别"} · 主动${frequencyLabel} 完成${proactive.completed}/失败${proactive.failed}/取消${proactive.cancelled} · ${lastSpoken}${actualGap}${turnDuration} · 下次最早 ${countdown}${waiting}${suppressed ? ` · 主要等待 ${suppressed[0]}×${suppressed[1]}` : ""}`
+      : " · 主动关闭";
+    const visual = sharedExperience.visualDiagnostics;
+    const visualState = { quiet: "慢速", normal: "普通", intense: "快速" }[visual?.state] || "准备中";
+    const visualText = visual
+      ? ` · 视觉${visualState} 原始${visual.sampledFrames}/窗口${visual.emittedWindows}/合并${visual.coalescedFrames}/丢弃${visual.droppedFrames} · 变化${(visual.latestChangeScorePpm / 10_000).toFixed(1)}% · 下窗≤${Math.ceil(visual.nextWindowInMs / 1000)}s`
+      : " · 视觉准备中";
+    const currentMode = sharedExperience.workspace?.snapshot().contentMode || "unknown";
+    const configuredFrequency = ["low", "standard", "frequent"].includes(settings.sharedExperienceProactiveFrequency)
+      ? settings.sharedExperienceProactiveFrequency : "standard";
+    sharedExperienceDebugMeta.textContent = sharedExperience.active
+      ? `状态：${sharedExperience.paused ? "已暂停" : "运行中"} · 情境${({ "game-narrated": "游戏解说", "short-video": "短视频", narrated: "解说", cinematic: "影视", livestream: "直播", "low-speech-game": "游戏", direct: "其他" })[currentMode] || "未选择"} · 配置频率${({ low: "低频", standard: "标准", frequent: "高频" })[configuredFrequency]}${proactiveText} · 窗口：${sharedExperience.windowLabel} · 采集 V${sharedExperience.capturedVisual}/A${sharedExperience.capturedAudio} · 处理 V${sharedExperience.processedVisual}/A${sharedExperience.processedAudio} · 积压 ${sharedExperience.spool?.snapshot().pending || 0}${visualText} · DeepSeek 对话${usage?.conversation.requests || 0}/证据${usage?.evidenceSummary?.requests || 0}/段总结${usage?.segmentSummary.requests || 0}/最终${usage?.finalSummary.requests || 0}（共${totalRequests}次/${formatTokenCount(totalTokens)} tok）· 估算 $${cost.toFixed(4)}${balanceText}${lifecycle?.budget.exhausted ? " · 已进入节省模式" : ""}`
+      : `状态：未运行 · 配置频率${({ low: "低频", standard: "标准", frequent: "高频" })[configuredFrequency]}`;
+  }
+  sharedExperienceDebugOutput.scrollTop = sharedExperienceDebugOutput.scrollHeight;
+}
+
+async function connectSharedExperience(selected, { segmentDurationMs, proactiveEnabled, proactiveFirstDelayMs, proactiveMinIntervalMs } = {}) {
+  if (!selected || !Number.isInteger(Number(selected.id))) throw new Error("没有选择有效窗口");
+  if (settings.textProvider !== "deepseek") {
+    throw new Error("共同体验当前仅支持 DeepSeek 在线文字模型，请先在设置中切换");
+  }
+  if (sharedExperience.stopPromise) await sharedExperience.stopPromise;
+  await invoke("start_shared_experience");
+  sharedExperience.active = true;
+  setCompanionAudioActive(true);
+  resetFreshIdleTimer();
+  sharedExperience.generation += 1;
+  sharedExperience.paused = false;
+  sharedExperience.windowId = Number(selected.id);
+  sharedExperience.windowLabel = `${selected.owner || "未知应用"} · ${selected.title || "无标题"}`;
+  sharedExperience.contentTitle = "";
+  sharedExperience.workspace = createSharedExperienceWorkspace({
+    windowId: sharedExperience.windowId,
+    contentMode: "unknown",
+    ...(Number.isFinite(Number(segmentDurationMs))
+      ? { segmentDurationMs: Number(segmentDurationMs) }
+      : {}),
+  });
+  sharedExperience.spool = createSharedExperienceSpool();
+  sharedExperience.captureTimeline = { visual: [], audio: [] };
+  sharedExperience.visualWindowQueued = false;
+  sharedExperience.visualDiagnostics = null;
+  sharedExperience.runtimeReceipts = createSharedExperienceRuntimeReceipts();
+  sharedExperience.lifecycle = createSharedExperienceLifecycle({
+    workspace: sharedExperience.workspace,
+    summarize: summarizeSharedExperience,
+    persistEpisode: persistSharedExperienceEpisode,
+    budgetUsd: settings.sharedExperienceBudgetUsd ?? 1,
+  });
+  sharedExperience.voiceTracker = createSharedExperienceVoiceTracker({
+    backend: (settings.realtimeBackend || "").toLowerCase(),
+  });
+  sharedExperience.primerGate = createSharedExperiencePrimerGate();
+  sharedExperience.characterTracker = createSharedExperienceCharacterTracker();
+  syncSharedExperienceProactive({
+    ...(typeof proactiveEnabled === "boolean" ? { enabled: proactiveEnabled } : {}),
+    ...(Number.isFinite(proactiveFirstDelayMs) ? { firstDelayMs: proactiveFirstDelayMs } : {}),
+    ...(Number.isFinite(proactiveMinIntervalMs) ? { minIntervalMs: proactiveMinIntervalMs } : {}),
+  });
+  try {
+    sharedExperience.voiceTracker.record(await invoke("check_voice_service"));
+  } catch (_) {}
+  scheduleSharedExperienceRollover();
+  void fetchDeepSeekBalance(sharedExperience.lifecycle);
+  sharedExperience.debugEntries = [];
+  if (sharedExperienceBtn) sharedExperienceBtn.classList.add("on");
+  if (sharedExperiencePauseBtn) sharedExperiencePauseBtn.hidden = false;
+  if (sharedExperienceStopBtn) sharedExperienceStopBtn.hidden = false;
+  if (typeof sharedExperienceFrequency !== "undefined" && sharedExperienceFrequency) {
+    sharedExperienceFrequency.value = ["low", "standard", "frequent"].includes(settings.sharedExperienceProactiveFrequency)
+      ? settings.sharedExperienceProactiveFrequency : "standard";
+    sharedExperienceFrequency.hidden = false;
+  }
+  if (typeof sharedExperienceMode !== "undefined" && sharedExperienceMode) {
+    sharedExperienceMode.value = "unknown";
+    sharedExperienceMode.hidden = false;
+  }
+  setSharedExperienceStatus(`共同体验已连接 · ${sharedExperience.windowLabel} · 首次画面分析中…`);
+  void captureSharedExperienceOnce();
+  void captureSharedExperienceAudioOnce();
+}
+
+async function startSharedExperience() {
+  const windows = await invoke("list_shared_experience_windows");
+  if (!Array.isArray(windows) || !windows.length) throw new Error("没有找到可观察的窗口");
+  setSharedExperienceStatus("共同体验正在连接视觉服务…");
+  const selected = await selectSharedWindow(windows.slice(0, 30));
+  if (!selected || !Number.isInteger(Number(selected.id))) {
+    throw new Error("没有选择有效窗口");
+  }
+  await connectSharedExperience(selected);
+}
+
+function selectSharedWindow(windows) {
+  if (!sharedExperiencePicker || !sharedExperienceWindowList) return Promise.resolve(null);
+  sharedExperienceWindowList.replaceChildren();
+  return new Promise((resolve) => {
+    const finish = (value) => {
+      sharedExperiencePicker.hidden = true;
+      sharedExperiencePickerWindowCleanup?.();
+      resolve(value || null);
+    };
+    const onKeyDown = (event) => { if (event.key === "Escape") finish(null); };
+    const onBackdrop = (event) => { if (event.target === sharedExperiencePicker) finish(null); };
+    const sharedExperiencePickerWindowCleanup = () => {
+      window.removeEventListener("keydown", onKeyDown);
+      sharedExperiencePicker.removeEventListener("click", onBackdrop);
+    };
+    windows.forEach((item) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "shared-experience-window";
+      const owner = document.createElement("span");
+      owner.className = "shared-experience-window-owner";
+      owner.textContent = item.owner || "未知应用";
+      const title = document.createElement("span");
+      title.className = "shared-experience-window-title";
+      title.textContent = item.title || "无标题窗口";
+      button.append(owner, title);
+      button.addEventListener("click", () => finish(item), { once: true });
+      sharedExperienceWindowList.append(button);
+    });
+    sharedExperiencePickerCancel?.addEventListener("click", () => finish(null), { once: true });
+    window.addEventListener("keydown", onKeyDown);
+    sharedExperiencePicker.addEventListener("click", onBackdrop);
+    sharedExperiencePicker.hidden = false;
+  });
+}
+
 // ---- 事件绑定 ----
 formEl.addEventListener("submit", (e) => {
   e.preventDefault();
@@ -3205,9 +4308,58 @@ formEl.addEventListener("submit", (e) => {
   inputEl.value = "";
   send(text);
 });
-inputEl.addEventListener("input", () => resetFreshIdleTimer());
+inputEl.addEventListener("focus", () => {
+  if (sharedExperience.active && !restoringComposerFocus) {
+    sharedExperience.typingUntil = Date.now() + 1500;
+    void cancelSharedExperienceProactive("user-active", { stopAudio: true });
+  }
+});
+inputEl.addEventListener("input", () => {
+  resetFreshIdleTimer();
+  if (sharedExperience.active) {
+    void cancelSharedExperienceProactive("user-active", { stopAudio: true });
+    sharedExperience.typingUntil = Date.now() + 1500;
+    sharedExperience.spool?.pauseInference("typing");
+  }
+});
 
 attachBtn.addEventListener("click", () => fileEl.click());
+sharedExperienceBtn?.addEventListener("click", async () => {
+  if (sharedExperience.active) return;
+  unlockAudio();
+  sharedExperienceBtn.disabled = true;
+  try {
+    await startSharedExperience();
+  } catch (error) {
+    setSharedExperienceStatus(`共同体验失败：${error?.message || "无法启动"}`, { error: true });
+  } finally {
+    sharedExperienceBtn.disabled = false;
+  }
+});
+sharedExperienceStopBtn?.addEventListener("click", () => { void stopSharedExperience(); });
+sharedExperiencePauseBtn?.addEventListener("click", () => {
+  if (sharedExperience.paused) resumeSharedExperience();
+  else pauseSharedExperience();
+});
+sharedExperienceMode?.addEventListener("change", () => {
+  setSharedExperienceContentMode(sharedExperienceMode.value);
+});
+sharedExperienceFrequency?.addEventListener("change", () => {
+  if (!sharedExperience.active) return;
+  settings.sharedExperienceProactiveFrequency = sharedExperienceFrequency.value;
+  syncSharedExperienceProactive();
+  setSharedExperienceStatus(`共同体验 · 已切换陪看频率：${sharedExperienceFrequency.selectedOptions?.[0]?.textContent || sharedExperienceFrequency.value}`);
+});
+sharedExperienceDebugBtn?.addEventListener("click", () => {
+  if (!sharedExperienceDebug) return;
+  renderSharedExperienceDebug();
+  sharedExperienceDebug.hidden = !sharedExperienceDebug.hidden;
+  chatEl?.classList.toggle("debug-open", !sharedExperienceDebug.hidden);
+});
+sharedExperienceDebugClose?.addEventListener("click", () => {
+  if (sharedExperienceDebug) sharedExperienceDebug.hidden = true;
+  chatEl?.classList.remove("debug-open");
+});
 attachRemoveBtn.addEventListener("click", clearPendingImage);
 stickerRemoveBtn.addEventListener("click", clearPendingSticker);
 stickersBtn.addEventListener("click", toggleStickerPanel);
@@ -3223,6 +4375,7 @@ callCapsuleEl?.addEventListener("mouseleave", () => {
   callCapsuleHovered = false;
   scheduleCallCapsuleCollapse();
 });
+window.addEventListener("beforeunload", () => { void stopSharedExperience({ silent: true, finalize: false }); });
 callCapsuleWaveEl?.addEventListener("mousedown", (event) => {
   if (event.button !== 0) return;
   clearCallCapsuleCollapseTimer();
@@ -3446,6 +4599,241 @@ listen("chat-window-mode", ({ payload }) => {
   if (compact) scheduleCallCapsuleCollapse();
 });
 
+// Debug-only desktop acceptance hook. Rust emits this only when explicitly
+// started with KXYY_START_SHARED_EXPERIENCE_WINDOW_ID in a debug build.
+listen("debug-start-shared-experience", async ({ payload }) => {
+  if (sharedExperience.active) return;
+  try {
+    const windows = await invoke("list_shared_experience_windows");
+    const id = Number(payload?.windowId);
+    const selected = Array.isArray(windows) && windows.find((item) => Number(item?.id) === id);
+    if (!selected) throw new Error("debug 指定窗口已不存在");
+    await connectSharedExperience(selected, {
+      segmentDurationMs: payload?.segmentDurationMs,
+      proactiveEnabled: payload?.proactiveEnabled,
+      proactiveFirstDelayMs: payload?.proactiveFirstDelayMs,
+      proactiveMinIntervalMs: payload?.proactiveMinIntervalMs,
+    });
+    if (payload?.showDebug === true && sharedExperienceDebug) {
+      sharedExperienceDebug.hidden = false;
+      chatEl?.classList.add("debug-open");
+      renderSharedExperienceDebug();
+    }
+    const actions = Array.isArray(payload?.actions) ? payload.actions : [];
+    actions.forEach((action) => {
+      const name = String(action?.name || "");
+      const delay = Math.max(0, Number(action?.delayMs) || 0);
+      window.setTimeout(() => {
+        if (name === "typing") {
+          const duration = Math.max(1000, Number(action?.durationMs) || 10000);
+          sharedExperience.typingUntil = Date.now() + duration;
+          sharedExperience.spool?.pauseInference("typing");
+          setSharedExperienceStatus(`共同体验 · ${sharedExperience.windowLabel} · 输入期间持续采集`);
+          window.setTimeout(() => {
+            if (!sharedExperience.active || sharedExperience.paused) return;
+            sharedExperience.typingUntil = 0;
+            sharedExperience.spool?.resumeInference("typing");
+            void processSharedExperienceOnce();
+          }, duration);
+        } else if (name === "pause") pauseSharedExperience();
+        else if (name === "resume") resumeSharedExperience();
+        else if (name === "stop") stopSharedExperience();
+        else if (name === "hide-chat" && sharedExperience.active) void invoke("hide_chat");
+        else if (name === "show-chat" && sharedExperience.active) void invoke("toggle_chat_window");
+      }, delay);
+    });
+    const viewingStatement = String(payload?.userViewingStatement || "").trim();
+    const prompt = String(payload?.prompt || "").trim();
+    const bootstrapPrompts = [viewingStatement, prompt].filter((item, index, all) => item && all.indexOf(item) === index);
+    if (bootstrapPrompts.length) {
+      // Let the first capture/ASR batches settle, then exercise the same send path as user input.
+      window.setTimeout(() => {
+        void (async () => {
+          for (const bootstrapPrompt of bootstrapPrompts) await send(bootstrapPrompt);
+        })();
+      }, 9000);
+    }
+    if (payload?.acceptancePlan && payload?.acceptanceReportUrl) {
+      const reportUrl = String(payload.acceptanceReportUrl);
+      if (!/^http:\/\/127\.0\.0\.1:\d{2,5}\//.test(reportUrl)) {
+        throw new Error("debug 验收报告地址必须是本机回环地址");
+      }
+      const usedQuestionEvidenceIds = new Set();
+      let lastQuestionEvidenceAtMs = null;
+      void runSharedExperienceAcceptancePlan({
+        plan: payload.acceptancePlan,
+        waitForStart: async () => {
+          const started = Date.now();
+          // Cold-start time is setup, not viewing time. Begin the schedule only
+          // after at least one media event is available for the first question.
+          while (sharedExperience.active && !sharedExperience.paused && Date.now() - started < 300_000) {
+            const snapshot = sharedExperience.workspace?.snapshot();
+            if ((snapshot?.visualEvents?.length || 0) + (snapshot?.audioEvents?.length || 0) > 0) return;
+            await new Promise((resolve) => window.setTimeout(resolve, 500));
+          }
+          throw new Error("验收准备失败：未取得有效媒体证据或共同体验已中断");
+        },
+        questionForTurn: async ({ index, elapsedMs, category, snapshot }) => {
+          const question = planEvidenceAnchoredQuestion({
+            turnIndex: index,
+            elapsedMs,
+            requestedCategory: category,
+            usedPrimaryEventIds: [...usedQuestionEvidenceIds],
+            lastPrimaryEvidenceAtMs: lastQuestionEvidenceAtMs,
+            snapshot,
+          });
+          const lifecycle = sharedExperience.lifecycle;
+          if (lifecycle?.snapshot().budget.exhausted) return {};
+          // Acceptance questions should exercise the live chat path even when
+          // the planner has no mature semantic candidate yet. Anchor a simple
+          // observation question to the newest real event; production chat
+          // remains governed by the stricter planner and grounding gates.
+          if (!question.anchorEventIds.length) {
+            return { ...question, ...buildAcceptanceEvidenceFallbackQuestion(snapshot) };
+          }
+          const focus = buildCurrentEvidenceWindow(snapshot?.workspace?.evidenceJournal, { focusEvidenceIds: question.anchorEventIds });
+          const questionSources = (snapshot?.workspace?.contentMode === "narrated" && focus.questionAudio.length
+            ? focus.questionAudio : focus.visual).filter((event) => !usedQuestionEvidenceIds.has(event.id));
+          const generated = await requestSharedExperienceQuestion({
+            apiBase,
+            evidence: questionSources,
+            maturity: question.maturity,
+            onUsage: (usage, model) => lifecycle?.recordUsage("questionGeneration", usage, { model }),
+          });
+          if (!generated || !sharedExperience.active || sharedExperience.lifecycle !== lifecycle) {
+            return buildAcceptanceEvidenceFallbackQuestion(snapshot);
+          }
+          const review = await requestGroundingReview({apiBase,kind:"question",text:generated.prompt,evidence:questionSources,
+            onUsage:(usage,model)=>lifecycle?.recordUsage("groundingReview",usage,{model})});
+          if (!review || !sharedExperience.active || sharedExperience.lifecycle !== lifecycle) {
+            return buildAcceptanceEvidenceFallbackQuestion(snapshot);
+          }
+          lastQuestionEvidenceAtMs = Math.max(...questionSources.filter((event) => generated.anchorEventIds.includes(event.id)).map((event) => event.atMs));
+          generated.anchorEventIds.forEach((id) => usedQuestionEvidenceIds.add(id));
+          return { ...question, ...generated };
+        },
+        sendPrompt: async (text, _index, question) => {
+          // The bootstrap viewing statement uses the same chat busy gate. Do not
+          // let an acceptance turn disappear while its startup TTS is finishing.
+          const sendDeadline = Date.now() + 30_000;
+          while (busy && Date.now() < sendDeadline) {
+            await new Promise((resolve) => window.setTimeout(resolve, 120));
+          }
+          if (busy) throw new Error("启动消息仍在处理中");
+          const beforeLength = history.length;
+          const sendResult = await send(text, {
+            sharedExperienceTest: true,
+            sharedExperienceFocusEventIds: question?.anchorEventIds,
+          });
+          const ttsReceipt = sendResult?.speechDone ? await sendResult.speechDone : null;
+          const appended = history.slice(beforeLength);
+          const assistant = appended.findLast((message) => message?.role === "assistant")?.content || "";
+          if (!assistant) throw new Error("本轮未产生角色回复");
+          const lifecycle = sharedExperience.lifecycle?.snapshot();
+          const workspace = sharedExperience.workspace?.snapshot();
+          return {
+            assistant,
+            ttsReceipt,
+            groundingAudit: sendResult?.groundingAudit,
+            usage: lifecycle?.usage || null,
+            workspace: workspace ? {
+              segmentId: workspace.segmentId,
+              rollingSummaryChars: workspace.rollingSummary.length,
+              visualEvents: workspace.visualEvents.length,
+              audioEvents: workspace.audioEvents.length,
+              chatTurns: workspace.chatTurns.length,
+              ...sharedExperienceSpoolStats(),
+              capturedVisual: sharedExperience.capturedVisual,
+              capturedAudio: sharedExperience.capturedAudio,
+              processedVisual: sharedExperience.processedVisual,
+              processedAudio: sharedExperience.processedAudio,
+              filteredVisualIdentities: sharedExperience.filteredVisualIdentities,
+            } : null,
+          };
+        },
+        snapshot: () => ({
+          lifecycle: sharedExperience.lifecycle?.snapshot() || null,
+          voiceService: sharedExperience.voiceTracker?.snapshot() || null,
+          proactive: sharedExperience.proactiveRunner?.snapshot() || null,
+          runtimeReceipts: sharedExperience.runtimeReceipts?.snapshot() || null,
+          workspace: (() => {
+            const workspace = sharedExperience.workspace?.snapshot();
+            return workspace ? {
+              sessionId: workspace.sessionId,
+              windowId: workspace.windowId,
+              contentMode: workspace.contentMode,
+              segmentId: workspace.segmentId,
+              rollingSummary: workspace.rollingSummary,
+              evidenceJournal: workspace.evidenceJournal,
+              evidenceBlocks: workspace.evidenceBlocks,
+              discussionJournal: workspace.discussionJournal,
+              visualEvents: workspace.visualEvents.length,
+              audioEvents: workspace.audioEvents.length,
+              chatTurns: workspace.chatTurns.length,
+              capturedVisual: sharedExperience.capturedVisual,
+              capturedAudio: sharedExperience.capturedAudio,
+              captureTimeline: {
+                visual: [...sharedExperience.captureTimeline.visual],
+                audio: [...sharedExperience.captureTimeline.audio],
+              },
+              processedVisual: sharedExperience.processedVisual,
+              processedAudio: sharedExperience.processedAudio,
+              filteredVisualIdentities: sharedExperience.filteredVisualIdentities,
+              characters: sharedExperience.characterTracker?.snapshot().length || 0,
+              primerGate: sharedExperience.primerGate?.snapshot() || null,
+              ...sharedExperienceSpoolStats(),
+            } : null;
+          })(),
+        }),
+        finish: async () => {
+          const result = await stopSharedExperience();
+          return {
+            ...result,
+            cleanup: buildSharedExperienceCleanupReceipt(sharedExperience),
+          };
+        },
+        onTurn: (record) => {
+          console.log("[shared-e2e] turn", record.index, record.ok, record.responseMs, record.scheduleLagMs);
+        },
+      }).then(async (report) => {
+        const body = {
+          ...report,
+          environment: {
+            buildKind: payload.buildKind,
+            realServices: !!report.beforeFinalize?.runtimeReceipts,
+            executable: payload.executable,
+            selectedWindowId: id,
+            selectedWindow: `${selected.owner || ""} · ${selected.title || ""}`,
+            visionProvider: report.beforeFinalize?.runtimeReceipts?.vision?.provider,
+            textProvider: report.beforeFinalize?.runtimeReceipts?.text?.provider,
+            textModel: settings.textModel || "deepseek-flash",
+            voiceBackend: report.beforeFinalize?.voiceService?.backend === "voxcpm"
+              && report.beforeFinalize.voiceService.runningSeen === true
+              ? "voxcpm" : "mixed-or-unknown",
+            testMode: report.plannedTurns === 0 ? "proactive-only" : "scripted-questions",
+            asrProvider: report.beforeFinalize?.runtimeReceipts?.asr?.provider,
+            autoSpeak: settings.autoSpeak,
+            userViewingStatement: viewingStatement,
+          },
+        };
+        const response = await fetch(reportUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(`验收报告写入失败 ${response.status}`);
+        setSharedExperienceStatus(`30 分钟压力测试完成 · ${report.successfulTurns}/${report.plannedTurns} 轮成功`);
+      }).catch(async (error) => {
+        await stopSharedExperience({ silent: true, finalize: false });
+        console.error("[shared-e2e] acceptance failed", error);
+        setSharedExperienceStatus(`压力测试失败：${error?.message || error}`, { error: true });
+      });
+    }
+  } catch (error) {
+    setSharedExperienceStatus(`共同体验失败：${error?.message || "无法启动"}`, { error: true });
+  }
+});
+
 listen("call-capsule-edge", ({ payload }) => {
   callCapsuleEdge = payload === "left" || payload === "right" ? payload : null;
   if (!callCapsuleEdge) {
@@ -3464,6 +4852,7 @@ listen("call-capsule-collapsed", ({ payload }) => {
 // 注意这是 push 事件，窗口打开前的事件会丢失；loadConfig 内有主动探活兜底。
 listen("voice-service-status", ({ payload }) => {
   if (!payload) return;
+  if (sharedExperience.active) sharedExperience.voiceTracker?.record(payload);
   svcVoiceEventReceived = true;
   const state = payload.state;
   if (state === "running") {
@@ -3501,6 +4890,10 @@ listen("apply-settings", async ({ payload }) => {
     await enqueueMemory();
   }
   settings = { ...settings, ...payload };
+  if (sharedExperience.active && (
+    "sharedExperienceProactiveEnabled" in payload
+    || "sharedExperienceProactiveFrequency" in payload
+  )) syncSharedExperienceProactive();
   if (personaChanged || payload.userName !== undefined) loadFamiliarity();
   const nextCardId = (settings.personaCardId || "").trim();
   const nextBackend = (settings.realtimeBackend || "").trim().toLowerCase();
@@ -3551,12 +4944,12 @@ listen("memory-cleared", ({ payload }) => {
   history.forEach((m) => { if (m?.id) memoryEnqueuedIds.add(m.id); });
 });
 
-/** 退出前挂断通话（把最后一轮写入 history）；收起窗口则保留通话。 */
+/** 退出前挂断通话；收起窗口则保留通话和共同体验。 */
 async function prepareAndFlushMemory({ hangup = true } = {}) {
   // 隐藏聊天窗口不是挂断电话：Rust 仍保持 realtime WebSocket，窗口重新显示
   // 后继续接收文字和音频。此时也不能提前巩固正在增长的可听助手句段，
   // 否则同一消息 ID 被标成已入队后，恢复窗口继续播放的尾段会永久漏记。
-  if (!hangup && callActive) return;
+  if (!hangup && (callActive || sharedExperience.active)) return;
   // 真正退出时才释放会话和音频设备，并在定稿后一次性入队。
   if (hangup && callActive) await endCall({ notice: false, reason: "app_quit" });
   if (!callActive) {
@@ -3566,11 +4959,19 @@ async function prepareAndFlushMemory({ hangup = true } = {}) {
   await enqueueMemory();
 }
 
-// 聊天窗口收起时：停掉朗读，并把本次对话增量写入持久化队列。
+// 隐藏只改变界面可见性，不能暂停陪看或覆盖用户手动暂停的状态。
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
+    if (sharedExperience.active) {
+      // WKWebView/WebView2 可能在窗口隐藏瞬间挂起 AudioContext；重新断言保活，
+      // 让正在排队或随后完成的 VoxCPM 音频仍能进入输出链。
+      setCompanionAudioActive(true);
+    }
     void prepareAndFlushMemory({ hangup: false });
     return;
+  }
+  if (document.visibilityState === "visible" && sharedExperience.active) {
+    setCompanionAudioActive(true);
   }
   if (document.visibilityState === "visible" && callActive) {
     // macOS/WKWebView 常在隐藏窗口时挂起 Web Audio；恢复时只 resume，
