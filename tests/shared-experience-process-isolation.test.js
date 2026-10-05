@@ -35,6 +35,8 @@ test("installed app detection covers relocated bundles but excludes the dev bina
 
 test("voice cleanup selects only this repository's Python servers", () => {
   const root = "/Users/me/repo";
-  const table = `  101 /opt/python /Users/me/repo/scripts/local-realtime/server_voxcpm.py\n  102 /opt/python /Users/other/repo/scripts/local-realtime/server_voxcpm.py\n  103 /opt/python /Users/me/repo/scripts/mage-vl/server.py\n  104 /opt/python /Users/me/repo/scripts/local-realtime/server.py\n  105 /opt/python /Users/me/repo/scripts/local-realtime/server.py.backup`;
+  const table = process.platform === "win32"
+    ? `  101 python C:\\Users\\me\\repo\\scripts\\local-realtime\\server_voxcpm.py\n  102 python C:\\Users\\other\\repo\\scripts\\local-realtime\\server_voxcpm.py\n  103 python C:\\Users\\me\\repo\\scripts\\mage-vl\\server.py\n  104 python C:\\Users\\me\\repo\\scripts\\local-realtime\\server.py\n  105 python C:\\Users\\me\\repo\\scripts\\local-realtime\\server.py.backup`
+    : `  101 /opt/python /Users/me/repo/scripts/local-realtime/server_voxcpm.py\n  102 /opt/python /Users/other/repo/scripts/local-realtime/server_voxcpm.py\n  103 /opt/python /Users/me/repo/scripts/mage-vl/server.py\n  104 /opt/python /Users/me/repo/scripts/local-realtime/server.py\n  105 /opt/python /Users/me/repo/scripts/local-realtime/server.py.backup`;
   assert.deepEqual(findProjectVoiceProcesses(table, root).map(({ pid }) => pid), [101, 104]);
 });

@@ -38,15 +38,16 @@ export function findInstalledAppProcesses(processTable) {
 
 export function findProjectVoiceProcesses(processTable, rootDir) {
   const scripts = ["server.py", "server_cosyvoice.py", "server_voxcpm.py"]
-    .map((name) => path.join(rootDir, "scripts", "local-realtime", name));
+    .map((name) => path.join(rootDir, "scripts", "local-realtime", name).replaceAll("\\", "/"));
   const matches = [];
   for (const line of String(processTable || "").split(/\r?\n/)) {
     const match = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
     if (!match) continue;
+    const command = match[2].replaceAll("\\", "/");
     if (scripts.some((script) => {
-      const index = match[2].indexOf(script);
+      const index = command.indexOf(script);
       return index > 0 && /\s/u.test(match[2][index - 1])
-        && (index + script.length === match[2].length || /\s/u.test(match[2][index + script.length]));
+        && (index + script.length === command.length || /\s/u.test(command[index + script.length]));
     })) matches.push({ pid: Number(match[1]) });
   }
   return matches;

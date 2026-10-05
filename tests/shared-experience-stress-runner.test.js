@@ -4,6 +4,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 import { buildStressPlan } from "../scripts/shared-experience/stress-plan-30min.mjs";
 import {
@@ -298,7 +301,8 @@ test("real stress report proves the requested dev model chain, isolation, durati
 });
 
 test("raw stress reports must stay outside the repository", () => {
-  assert.match(assertExternalReportPath("/tmp/kxyy-stress.json"), /\/tmp\/kxyy-stress\.json$/);
+  const external = path.join(tmpdir(), "kxyy-stress.json");
+  assert.equal(path.basename(assertExternalReportPath(external)), "kxyy-stress.json");
   assert.throws(() => assertExternalReportPath("docs/test-reports/raw.json"), /outside the repository/);
 });
 
@@ -369,7 +373,7 @@ test("simulation CLI completes immediately and writes only the explicit external
   const output = path.join(directory, "report.json");
   try {
     const result = spawnSync(process.execPath, ["scripts/shared-experience/run-30min.mjs", "--simulate", "--output", output], {
-      cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."),
+      cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: 2_000,
     });
