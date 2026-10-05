@@ -4,6 +4,10 @@ This context describes the user-visible conversation concepts shared by text cha
 
 ## Realtime Conversation
 
+**Viewing Context**:
+The kind of media a Shared Experience Session is accompanying, such as continuous film, commentary, live broadcast, or a changing short-video feed. It guides how evidence is connected and when a companion comment fits, without claiming to identify the exact work from a frame.
+_Avoid_: Genre, platform, content identity
+
 **Background Companion Call**:
 An explicitly started, long-running voice session for sparse conversation while the user focuses on another activity. It uses deliberate Talk Holds and bounded, low-frequency character initiative without observing the user's screen or ambient media.
 _Avoid_: Realtime call mode, Shared Experience Session, always-on call
