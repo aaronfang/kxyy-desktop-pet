@@ -10,19 +10,18 @@ try:
     from PIL import Image
 except ModuleNotFoundError:  # Mage-VL's optional image dependency is not in every CI runner.
     Image = None
-if Image is None:
-    raise unittest.SkipTest("Mage-VL's optional Pillow dependency is unavailable")
-
 try:
     import cv2  # noqa: F401
 except ModuleNotFoundError:
-    raise unittest.SkipTest("Mage-VL's optional OpenCV dependency is unavailable")
+    cv2 = None
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "mage-vl" / "server.py"
 SPEC = importlib.util.spec_from_file_location("kxyy_mage_vl_server", MODULE_PATH)
-SERVER = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(SERVER)
+SERVER = None
+if Image is not None and cv2 is not None:
+    SERVER = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(SERVER)
 
 
 def image_data_url(color):
@@ -31,7 +30,7 @@ def image_data_url(color):
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode()
 
 
-@unittest.skipUnless(Image is not None, "Pillow is required for Mage-VL server tests")
+@unittest.skipUnless(SERVER is not None, "Mage-VL server dependencies are unavailable")
 class MageVlFrameWindowTests(unittest.TestCase):
     def test_observe_frames_sends_one_time_aware_video_to_mage(self):
         calls = []
