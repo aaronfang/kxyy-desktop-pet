@@ -8,7 +8,7 @@ const root = new URL("../", import.meta.url);
 const chatCss = fs.readFileSync(new URL("src/chat.css", root), "utf8");
 const chatHtml = fs.readFileSync(new URL("src/chat.html", root), "utf8");
 const tauriConfig = JSON.parse(fs.readFileSync(new URL("src-tauri/tauri.conf.json", root), "utf8"));
-const chatJs = fs.readFileSync(new URL("src/chat.js", root), "utf8");
+const chatJs = fs.readFileSync(new URL("src/chat.js", root), "utf8").replace(/\r\n/g, "\n");
 
 test("chat summary adapter forwards media mode for every summary level", async () => {
   const start = chatJs.indexOf("async function summarizeSharedExperience(");
