@@ -1976,6 +1976,7 @@ pub fn memory_restore_backup(
     state: State<'_, MemoryState>,
     request: MemoryBackupRequest,
 ) -> Result<MemoryRestoreResponse, String> {
+    crate::qq::invalidate_memory(&app);
     let source_path = validated_backup_path(&app, &request.path)?;
     let verified = verify_backup_file(&source_path)?;
     if verified.integrity_result != "ok" || verified.foreign_key_errors != 0 {
@@ -3936,9 +3937,12 @@ pub fn memory_list(
 
 #[tauri::command]
 pub fn memory_update(
+    app: AppHandle,
     state: State<'_, MemoryState>,
     request: MemoryUpdateRequest,
 ) -> Result<MemoryMutationResponse, String> {
+    // Cancel drafts synchronously before mutating memory; UI events may arrive later.
+    crate::qq::invalidate_memory(&app);
     let mut guard = state.conn.lock().unwrap();
     let conn = guard
         .as_mut()
@@ -3981,6 +3985,7 @@ fn update_memory(
         }
     }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    experience::invalidate_write_leases(&tx).map_err(|e|e.to_string())?;
     if let Some(text) = edited_text.as_ref() {
         if text.is_empty() {
             return Err("记忆内容不能为空".into());
@@ -4216,9 +4221,12 @@ fn record_revision(
 
 #[tauri::command]
 pub fn memory_delete(
+    app: AppHandle,
     state: State<'_, MemoryState>,
     request: MemoryDeleteRequest,
 ) -> Result<MemoryMutationResponse, String> {
+    // Cancel drafts synchronously before mutating memory; UI events may arrive later.
+    crate::qq::invalidate_memory(&app);
     let mut guard = state.conn.lock().unwrap();
     let conn = guard
         .as_mut()
@@ -4267,9 +4275,12 @@ fn delete_memory(
 
 #[tauri::command]
 pub fn memory_clear_scope(
+    app: AppHandle,
     state: State<'_, MemoryState>,
     request: MemoryClearRequest,
 ) -> Result<MemoryMutationResponse, String> {
+    // Cancel drafts synchronously before mutating memory; UI events may arrive later.
+    crate::qq::invalidate_memory(&app);
     let mut guard = state.conn.lock().unwrap();
     let conn = guard
         .as_mut()
@@ -5710,6 +5721,27 @@ mod tests {
         configure(&conn).unwrap();
         migrate(&mut conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn qq_admission_rejects_deleted_memory_lease_before_ui_events() {
+        let state=MemoryState { db_path:None,conn:Mutex::new(Some(test_db())),worker_running:AtomicBool::new(false),database_generation:AtomicU64::new(0),wake_generation:Mutex::new(0),worker_wakeup:Condvar::new(),last_error:Mutex::new(None) };
+        let lease=with_qq_memory_lease(&state,None,|lease|lease).unwrap();
+        assert_eq!(with_qq_memory_lease(&state,Some(&lease),|_|"admitted"),Some("admitted"));
+        {
+            let mut guard=state.conn.lock().unwrap();
+            clear_scope(guard.as_mut().unwrap(),&MemoryClearRequest {card_id:"card".into(),nickname:"主人".into()}).unwrap();
+        }
+        let mut sent=false;
+        assert!(with_qq_memory_lease(&state,Some(&lease),|_|sent=true).is_none());
+        assert!(!sent);
+        let next=with_qq_memory_lease(&state,None,|lease|lease).unwrap();
+        assert_ne!(lease,next);
+        {
+            let mut guard=state.conn.lock().unwrap();
+            finish_restored_database(guard.as_mut().unwrap()).unwrap();
+        }
+        assert!(with_qq_memory_lease(&state,Some(&next),|_|()).is_none());
     }
 
     fn fact(text: &str, predicate: &str, value: &str, evidence: &str) -> ExtractedFact {
@@ -7967,4 +7999,15 @@ mod tests {
             .unwrap();
         assert_eq!(version, "999");
     }
+}
+
+// Serialize QQ draft admission with destructive Memory changes. Once admitted,
+// socket delivery may already have started and cannot be retracted.
+pub(crate) fn with_qq_memory_lease<T>(state:&MemoryState, expected:Option<&str>, admit:impl FnOnce(String)->T) -> Option<T> {
+    let guard=state.conn.lock().ok()?;
+    let conn=guard.as_ref()?;
+    conn.execute("INSERT OR IGNORE INTO memory_meta(key,value) VALUES('explicit-write-epoch',?1)",[Uuid::new_v4().to_string()]).ok()?;
+    let lease:String=conn.query_row("SELECT value FROM memory_meta WHERE key='explicit-write-epoch'",[],|r|r.get(0)).ok()?;
+    if expected.is_some_and(|value|value!=lease) {return None;}
+    Some(admit(lease))
 }

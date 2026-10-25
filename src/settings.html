@@ -29,6 +29,7 @@
         <span class="tab-icon">🌐</span>
         <span class="tab-label">时下信息</span>
       </button>
+      <button class="tab-btn" data-tab="qq"><span class="tab-icon">💬</span><span class="tab-label">QQ 接入</span></button>
       <button class="tab-btn" data-tab="appearance">
         <span class="tab-icon">🎨</span>
         <span class="tab-label">外观</span>
@@ -439,6 +440,25 @@
             <button id="topicPreferenceAdd" type="button" class="ghost">添加</button>
           </div>
           <p class="hint">聊天中出现的网络正文不会写进这里；自动推测也不能覆盖你的手动选择。</p>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-qq">
+        <section>
+          <h2>QQ 主人私聊（实验）</h2>
+          <p class="hint">使用独立个人 QQ 号登录本机 NapCat，并开启 OneBot v11 正向 WebSocket。仅回复指定主人的好友私聊纯文字；群聊、图片、语音和电话不接收。</p>
+          <label class="row-inline"><input id="qqEnabled" type="checkbox" /><span>启用 QQ 自动回复（默认关闭）</span></label>
+          <label><span>OneBot WebSocket 地址</span><input id="qqWsUrl" maxlength="200" placeholder="ws://127.0.0.1:3001" /></label>
+          <label><span>机器人 QQ 号<small>独立个人号，登录号必须匹配</small></span><input id="qqBotId" inputmode="numeric" maxlength="12" /></label>
+          <label><span>主人 QQ 号<small>唯一允许收发的好友</small></span><input id="qqOwnerId" inputmode="numeric" maxlength="12" /></label>
+          <label><span>绑定人设卡 ID<small>默认人设留空</small></span><input id="qqCardId" maxlength="120" /></label>
+          <label><span>绑定记忆昵称<small>必须与桌面当前生效昵称一致</small></span><input id="qqNickname" maxlength="80" /></label>
+          <button id="qqBindCurrent" class="ghost" type="button">填入当前人设与昵称</button>
+          <label><span>OneBot access token<small>必须与 NapCat 配置一致；留空保留已存 token</small></span><input id="qqToken" type="password" maxlength="256" autocomplete="new-password" /></label>
+          <label class="row-inline"><input id="qqClearToken" type="checkbox" /><span>清除已存 token（需先关闭接入）</span></label>
+          <div class="memory-actions"><button id="qqSave" type="button">单独保存 QQ 设置</button><button id="qqRefresh" class="ghost" type="button">刷新连接状态</button></div>
+          <p id="qqStatus" class="hint" role="status"></p>
+          <p class="hint">桌宠须保持运行；当前人设或昵称与绑定不符时不回复。QQ 使用独立短历史，只读绑定记忆，不自动写入长期记忆。发送结果不明时不会自动重发。Token 仅在本机单独配置文件保存，不会回显。</p>
         </section>
       </div>
 
