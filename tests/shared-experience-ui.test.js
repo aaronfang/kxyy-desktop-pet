@@ -261,3 +261,16 @@ test("the packaged app includes the native adaptive frame helper", () => {
     "scripts/mage-vl/capture_frames.swift",
   );
 });
+
+test("normal and explicit-save assistant replies can enter history without an undefined user variable", () => {
+  const start = chatJs.indexOf('    history.push({\n      role: "assistant",', chatJs.indexOf("async function streamAssistantReply("));
+  const end = chatJs.indexOf('\n    });',start) + '\n    });'.length;
+  for (const question of ["你好", "请记住：我喜欢茶"]) {
+    const history = [];
+    vm.runInNewContext(chatJs.slice(start,end), { history,reply:"收到",replyId:"r",emotion:null,
+      currentTurnDoNotRemember:false,sharedExperience:{active:false},reviewQuestion:question,
+      explicitMemoryText: (text) => text.startsWith("请记住：") ? text : null });
+    assert.equal(history[0].content,"收到");
+    assert.equal(Boolean(history[0].doNotRemember),question.startsWith("请记住："));
+  }
+});

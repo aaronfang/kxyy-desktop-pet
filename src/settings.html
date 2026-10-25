@@ -486,6 +486,16 @@
             <input id="memorySearch" type="search" placeholder="搜索记忆…" />
             <button id="memoryRefresh" type="button" class="ghost">刷新</button>
           </div>
+          <details class="memory-projection">
+            <summary>记忆摘录：画像 / 共同主题 / 活动交接</summary>
+            <p class="hint">先选择一个昵称。快照只引用当前有效记录，不修改人设；用户陈述和模型摘要均可能有误。主题使用上方搜索框（最多80字）。</p>
+            <div class="memory-maintenance-actions">
+              <button id="memoryProfileSnapshot" type="button" class="ghost">画像摘录</button>
+              <button id="memoryTopicSnapshot" type="button" class="ghost">共同主题档案</button>
+              <button id="memoryHandoffSnapshot" type="button" class="ghost">活动交接</button>
+            </div>
+            <div id="memoryProjectionOutput" class="memory-list" role="status"></div>
+          </details>
           <div class="memory-view-switch" role="tablist" aria-label="记忆视图">
             <button id="memoryListView" type="button" class="ghost active" role="tab" aria-selected="true">列表</button>
             <button id="memoryGraphView" type="button" class="ghost" role="tab" aria-selected="false">关系图</button>

@@ -955,3 +955,5 @@ body {
 .msg-context-item.danger {
   color: #ff8a8a;
 }
+
+#memory-write-receipt { padding: 4px 12px; font-size: 11px; color: var(--muted, #777); }

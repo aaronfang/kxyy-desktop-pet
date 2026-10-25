@@ -63,6 +63,7 @@ import {
 import { synthesizeSpeech, playSpeechBlob, streamSpeech, stopSpeak, unlockAudio, resetPlaybackPipeline, setCompanionAudioActive, onTtsProgress, splitSpeechChunks, detectEmotion } from "./ai/tts.js";
 import { DEFAULT_AI_AVATAR, DEFAULT_AI_AVATAR_NEUTRAL, DEFAULT_USER_AVATAR } from "./ai/avatars.js";
 import { formatChatTranscript } from "./ai/chat-transcript.js";
+import { explicitMemoryText, recallWithFollowup, rememberExplicitMessage, requestMemoryRecallPlan } from "./ai/memory-experience.js";
 import { asksNotToRemember } from "./memory-ui.js";
 import { renderObservationBlock } from "./ai/observation.js";
 import { fetchWebObservations, hasDirectWebSearchIntent, needsCurrentWebInformation, renderWebObservationBlock, renderWebObservationUnavailableBlock } from "./ai/web-observations.js";
@@ -463,6 +464,7 @@ let freshAssociationSessionState = createFreshAssociationSessionState();
 let freshExposureLedger = loadFreshExposureLedger();
 const freshIdleState = createFreshIdleState();
 let freshIdleTimer = null;
+let memoryContextEpoch = 0;
 let activeName = null;      // 当前生效昵称（记忆分档键；无有效昵称时为 null，不落盘）
 const memoryEnqueuedIds = new Set(); // 已可靠写入 Rust 待巩固队列的消息 id
 let memoryBatchSeq = 0;
@@ -1941,16 +1943,15 @@ async function buildRequestMessages(opts = {}) {
   if (requestPolicy.memoryRecall && !opts.proactiveKind && activeName) {
     const last = lastRealUserMessage();
     try {
-      const recalled = await invoke("memory_recall", {
-        request: {
-          cardId: settings.personaCardId || "",
-          nickname: activeName,
-          query: last?.content || "",
-          imageCaption: last?.imageCaption || "",
-          maxItems: 6,
-        },
+      const owner = { cardId: settings.personaCardId || "", nickname: activeName };
+      const epoch = memoryContextEpoch;
+      const prior = history.filter((m) => m.role === "user" && !isHiddenUserMessage(m.content) && !m.doNotRemember).slice(-2)[0];
+      recalledMemoryItems = await recallWithFollowup({ query: last?.content || "", priorUserText: prior !== last ? prior?.content || "" : "",
+        signal: opts.abortSignal,
+        isCurrent: () => epoch === memoryContextEpoch && isSharedExperienceMemoryScopeCurrent(owner),
+        recall: (query) => invoke("memory_recall", { request: { ...owner, query, imageCaption: last?.imageCaption || "", maxItems:6 } }),
+        plan: (request) => requestMemoryRecallPlan({ ...request, apiBase }),
       });
-      recalledMemoryItems = recalled?.items || [];
       if (workspaceFeatureEnabled(settings)) {
         let graph = null;
         try {
@@ -1981,9 +1982,7 @@ async function buildRequestMessages(opts = {}) {
       } else {
         memoryPrompt = renderRecalledMemory(recalledMemoryItems);
       }
-      if (chatDebugEnabled() && recalled) {
-        console.log("[memory] recall", { count: recalled.items?.length || 0, elapsedMs: recalled.elapsedMs });
-      }
+      if (chatDebugEnabled()) console.log("[memory] recall", { count: recalledMemoryItems.length });
     } catch (e) {
       if (chatDebugEnabled()) console.warn("[memory] recall unavailable", e);
     }
@@ -2244,7 +2243,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
     }
     if (!proactiveKind) showWebSearchLead(lastRealUserMessage()?.content || "");
     const reviewQuestion = groundingQuestion ?? lastRealUserMessage()?.content ?? "";
-    let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep, focusEvidenceIds, question: reviewQuestion });
+    let requestMessages = await buildRequestMessages({ proactiveKind, patAction, deep, focusEvidenceIds, question: reviewQuestion, abortSignal });
     if (groundingSession) reviewSources = groundingEvidence(groundingSession.workspace?.snapshot(), {
       question: reviewQuestion,
     });
@@ -2442,7 +2441,7 @@ async function streamAssistantReply(streamBubble, streamRow, {
       role: "assistant",
       content: reply,
       id: replyId,
-      ...(currentTurnDoNotRemember || sharedExperience.active ? { doNotRemember: true } : {}),
+      ...(currentTurnDoNotRemember || sharedExperience.active || explicitMemoryText(reviewQuestion) ? { doNotRemember: true } : {}),
       ...(emotion ? { sticker: { emotion } } : {}),
     });
     if (sharedExperience.active) memoryEnqueuedIds.add(replyId);
@@ -2603,12 +2602,35 @@ async function send(text, opts = {}) {
       role: "user",
       content: text,
       id: userId,
-      ...(currentTurnDoNotRemember || sharedExperience.active ? { doNotRemember: true } : {}),
+      ...(currentTurnDoNotRemember || sharedExperience.active || explicitMemoryText(text) ? { doNotRemember: true } : {}),
       ...(caption ? { imageCaption: caption } : {}),
       ...(image ? { images: [image.dataUrl] } : {}),
       ...(sticker ? { sticker } : {}),
     });
     if (sharedExperience.active) memoryEnqueuedIds.add(userId);
+    if (!sharedExperience.active && !currentTurnDoNotRemember && explicitMemoryText(text)) {
+      const scope = { cardId: settings.personaCardId || "", nickname: activeName || "" }, epoch = memoryContextEpoch;
+      const receipt = document.getElementById("memory-write-receipt");
+      const current = () => epoch === memoryContextEpoch && isSharedExperienceMemoryScopeCurrent(scope);
+      if (receipt) { receipt.hidden = false; receipt.textContent = "正在保存你明确要求记住的内容…"; }
+      try {
+        const result = await rememberExplicitMessage({ text, isCurrent: current,
+          persist: async () => {
+            if (!scope.nickname) throw new Error("missing identity");
+            const lease = await invoke("memory_write_lease");
+            if (!current()) throw new Error("stale");
+            return invoke("memory_remember_explicit", { request: { ...scope, messageId:userId, message:text, lease } });
+          },
+        });
+        if (current() && receipt) receipt.textContent = result?.stored ? "已保存到长期记忆 · 可在设置中查看或删除" : "未保存到长期记忆";
+        // This explicit request is handled synchronously; do not silently retry it through consolidation.
+        memoryEnqueuedIds.add(userId);
+      } catch {
+        if (current() && receipt) receipt.textContent = "记忆保存失败（身份、敏感内容或数据库不可用），本次未确认保存";
+        memoryEnqueuedIds.add(userId);
+      }
+    }
+
     if (sharedExperience.active && text) {
       sharedExperience.workspace?.addChatTurn("user", text, Date.now(), {
         confirmed: Boolean(viewingStatement),
@@ -3602,6 +3624,9 @@ function isSharedExperienceMemoryScopeCurrent(scope) {
 }
 
 function clearSharedExperienceRetry() {
+  memoryContextEpoch += 1;
+  const receipt = document.getElementById("memory-write-receipt");
+  if (receipt) { receipt.hidden = true; receipt.textContent = ""; }
   clearLatestSharedExperienceRaw();
   if (sharedExperienceRecapBtn) sharedExperienceRecapBtn.hidden = true;
 }
