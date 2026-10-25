@@ -8,7 +8,7 @@ const root = new URL("../", import.meta.url);
 const chatCss = fs.readFileSync(new URL("src/chat.css", root), "utf8");
 const chatHtml = fs.readFileSync(new URL("src/chat.html", root), "utf8");
 const tauriConfig = JSON.parse(fs.readFileSync(new URL("src-tauri/tauri.conf.json", root), "utf8"));
-const chatJs = fs.readFileSync(new URL("src/chat.js", root), "utf8");
+const chatJs = fs.readFileSync(new URL("src/chat.js", root), "utf8").replace(/\r\n/g, "\n");
 
 test("chat summary adapter forwards media mode for every summary level", async () => {
   const start = chatJs.indexOf("async function summarizeSharedExperience(");
@@ -260,4 +260,17 @@ test("the packaged app includes the native adaptive frame helper", () => {
     tauriConfig.bundle.resources["../scripts/mage-vl/capture_frames.swift"],
     "scripts/mage-vl/capture_frames.swift",
   );
+});
+
+test("normal and explicit-save assistant replies can enter history without an undefined user variable", () => {
+  const start = chatJs.indexOf('    history.push({\n      role: "assistant",', chatJs.indexOf("async function streamAssistantReply("));
+  const end = chatJs.indexOf('\n    });',start) + '\n    });'.length;
+  for (const question of ["你好", "请记住：我喜欢茶"]) {
+    const history = [];
+    vm.runInNewContext(chatJs.slice(start,end), { history,reply:"收到",replyId:"r",emotion:null,
+      currentTurnDoNotRemember:false,sharedExperience:{active:false},reviewQuestion:question,
+      explicitMemoryText: (text) => text.startsWith("请记住：") ? text : null });
+    assert.equal(history[0].content,"收到");
+    assert.equal(Boolean(history[0].doNotRemember),question.startsWith("请记住："));
+  }
 });

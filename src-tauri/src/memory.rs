@@ -14,6 +14,9 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
+#[path = "memory_experience.rs"]
+pub mod experience;
+
 const SCHEMA_VERSION: i64 = 5;
 const SOURCE_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
@@ -1956,6 +1959,7 @@ fn finish_restored_database(conn: &mut Connection) -> Result<MemoryIntegrityResp
     configure(conn).map_err(|e| format!("恢复数据库配置失败：{e}"))?;
     migrate(conn).map_err(|e| format!("迁移恢复数据库失败：{e}"))?;
     maintenance(conn).map_err(|e| format!("维护恢复数据库失败：{e}"))?;
+    experience::invalidate_write_leases(conn).map_err(|e|e.to_string())?;
     let result = integrity_check(conn)?;
     if !result.ok {
         return Err(format!(
@@ -4227,6 +4231,7 @@ fn delete_memory(
     request: &MemoryDeleteRequest,
 ) -> Result<MemoryMutationResponse, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    experience::invalidate_write_leases(&tx).map_err(|e|e.to_string())?;
     let mut affected = 0;
     for item in request.items.iter().take(200) {
         let table = kind_table(&item.kind)?;
@@ -4277,6 +4282,7 @@ fn clear_scope(
     request: &MemoryClearRequest,
 ) -> Result<MemoryMutationResponse, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    experience::invalidate_write_leases(&tx).map_err(|e|e.to_string())?;
     let affected = if request.nickname.trim().is_empty() {
         tx.execute(
             "DELETE FROM memory_search WHERE card_id=?1",

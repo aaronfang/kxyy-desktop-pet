@@ -2266,6 +2266,7 @@ memoryGraphViewport?.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 async function loadMemoryPage({ resetPage = false } = {}) {
+  clearMemoryProjection();
   if (!el("memoryList")) return;
   if (resetPage) memoryPage = 1;
   const cardId = selectedMemoryCardId();
@@ -2294,6 +2295,45 @@ async function loadMemoryPage({ resetPage = false } = {}) {
     el("memoryList").textContent = `读取记忆失败：${e.message || e}`;
   }
 }
+
+let memoryProjectionEpoch = 0;
+function clearMemoryProjection() {
+  memoryProjectionEpoch += 1;
+  el("memoryProjectionOutput")?.replaceChildren();
+}
+async function showMemoryProjection(kind) {
+  clearMemoryProjection();
+  const epoch = memoryProjectionEpoch;
+  const output = el("memoryProjectionOutput");
+  const cardId = selectedMemoryCardId(), nickname = el("memoryNickname")?.value.trim() || "";
+  const query = kind === "topic" ? el("memorySearch")?.value.trim() || "" : "";
+  if (!nickname || (kind === "topic" && (!query || [...query].length > 80))) {
+    output.textContent = "请选择昵称；共同主题还需填写最多80字搜索词。"; return;
+  }
+  output.textContent = "正在读取当前记忆…";
+  try {
+    const result = await invoke("memory_projection", { request: { cardId,nickname,kind,query } });
+    if (epoch !== memoryProjectionEpoch) return;
+    output.replaceChildren();
+    if (!result.items?.length) { output.textContent = "没有匹配的有效记录。"; return; }
+    for (const item of result.items) {
+      const row = document.createElement("div"), text = document.createElement("p"), timeline = document.createElement("div");
+      const labels = { fact:"事实摘录",episode:"最近经历",commitment:"待兑现约定" };
+      text.textContent = `${labels[item.kind] || "记忆"}：${item.text}`;
+      row.append(text, memoryActionButton(`查看来源（${item.sourceEventIds?.length || 0}）`, async () => {
+        try {
+          const result = await invoke("memory_timeline", { query: { cardId,kind:item.kind,id:item.id,limit:20 } });
+          if (epoch === memoryProjectionEpoch) renderMemoryTimeline(timeline,result);
+        } catch { if (epoch === memoryProjectionEpoch) timeline.textContent = "来源不可用或已删除。"; }
+      }), timeline);
+      output.append(row);
+    }
+  } catch { if (epoch === memoryProjectionEpoch) output.textContent = "快照读取失败；现有记忆未改变。"; }
+}
+for (const [id,kind] of [["memoryProfileSnapshot","profile"],["memoryTopicSnapshot","topic"],["memoryHandoffSnapshot","handoff"]]) {
+  el(id)?.addEventListener("click", () => showMemoryProjection(kind));
+}
+for (const id of ["memoryCardId","memoryNickname","memorySearch"]) el(id)?.addEventListener("input",clearMemoryProjection);
 
 el("memoryRefresh")?.addEventListener("click", () => loadMemoryPage({ resetPage: true }));
 for (const id of ["memoryNickname", "memoryKind", "memoryStatus"]) {
