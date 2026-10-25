@@ -27,6 +27,7 @@
       },
       {
         "label": "chat",
+        "backgroundThrottling": "disabled",
         "url": "chat.html",
         "width": 420,
         "height": 340,
