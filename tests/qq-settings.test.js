@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+test('hidden QQ host keeps its background execution policy in the packaged window config',()=>{
+  const config=JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json',import.meta.url),'utf8'));
+  const chat=config.app.windows.find(window=>window.label==='chat');
+  assert.equal(chat.visible,false);
+  assert.equal(chat.backgroundThrottling,'disabled');
+});
 const source=readFileSync(new URL('../src/settings.js',import.meta.url),'utf8').replace(/\r\n/g,'\n');
 function mount(invoke) {
   const nodes=new Map(),tabs=new Map();

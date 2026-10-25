@@ -68,3 +68,14 @@ test('backend Memory lease change clears prior replies even before the UI delete
   await client.receive(event());lease='after-delete';await client.receive(event('two'));
   assert.deepEqual(request.history,[]);
 });
+test('ordinary incoming-message invalidation preserves the preceding confirmed QQ exchange',async()=>{
+  const requests=[];
+  const {client}=fixture({claim:async()=> 'same-memory-lease',generate:async r=>{requests.push(r);return '记住本次短对话';}});
+  await client.receive(event('first'));
+  client.invalidate({clearHistory:false});
+  await client.receive({...event('second'),text:'刚才聊了什么'});
+  assert.deepEqual(requests[1].history,[
+    {role:'user',content:'你好'},
+    {role:'assistant',content:'记住本次短对话'},
+  ]);
+});
