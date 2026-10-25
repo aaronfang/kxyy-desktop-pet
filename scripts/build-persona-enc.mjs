@@ -76,6 +76,8 @@ if (!userProfile || Object.keys(userProfile).length === 0) {
 
 // ── 3. 组装 payload → XOR 加密 ──
 const payload = {
+  identity: card.identity ?? {},
+  displayName: card.identity?.name ?? card.meta?.name ?? card.meta?.card_id ?? "",
   systemPrompt: card.system_prompt ?? "",
   fewShot: Array.isArray(card.few_shot) ? card.few_shot : [],
   userProfile: userProfile,
