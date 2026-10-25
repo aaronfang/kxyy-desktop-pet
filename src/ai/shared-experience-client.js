@@ -116,6 +116,7 @@ function parseEvidenceSummary(raw, evidence, maxEvents = 6, maxRenderedChars = S
     });
     const text = event.text.trim().replace(/\s+/gu, " ");
     return {text: /[。！？.!?][”’"']*$/u.test(text) ? text : `${text}。`,supports,status:event.status,claimType:event.claimType,
+      memoryRole:event.memoryRole,
       rendered: `- [${event.status === "observed" ? "观察支持" : "不确定"}] ${text}（原文：${supports.map(({id,quote})=>`[${id}] ${quote}`).join("；")}）`};
     } catch { return null; }
   }).filter(Boolean);
@@ -124,10 +125,46 @@ function parseEvidenceSummary(raw, evidence, maxEvents = 6, maxRenderedChars = S
   return lines;
 }
 
-function finalSummarySources(evidence) {
+function validateFinalMemoryRoles(events) {
+  const hasRoles = events.some((event) => event.memoryRole !== undefined);
+  if (!hasRoles) return { structuredMemory: false, events };
+  const subjects = events.filter((event) => event.memoryRole === "subject");
+  const overview = events.filter((event) => event.memoryRole === "overview");
+  const highlights = events.filter((event) => event.memoryRole === "highlight");
+  if (subjects.length > 1 || overview.length !== 1 || highlights.length < 1 || highlights.length > 5
+    || subjects.length + overview.length + highlights.length !== events.length) {
+    throw new Error("最终记忆结构无效");
+  }
+  return { structuredMemory: true, events: [...subjects, ...overview, ...highlights] };
+}
+
+function renderFinalMemory(events, structuredMemory, contentMode = "unknown") {
+  const renderEvent = (event) => `${event.visualOnly ? "画面模型线索（未独立核实）：" : event.status === "uncertain" ? "未确认：" : ""}${event.text}`;
+  if (!structuredMemory) return events.map(renderEvent).join("\n");
+  const subject = events.find((event) => event.memoryRole === "subject");
+  const overview = events.find((event) => event.memoryRole === "overview");
+  const highlights = events.filter((event) => event.memoryRole === "highlight");
+  const modeLabel = {
+    cinematic: "电影或剧集",
+    livestream: "直播间",
+    "low-speech-game": "游戏实况",
+    "game-narrated": "游戏解说",
+    narrated: "解说视频",
+    "short-video": "短视频",
+    direct: "直接观看内容",
+    unknown: "共同观看内容",
+  }[contentMode] || "共同观看内容";
+  const subjectLine = subject ? `\n观看对象：${renderEvent(subject)}` : "";
+  return `观看情境：${modeLabel}${subjectLine}\n整体：${renderEvent(overview)}\n记忆点：\n${highlights.map((event) => `- ${renderEvent(event)}`).join("\n")}`;
+}
+
+function finalSummarySources(evidence, { includeReviewedSummaries = false } = {}) {
   // Match the workspace's 2048 media events, 256 user turns and one title; never silently truncate a recap.
   if (!Array.isArray(evidence) || evidence.length > 2305) throw new Error("最终总结证据超出范围");
-  return evidence.filter((event) => ["audio", "visual", "user", "identity"].includes(event?.kind))
+  const allowedKinds = includeReviewedSummaries
+    ? ["audio", "visual", "user", "identity", "summary"]
+    : ["audio", "visual", "user", "identity"];
+  return evidence.filter((event) => allowedKinds.includes(event?.kind))
     .map(({id,kind,text,atMs,endedAtMs}) => {
       if (typeof id !== "string" || !id || id.length > 80
         || typeof text !== "string" || text.length > 500) throw new Error("最终总结证据格式无效");
@@ -166,17 +203,17 @@ export async function requestSharedExperienceSummary(options = {}) {
       const minimumEvents = options.kind === "final" && media.length >= 6
         ? Math.min(8, Math.max(3, Math.ceil(media.length / 4)))
         : 0;
-      if (minimumEvents > 0 && (result.eventCount || 0) < minimumEvents) {
+      if (!result._structuredMemory && minimumEvents > 0 && (result.eventCount || 0) < minimumEvents) {
         const retry = await requestSummaryBatch({
           ...options,
           coverageRetry: true,
           finalEventLimit: Math.max(options.finalEventLimit || 8, minimumEvents),
         });
         const combined = mergeSummaryAccounting(result, retry);
-        const { eventCount: _eventCount, ...publicRetry } = retry;
+        const { eventCount: _eventCount, _structuredMemory, ...publicRetry } = retry;
         return { ...publicRetry, usage: combined.usage, model: combined.model, requestCount: combined.requestCount };
       }
-      const { eventCount: _eventCount, ...publicResult } = result;
+      const { eventCount: _eventCount, _structuredMemory, ...publicResult } = result;
       return publicResult;
     }
   }
@@ -219,7 +256,7 @@ export async function requestSharedExperienceSummary(options = {}) {
     const result = await requestSummaryBatch({ ...options, evidence: batch, finalEventLimit: 2,
       timeoutMs: Math.max(1, Math.min(20000, deadline - Date.now())) });
     account(result);
-    summaries[index] = result.summary;
+    summaries[index] = result;
   };
   // Preserve the old sequential behavior for the small deterministic path;
   // only large real sessions use bounded parallelism to fit the finalization
@@ -245,7 +282,32 @@ export async function requestSharedExperienceSummary(options = {}) {
     firstError.summaryUsage = aggregate;
     throw firstError;
   }
-  return { ...aggregate, summary: summaries.join("\n") };
+  if (summaries.length && summaries.every((result) => result?._structuredMemory)) {
+    let synthesis;
+    try {
+      if (Date.now() >= deadline) {
+        const error = new Error("共同体验总结失败"); error.summaryFailureCode = "timeout"; throw error;
+      }
+      synthesis = await requestSummaryBatch({
+        ...options,
+        evidence: summaries.map((result, index) => ({
+          id: `recap-${index + 1}`,
+          kind: "summary",
+          text: result.summary,
+          atMs: index,
+        })),
+        memorySynthesis: true,
+        finalEventLimit: 6,
+        timeoutMs: Math.max(1, Math.min(20_000, deadline - Date.now())),
+      });
+    } catch (error) {
+      error.summaryUsage = mergeSummaryAccounting(aggregate, error.summaryUsage);
+      throw error;
+    }
+    const combined = mergeSummaryAccounting(aggregate, synthesis);
+    return { summary: synthesis.summary, usage: combined.usage, model: combined.model, requestCount: combined.requestCount };
+  }
+  return { ...aggregate, summary: summaries.map((result) => result.summary).join("\n") };
 }
 
 async function requestSummaryBatch({
@@ -259,10 +321,13 @@ async function requestSummaryBatch({
   finalEventLimit = 8,
   groundingRetry = false,
   coverageRetry = false,
+  memorySynthesis = false,
 } = {}) {
   if (!String(apiBase || "").startsWith("http://")) throw new Error("DeepSeek 代理未就绪");
   const structured = kind === "evidence" || kind === "final" || (kind === "segment" && evidence.length > 0);
-  if (kind === "final" || kind === "segment") evidence = finalSummarySources(evidence);
+  if (kind === "final" || kind === "segment") evidence = finalSummarySources(evidence, {
+    includeReviewedSummaries: kind === "final" && memorySynthesis,
+  });
   const controller = new AbortController();
   const timeout = globalThis.setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || 20_000));
   let accounting;
@@ -283,21 +348,23 @@ async function requestSummaryBatch({
             : "内容类型未明确：根据本批原始证据的声画密度平衡使用声音与连续画面，不强行指定单一主线。";
     const timelineGuidance = kind === "final" ? recapTimelineGuidance(evidence).replaceAll("8条", `${finalEventLimit}条`) : "";
     let task = kind === "final"
-      ? '请直接从本次原始观察重新总结共同观看的主要事件、变化，以及用户明确表达的感受或讨论重点，不继承旧摘要。只输出 JSON：{"events":[{"text":"简洁中文回顾条目","status":"observed 或 uncertain","claimType":"speech、appearance、visual-action、screen-text、interpretation 或 user","supports":[{"id":"原始来源 id","quote":"逐字原文"}]}]}。claimType 必须写在每个 events 条目内，不能写在根节点。每条只引用同一种来源：speech 只引用 audio，appearance/visual-action 只引用 visual，user 只引用 user；不把声音和画面合并成一条。最多8条，每条不超过160字，每条1到3个引用，每个引用不超过120字。按事件发生次序和下方内容类型策略组织全部原始证据，不要让重复场景挤掉后半段事件。画面是单帧模型描述，不是真实字幕或声音，不能独自证明人名、地名、任务指令、声音内容或动机，缺少独立依据就省略这些具体断言。只引用 ev-* 原始观察或 discussion-* 真实用户发言，不引用 block-* 摘要作为证据。用户感受只能由 kind=user 的真实用户发言支持，不把疑问当成用户信念；identity-only 只支持用户确认的作品名称，不能证明视频中已经播放任何基础设定或剧情。所有剧情陈述必须来自带 source id 的媒体证据。不得继承角色先前判断；冲突信息要保留不确定性。'
+      ? '请直接从本次原始观察提炼一条适合长期记忆的观看对象（优先记录用户确认的电影名、直播间名、游戏名、节目名或解说对象；如果资料明确出现才填写）、整体概述和少量记忆点，不继承旧摘要。只输出 JSON：{"events":[{"memoryRole":"subject","text":"已明确出现的观看对象名称","status":"observed","claimType":"identity、screen-text、speech 或 user","supports":[{"id":"原始来源 id","quote":"逐字原文"}]},{"memoryRole":"overview","text":"一至三句整体概述","status":"observed 或 uncertain","claimType":"speech、appearance、visual-action、screen-text、interpretation 或 user","supports":[{"id":"原始来源 id","quote":"逐字原文"}]},{"memoryRole":"highlight","text":"有辨识度的记忆点","status":"observed 或 uncertain","claimType":"speech、appearance、visual-action、screen-text、interpretation 或 user","supports":[{"id":"原始来源 id","quote":"逐字原文"}]}]}。subject 最多一条，可以省略；没有明确名称时不要猜，也不要写“未知”。identity-only 是用户确认的名称，可以记录为观看对象，但不能据此补写剧情；画面模型识别出的名称必须保留未独立核实标记。必须恰好一条 overview 和一至五条 highlight。overview 要通读全程后概括主要内容、核心进展与最终状态，是整体归纳，不是按时间把片段罗列或复述采集过程；highlight 只保留关键转折、结果、独特设定、反复出现的核心特征，以及用户明确表达的感受或讨论重点。省略普通经过、重复场景、时间戳和低辨识度细节，文字多不等于记得好。claimType 必须写在每个 events 条目内，不能写在根节点。每条只引用同一种来源：speech 只引用 audio，appearance/visual-action 只引用 visual，user 只引用 user，subject 可引用 identity、audio、visual 或 user，但必须有明确名称原文。每条不超过160字，每条1到3个引用，每个引用不超过120字。画面是单帧模型描述，不是真实字幕或声音，不能独自证明人名、地名、任务指令、声音内容或动机，缺少独立依据就省略这些具体断言。只引用 ev-* 原始观察、identity-only 用户确认标题或 discussion-* 真实用户发言，不引用 block-* 摘要作为证据。用户感受只能由 kind=user 的真实用户发言支持，不把疑问当成用户信念；identity-only 只支持用户确认的作品名称，不能证明视频中已经播放任何基础设定或剧情。所有剧情陈述必须来自带 source id 的媒体证据。不得继承角色先前判断；冲突信息要保留不确定性。'
       : kind === "evidence"
         ? '只输出 JSON：{"events":[{"text":"简洁中文事件概述","status":"observed 或 uncertain","supports":[{"id":"输入 id","quote":"逐字原文"}]}]}。最多6条，每条只概括一件独立事件，不把相邻的音频和画面拼成一个人物的言行；音频发言者身份不明就写有人，不用同期画面猜测是谁。合并重复场景，优先保留明确的行动、计划、原因、结果和变化，不逐帧抄录。text不超过90字，每条引用1到2段原文，每段不超过80字，不为塞入更多细节增加引用数量。observed仅指原始观察直接支持，不代表客观真相：计划不等于完成，请求对方承诺不等于自己承诺，转述医生的话不等于医生在场，人物说法不等于事实。uncertain用于影响理解的残缺转折、歧义名字或未证实关系；保留缺失而不是补全残句。不记录无语义转写或播放状态、调试等界面信息。无完整信息可返回空events。只整理本批原始证据，不继承旧总结，不补剧情。'
         : structured
           ? '请直接从本阶段原始观察形成阶段概述，不读取或继承旧摘要。只输出 JSON：{"events":[{"text":"简洁中文事件概述","status":"observed 或 uncertain","supports":[{"id":"原始来源 id","quote":"逐字原文"}]}]}。最多8条，按发生顺序保留事件变化；每条引用1到3个原始来源，不引用 block-* 摘要。'
           : "请只基于本阶段证据块和原始观察形成阶段概述，保留事件变化、source id 与不确定性；不得继承角色先前判断。";
     if (kind === "final" && finalEventLimit === 2) {
-      task = task.replace("最多8条", "最多2条");
-      task += "\n这是本次观看的一个独立时间段，请只挑本段最重要的两个行动或转折，不按开头逐项列举。每条只说一件事，不拼接多个步骤。每条正文只能改写一条引用中的明确内容；不得添加引用没有的物品名称、人物身份、地点、目的、结果或因果。无法逐字支持的细节直接省略。";
+      task += "\n这是本次观看的一个独立时间段，最多2条，只输出一条 overview 和一条 highlight：概括本段核心进展，并挑出最重要的行动、转折或结果，不按开头逐项列举。每条只说一件事，不拼接多个步骤。每条正文只能改写一条引用中的明确内容；不得添加引用没有的物品名称、人物身份、地点、目的、结果或因果。无法逐字支持的细节直接省略。";
     }
     if (groundingRetry) {
       task += "\n这是一次证据约束重试。上一版没有通过证据审核；请只保留一条最容易逐字支持的原始事件。正文只能改写一条 supports.quote，不得补充人物身份、因果、目的、结果、时间关系或片名。宁可返回空 events，也不要综合多条来源或沿用任何旧摘要。";
     }
     if (coverageRetry) {
       task += "\n这是一次覆盖不足重试。上一版虽然有可核实条目，但遗漏了观看过程中的大部分时间段；请至少分别选择前段、中段和后段的重要事件，优先行动、转折、结果和最新进展。每条仍必须只由自己的 supports 逐字支持，不要补写未出现的因果或身份。";
+    }
+    if (kind === "final" && memorySynthesis) {
+      task = '以下资料是已通过证据审核的分段记忆。请跨分段再次提炼长期记忆，而不是按时间重新罗列。只输出 JSON：{"events":[{"memoryRole":"overview","text":"一至三句整体概述","status":"observed 或 uncertain","claimType":"interpretation","supports":[{"id":"recap-* id","quote":"分段记忆中的逐字原文"}]},{"memoryRole":"highlight","text":"有辨识度的记忆点","status":"observed 或 uncertain","claimType":"interpretation","supports":[{"id":"recap-* id","quote":"分段记忆中的逐字原文"}]}]}。必须恰好一条 overview 和一至五条 highlight。overview 概括贯穿全程的主要内容、核心变化和最终状态；highlight 只保留关键转折、结果、独特特征或明确用户感受。合并重复经过，删除时间戳、采集过程和低辨识度细节。不得添加分段记忆中没有的身份、因果、结果或感受。';
     }
     const response = await fetchImpl(`${apiBase}/api/chat`, {
       method: "POST",
@@ -330,14 +397,20 @@ async function requestSummaryBatch({
       failureCode = "invalid-structure";
       if (structured) {
         const byId = new Map(evidence.map((event)=>[event.id,event]));
-        const events = parseEvidenceSummary(
+        const parsedEvents = parseEvidenceSummary(
           summary,
           evidence,
           kind === "evidence" ? 6 : kind === "final" ? finalEventLimit : 8,
           kind === "final" ? FINAL_SUMMARY_RENDER_MAX_CHARS : SEGMENT_SUMMARY_RENDER_MAX_CHARS,
-        )
+        );
+        const finalMemory = kind === "final"
+          ? validateFinalMemoryRoles(parsedEvents)
+          : { structuredMemory: false, events: parsedEvents };
+        const events = finalMemory.events
           .map((event)=>({...event,visualOnly:event.supports.every((support)=>byId.get(support.id)?.kind === "visual")}))
-          .filter((event)=>kind !== "final" || !event.visualOnly || ["appearance", "visual-action"].includes(event.claimType));
+          .filter((event)=>kind !== "final" || !event.visualOnly
+            || ["appearance", "visual-action"].includes(event.claimType)
+            || (event.memoryRole === "subject" && ["identity", "screen-text"].includes(event.claimType)));
         if (events.length) {
           const sourceIds = new Set(events.flatMap((event)=>event.supports.map((support)=>support.id)));
           const reviewEvidence = kind === "final" ? evidence.filter((event)=>sourceIds.has(event.id)) : evidence;
@@ -358,8 +431,13 @@ async function requestSummaryBatch({
           const supportedEvents = events.filter((event,index) => reviewed.parts[index].verdict === "supported"
             && reviewed.parts[index].supports.every((support)=>event.supports.some((original)=>original.id === support.id)));
           eventCount = supportedEvents.length;
-          summary = supportedEvents
-            .map((event) => kind === "final" ? `${event.visualOnly ? "画面模型线索（未独立核实）：" : event.status === "uncertain" ? "未确认：" : ""}${event.text}` : event.rendered).join("\n");
+          let supportedFinalMemory = { structuredMemory: false, events: supportedEvents };
+          if (kind === "final" && finalMemory.structuredMemory) {
+            supportedFinalMemory = validateFinalMemoryRoles(supportedEvents);
+          }
+          summary = kind === "final"
+            ? renderFinalMemory(supportedFinalMemory.events, supportedFinalMemory.structuredMemory, contentMode)
+            : supportedEvents.map((event) => event.rendered).join("\n");
           if (!summary) {
             if (!groundingRetry && kind === "final") {
               let retry;
@@ -388,6 +466,7 @@ async function requestSummaryBatch({
       throw error;
     }
     return { summary, usage: accounting.usage, model: accounting.model, eventCount,
+      ...(kind === "final" ? {_structuredMemory: summary.includes("整体：") && summary.includes("\n记忆点：\n")} : {}),
       ...(structured ? {requestCount:accounting.requestCount} : {}) };
   } catch (cause) {
     if (cause?.summaryFailureCode) throw cause;

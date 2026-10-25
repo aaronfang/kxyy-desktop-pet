@@ -930,6 +930,8 @@ pub struct SharedExperienceEpisodeRequest {
     pub session_id: String,
     pub summary: String,
     pub occurred_at: i64,
+    #[serde(default)]
+    pub replace_existing: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3056,8 +3058,13 @@ fn record_shared_experience_episode(
     if is_sensitive(&summary) {
         return Err("共同体验总结包含敏感信息，未写入记忆".into());
     }
-    let user_id =
-        get_or_create_user(conn, &request.card_id, nickname).map_err(|error| error.to_string())?;
+    let user_id = if request.replace_existing {
+        find_user(conn, &request.card_id, nickname)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "共同体验记忆范围已清除，不能自动恢复".to_string())?
+    } else {
+        get_or_create_user(conn, &request.card_id, nickname).map_err(|e| e.to_string())?
+    };
     let idempotency_key = format!("shared-experience:{user_id}:{session_id}");
     let existing = conn
         .query_row(
@@ -3068,11 +3075,73 @@ fn record_shared_experience_episode(
         .optional()
         .map_err(|error| error.to_string())?;
     if let Some(episode_id) = existing {
+        if request.replace_existing {
+            let (owner, current, before) = load_revision_state(conn, "episode", &episode_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "共同体验记忆已删除，不能自动恢复".to_string())?;
+            let previous: Value = serde_json::from_str(&before).map_err(|e| e.to_string())?;
+            if previous.get("userEdited").and_then(Value::as_bool) == Some(true) {
+                return Err("共同体验记忆已由用户编辑，不能自动覆盖".into());
+            }
+            if current != summary {
+                let now = now_ts();
+                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                record_revision(&tx, "episode", &episode_id, &owner, &before, now)
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE memory_episodes SET summary=?1,updated_at=?2 WHERE id=?3",
+                    params![summary, now, episode_id],
+                )
+                .map_err(|e| e.to_string())?;
+                rebuild_search_item(&tx, "episode", &episode_id).map_err(|e| e.to_string())?;
+                let (_, _, after) = load_revision_state(&tx, "episode", &episode_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("记忆更新后不可用")?;
+                let payload = serde_json::json!({"snapshot": serde_json::from_str::<Value>(&after)
+                    .map_err(|e| e.to_string())?})
+                .to_string();
+                let event_id = append_event(
+                    &tx,
+                    &MemoryEventInput {
+                        user_id: &owner,
+                        card_id: &request.card_id,
+                        item_kind: "episode",
+                        item_id: &episode_id,
+                        event_type: "episode.resummarized",
+                        source_type: "shared-experience-summary",
+                        source_id: Some(&session_id),
+                        modality: "text",
+                        observed_at: now,
+                        trust: 0.8,
+                        consent: "allowed",
+                        idempotency_key: &format!("shared-retry:{}:{}", episode_id, Uuid::new_v4()),
+                        payload_json: &payload,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+                append_evidence(
+                    &tx,
+                    &event_id,
+                    "episode",
+                    &episode_id,
+                    "summarized_from",
+                    &[],
+                    None,
+                    now,
+                )
+                .map_err(|e| e.to_string())?;
+                tx.commit().map_err(|error| error.to_string())?;
+            }
+        }
         return Ok(SharedExperienceEpisodeResponse {
             stored: true,
             duplicate: true,
             episode_id,
         });
+    }
+
+    if request.replace_existing {
+        return Err("原共同体验记忆不存在或已删除，不能自动恢复".into());
     }
 
     let episode_id = Uuid::new_v4().to_string();
@@ -5660,6 +5729,7 @@ mod tests {
             session_id: "shared-session-1".into(),
             summary: "我们一起看了一段古风短剧，两人在药铺相识，最后在雨中告别。".into(),
             occurred_at: 1_788_624_000,
+            replace_existing: false,
         };
 
         let first = record_shared_experience_episode(&mut conn, &request).unwrap();
@@ -5692,6 +5762,138 @@ mod tests {
     }
 
     #[test]
+    fn shared_experience_episode_can_replace_a_degraded_summary() {
+        let mut conn = test_db();
+        let original = SharedExperienceEpisodeRequest {
+            card_id: "card".into(),
+            nickname: "小明".into(),
+            session_id: "shared-replay".into(),
+            summary: "降级回顾：原始事件罗列".into(),
+            occurred_at: 1_788_624_000,
+            replace_existing: false,
+        };
+        let first = record_shared_experience_episode(&mut conn, &original).unwrap();
+        let replacement = SharedExperienceEpisodeRequest {
+            summary: "整体：重新核对后的完整总结".into(),
+            replace_existing: true,
+            ..original
+        };
+        let second = record_shared_experience_episode(&mut conn, &replacement).unwrap();
+        assert!(second.duplicate);
+        let stored: String = conn
+            .query_row(
+                "SELECT summary FROM memory_episodes WHERE id=?1",
+                [&first.episode_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "整体：重新核对后的完整总结");
+        rebuild_from_events(
+            &mut conn,
+            &MemoryRebuildEventsRequest {
+                card_id: "card".into(),
+                nickname: Some("小明".into()),
+            },
+        )
+        .unwrap();
+        let replayed: String = conn
+            .query_row(
+                "SELECT summary FROM memory_episodes WHERE id=?1",
+                [&first.episode_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replayed, stored);
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_revisions").unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_evidence").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn shared_experience_retry_preserves_human_edit_and_deleted_episode() {
+        let mut conn = test_db();
+        let mut request = SharedExperienceEpisodeRequest {
+            card_id: "card".into(),
+            nickname: "小明".into(),
+            session_id: "shared-edit".into(),
+            summary: "核实后的陪看记录".into(),
+            occurred_at: 1_788_624_000,
+            replace_existing: false,
+        };
+        let first = record_shared_experience_episode(&mut conn, &request).unwrap();
+        update_memory(
+            &mut conn,
+            &MemoryUpdateRequest {
+                kind: "episode".into(),
+                id: first.episode_id.clone(),
+                text: Some("用户亲自修正的记录".into()),
+                pinned: None,
+                status: None,
+            },
+        )
+        .unwrap();
+        request.replace_existing = true;
+        request.summary = "自动重新生成的记录".into();
+        assert!(record_shared_experience_episode(&mut conn, &request).is_err());
+        let text: String = conn
+            .query_row(
+                "SELECT summary FROM memory_episodes WHERE id=?1",
+                [&first.episode_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "用户亲自修正的记录");
+        delete_memory(
+            &mut conn,
+            &MemoryDeleteRequest {
+                items: vec![MemoryItemRef {
+                    kind: "episode".into(),
+                    id: first.episode_id.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(record_shared_experience_episode(&mut conn, &request).is_err());
+    }
+
+    #[test]
+    fn shared_experience_retry_cannot_recreate_cleared_scope() {
+        let mut conn = test_db();
+        let mut request = SharedExperienceEpisodeRequest {
+            card_id: "card".into(),
+            nickname: "小明".into(),
+            session_id: "shared-clear".into(),
+            summary: "已核实的观看记录".into(),
+            occurred_at: 1_788_624_000,
+            replace_existing: false,
+        };
+        record_shared_experience_episode(&mut conn, &request).unwrap();
+        clear_scope(
+            &mut conn,
+            &MemoryClearRequest {
+                card_id: "card".into(),
+                nickname: "小明".into(),
+            },
+        )
+        .unwrap();
+        request.replace_existing = true;
+        assert!(record_shared_experience_episode(&mut conn, &request).is_err());
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_users").unwrap(),
+            0
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM memory_episodes").unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn shared_experience_episode_request_rejects_raw_media_fields() {
         let result = serde_json::from_value::<SharedExperienceEpisodeRequest>(serde_json::json!({
             "cardId": "card",
@@ -5713,6 +5915,7 @@ mod tests {
             session_id: "shared-session-2".into(),
             summary: "一起看了短剧".into(),
             occurred_at: 1_788_624_000,
+            replace_existing: false,
         };
         for request in [
             SharedExperienceEpisodeRequest {

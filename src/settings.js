@@ -1763,6 +1763,7 @@ function renderMemoryItems(items) {
     actions.appendChild(memoryActionButton("删除", async () => {
       if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
       await invoke("memory_delete", { request: { items: [{ kind: item.kind, id: item.id }] } });
+      await emit("memory-items-deleted", { cardId: selectedMemoryCardId() });
       await loadMemoryPage();
     }, "danger"));
     card.append(actions, timeline);
@@ -2062,6 +2063,7 @@ function renderMemoryGraphInspector(node) {
     actions.appendChild(memoryActionButton("删除", async () => {
       if (!window.confirm("永久删除这条记忆？此操作不可撤销。")) return;
       await invoke("memory_delete", { request: { items: [{ kind: node.kind, id: node.id }] } });
+      await emit("memory-items-deleted", { cardId: selectedMemoryCardId() });
       memoryGraphSelectedKey = "";
       await loadMemoryPage({ resetPage: true });
     }, "danger"));
