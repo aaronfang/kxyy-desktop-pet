@@ -1,5 +1,8 @@
 const SUMMARY_SOURCE_MAX_CHARS = 48_000;
 const SUMMARY_MAX_CHARS = 1_800;
+// Splitting 2,305 items across thirds makes at most 79 chunks. Each chunk
+// plus synthesis can use generation/review and one bounded grounding retry.
+const FINAL_SUMMARY_REQUEST_MAX = 320;
 
 // https://api-docs.deepseek.com/quick_start/pricing, verified 2026-10-05.
 // Values are USD per 1M tokens; off-peak is half price.
@@ -97,8 +100,22 @@ function fallbackFinalSummary(snapshot) {
     add(event.text);
     if (lines.length >= 8) break;
   }
-  if (!lines.length) return "本次共同观看的降级回顾（最终核对未完成）：已取得声音或画面记录，但具体内容未核实。";
-  return cleanText(`本次共同观看的降级回顾（最终核对未完成）：${lines.slice(-8).join("；")}`, SUMMARY_MAX_CHARS);
+  const modeLabel = {
+    cinematic: "电影或剧集",
+    livestream: "直播间",
+    "low-speech-game": "游戏实况",
+    "game-narrated": "游戏解说",
+    narrated: "解说视频",
+    "short-video": "短视频",
+    direct: "直接观看内容",
+  }[snapshot.contentMode] || "共同观看内容";
+  if (!lines.length) return `观看情境：${modeLabel}\n整体：降级回顾（最终核对未完成）：本次共同观看已取得声音或画面记录，但具体内容未核实。\n记忆点：\n- 暂无可安全提炼的记忆点。`;
+  const latestAudio = (snapshot.audioEvents || []).at(-1)?.text;
+  const overall = latestAudio
+    ? `未完成独立核对的资料显示，${modeLabel}最后一段解说提到：${cleanText(latestAudio, 180)}`
+    : `未完成独立核对的资料显示，本次${modeLabel}记录了画面变化。`;
+  const highlights = lines.slice(-3).map((line) => `- ${line}`).join("\n");
+  return cleanText(`观看情境：${modeLabel}\n整体：降级回顾（最终核对未完成）：${overall}\n记忆点（最终核对未完成）：\n${highlights}`, SUMMARY_MAX_CHARS);
 }
 
 function renderFinalSource(snapshot) {
@@ -145,7 +162,8 @@ export function createSharedExperienceLifecycle({
     if (!Object.hasOwn(state.usage, kind)) throw new TypeError("unknown usage kind");
     const usage = normalizeUsage(value || {});
     const bucket = state.usage[kind];
-    bucket.requests += Number.isInteger(requestCount) && requestCount >= 1 && requestCount <= (kind === "finalSummary" ? 6 : 2) ? requestCount : 1;
+    bucket.requests += Number.isInteger(requestCount) && requestCount >= 1
+      && requestCount <= (kind === "finalSummary" ? FINAL_SUMMARY_REQUEST_MAX : 2) ? requestCount : 1;
     bucket.prompt += usage.prompt;
     bucket.completion += usage.completion;
     bucket.total += usage.total;

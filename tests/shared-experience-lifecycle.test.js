@@ -209,6 +209,15 @@ test("test question generation costs are separate from role conversation and spe
   assert.equal(lifecycle.snapshot().usage.groundingReview.requests, 1);
 });
 
+test("long final-memory synthesis accounts for every bounded provider request", () => {
+  const lifecycle = createSharedExperienceLifecycle({ workspace: createSharedExperienceWorkspace(), summarize: async () => ({}) });
+  lifecycle.recordUsage("finalSummary", { prompt: 800, completion: 160 }, {
+    model: "deepseek-v4-flash",
+    requestCount: 8,
+  });
+  assert.equal(lifecycle.snapshot().usage.finalSummary.requests, 8);
+});
+
 test("DeepSeek cost estimate separates cached input, uncached input, and output", () => {
   // Sunday 12:00 UTC is off-peak. Flash rates per 1M tokens are
   // $0.003 cache hit, $0.15 cache miss, and $0.60 output.

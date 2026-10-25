@@ -271,6 +271,7 @@ export function createSharedExperienceWorkspace({
         segmentStartedAtMs: state.segmentStartedAtMs,
         segmentDurationMs: safeSegmentDurationMs,
         contentMode: state.contentMode,
+        primer: state.primer ? { title: state.primer.title, facts: [...state.primer.facts] } : null,
         initialOrientationPending: state.initialOrientationPending,
       };
     },

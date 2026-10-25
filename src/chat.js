@@ -98,6 +98,7 @@ import {
   filterVisualIdentityClaims,
 } from "./ai/shared-experience-visual-identity.js";
 import { createSharedExperienceCharacterTracker } from "./ai/shared-experience-character-tracker.js";
+import { clearLatestSharedExperienceRaw, retryLatestSharedExperienceSummary, saveLatestSharedExperienceRaw } from "./ai/shared-experience-archive.js";
 import { createTtsReceipt } from "./ai/shared-experience-tts-receipt.js";
 import { createSharedExperienceVoiceTracker } from "./ai/shared-experience-voice-tracker.js";
 import {
@@ -553,6 +554,7 @@ const attachBtn = document.getElementById("attach");
 const sharedExperienceBtn = document.getElementById("shared-experience-btn");
 const sharedExperiencePauseBtn = document.getElementById("shared-experience-pause-btn");
 const sharedExperienceStopBtn = document.getElementById("shared-experience-stop-btn");
+const sharedExperienceRecapBtn = document.getElementById("shared-experience-recap-btn");
 const sharedExperienceFrequency = document.getElementById("shared-experience-frequency");
 const sharedExperienceMode = document.getElementById("shared-experience-mode");
 const sharedExperienceStatus = document.getElementById("shared-experience-status");
@@ -586,7 +588,7 @@ const capsuleWaveRenderer = createSiriWaveModernRenderer(capsuleWaveCanvas);
 const callCapsuleOpenBtn = document.getElementById("call-capsule-open");
 const callCapsuleHangupBtn = document.getElementById("call-capsule-hangup");
 let activeVisualContext = null;
-const sharedExperience = { active: false, paused: false, generation: 0, windowId: null, windowLabel: "", contentTitle: "", timer: 0, captureTimer: 0, audioTimer: 0, processing: false, observing: false, transcribing: false, capturing: false, capturingAudio: false, visualWindowQueued: false, visualDiagnostics: null, pendingObservation: null, pendingAudio: null, debugEntries: [], typingUntil: 0, capturedVisual: 0, capturedAudio: 0, processedVisual: 0, processedAudio: 0, captureTimeline: { visual: [], audio: [] }, filteredVisualIdentities: 0, lastAudioCaptureEndMs: 0, workspace: null, spool: null, lifecycle: null, voiceTracker: null, primerGate: null, proactiveRunner: null, proactivePromise: null, stopPromise: null };
+const sharedExperience = { active: false, paused: false, generation: 0, windowId: null, windowLabel: "", contentTitle: "", timer: 0, captureTimer: 0, audioTimer: 0, scope: null, processing: false, observing: false, transcribing: false, capturing: false, capturingAudio: false, visualWindowQueued: false, visualDiagnostics: null, pendingObservation: null, pendingAudio: null, debugEntries: [], typingUntil: 0, capturedVisual: 0, capturedAudio: 0, processedVisual: 0, processedAudio: 0, captureTimeline: { visual: [], audio: [] }, filteredVisualIdentities: 0, lastAudioCaptureEndMs: 0, workspace: null, spool: null, lifecycle: null, voiceTracker: null, primerGate: null, proactiveRunner: null, proactivePromise: null, stopPromise: null };
 
 function recordSharedExperienceCapture(kind, capturedAtMs = Date.now()) {
   const timeline = sharedExperience.captureTimeline[kind];
@@ -2533,6 +2535,10 @@ async function send(text, opts = {}) {
   if ((!text && !image && !sticker) || busy) return;
   if (viewingStatement) {
     sharedExperience.contentTitle = viewingStatement.title;
+    // The user's explicit viewing statement is already a first-party identity
+    // signal. Record it immediately so final memory does not depend on the
+    // optional web primer being enabled or finishing before the session ends.
+    sharedExperience.workspace?.addPrimer({ title: viewingStatement.title, facts: [] });
     void (async () => {
       if (!apiBase || !apiBase.startsWith("http://")) await ensureApiBase();
       const primer = await sharedExperience.primerGate?.consider({
@@ -3586,18 +3592,55 @@ async function summarizeSharedExperience({ kind, source, evidence, contentMode }
   };
 }
 
-async function persistSharedExperienceEpisode(episode) {
-  const nickname = activeName || userDisplayName();
-  if (!nickname) throw new Error("当前人设没有可用的记忆昵称");
+function sharedExperienceMemoryScope() {
+  return { cardId: settings.personaCardId || "", nickname: activeName || userDisplayName() || "" };
+}
+
+function isSharedExperienceMemoryScopeCurrent(scope) {
+  const current = sharedExperienceMemoryScope();
+  return current.cardId === scope?.cardId && current.nickname === scope?.nickname;
+}
+
+function clearSharedExperienceRetry() {
+  clearLatestSharedExperienceRaw();
+  if (sharedExperienceRecapBtn) sharedExperienceRecapBtn.hidden = true;
+}
+
+async function persistSharedExperienceEpisode(episode, { replaceExisting = false, scope = sharedExperienceMemoryScope() } = {}) {
+  if (!scope.nickname || !isSharedExperienceMemoryScopeCurrent(scope)) throw new Error("共同体验记忆归属已改变");
   return invoke("memory_record_shared_experience", {
     request: {
-      cardId: settings.personaCardId || "",
-      nickname,
-      sessionId: episode.sessionId,
-      summary: episode.summary,
-      occurredAt: Math.max(1, Math.floor(episode.occurredAtMs / 1000)),
+      ...scope, sessionId: episode.sessionId, summary: episode.summary,
+      occurredAt: Math.max(1, Math.floor(episode.occurredAtMs / 1000)), replaceExisting,
     },
   });
+}
+
+async function regenerateLatestSharedExperienceSummary() {
+  if (sharedExperience.active || sharedExperience.stopPromise || sharedExperienceRecapBtn?.disabled) return null;
+  const scope = sharedExperienceMemoryScope();
+  if (sharedExperienceRecapBtn) sharedExperienceRecapBtn.disabled = true;
+  setSharedExperienceStatus("正在使用本次运行保留的最近陪看素材重新总结…");
+  try {
+    const result = await retryLatestSharedExperienceSummary({ scope,
+      isCurrent: () => isSharedExperienceMemoryScopeCurrent(scope),
+      summarize: async (archive) => {
+        if ((!apiBase || !apiBase.startsWith("http://")) && !await ensureApiBase()) throw new Error("proxy");
+        return requestSharedExperienceSummary({ apiBase, kind: "final", evidence: archive.events,
+          contentMode: archive.contentMode, timeoutMs: 60_000 });
+      },
+      persist: (episode, owner) => persistSharedExperienceEpisode(episode, { replaceExisting: true, scope: owner }),
+    });
+    if (isSharedExperienceMemoryScopeCurrent(scope)) setSharedExperienceStatus(result?.stored?.stored
+      ? "已核实并更新陪看记忆" : "重试素材已过期、被清除或归属改变，未更新记忆", { error: !result?.stored?.stored });
+    return result;
+  } catch (error) {
+    if (isSharedExperienceMemoryScopeCurrent(scope)) setSharedExperienceStatus(
+      `重新总结失败，原有记忆保持不变：${error?.summaryFailureCode || "审核或保存失败"}`, { error: true });
+    return null;
+  } finally {
+    if (sharedExperienceRecapBtn) sharedExperienceRecapBtn.disabled = false;
+  }
 }
 
 function stopSharedExperienceCapture() {
@@ -3684,6 +3727,9 @@ function stopSharedExperience({ silent = false, finalize = true } = {}) {
   }
   if (!sharedExperience.active && !sharedExperience.lifecycle) return Promise.resolve(null);
   const lifecycle = sharedExperience.lifecycle;
+  const archived = finalize && isSharedExperienceMemoryScopeCurrent(sharedExperience.scope)
+    && saveLatestSharedExperienceRaw(sharedExperience.workspace?.snapshot(), { scope: sharedExperience.scope });
+  if (archived && sharedExperienceRecapBtn) sharedExperienceRecapBtn.hidden = false;
   stopSharedExperienceCapture();
   setCompanionAudioActive(false);
   if (!finalize) {
@@ -4213,10 +4259,13 @@ async function connectSharedExperience(selected, { segmentDurationMs, proactiveE
   sharedExperience.visualWindowQueued = false;
   sharedExperience.visualDiagnostics = null;
   sharedExperience.runtimeReceipts = createSharedExperienceRuntimeReceipts();
+  const scope = sharedExperienceMemoryScope();
+  sharedExperience.scope = scope;
+  clearSharedExperienceRetry();
   sharedExperience.lifecycle = createSharedExperienceLifecycle({
     workspace: sharedExperience.workspace,
     summarize: summarizeSharedExperience,
-    persistEpisode: persistSharedExperienceEpisode,
+    persistEpisode: (episode) => persistSharedExperienceEpisode(episode, { scope }),
     budgetUsd: settings.sharedExperienceBudgetUsd ?? 1,
   });
   sharedExperience.voiceTracker = createSharedExperienceVoiceTracker({
@@ -4243,6 +4292,7 @@ async function connectSharedExperience(selected, { segmentDurationMs, proactiveE
       ? settings.sharedExperienceProactiveFrequency : "standard";
     sharedExperienceFrequency.hidden = false;
   }
+  if (sharedExperienceRecapBtn) sharedExperienceRecapBtn.hidden = true;
   if (typeof sharedExperienceMode !== "undefined" && sharedExperienceMode) {
     sharedExperienceMode.value = "unknown";
     sharedExperienceMode.hidden = false;
@@ -4300,6 +4350,9 @@ function selectSharedWindow(windows) {
 }
 
 // ---- 事件绑定 ----
+// Remove raw observations left by the previous experimental persistent archive.
+clearLatestSharedExperienceRaw();
+
 formEl.addEventListener("submit", (e) => {
   e.preventDefault();
   // 在用户手势（提交）的同步栈内「加持」共享 <audio>，让稍后脱离手势的自动朗读也能 play()。
@@ -4337,6 +4390,8 @@ sharedExperienceBtn?.addEventListener("click", async () => {
   }
 });
 sharedExperienceStopBtn?.addEventListener("click", () => { void stopSharedExperience(); });
+sharedExperienceRecapBtn?.addEventListener("click", () => { void regenerateLatestSharedExperienceSummary(); });
+
 sharedExperiencePauseBtn?.addEventListener("click", () => {
   if (sharedExperience.paused) resumeSharedExperience();
   else pauseSharedExperience();
@@ -4375,7 +4430,7 @@ callCapsuleEl?.addEventListener("mouseleave", () => {
   callCapsuleHovered = false;
   scheduleCallCapsuleCollapse();
 });
-window.addEventListener("beforeunload", () => { void stopSharedExperience({ silent: true, finalize: false }); });
+window.addEventListener("beforeunload", () => { clearSharedExperienceRetry(); void stopSharedExperience({ silent: true, finalize: false }); });
 callCapsuleWaveEl?.addEventListener("mousedown", (event) => {
   if (event.button !== 0) return;
   clearCallCapsuleCollapseTimer();
@@ -4883,6 +4938,10 @@ listen("apply-settings", async ({ payload }) => {
   if (!payload) return;
   const { personaChanged, backendChanged, identityChanged } =
     classifySettingsUpdate(settings, payload);
+  if (personaChanged || identityChanged) {
+    clearSharedExperienceRetry();
+    await stopSharedExperience({ silent: true, finalize: false });
+  }
   const debugWasOn = settings.showChatDebug === true;
   const prevCardId = (settings.personaCardId || "").trim();
   const prevBackend = (settings.realtimeBackend || "").trim().toLowerCase();
@@ -4938,9 +4997,15 @@ listen("apply-settings", async ({ payload }) => {
 });
 
 // 设置页清空长期记忆：同步内存态，并避免收起窗口时把当前会话再写回记忆。
+listen("memory-items-deleted", ({ payload }) => {
+  if ((payload?.cardId || "") === (settings.personaCardId || "")) clearSharedExperienceRetry();
+});
+
 listen("memory-cleared", ({ payload }) => {
   if ((payload?.cardId || "") !== (settings.personaCardId || "")) return;
   if (payload?.nickname && payload.nickname.trim().toLowerCase() !== (activeName || "").trim().toLowerCase()) return;
+  clearSharedExperienceRetry();
+  void stopSharedExperience({ silent: true, finalize: false });
   history.forEach((m) => { if (m?.id) memoryEnqueuedIds.add(m.id); });
 });
 

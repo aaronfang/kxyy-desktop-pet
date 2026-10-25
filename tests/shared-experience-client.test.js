@@ -3,6 +3,66 @@ import assert from "node:assert/strict";
 
 import { requestSharedExperienceSummary, requestSharedExperienceQuestion } from "../src/ai/shared-experience-client.js";
 
+test("final memory distills the whole session into an overview and distinctive memory points", async () => {
+  const evidence = [
+    { id: "ev-1", kind: "audio", atMs: 1000, text: "队伍起初决定寻找失踪的同伴。" },
+    { id: "ev-2", kind: "audio", atMs: 2000, text: "他们发现求救信号来自废弃医院。" },
+    { id: "ev-3", kind: "audio", atMs: 3000, text: "最后他们救出了同伴，但没有找到信号发送者。" },
+    { id: "discussion-1", kind: "user", atMs: 3500, text: "这个结尾让我觉得既松了口气又有点悬。" },
+  ];
+  const draft = {
+    events: [
+      {
+        memoryRole: "overview",
+        text: "这次主要看了队伍循着求救信号寻找并救出失踪同伴，而信号来源仍留下悬念。",
+        status: "observed",
+        claimType: "speech",
+        supports: [
+          { id: "ev-1", quote: evidence[0].text },
+          { id: "ev-2", quote: evidence[1].text },
+          { id: "ev-3", quote: evidence[2].text },
+        ],
+      },
+      {
+        memoryRole: "highlight",
+        text: "废弃医院的求救信号是推动寻找行动的关键线索。",
+        status: "observed",
+        claimType: "speech",
+        supports: [{ id: "ev-2", quote: evidence[1].text }],
+      },
+      {
+        memoryRole: "highlight",
+        text: "用户对结尾的感受是如释重负中仍带着悬念。",
+        status: "observed",
+        claimType: "user",
+        supports: [{ id: "discussion-1", quote: evidence[3].text }],
+      },
+    ],
+  };
+  let calls = 0;
+  const result = await requestSharedExperienceSummary({
+    apiBase: "http://127.0.0.1:1234",
+    kind: "final",
+    evidence,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      if (++calls === 1) {
+        assert.match(body.messages[1].content, /整体概述/);
+        assert.match(body.messages[1].content, /记忆点/);
+        assert.match(body.messages[1].content, /不是按时间.*罗列/);
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(draft) } }] }) };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        parts: draft.events.map((event, index) => ({ index, verdict: "supported", supports: event.supports })),
+      }) } }] }) };
+    },
+  });
+
+  assert.equal(result.summary,
+    "观看情境：共同观看内容\n整体：这次主要看了队伍循着求救信号寻找并救出失踪同伴，而信号来源仍留下悬念。\n记忆点：\n- 废弃医院的求救信号是推动寻找行动的关键线索。\n- 用户对结尾的感受是如释重负中仍带着悬念。");
+  assert.doesNotMatch(result.summary, /1970|T00:00|ev-/);
+});
+
 test("long final recap independently verifies all chronological thirds from raw evidence", async () => {
   const evidence = Array.from({ length: 90 }, (_, i) => ({ id: `ev-${i}`, kind: "audio", atMs: i * 20000, text: `第${i}次开门。` }));
   const batches = [];
@@ -29,6 +89,109 @@ test("long final recap independently verifies all chronological thirds from raw 
   assert.equal(result.summary, "第29次开门。\n第59次开门。\n第89次开门。");
   assert.equal(result.requestCount, 6);
   assert.equal(result.usage.total, 90);
+});
+
+test("final memory records an evidenced watch subject and mode-specific context", async () => {
+  const evidence = [
+    { id: "ev-title", kind: "visual", atMs: 1000, text: "画面字幕显示：《夜行者》电影。" },
+    { id: "ev-story", kind: "audio", atMs: 2000, text: "主角在废弃医院寻找失踪的人。" },
+    { id: "ev-turn", kind: "audio", atMs: 3000, text: "最后他发现求救信号来自医院深处。" },
+  ];
+  const events = [
+    { memoryRole: "subject", text: "《夜行者》", status: "observed", claimType: "screen-text", supports: [{ id: "ev-title", quote: evidence[0].text }] },
+    { memoryRole: "overview", text: "这部电影围绕主角在废弃医院寻找失踪者展开，线索最终指向医院深处。", status: "observed", claimType: "speech", supports: [{ id: "ev-story", quote: evidence[1].text }] },
+    { memoryRole: "highlight", text: "求救信号来自医院深处，成为后续追查的关键线索。", status: "observed", claimType: "speech", supports: [{ id: "ev-turn", quote: evidence[2].text }] },
+  ];
+  let calls = 0;
+  const result = await requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final", contentMode: "cinematic", evidence,
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      const body = JSON.parse(init.body);
+      if (calls === 1) {
+        assert.match(body.messages[1].content, /观看对象/);
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ events }) } }] }) };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ parts: events.map((event, index) => ({ index, verdict: "supported", supports: event.supports })) }) } }] }) };
+    },
+  });
+  assert.equal(result.summary, "观看情境：电影或剧集\n观看对象：画面模型线索（未独立核实）：《夜行者》。\n整体：这部电影围绕主角在废弃医院寻找失踪者展开，线索最终指向医院深处。\n记忆点：\n- 求救信号来自医院深处，成为后续追查的关键线索。");
+});
+
+test("final memory records a user-confirmed title as the watched object", async () => {
+  const evidence = [
+    { id: "identity-only", kind: "identity", atMs: 1, text: "用户确认标题：星海纪事" },
+    { id: "ev-1", kind: "audio", atMs: 2, text: "主角进入空间站寻找失踪的同伴。" },
+    { id: "ev-2", kind: "audio", atMs: 3, text: "最后发现求救信号来自维修舱。" },
+  ];
+  const events = [
+    { memoryRole: "subject", text: "星海纪事", status: "observed", claimType: "identity", supports: [{ id: "identity-only", quote: evidence[0].text }] },
+    { memoryRole: "overview", text: "这部作品围绕主角在空间站寻找失踪同伴展开。", status: "observed", claimType: "speech", supports: [{ id: "ev-1", quote: evidence[1].text }] },
+    { memoryRole: "highlight", text: "求救信号最终指向维修舱。", status: "observed", claimType: "speech", supports: [{ id: "ev-2", quote: evidence[2].text }] },
+  ];
+  let calls = 0;
+  const result = await requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final", contentMode: "cinematic", evidence,
+    fetchImpl: async () => {
+      calls += 1;
+      const content = calls === 1 ? { events } : { parts: events.map((event, index) => ({ index, verdict: "supported", supports: event.supports })) };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(content) } }] }) };
+    },
+  });
+  assert.match(result.summary, /观看对象：星海纪事/);
+});
+
+test("long final memory synthesizes reviewed chunks instead of concatenating a timeline", async () => {
+  const evidence = Array.from({ length: 90 }, (_, index) => ({
+    id: `ev-${index}`,
+    kind: "audio",
+    atMs: index * 20_000,
+    text: index < 30
+      ? `队伍在废弃医院寻找同伴，线索${index}。`
+      : index < 60
+        ? `队伍发现求救信号并绕开守卫，进展${index}。`
+        : `队伍救出同伴，但信号发送者仍未知，结果${index}。`,
+  }));
+  let calls = 0;
+  let currentEvents = [];
+  let synthesisSeen = false;
+  const result = await requestSharedExperienceSummary({
+    apiBase: "http://127.0.0.1:1234",
+    kind: "final",
+    evidence,
+    fetchImpl: async (_url, init) => {
+      calls += 1;
+      const body = JSON.parse(init.body);
+      const system = body.messages[0].content;
+      const prompt = body.messages[1].content;
+      if (system.startsWith("你是共同观看记录整理器")) {
+        if (prompt.includes("已通过证据审核的分段记忆")) {
+          synthesisSeen = true;
+          currentEvents = [
+            { memoryRole: "overview", text: "这次主要看了队伍在废弃医院追踪求救信号并救出同伴，但信号来源仍未揭晓。", status: "observed", claimType: "interpretation", supports: [
+              { id: "recap-1", quote: "废弃医院" }, { id: "recap-2", quote: "求救信号" }, { id: "recap-3", quote: "信号发送者仍未知" },
+            ] },
+            { memoryRole: "highlight", text: "成功救出同伴却留下信号来源之谜，是这次观看最鲜明的记忆点。", status: "observed", claimType: "interpretation", supports: [{ id: "recap-3", quote: "救出同伴，但信号发送者仍未知" }] },
+          ];
+        } else {
+          const batch = evidence.filter((event) => prompt.includes(`\"id\":\"${event.id}\"`));
+          const stage = batch[0].atMs < 600_000 ? 1 : batch[0].atMs < 1_200_000 ? 2 : 3;
+          const source = batch.at(-1);
+          currentEvents = [
+            { memoryRole: "overview", text: stage === 1 ? "队伍在废弃医院寻找同伴。" : stage === 2 ? "队伍追踪求救信号并绕开守卫。" : "队伍救出同伴，但信号发送者仍未知。", status: "observed", claimType: "speech", supports: [{ id: source.id, quote: source.text }] },
+            { memoryRole: "highlight", text: source.text, status: "observed", claimType: "speech", supports: [{ id: source.id, quote: source.text }] },
+          ];
+        }
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ events: currentEvents }) } }] }) };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({
+        parts: currentEvents.map((event, index) => ({ index, verdict: "supported", supports: event.supports })),
+      }) } }] }) };
+    },
+  });
+
+  assert.equal(synthesisSeen, true);
+  assert.equal(result.summary,
+    "观看情境：共同观看内容\n整体：这次主要看了队伍在废弃医院追踪求救信号并救出同伴，但信号来源仍未揭晓。\n记忆点：\n- 成功救出同伴却留下信号来源之谜，是这次观看最鲜明的记忆点。");
+  assert.ok(calls >= 8);
 });
 
 test("long recap rejects partial success and retains usage when a later third fails", async () => {
@@ -627,4 +790,32 @@ test("question generation fails closed on timeout and counts billed malformed re
   });
   assert.equal(malformed, null);
   assert.equal(accounted, 1);
+});
+
+test("compact structured memory does not retry merely to inflate event count", async () => {
+  const evidence = Array.from({ length: 24 }, (_, i) => ({ id: `ev-${i}`, kind: "audio", atMs: i, text: "队伍救出了同伴。" }));
+  const events = [
+    { memoryRole: "overview", text: "队伍救出了同伴。", status: "observed", claimType: "speech", supports: [{ id: "ev-0", quote: evidence[0].text }] },
+    { memoryRole: "highlight", text: "救出同伴是这次行动的结果。", status: "observed", claimType: "speech", supports: [{ id: "ev-0", quote: evidence[0].text }] },
+  ];
+  let calls = 0;
+  const result = await requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final", evidence,
+    fetchImpl: async () => { calls++; return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(calls % 2
+      ? { events } : { parts: events.map((e,index) => ({ index, verdict: "supported", supports: e.supports })) }) } }] }) }; },
+  });
+  assert.match(result.summary, /整体：队伍救出了同伴/);
+  assert.equal(calls, 2);
+});
+
+test("rejected overview cannot be replaced by relabeling a highlight", async () => {
+  const evidence = [{ id: "ev-1", kind: "audio", text: "队伍打开了门。" }];
+  const events = [
+    { memoryRole: "overview", text: "队伍获得了最终胜利。", status: "observed", claimType: "speech", supports: [{ id: "ev-1", quote: evidence[0].text }] },
+    { memoryRole: "highlight", text: "队伍打开了门。", status: "observed", claimType: "speech", supports: [{ id: "ev-1", quote: evidence[0].text }] },
+  ];
+  let calls = 0;
+  await assert.rejects(requestSharedExperienceSummary({ apiBase: "http://127.0.0.1:1234", kind: "final", evidence,
+    fetchImpl: async () => { calls++; return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(calls % 2
+      ? { events } : { parts: events.map((e,index) => ({ index, verdict: index ? "supported" : "unsupported", supports: index ? e.supports : [] })) }) } }] }) }; },
+  }), (error) => error.summaryFailureCode === "no-supported-events");
 });

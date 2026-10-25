@@ -88,6 +88,9 @@ body {
 #shared-experience-btn:disabled { opacity: .45; cursor: wait; }
 #shared-experience-stop-btn { border: 0; background: transparent; color: #ffaaa8; cursor: pointer; font-size: 13px; padding: 0 4px; }
 #shared-experience-stop-btn:hover { color: #ffd0ce; }
+#shared-experience-recap-btn { border: 0; background: transparent; color: #b8d7ff; cursor: pointer; font-size: 16px; padding: 0 4px; }
+#shared-experience-recap-btn:hover { color: #e0edff; }
+#shared-experience-recap-btn:disabled { opacity: .5; cursor: wait; }
 #shared-experience-pause-btn { border: 0; background: transparent; color: #f5c86b; cursor: pointer; font-size: 13px; padding: 0 4px; }
 #shared-experience-pause-btn:hover { color: #ffe1a0; }
 #shared-experience-mode { max-width: 112px; border: 1px solid rgba(255,255,255,.14); border-radius: 5px; background: rgba(255,255,255,.06); color: rgba(255,255,255,.82); font-size: 11px; padding: 3px 4px; }
