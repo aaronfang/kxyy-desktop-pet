@@ -290,3 +290,5 @@ CI 与发布职责：
 ## 致谢
 
 动画引擎源自 Lars de Rooij 的 [webmeji](https://webmeji.neocities.org)。
+
+QQ 个人号接入首版（NapCat / OneBot v11）：见 [配置与验证边界](docs/qq-onebot-setup.md)。默认关闭，仅指定主人的好友私聊文字。

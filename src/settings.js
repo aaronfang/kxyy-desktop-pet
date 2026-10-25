@@ -2578,6 +2578,36 @@ el("memoryClearAll")?.addEventListener("click", async () => {
   }
 });
 
+const qqStatusLabels={disabled:"已关闭",connecting:"连接中",connected:"OneBot已连接（仍需当前人设和昵称匹配）",
+  "connection-or-identity-failed":"连接或登录号校验失败，请检查 NapCat、地址、token 与机器人号",reconnecting:"正在重连",
+  "send-unknown":"发送结果不明；不会自动重发","send-failed":"发送失败","storage-failed":"本地去重记录保存失败，已停止本条回复"};
+async function refreshQqConfig(fill=false) {
+  const cfg=await invoke("qq_get_config");
+  if(fill) {
+    el("qqEnabled").checked=cfg.enabled===true;
+    for(const [id,key] of [["qqWsUrl","wsUrl"],["qqBotId","botId"],["qqOwnerId","ownerId"],["qqCardId","cardId"],["qqNickname","nickname"]]) el(id).value=cfg[key]||"";
+    if(!cfg.wsUrl) el("qqWsUrl").value="ws://127.0.0.1:3001";
+    el("qqToken").value="";el("qqClearToken").checked=false;
+  }
+  el("qqStatus").textContent=(qqStatusLabels[cfg.status]||"状态暂不可用")+" · "+(cfg.hasToken?"已保存 token":"未配置 token");
+}
+el("qqBindCurrent")?.addEventListener("click",()=>{
+  el("qqCardId").value=el("personaCardId").value.trim();
+  el("qqNickname").value=el("userName").value.trim();
+});
+el("qqRefresh")?.addEventListener("click",()=>refreshQqConfig().catch(()=>{el("qqStatus").textContent="读取连接状态失败";}));
+el("qqSave")?.addEventListener("click",async()=>{
+  el("qqSave").disabled=true;
+  try {
+    await invoke("qq_save_config",{request:{enabled:el("qqEnabled").checked,wsUrl:el("qqWsUrl").value.trim(),
+      ownerId:el("qqOwnerId").value.trim(),botId:el("qqBotId").value.trim(),cardId:el("qqCardId").value.trim(),
+      nickname:el("qqNickname").value.trim(),token:el("qqToken").value},clearToken:el("qqClearToken").checked});
+    await refreshQqConfig(true);
+  } catch(_) {el("qqStatus").textContent="保存失败：请检查地址、不同的QQ号、绑定昵称与 token；清除 token 前须关闭接入。";}
+  finally {el("qqSave").disabled=false;}
+});
+document.querySelector('.tab-btn[data-tab="qq"]')?.addEventListener("click",()=>refreshQqConfig().catch(()=>{}));
+
 async function init() {
   try {
     platform = await invoke("get_platform");
@@ -2603,6 +2633,7 @@ async function init() {
   probeBackendStatus();
   probeLocalTextStatus();
   probeFreshTopicStatus();
+  await refreshQqConfig(true).catch(()=>{el("qqStatus").textContent="QQ配置暂不可用";});
 }
 
 init();

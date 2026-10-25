@@ -2,6 +2,7 @@ mod api;
 mod fresh_topics;
 mod local_text;
 mod memory;
+mod qq;
 mod memory_core;
 mod persona_assets;
 mod realtime;
@@ -2251,6 +2252,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
         s.capsule_collapsed_width = settings.capsule_collapsed_width.clamp(64, 160);
         s.persona_card_id = card_id;
     });
+    qq::qq_cancel_pending(app.clone(), app.state::<qq::QqState>());
     re_register_hotkey(&app);
     let app_state = app.state::<AppState>();
     if app_state.chat_compact.load(Ordering::Acquire) {
@@ -2438,6 +2440,7 @@ pub fn run() {
             app.manage(shared_experience::SharedExperienceManager::new());
             let memory_state = memory::MemoryState::open(&handle);
             app.manage(memory_state);
+            app.manage(qq::QqState::open(&handle)?);
             let fresh_topics_path = handle
                 .path()
                 .app_config_dir()
@@ -2457,6 +2460,7 @@ pub fn run() {
             });
             // 尽早创建托盘，避免语音服务等后台任务拖慢菜单栏图标出现。
             install_tray(app)?;
+            qq::start(handle.clone());
 
             // 兜底清理：托盘「退出」走 app.exit() → tauri::RunEvent::Exit（见 run() 尾部），
             // 但那套机制依赖事件循环正常收到并处理该事件。若进程被外部信号强杀
@@ -2777,6 +2781,12 @@ pub fn run() {
             shared_experience::observe_shared_experience_frames,
             shared_experience::transcribe_shared_experience_audio,
             shared_experience::observe_shared_experience,
+            qq::qq_get_config,
+            qq::qq_receiver_ready,
+            qq::qq_claim_message,
+            qq::qq_save_config,
+            qq::qq_cancel_pending,
+            qq::qq_send_draft,
             memory::memory_status,
             memory::memory_integrity_check,
             memory::memory_export,
