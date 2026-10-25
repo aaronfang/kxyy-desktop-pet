@@ -32,6 +32,19 @@ test("primer requires an explicit user viewing statement and ignores title metad
   assert.equal(calls, 0);
 });
 
+test("viewing statements preserve movie, live-room, game, and narrated-work names", async () => {
+  const { parseSharedExperienceViewingStatement } = await import("../src/ai/shared-experience-primer.js");
+  const cases = [
+    ["我正在看《夜行者》电影", "夜行者", "电影"],
+    ["正在看星河放映厅直播间", "星河放映厅", "直播间"],
+    ["我们现在看《边境纪元》游戏实况", "边境纪元", "游戏实况"],
+    ["我正在看《生化危机9》游戏解说视频", "生化危机9", "解说"],
+  ];
+  for (const [statement, title, format] of cases) {
+    assert.deepEqual(parseSharedExperienceViewingStatement(statement), { title, format, statement });
+  }
+});
+
 test("primer searches once then exposes only bounded spoiler-free identity fields", async () => {
   const bodies = [];
   const fetchImpl = async (url, init) => {

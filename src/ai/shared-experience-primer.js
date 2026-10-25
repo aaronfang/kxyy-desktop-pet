@@ -1,8 +1,8 @@
 const MAX_TITLE_CHARS = 120;
 const MAX_FIELD_CHARS = 160;
 const SPOILER_RE = /结局|最终战|死亡|死去|牺牲|反转|幕后真凶|真实身份|完结|击败了|杀死了/;
-const VIEWING_PREFIX_RE = /^我们(?:现在|正在)?(?:一起)?(?:来|在|开始|继续)?看(?:看)?[：:，,\s]*/u;
-const VIEWING_FORMAT_RE = /(解说(?:视频)?|电影|影片|电视剧|剧集|动漫|动画|番剧|纪录片)(?:吧|呢|呀|啊|了)?[。！!？?\s]*$/u;
+const VIEWING_PREFIX_RE = /^(?:我们|我)?(?:现在|正在)?(?:一起)?(?:来|在|开始|继续)?看(?:看)?[：:，,\s]*/u;
+const VIEWING_FORMAT_RE = /(游戏解说(?:视频)?|游戏实况|直播间|直播|短视频|解说(?:视频)?|电影|影片|电视剧|剧集|动漫|动画|番剧|纪录片|游戏)(?:吧|呢|呀|啊|了)?[。！!？?\s]*$/u;
 
 function clean(value, maxChars = MAX_FIELD_CHARS) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, maxChars);
@@ -35,7 +35,7 @@ export function parseSharedExperienceViewingStatement(value) {
   const subject = statement.replace(VIEWING_PREFIX_RE, "");
   const formatMatch = subject.match(VIEWING_FORMAT_RE);
   if (!formatMatch) return null;
-  const format = formatMatch[1].startsWith("解说") ? "解说" : formatMatch[1];
+  const format = /解说/u.test(formatMatch[1]) ? "解说" : formatMatch[1];
   const quoted = subject.match(/[《「『"]([^》」』"]{1,80})[》」』"]/u)?.[1];
   const beforeFormat = subject.slice(0, formatMatch.index).replace(/的\s*$/u, "");
   const title = clean(quoted || beforeFormat, MAX_TITLE_CHARS)
