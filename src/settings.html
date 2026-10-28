@@ -446,19 +446,28 @@
       <div class="tab-panel" id="tab-qq">
         <section>
           <h2>QQ 主人私聊（实验）</h2>
-          <p class="hint">使用独立个人 QQ 号登录本机 NapCat，并开启 OneBot v11 正向 WebSocket。仅回复指定主人的好友私聊纯文字；群聊、图片、语音和电话不接收。</p>
-          <label class="row-inline"><input id="qqEnabled" type="checkbox" /><span>启用 QQ 自动回复（默认关闭）</span></label>
+          <p class="hint">使用独立个人 QQ 号登录本机 NapCat，并开启 OneBot v11 正向 WebSocket。仅回复指定主人的好友私聊。支持文字和可选语音消息；群聊和图片不接收。</p>
+          <label class="row-inline"><input id="qqEnabled" type="checkbox" /><span>开启 QQ 自动回复（立即生效）</span></label>
+          <p id="qqServiceStatus" class="hint" role="status"></p>
+          <p class="hint">开启时自动保存配置、启动 QQ / NapCat 并连接；普通方式打开的 QQ 会正常退出后以 NapCat 方式重启。关闭时停止回复并关闭桌宠启动的 QQ。首次需安装 NapCat，未登录时请扫描下方二维码；以后无需先手动打开 QQ 或运行脚本。</p>
+          <img id="qqLoginQr" hidden alt="请使用机器人小号扫描 QQ 登录二维码" width="240" height="240" style="background:white;padding:8px" />
+          <div class="memory-actions"><button id="qqRefreshLogin" class="ghost" type="button" hidden>刷新登录二维码</button><button id="qqLogin" class="ghost" type="button">打开 NapCat 管理页（排查用）</button></div>
           <label><span>OneBot WebSocket 地址</span><input id="qqWsUrl" maxlength="200" placeholder="ws://127.0.0.1:3001" /></label>
           <label><span>机器人 QQ 号<small>独立个人号，登录号必须匹配</small></span><input id="qqBotId" inputmode="numeric" maxlength="12" /></label>
           <label><span>主人 QQ 号<small>唯一允许收发的好友</small></span><input id="qqOwnerId" inputmode="numeric" maxlength="12" /></label>
-          <label><span>绑定人设卡 ID<small>默认人设留空</small></span><input id="qqCardId" maxlength="120" /></label>
-          <label><span>绑定记忆昵称<small>必须与桌面当前生效昵称一致</small></span><input id="qqNickname" maxlength="80" /></label>
-          <button id="qqBindCurrent" class="ghost" type="button">填入当前人设与昵称</button>
+          <label><span>当前人设卡 ID<small>自动跟随已保存的桌宠设置；默认人设为空</small></span><input id="qqCardId" readonly /></label>
+          <label><span>当前记忆昵称<small>自动跟随已保存的桌宠昵称</small></span><input id="qqNickname" readonly /></label>
           <label><span>OneBot access token<small>必须与 NapCat 配置一致；留空保留已存 token</small></span><input id="qqToken" type="password" maxlength="256" autocomplete="new-password" /></label>
           <label class="row-inline"><input id="qqClearToken" type="checkbox" /><span>清除已存 token（需先关闭接入）</span></label>
-          <div class="memory-actions"><button id="qqSave" type="button">单独保存 QQ 设置</button><button id="qqRefresh" class="ghost" type="button">刷新连接状态</button></div>
+          <div class="memory-actions"><button id="qqSave" type="button">保存 QQ 配置</button><button id="qqRefresh" class="ghost" type="button">刷新连接状态</button></div>
+          <label><span>QQ 回复方式<small>使用桌宠当前声音；语音不可用时改用文字</small></span><select id="qqReplyMode"><option value="text">文字</option><option value="voice">语音</option></select></label>
+          <label class="row-inline"><input id="qqVoiceInput" type="checkbox" /><span>识别主人语音消息（QQ 云端转写）</span></label>
+          <label class="row-inline"><input id="qqPhoneEnabled" type="checkbox" /><span>接听主人 QQ 电话（实验）<small>使用当前本地语音后端；需原生电话桥及两条虚拟音频线路</small></span></label>
+          <div id="qqPhoneStatus" class="hint" role="status"></div>
+          <p class="hint">语音选项点击“保存 QQ 配置”后生效。开启识别会调用 QQ 的语音转文字服务；转写后使用与桌宠相同的人格和记忆，原始录音不写入记忆库。</p>
+          <p id="qqMediaStatus" class="hint" role="status"></p>
           <p id="qqStatus" class="hint" role="status"></p>
-          <p class="hint">桌宠须保持运行；当前人设或昵称与绑定不符时不回复。QQ 使用独立短历史，只读绑定记忆，不自动写入长期记忆。发送结果不明时不会自动重发。Token 仅在本机单独配置文件保存，不会回显。</p>
+          <p class="hint">桌宠须保持运行；保存人设、昵称或完整 / 抽象人格设置后，QQ 下一条消息自动使用新设置，无需重新绑定。QQ 使用独立短历史，并共享当前人设 / 昵称的长期记忆。可发送“请记住：…”获得保存回执；普通成功对话也会在后台整理，临时口令及明确要求不保存的内容会跳过。在线巩固使用当前 DeepSeek，本地模式使用 Ollama。发送结果不明时不会自动重发。Token 仅在本机单独配置文件保存，不会回显。</p>
         </section>
       </div>
 

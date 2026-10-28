@@ -3,6 +3,10 @@ mod fresh_topics;
 mod local_text;
 mod memory;
 mod qq;
+mod qq_audio;
+mod qq_media;
+mod qq_phone;
+mod qq_service;
 mod memory_core;
 mod persona_assets;
 mod realtime;
@@ -2440,7 +2444,7 @@ pub fn run() {
             app.manage(shared_experience::SharedExperienceManager::new());
             let memory_state = memory::MemoryState::open(&handle);
             app.manage(memory_state);
-            app.manage(qq::QqState::open(&handle)?);
+            app.manage(qq::QqState::open(&handle, &settings)?);
             let fresh_topics_path = handle
                 .path()
                 .app_config_dir()
@@ -2472,6 +2476,7 @@ pub fn run() {
                 let sig_handle = handle.clone();
                 let _ = ctrlc::set_handler(move || {
                     eprintln!("[lib] 收到终止信号，清理本地语音子进程后退出…");
+                    sig_handle.state::<qq::QqState>().shutdown();
                     voice_service::stop(&sig_handle);
                     sig_handle
                         .state::<shared_experience::SharedExperienceManager>()
@@ -2781,12 +2786,18 @@ pub fn run() {
             shared_experience::observe_shared_experience_frames,
             shared_experience::transcribe_shared_experience_audio,
             shared_experience::observe_shared_experience,
+            qq_phone::qq_phone_persona,
             qq::qq_get_config,
+            qq::qq_refresh_login,
+            qq::qq_open_login,
+            qq::qq_stop_service,
             qq::qq_receiver_ready,
             qq::qq_claim_message,
+            qq::qq_remember_message,
             qq::qq_save_config,
             qq::qq_cancel_pending,
             qq::qq_send_draft,
+            qq::qq_cancel_draft,
             memory::memory_status,
             memory::memory_integrity_check,
             memory::memory_export,
@@ -2815,6 +2826,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| match event {
             tauri::RunEvent::Exit => {
+                app.state::<qq::QqState>().shutdown();
                 voice_service::stop(app);
                 app.state::<shared_experience::SharedExperienceManager>()
                     .stop();

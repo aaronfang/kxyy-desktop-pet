@@ -5308,6 +5308,36 @@ class LocalRealtimeEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["llm"]["total"], 16)
         self.assertEqual(usage["ttsCharacters"], len("（开心）第一句已经完成。第二句尾巴"))
 
+    async def test_buffered_pcm_reserves_actual_audio_duration_without_overspeed_or_tail_padding(self):
+        original_asyncio = common.asyncio
+        waits = []
+        started = False
+        class ClockProxy:
+            def __getattr__(self, name):
+                return getattr(original_asyncio, name)
+            async def sleep(self, seconds):
+                if started:
+                    waits.append(seconds)
+                await original_asyncio.sleep(0)
+        common.asyncio = ClockProxy()
+        common._synth_tts = lambda _text: b"\x01\x00" * (1920 * 3 + 240)
+        self.stream_events = [{"type": "delta", "text": "按真实声音时长发送这一句。"}, {"type": "done"}]
+        original_send = self.session.send_downlink_pcm
+        async def send(pcm, **kwargs):
+            nonlocal started
+            started = True
+            return await original_send(pcm, **kwargs)
+        self.session.send_downlink_pcm = send
+        try:
+            scope = self.session._new_scope("response")
+            self.session.response_scope = scope
+            await self.session._reply_pipeline("用户输入", scope)
+        finally:
+            common.asyncio = original_asyncio
+        self.assertEqual(len(waits), 4)
+        self.assertAlmostEqual(sum(waits), 0.25)
+        self.assertAlmostEqual(waits[-1], 0.01)
+
     async def test_reply_keeps_playing_until_frontend_segment_receipt(self):
         common._synth_tts = lambda _text: (
             b"\x01\x00" * 40,

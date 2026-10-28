@@ -3374,7 +3374,7 @@ pub fn memory_recall(
     recall_memory(conn, &request)
 }
 
-fn recall_memory(
+pub(crate) fn recall_memory(
     conn: &mut Connection,
     request: &MemoryRecallRequest,
 ) -> Result<MemoryRecallResponse, String> {
@@ -5735,6 +5735,7 @@ mod tests {
         let mut sent=false;
         assert!(with_qq_memory_lease(&state,Some(&lease),|_|sent=true).is_none());
         assert!(!sent);
+        assert!(with_qq_memory_db(&state,Some(&lease),|_,_|panic!("late QQ write after clear")).is_none());
         let next=with_qq_memory_lease(&state,None,|lease|lease).unwrap();
         assert_ne!(lease,next);
         {
@@ -5742,6 +5743,33 @@ mod tests {
             finish_restored_database(guard.as_mut().unwrap()).unwrap();
         }
         assert!(with_qq_memory_lease(&state,Some(&next),|_|()).is_none());
+        assert!(with_qq_memory_db(&state,Some(&next),|_,_|panic!("late QQ write after restore")).is_none());
+    }
+
+    #[test]
+    fn qq_exchange_uses_existing_consolidation_and_desktop_recall() {
+        let mut conn = test_db();
+        let queued = enqueue_qq_exchange(&mut conn, MemoryEnqueueRequest {
+            card_id: "card".into(), nickname: "元宝".into(), session_id: "qq:test".into(),
+            batch_start: 0, batch_end: 2,
+            messages: vec![
+                MemoryMessage { id: "user-1".into(), role: "user".into(), content: "我喜欢乌龙茶".into(), image_caption: String::new(), do_not_remember: false },
+                MemoryMessage { id: "assistant-1".into(), role: "assistant".into(), content: "下回聊聊茶吧".into(), image_caption: String::new(), do_not_remember: false },
+            ],
+        }).unwrap();
+        assert!(queued.accepted);
+        let job = take_due_job(&mut conn).unwrap().unwrap();
+        assert_eq!(job.id, queued.job_id);
+        apply_extraction(&mut conn, &job, Extraction {
+            facts: vec![fact("用户喜欢乌龙茶", "饮品偏好", "乌龙茶", "assertion")],
+            ..Extraction::default()
+        }).unwrap();
+        let request = MemoryRecallRequest { card_id: "card".into(), nickname: "元宝".into(), query: "乌龙茶".into(), reason: String::new(), image_caption: String::new(), max_items: Some(6) };
+        let items = recall_memory(&mut conn, &request).unwrap().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "用户喜欢乌龙茶");
+        assert!(recall_memory(&mut conn, &MemoryRecallRequest { nickname: "ππ".into(), ..request }).unwrap().items.is_empty());
+        assert!(take_due_job(&mut conn).unwrap().is_none());
     }
 
     fn fact(text: &str, predicate: &str, value: &str, evidence: &str) -> ExtractedFact {
@@ -8003,11 +8031,40 @@ mod tests {
 
 // Serialize QQ draft admission with destructive Memory changes. Once admitted,
 // socket delivery may already have started and cannot be retracted.
-pub(crate) fn with_qq_memory_lease<T>(state:&MemoryState, expected:Option<&str>, admit:impl FnOnce(String)->T) -> Option<T> {
-    let guard=state.conn.lock().ok()?;
-    let conn=guard.as_ref()?;
+pub(crate) fn with_qq_memory_lease<T>(state: &MemoryState, expected: Option<&str>, admit: impl FnOnce(String) -> T) -> Option<T> {
+    with_qq_memory_db(state, expected, |_, lease| admit(lease))
+}
+
+// Always acquire Memory before QQ Core; keep lease validation and persistence
+// under the same lock as deletion/restore, including late transport receipts.
+pub(crate) fn with_qq_memory_db<T>(state: &MemoryState, expected: Option<&str>, admit: impl FnOnce(&mut Connection, String) -> T) -> Option<T> {
+    let mut guard=state.conn.lock().ok()?;
+    let conn=guard.as_mut()?;
     conn.execute("INSERT OR IGNORE INTO memory_meta(key,value) VALUES('explicit-write-epoch',?1)",[Uuid::new_v4().to_string()]).ok()?;
     let lease:String=conn.query_row("SELECT value FROM memory_meta WHERE key='explicit-write-epoch'",[],|r|r.get(0)).ok()?;
     if expected.is_some_and(|value|value!=lease) {return None;}
-    Some(admit(lease))
+    Some(admit(conn,lease))
+}
+
+#[cfg(test)]
+pub(crate) fn qq_test_connection() -> Connection {
+    let mut conn=Connection::open_in_memory().unwrap();
+    configure(&conn).unwrap();migrate(&mut conn).unwrap();
+    conn.execute("INSERT OR REPLACE INTO memory_meta(key,value) VALUES('explicit-write-epoch','test-lease')",[]).unwrap();
+    conn
+}
+
+// Preserve the entire exchange privacy boundary: never consolidate a reply by
+// itself after dropping a private/sensitive/explicit-save user request.
+pub(crate) fn qq_private_text(text: &str) -> bool {
+    is_sensitive(text) || ["别记","不要记","不用记","别保存","不要保存","不用保存","别把","只在本次","只在这次","仅本次","只在这轮","仅在本次","临时口令"].iter().any(|word|text.contains(word))
+}
+pub(crate) fn enqueue_qq_exchange(conn: &mut Connection, request: MemoryEnqueueRequest) -> Result<MemoryEnqueueResponse,String> {
+    let excluded=request.messages.iter().any(|m| {
+        let text=m.content.trim();
+        m.do_not_remember || qq_private_text(text) || text.starts_with("请记住") || text.starts_with("请你记住")
+            || text.starts_with("请帮我记住") || text.starts_with("帮我记住") || text.starts_with("记住：")
+    });
+    if excluded {return Ok(MemoryEnqueueResponse {accepted:false,duplicate:false,job_id:String::new()});}
+    enqueue_session(conn,request)
 }

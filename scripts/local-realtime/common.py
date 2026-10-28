@@ -5590,7 +5590,9 @@ class Session:
                         chunk_sequence=chunk_sequence,
                     ):
                         return
-                    await asyncio.sleep(0.06)
+                    # Reserve the actual PCM duration, including the short tail.
+                    # Sending 80ms every 60ms overfills headless QQ playback queues.
+                    await asyncio.sleep(len(chunk) / (OUTPUT_RATE * 2))
                 await self.send_json(
                     {"type": "audio_segment_end", "segmentId": segment_id},
                     scope=scope,

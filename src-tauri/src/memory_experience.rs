@@ -49,9 +49,9 @@ pub fn memory_remember_explicit(
     remember(guard.as_mut().ok_or("记忆数据库不可用")?, &request)
 }
 
-fn remember(conn: &mut Connection, request: &RememberRequest) -> Result<RememberReceipt, String> {
+pub(crate) fn remember(conn: &mut Connection, request: &RememberRequest) -> Result<RememberReceipt, String> {
     let message = request.message.trim();
-    let body = ["请你记住", "请记住", "帮我记住", "记住"]
+    let body = ["请你记住", "请记住", "请帮我记住", "帮我记住", "记住"]
         .iter()
         .find_map(|prefix| {
             let rest = message.strip_prefix(prefix)?;

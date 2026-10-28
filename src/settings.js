@@ -2578,34 +2578,83 @@ el("memoryClearAll")?.addEventListener("click", async () => {
   }
 });
 
-const qqStatusLabels={disabled:"已关闭",connecting:"连接中",connected:"OneBot已连接（仍需当前人设和昵称匹配）",
+const qqStatusLabels={disabled:"已关闭",connecting:"连接中",connected:"OneBot 已连接",
   "connection-or-identity-failed":"连接或登录号校验失败，请检查 NapCat、地址、token 与机器人号",reconnecting:"正在重连",
   "send-unknown":"发送结果不明；不会自动重发","send-failed":"发送失败","storage-failed":"本地去重记录保存失败，已停止本条回复"};
+const qqServiceLabels={managed:"QQ / NapCat 已由桌宠启动",external:"检测到外部 QQ / NapCat；关闭开关时停止自动回复，保留外部 QQ",stopped:"QQ 服务未启动",exited:"QQ 已退出；关闭再开启可重试",manual:"此平台请手动启动 NapCat", "process-status":"QQ 进程状态暂不可用"};
+const qqLoginLabels={"waiting-login":"QQ 尚未登录，请用机器人小号扫描下方二维码并在手机确认。登录后会自动连接，无需再开关。","initializing":"QQ 正在登录并初始化，请稍候…","logged-in":"QQ 已登录，正在等待 OneBot 连接。","unavailable":"正在等待 NapCat 启动；若长时间未连接，请检查 QQ / NapCat 安装。"};
+const qqServiceErrors={"invalid-config":"请填写正确的 QQ 号、绑定昵称、地址和 token，再开启。","qq-missing":"未找到 QQ，请先安装 QQ。","napcat-missing":"未检测到 NapCat，请先完成 NapCat 安装。","launch-failed":"QQ 启动失败，请检查 QQ / NapCat 安装与系统权限。","qq-restart-required":"QQ 未能正常退出；请保存 QQ 中的工作并退出后重试。","process-status":"无法检查 QQ 进程，请检查系统权限后重试。","stop-failed":"QQ 进程未能完全停止，请正常退出 QQ 后重试。","local-storage":"无法保存 QQ 配置，启动已取消。","stop-storage-failed":"本次已停止自动回复，但开关未能保存；请检查本机存储后重新关闭。"};
+let qqMediaDirty=false;
+let qqServiceBusy=false;
+let qqServiceError="";
+let qqRefreshEpoch=0;
+let qqRefreshPending=false;
 async function refreshQqConfig(fill=false) {
+  const epoch=qqRefreshEpoch;
   const cfg=await invoke("qq_get_config");
+  if(epoch!==qqRefreshEpoch) return;
+  el("qqEnabled").checked=cfg.enabled===true;
+  if(fill || !qqMediaDirty) {
+    el("qqReplyMode").value=cfg.replyMode==="voice"?"voice":"text";
+    el("qqVoiceInput").checked=cfg.voiceInput===true;
+    el("qqPhoneEnabled").checked=cfg.phoneEnabled===true;
+  }
+  el("qqPhoneStatus").textContent=({disabled:"",ready:"QQ 电话已就绪，只接听绑定主号的新来电。",connecting:"正在连接 QQ 电话桥…",ringing:"正在准备接听主人来电…",active:"QQ 电话通话中", "phone-setup-required":"电话需要安装原生桥、独立 Python 音频环境及 BlackHole 2ch / 16ch。", "phone-audio-route-unavailable":"无法准备独立虚拟音频线路，请关闭电话后重试；普通 QQ 消息仍可用。", "phone-external-qq":"请先退出外部 QQ，桌宠才能启动电话专用 QQ。", "phone-backend-unavailable":"请先配置并启动本地 / VoxCPM2 / CosyVoice 实时语音服务。", "phone-native-not-ready":"电话桥尚未确认账号、原生能力或双向音频，请检查登录和音频权限。", "phone-connection-failed":"电话桥未连接，请检查安装与系统权限后关闭再开启。", "phone-ended":"电话已结束，等待下一次来电。", "phone-session-failed":"本次电话已停止，可重新拨打。"})[cfg.phoneStatus]||"电话服务尚未就绪。";
+  el("qqMediaStatus").textContent=({ready:"",synthesizing:"正在合成 QQ 语音…",transcribing:"正在识别主人语音…","voice-fallback":"语音合成未完成，本条改用文字。","transcription-failed":"语音识别失败，请重发或发送文字。"})[cfg.mediaStatus]||"";
+  // Scope is read-only and always comes from saved desktop settings.
+  el("qqCardId").value=cfg.cardId||"";
+  el("qqNickname").value=cfg.nickname||"";
   if(fill) {
-    el("qqEnabled").checked=cfg.enabled===true;
-    for(const [id,key] of [["qqWsUrl","wsUrl"],["qqBotId","botId"],["qqOwnerId","ownerId"],["qqCardId","cardId"],["qqNickname","nickname"]]) el(id).value=cfg[key]||"";
+    for(const [id,key] of [["qqWsUrl","wsUrl"],["qqBotId","botId"],["qqOwnerId","ownerId"]]) el(id).value=cfg[key]||"";
     if(!cfg.wsUrl) el("qqWsUrl").value="ws://127.0.0.1:3001";
     el("qqToken").value="";el("qqClearToken").checked=false;
   }
-  el("qqStatus").textContent=(qqStatusLabels[cfg.status]||"状态暂不可用")+" · "+(cfg.hasToken?"已保存 token":"未配置 token");
+  const connected=cfg.status==="connected";
+  const loginHint=cfg.enabled&&!connected?(qqLoginLabels[cfg.login]||""):"";
+  el("qqServiceStatus").textContent=qqServiceError||qqServiceErrors[cfg.serviceError]||[qqServiceLabels[cfg.service]||"QQ 服务状态暂不可用",loginHint].filter(Boolean).join(" · ");
+  const qr=cfg.enabled&&!connected&&cfg.login==="waiting-login"&&typeof cfg.qrDataUrl==="string"&&cfg.qrDataUrl.startsWith("data:image/svg+xml;base64,")?cfg.qrDataUrl:"";
+  el("qqLoginQr").hidden=!qr;
+  el("qqLoginQr").src=qr;
+  el("qqRefreshLogin").hidden=!cfg.enabled||cfg.login!=="waiting-login";
+  el("qqStatus").textContent=(qqStatusLabels[cfg.status]||"状态暂不可用")+" · "+(cfg.hasToken?"已保存 token":"未配置 token")+(cfg.bindingMatches===false?" · 请先在人设页保存主人昵称":"");
 }
-el("qqBindCurrent")?.addEventListener("click",()=>{
-  el("qqCardId").value=el("personaCardId").value.trim();
-  el("qqNickname").value=el("userName").value.trim();
+function qqFormRequest() {
+  return {request:{enabled:el("qqEnabled").checked,wsUrl:el("qqWsUrl").value.trim(),
+    ownerId:el("qqOwnerId").value.trim(),botId:el("qqBotId").value.trim(),cardId:el("qqCardId").value.trim(),
+    replyMode:el("qqReplyMode").value||"text",voiceInput:el("qqVoiceInput").checked,phoneEnabled:el("qqPhoneEnabled").checked,nickname:el("qqNickname").value.trim(),token:el("qqToken").value},clearToken:el("qqClearToken").checked};
+}
+async function controlQqService(stop=false, save=false) {
+  if(qqServiceBusy) return;
+  qqServiceBusy=true;qqServiceError="";qqRefreshEpoch++;
+  for(const id of ["qqEnabled","qqSave","qqRefresh","qqReplyMode","qqVoiceInput","qqPhoneEnabled"]) el(id).disabled=true;
+  el("qqServiceStatus").textContent=stop?"正在关闭自动回复和 QQ 连接…":"正在保存并启动 QQ / NapCat，请稍候…";
+  try {
+    if(stop) await invoke("qq_stop_service");
+    else await invoke("qq_save_config",qqFormRequest());
+    // Clear submitted credentials without overwriting unrelated unsaved fields.
+    if(!stop){qqMediaDirty=false;el("qqToken").value="";el("qqClearToken").checked=false;}
+    await refreshQqConfig();
+  } catch(error) {
+    qqServiceError=qqServiceErrors[typeof error==="string"?error:""]||(save?"保存失败：请检查地址、不同的 QQ 号、绑定昵称与 token。":"QQ 服务操作失败，请检查配置与本机服务后重试。");
+    await refreshQqConfig().catch(()=>{el("qqEnabled").checked=false;});
+    el("qqServiceStatus").textContent=qqServiceError;
+    if(save) el("qqStatus").textContent=qqServiceError;
+  } finally {
+    qqServiceBusy=false;
+    for(const id of ["qqEnabled","qqSave","qqRefresh","qqReplyMode","qqVoiceInput","qqPhoneEnabled"]) el(id).disabled=false;
+  }
+}
+for(const id of ["qqReplyMode","qqVoiceInput","qqPhoneEnabled"]) el(id)?.addEventListener("change",()=>{qqMediaDirty=true;});
+el("qqEnabled")?.addEventListener("change",()=>controlQqService(!el("qqEnabled").checked));
+el("qqLogin")?.addEventListener("click",()=>invoke("qq_open_login").catch(()=>{el("qqServiceStatus").textContent="无法打开本机 NapCat 登录页；请确认开关已开启。";}));
+el("qqRefreshLogin")?.addEventListener("click",async()=>{
+  el("qqRefreshLogin").disabled=true;
+  try {await invoke("qq_refresh_login");await refreshQqConfig();}
+  catch(_){el("qqServiceStatus").textContent="二维码暂不可用，请稍后重试。";}
+  finally{el("qqRefreshLogin").disabled=false;}
 });
 el("qqRefresh")?.addEventListener("click",()=>refreshQqConfig().catch(()=>{el("qqStatus").textContent="读取连接状态失败";}));
-el("qqSave")?.addEventListener("click",async()=>{
-  el("qqSave").disabled=true;
-  try {
-    await invoke("qq_save_config",{request:{enabled:el("qqEnabled").checked,wsUrl:el("qqWsUrl").value.trim(),
-      ownerId:el("qqOwnerId").value.trim(),botId:el("qqBotId").value.trim(),cardId:el("qqCardId").value.trim(),
-      nickname:el("qqNickname").value.trim(),token:el("qqToken").value},clearToken:el("qqClearToken").checked});
-    await refreshQqConfig(true);
-  } catch(_) {el("qqStatus").textContent="保存失败：请检查地址、不同的QQ号、绑定昵称与 token；清除 token 前须关闭接入。";}
-  finally {el("qqSave").disabled=false;}
-});
+el("qqSave")?.addEventListener("click",()=>controlQqService(false,true));
 document.querySelector('.tab-btn[data-tab="qq"]')?.addEventListener("click",()=>refreshQqConfig().catch(()=>{}));
 
 async function init() {
@@ -2634,6 +2683,11 @@ async function init() {
   probeLocalTextStatus();
   probeFreshTopicStatus();
   await refreshQqConfig(true).catch(()=>{el("qqStatus").textContent="QQ配置暂不可用";});
+  setInterval(async()=>{
+    if(document.hidden || !el("tab-qq")?.classList.contains("active") || qqServiceBusy || qqRefreshPending) return;
+    qqRefreshPending=true;
+    try {await refreshQqConfig();} catch(_) {} finally {qqRefreshPending=false;}
+  },2500);
 }
 
 init();

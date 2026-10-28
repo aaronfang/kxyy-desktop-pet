@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { createQqPrivateChat } from '../src/ai/qq-private-chat.js';
+import { recallWithFollowup, requestMemoryRecallPlan } from '../src/ai/memory-experience.js';
 const event = (nonce='one') => ({ nonce, text:'你好', cardId:'', nickname:'主人' });
 function fixture(overrides={}) {
   const calls=[];
@@ -78,4 +81,109 @@ test('ordinary incoming-message invalidation preserves the preceding confirmed Q
     {role:'user',content:'你好'},
     {role:'assistant',content:'记住本次短对话'},
   ]);
+});
+
+test('live chat wiring uses saved nickname, full persona, new memory scope and clears old QQ history',async()=>{
+  const src=readFileSync(new URL('../src/chat.js',import.meta.url),'utf8');
+  const calls=[],requests=[];
+  const context=vm.createContext({
+    createQqPrivateChat,recallWithFollowup,requestMemoryRecallPlan:args=>requestMemoryRecallPlan({...args,fetchImpl:context.fetch}),assets:{activeCardId:''},apiBase:'http://127.0.0.1:1234',
+    activeName:'ππ',activeProfile:{},settings:{personaCardId:'',onlinePromptMode:'abstract'},
+    buildLocalTextSystemPrompt:()=> 'local',buildOnlineAbstractSystemPrompt:()=> 'abstract',
+    buildSystemPrompt:(_a,args)=> 'full:'+args.name,computeLiveContext:()=> 'time',
+    stripStickerForDisplay:x=>x,stripSpeakBlockForDisplay:x=>x,sanitizeReply:x=>x,
+    invoke:async(command,args)=>{calls.push({command,args});return command==='memory_recall'?{items:[]}:command==='qq_claim_message'?'same-lease':'sent';},
+    fetch:async(_url,opts)=>{requests.push(JSON.parse(opts.body));return {ok:true,json:async()=>({choices:[{message:{content:'回复'}}]})};},
+  });
+  vm.runInContext(src.slice(src.indexOf('let qqScopeEpoch = 0;'),src.indexOf('async function recoverQqPending()')),context);
+  context.incoming={...event('before'),nickname:'ππ'};
+  assert.equal(await vm.runInContext('qqPrivateChat.receive(incoming)',context),'sent');
+  vm.runInContext("settings={...settings,userName:'元宝',onlinePromptMode:'original'};activeName='元宝';qqScopeEpoch++;qqPrivateChat.invalidate();",context);
+  assert.equal(await vm.runInContext('qqPrivateChat.receive(incoming)',context),'ignored');
+  context.incoming={...event('after'),nickname:'元宝'};
+  assert.equal(await vm.runInContext('qqPrivateChat.receive(incoming)',context),'sent');
+  assert.match(requests[1].messages[0].content,/full:元宝/);
+  assert.deepEqual(requests[1].messages.map(m=>m.role),['system','user']);
+  assert.equal(calls.filter(c=>c.command==='memory_recall').at(-1).args.request.nickname,'元宝');
+});
+
+test('QQ live prompt describes the saved voice transport without pretending to know delivery or phone support',async()=>{
+  const src=readFileSync(new URL('../src/chat.js',import.meta.url),'utf8');
+  const requests=[];
+  const context=vm.createContext({createQqPrivateChat,recallWithFollowup,requestMemoryRecallPlan,
+    assets:{activeCardId:''},apiBase:'http://127.0.0.1:1234',activeName:'元宝',activeProfile:{},
+    settings:{personaCardId:'',onlinePromptMode:'original'},
+    buildSystemPrompt:()=> 'full:元元',computeLiveContext:()=> 'time',
+    stripStickerForDisplay:x=>x,stripSpeakBlockForDisplay:x=>x,sanitizeReply:x=>x,
+    invoke:async command=>command==='memory_recall'?{items:[]}:command==='qq_claim_message'?'lease':'sent',
+    fetch:async(_url,opts)=>{requests.push(JSON.parse(opts.body));return {ok:true,json:async()=>({choices:[{message:{content:'你好元宝'}}]})};},
+  });
+  vm.runInContext(src.slice(src.indexOf('let qqScopeEpoch = 0;'),src.indexOf('async function recoverQqPending()')),context);
+  context.incoming={...event('voice-mode'),nickname:'元宝',text:'你能发语音吗',replyMode:'voice',voiceInput:true};
+  assert.equal(await vm.runInContext('qqPrivateChat.receive(incoming)',context),'sent');
+  const voice=requests.at(-1).messages[0].content;
+  assert.match(voice,/应用会将你的回复合成为 QQ 语音消息/);
+  assert.match(voice,/主人语音.*QQ 云端转写/);
+  assert.match(voice,/不代表.*实时电话/);
+  assert.match(voice,/不得.*已发送.*已听见/);
+  context.incoming={...event('text-mode'),nickname:'元宝',replyMode:'text',voiceInput:false};
+  await vm.runInContext('qqPrivateChat.receive(incoming)',context);
+  const text=requests.at(-1).messages[0].content;
+  assert.match(text,/当前设置使用 QQ 文字回复/);
+  assert.doesNotMatch(text,/应用会将你的回复合成为 QQ 语音消息/);
+  assert.doesNotMatch(text,/主人语音.*QQ 云端转写/);
+});
+
+test('QQ recall resolves a vague memory question using only its own prior user topic',async()=>{
+  const src=readFileSync(new URL('../src/chat.js',import.meta.url),'utf8');
+  const queries=[],requests=[];
+  const context=vm.createContext({createQqPrivateChat,recallWithFollowup,requestMemoryRecallPlan:args=>requestMemoryRecallPlan({...args,fetchImpl:context.fetch}),
+    assets:{activeCardId:''},apiBase:'http://127.0.0.1:1234',activeName:'元宝',activeProfile:{},
+    settings:{personaCardId:'',onlinePromptMode:'original'},
+    buildSystemPrompt:()=> '元元',computeLiveContext:()=> 'time',
+    stripStickerForDisplay:x=>x,stripSpeakBlockForDisplay:x=>x,sanitizeReply:x=>x,
+    invoke:async(command,args)=>{
+      if(command==='memory_recall'){
+        queries.push(args.request);
+        return {items:args.request.query==='乌龙茶 偏好'?[{id:'tea',kind:'fact',text:'元宝喜欢乌龙茶'}]:[]};
+      }
+      return command==='qq_claim_message'?'lease':'sent';
+    },
+    fetch:async(_url,opts)=>{
+      const body=JSON.parse(opts.body);requests.push(body);
+      return {ok:true,json:async()=>({choices:[{message:{content:body.max_tokens===120?'\u007b"query":"乌龙茶 偏好"\u007d':'回复'}}]})};
+    },
+  });
+  vm.runInContext(src.slice(src.indexOf('let qqScopeEpoch = 0;'),src.indexOf('async function recoverQqPending()')),context);
+  for(const [nonce,text] of [['first','聊聊乌龙茶'],['second','还记得我之前说喜欢哪种茶吗']]){
+    context.incoming={...event(nonce),nickname:'元宝',text};
+    assert.equal(await vm.runInContext('qqPrivateChat.receive(incoming)',context),'sent');
+  }
+  assert.deepEqual(queries.map(q=>q.query),['聊聊乌龙茶','还记得我之前说喜欢哪种茶吗','乌龙茶 偏好']);
+  assert.ok(queries.every(q=>q.nickname==='元宝'&&q.cardId===''));
+  assert.equal(JSON.parse(requests.find(r=>r.max_tokens===120).messages[1].content).priorUserText,'聊聊乌龙茶');
+  assert.match(requests.at(-1).messages.map(m=>m.content).join('\n'),/元宝喜欢乌龙茶/);
+});
+
+test('QQ explicit remember returns a real receipt without model claims or ordinary history',async()=>{
+  let generated=0,stored=0;const sent=[];
+  const {client}=fixture({remember:async nonce=>{assert.equal(nonce,'save');stored++;return {stored:true};},
+    generate:async()=>{generated++;return '模型不能代替保存回执';},send:async(n,t)=>{sent.push(t);return 'sent';}});
+  assert.equal(await client.receive({...event('save'),text:'请帮我记住，我喜欢乌龙茶'}),'sent');
+  assert.equal(stored,1);assert.equal(generated,0);assert.match(sent[0],/已保存到长期记忆/);
+  const failed=fixture({remember:async()=>{throw Error('storage');}});
+  assert.equal(await failed.client.receive({...event('failed-save'),text:'请记住：我喜欢茶'}),'sent');
+  assert.match(failed.calls[0].text,/未保存/);
+});
+
+test('voice delivery has its own deadline and abort cancels only its nonce',async()=>{
+  const cancelled=[];let finish;
+  const {client}=fixture({timeoutMs:15,deliveryTimeoutMs:100,cancel:nonce=>cancelled.push(nonce),send:()=>new Promise(r=>finish=r)});
+  const pending=client.receive(event('voice'));
+  await new Promise(r=>setTimeout(r,30));
+  assert.deepEqual(cancelled,[]);
+  finish('sent');assert.equal(await pending,'sent');
+  const stalled=fixture({timeoutMs:100,deliveryTimeoutMs:15,cancel:nonce=>cancelled.push(nonce),send:()=>new Promise(()=>{})});
+  assert.equal(await stalled.client.receive(event('stalled')),'cancelled');
+  assert.deepEqual(cancelled,['stalled']);
 });

@@ -4,6 +4,8 @@ import { explicitMemoryText, recallWithFollowup, rememberExplicitMessage } from 
 
 test("explicit memory intent is anchored and respects refusal", () => {
   assert.equal(explicitMemoryText("请记住：我不吃香菜"), "我不吃香菜");
+  assert.equal(explicitMemoryText("请帮我记住，我喜欢乌龙茶"), "我喜欢乌龙茶");
+  for (const text of ["他说请帮我记住：规则", "请帮我记住，不要保存这段", "请帮我记住："]) assert.equal(explicitMemoryText(text), null);
   for (const text of ["他说请记住：规则", "别记住这段", "请记住：", "你还记住上次的事吗"]) assert.equal(explicitMemoryText(text), null);
 });
 

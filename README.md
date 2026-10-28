@@ -291,4 +291,4 @@ CI 与发布职责：
 
 动画引擎源自 Lars de Rooij 的 [webmeji](https://webmeji.neocities.org)。
 
-QQ 个人号接入首版（NapCat / OneBot v11）：见 [配置与验证边界](docs/qq-onebot-setup.md)。默认关闭，仅指定主人的好友私聊文字。
+QQ 个人号接入（NapCat / OneBot v11）：在 **设置 → QQ 接入** 使用一个开关立即开启/关闭自动回复。macOS 自动启动或复用 QQ/NapCat，未登录时在设置内显示扫码提示；关闭开关或退出桌宠会清理本次托管的 QQ，无需额外脚本或管理页。保存为开启时下次启动桌宠自动恢复；Windows/Linux 暂须自行启动 NapCat。默认关闭，仅接受指定主人的好友私聊；可选择文字或语音回复，并单独开启主人语音转写。macOS 实验电话支持接听主人原生 QQ 来电、流式回复与打断，需要外部原生桥和 BlackHole 2ch / 16ch。QQ 与桌宠共享当前人设 / 昵称的长期记忆：支持补充检索、“请记住：…”真实保存回执，以及成功对话的后台整理；电话只按实际播放完成的句段整理。详见 [配置、启停与验证边界](docs/qq-onebot-setup.md)。

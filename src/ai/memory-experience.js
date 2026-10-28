@@ -2,7 +2,7 @@ import { asksNotToRemember } from "../memory-ui.js";
 
 export function explicitMemoryText(text) {
   if (typeof text !== "string" || asksNotToRemember(text)) return null;
-  const match = text.trim().match(/^(?:请(?:你)?记住|帮我记住|记住)[：:,，\s]+(.+)$/u);
+  const match = text.trim().match(/^(?:请(?:你)?记住|请?帮我记住|记住)[：:,，\s]+(.+)$/u);
   return match?.[1]?.trim() || null;
 }
 
