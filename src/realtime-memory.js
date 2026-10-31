@@ -4,6 +4,7 @@
 // 直接回到原有 system role。这里把超时、裁剪和提示词格式化做成纯函数，避免
 // 在 realtime.js 的音频状态机里引入数据库依赖。
 
+import { memoryTimeText } from "./ai/memory-time.js";
 import { sanitizeObservationText } from "./ai/observation.js";
 
 export const REALTIME_MEMORY_MAX_ITEMS = 3;
@@ -111,7 +112,7 @@ export function selectRealtimeMemoryItems(
   let chars = 0;
   for (const { item } of candidates) {
     if (selected.length >= limit) break;
-    const text = sanitizeObservationText(item.text, { maxChars: 300 });
+    const text = memoryTimeText(item);
     if (!text) continue;
     if (chars + text.length > budget) continue;
     selected.push({

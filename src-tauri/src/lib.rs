@@ -1,8 +1,17 @@
 mod api;
+mod web_research;
 mod fresh_topics;
 mod local_text;
 mod memory;
+mod memory_time;
 mod qq;
+mod qq_delivery;
+mod proactive;
+mod companion_activity;
+mod qq_audio;
+mod qq_media;
+mod qq_phone;
+mod qq_service;
 mod memory_core;
 mod persona_assets;
 mod realtime;
@@ -228,7 +237,7 @@ struct Settings {
     web_grounding_enabled: bool,
     #[serde(default = "default_fresh_topic_participation")]
     fresh_topic_participation: String,
-    /// 网页观察 provider：`none` / `tavily`。
+    /// 网页观察 provider：`none` / `tavily` / `deepseek`。
     #[serde(default)]
     web_grounding_provider: String,
     /// Tavily Search API Key。持久化在本机，由 Rust 代理用于固定搜索端点。
@@ -2208,6 +2217,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             .as_str()
         {
             "tavily" => "tavily".into(),
+            "deepseek" => "deepseek".into(),
             _ => "none".into(),
         };
         s.tavily_api_key = settings.tavily_api_key.trim().to_string();
@@ -2440,7 +2450,7 @@ pub fn run() {
             app.manage(shared_experience::SharedExperienceManager::new());
             let memory_state = memory::MemoryState::open(&handle);
             app.manage(memory_state);
-            app.manage(qq::QqState::open(&handle)?);
+            app.manage(qq::QqState::open(&handle, &settings)?);
             let fresh_topics_path = handle
                 .path()
                 .app_config_dir()
@@ -2472,6 +2482,7 @@ pub fn run() {
                 let sig_handle = handle.clone();
                 let _ = ctrlc::set_handler(move || {
                     eprintln!("[lib] 收到终止信号，清理本地语音子进程后退出…");
+                    sig_handle.state::<qq::QqState>().shutdown();
                     voice_service::stop(&sig_handle);
                     sig_handle
                         .state::<shared_experience::SharedExperienceManager>()
@@ -2781,12 +2792,22 @@ pub fn run() {
             shared_experience::observe_shared_experience_frames,
             shared_experience::transcribe_shared_experience_audio,
             shared_experience::observe_shared_experience,
+            qq_phone::qq_phone_persona,
             qq::qq_get_config,
+            qq::qq_refresh_login,
+            qq::qq_open_login,
+            qq::qq_stop_service,
             qq::qq_receiver_ready,
             qq::qq_claim_message,
+            qq::qq_remember_message,
             qq::qq_save_config,
             qq::qq_cancel_pending,
             qq::qq_send_draft,
+            qq::qq_conversation_activity,
+            qq::qq_present_initiative,
+            qq::qq_decline_initiative,
+            qq::qq_read_images,
+            qq::qq_cancel_draft,
             memory::memory_status,
             memory::memory_integrity_check,
             memory::memory_export,
@@ -2815,6 +2836,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| match event {
             tauri::RunEvent::Exit => {
+                app.state::<qq::QqState>().shutdown();
                 voice_service::stop(app);
                 app.state::<shared_experience::SharedExperienceManager>()
                     .stop();

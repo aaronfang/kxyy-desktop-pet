@@ -446,19 +446,46 @@
       <div class="tab-panel" id="tab-qq">
         <section>
           <h2>QQ 主人私聊（实验）</h2>
-          <p class="hint">使用独立个人 QQ 号登录本机 NapCat，并开启 OneBot v11 正向 WebSocket。仅回复指定主人的好友私聊纯文字；群聊、图片、语音和电话不接收。</p>
-          <label class="row-inline"><input id="qqEnabled" type="checkbox" /><span>启用 QQ 自动回复（默认关闭）</span></label>
+          <p class="hint">使用独立个人 QQ 号登录本机 NapCat，并开启 OneBot v11 正向 WebSocket。仅回复指定主人的好友私聊。支持文字和可选语音消息；支持图片与表情；视频暂不理解，群聊不接收。</p>
+          <label class="row-inline"><input id="qqEnabled" type="checkbox" /><span>开启 QQ 自动回复（立即生效）</span></label>
+          <p id="qqServiceStatus" class="hint" role="status"></p>
+          <p class="hint">开启时自动保存配置、启动 QQ / NapCat 并连接；普通方式打开的 QQ 会正常退出后以 NapCat 方式重启。关闭时停止回复并关闭桌宠启动的 QQ。首次需安装 NapCat，未登录时请扫描下方二维码；以后无需先手动打开 QQ 或运行脚本。</p>
+          <img id="qqLoginQr" hidden alt="请使用机器人小号扫描 QQ 登录二维码" width="240" height="240" style="background:white;padding:8px" />
+          <div class="memory-actions"><button id="qqRefreshLogin" class="ghost" type="button" hidden>刷新登录二维码</button><button id="qqLogin" class="ghost" type="button">打开 NapCat 管理页（排查用）</button></div>
           <label><span>OneBot WebSocket 地址</span><input id="qqWsUrl" maxlength="200" placeholder="ws://127.0.0.1:3001" /></label>
           <label><span>机器人 QQ 号<small>独立个人号，登录号必须匹配</small></span><input id="qqBotId" inputmode="numeric" maxlength="12" /></label>
           <label><span>主人 QQ 号<small>唯一允许收发的好友</small></span><input id="qqOwnerId" inputmode="numeric" maxlength="12" /></label>
-          <label><span>绑定人设卡 ID<small>默认人设留空</small></span><input id="qqCardId" maxlength="120" /></label>
-          <label><span>绑定记忆昵称<small>必须与桌面当前生效昵称一致</small></span><input id="qqNickname" maxlength="80" /></label>
-          <button id="qqBindCurrent" class="ghost" type="button">填入当前人设与昵称</button>
+          <label><span>当前人设卡 ID<small>自动跟随已保存的桌宠设置；默认人设为空</small></span><input id="qqCardId" readonly /></label>
+          <label><span>当前记忆昵称<small>自动跟随已保存的桌宠昵称</small></span><input id="qqNickname" readonly /></label>
           <label><span>OneBot access token<small>必须与 NapCat 配置一致；留空保留已存 token</small></span><input id="qqToken" type="password" maxlength="256" autocomplete="new-password" /></label>
           <label class="row-inline"><input id="qqClearToken" type="checkbox" /><span>清除已存 token（需先关闭接入）</span></label>
-          <div class="memory-actions"><button id="qqSave" type="button">单独保存 QQ 设置</button><button id="qqRefresh" class="ghost" type="button">刷新连接状态</button></div>
+          <label><span>QQ 回复方式<small>文字可附表情；语音模式每条只发语音或单独表情，语音不可用时改用文字</small></span><select id="qqReplyMode"><option value="text">文字</option><option value="voice">语音</option></select></label>
+          <label><span>主动交流<small>有新内容才开口；会话内可补充一次，等你回答或收尾时保持安静</small></span><select id="qqProactiveMode"><option value="off">安静（默认关闭）</option><option value="natural">自然（会话内续话＋择机联系）</option><option value="active">更主动（会话内续话＋较多联系）</option></select></label>
+          <p class="hint">会话内有新的同话题内容时，文字回复后最早约 20 秒、语音送达后最早约 60 秒再决定是否补充一次；等待你的回答、话题收尾时不续话。长时间主动联系：“自然”闲置至少 45 分钟、两次至少间隔 3 小时、每天最多 3 次；“更主动”为 20 分钟、90 分钟、5 次。两次已送达的提问未获回应时暂停；普通分享无人回应会降低频率。你发消息后恢复普通退避。</p>
+          <label class="row-inline"><input id="qqDailyContactGoal" type="checkbox" /><span>每日一次主动联系目标（QQ，可选）<small>默认关闭；18 点起若当天尚未主动联系，优先准备兴趣分享或轻量闲聊；最多准备两次，不越过静默、暂停或连接限制</small></span></label>
+          <p id="qqDailyGoalStatus" class="hint" role="status"></p>
+          <label><span>主动交流通道<small>自动跟随最近收到主人消息的渠道；桌宠仅在聊天窗口可见时主动</small></span><select id="qqProactiveChannel"><option value="auto">自动（只选一个渠道）</option><option value="qq">QQ 私聊</option><option value="desktop">桌宠聊天窗口</option></select></label>
+          <label><span>静默时段（北京时间）<small>开始与结束相同表示全天不设静默；“先别主动找我”暂停，“可以主动找我”恢复</small></span><span><input id="qqQuietStart" type="number" min="0" max="23" value="23" aria-label="静默开始小时" /> 至 <input id="qqQuietEnd" type="number" min="0" max="23" value="9" aria-label="静默结束小时" /></span></label>
+          <div class="memory-actions"><button id="qqSave" type="button">保存 QQ 配置</button><button id="qqRefresh" class="ghost" type="button">刷新连接状态</button></div>
+          <div class="qq-debug-panel" aria-label="主动交流状态与调试">
+            <h3>主动交流状态</h3>
+            <p id="qqDebugSummary" class="hint"></p>
+            <p id="qqProactiveStatus" class="hint" role="status"></p>
+            <p class="hint">这里的时间是最早再次评估时间，不保证到点发送；内容、静默、忙碌和额度仍会影响决定。此页打开时每 2.5 秒更新。开启时下信息后，后台每分钟检查到期来源并自动更新，失败后逐步延长重试间隔。</p>
+            <p id="qqInterestCacheStatus" class="hint" role="status"></p>
+            <p id="qqCacheRefreshStatus" class="hint" role="status"></p>
+            <div class="memory-actions"><button id="qqOpenInterestCache" class="ghost" type="button">打开兴趣缓存（时下信息）</button><button id="qqOpenTopicPreferences" class="ghost" type="button">设置感兴趣的话题</button></div>
+            <p class="hint">兴趣缓存是“时下信息”的本机资料库：开启“允许时下信息观察”，在人设中标记“感兴趣”，保存后可重新采集。无需额外搜索 Key；主动分享只读取已有缓存。</p>
+            <p id="qqActivityStatus" class="hint" role="status"></p>
+            <details><summary>最近主动决策（仅状态与时间）</summary><p id="qqDecisionHistory" class="hint"></p></details>
+          </div>
+          <label class="row-inline"><input id="qqVoiceInput" type="checkbox" /><span>识别主人语音消息（QQ 云端转写）</span></label>
+          <label class="row-inline"><input id="qqPhoneEnabled" type="checkbox" /><span>接听主人 QQ 电话（实验）<small>使用当前本地语音后端；需原生电话桥及两条虚拟音频线路</small></span></label>
+          <div id="qqPhoneStatus" class="hint" role="status"></div>
+          <p class="hint">QQ 选项点击底部“保存”或“保存 QQ 配置”后生效。开启识别会调用 QQ 的语音转文字服务；转写后使用与桌宠相同的人格和记忆，原始录音不写入记忆库。</p>
+          <p id="qqMediaStatus" class="hint" role="status"></p>
           <p id="qqStatus" class="hint" role="status"></p>
-          <p class="hint">桌宠须保持运行；当前人设或昵称与绑定不符时不回复。QQ 使用独立短历史，只读绑定记忆，不自动写入长期记忆。发送结果不明时不会自动重发。Token 仅在本机单独配置文件保存，不会回显。</p>
+          <p class="hint">桌宠须保持运行；保存人设、昵称或完整 / 抽象人格设置后，QQ 下一条消息自动使用新设置，无需重新绑定。QQ 使用独立短历史，并共享当前人设 / 昵称的长期记忆。可发送“请记住：…”获得保存回执；普通成功对话也会在后台整理，临时口令及明确要求不保存的内容会跳过。在线巩固使用当前 DeepSeek，本地模式使用 Ollama。发送结果不明时不会自动重发。Token 仅在本机单独配置文件保存，不会回显。</p>
         </section>
       </div>
 
@@ -586,10 +613,11 @@
       <!-- ========== 页签 5：时下信息 ========== -->
       <div class="tab-panel" id="tab-fresh-topics">
         <section>
-          <h2>时下信息</h2>
+          <h2>时下信息 · 兴趣缓存</h2>
+          <p class="hint">这里也是 QQ“大肥鱼式主动分享”的资料入口。开启下方开关并保存，再到“人设 → 话题偏好”将想让角色分享的分类标记为“感兴趣”。“参与方式”控制普通聊天带入资料的频率；QQ 是否主动联系仍由“QQ 接入 → 主动交流”控制。</p>
           <label class="row-inline">
             <input id="webGroundingEnabled" type="checkbox" />
-            <span>允许时下信息观察<small>默认关闭；专业榜单优先、分类搜索兜底；明确搜索时可额外使用 Tavily</small></span>
+            <span>允许时下信息观察<small>控制后台兴趣缓存和主动资讯分享；QQ 按需搜索独立运行，不受此开关限制</small></span>
           </label>
           <label>
             <span>参与方式<small>只使用本机缓存的候选，不会每句话都联网</small></span>
@@ -600,13 +628,15 @@
             </select>
           </label>
           <label>
-            <span>网页观察服务</span>
+            <span>按需搜索优先服务</span>
             <select id="webGroundingProvider">
-              <option value="none">内置中文来源（无需 Key）</option>
-              <option value="tavily">Tavily Search</option>
+              <option value="none">自动选择（有可用 Key 即可搜索）</option>
+              <option value="deepseek">优先 DeepSeek Search（复用 DeepSeek Key）</option>
+              <option value="tavily">优先 Tavily Search</option>
             </select>
           </label>
-          <div id="webGroundingFieldsTavily" hidden>
+          <p class="hint">QQ 无需说“查一下”：文字和语音转写按问题判断是否检索；明确搜索会直接执行，天气、新闻等在判断服务异常时仍会搜索，明确说“不联网”会跳过。完整人格、抽象人格与本地文字模型均可搜索。一次检索优先使用已配 Key 的服务，失败或无可用结果自动尝试另一家，最多各一次；没有独立的搜索启用开关。DeepSeek 复用已保存的 Key，Tavily Key 可同时配置。搜索服务仅收到必要搜索词，网页资料不保存到长期记忆。</p>
+          <div id="webGroundingFieldsTavily">
             <label>
               <span>Tavily API Key<small>搜索内容会发送给 Tavily；Key 仅保存在本机，<a href="https://app.tavily.com/home" target="_blank" rel="noreferrer">获取 Key</a></small></span>
               <div class="pw-field">

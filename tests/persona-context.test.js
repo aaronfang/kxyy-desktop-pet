@@ -105,7 +105,7 @@ test("familiarity inference uses explicit conversational signals and ignores ord
 
 test("daily context carries exact local time and timezone without inferred livestream state", () => {
   const context = computeLiveContext(
-    new Date(2026, 6, 29, 21, 7, 0),
+    new Date("2026-07-29T21:07:00+08:00"),
     LORE,
     "kxyy-yuanyuan",
     { timeZone: "Asia/Shanghai" },
@@ -139,7 +139,7 @@ test("explicit livestream turns receive bounded lore without a fabricated curren
     useLive: true,
     lore: LORE,
     cardId: "kxyy-yuanyuan",
-    now: new Date(2026, 6, 29, 21, 7, 0),
+    now: new Date("2026-07-29T21:07:00+08:00"),
     timeZone: "Asia/Shanghai",
   });
   const runtime = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
@@ -158,7 +158,7 @@ test("ordinary turns do not receive livestream lore", () => {
     useLive: true,
     lore: LORE,
     cardId: "kxyy-yuanyuan",
-    now: new Date(2026, 6, 29, 21, 7, 0),
+    now: new Date("2026-07-29T21:07:00+08:00"),
     timeZone: "Asia/Shanghai",
   });
   const runtime = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
@@ -195,7 +195,7 @@ test("proactive daily prompts contain no livestream-room topic seeds", () => {
       lore: LORE,
       cardId: "kxyy-yuanyuan",
       proactiveKind,
-      now: new Date(2026, 6, 29, 21, 7, 0),
+      now: new Date("2026-07-29T21:07:00+08:00"),
       timeZone: "Asia/Shanghai",
     });
     const prompt = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n");
@@ -340,8 +340,8 @@ test("bundled YuanYuan card defaults to daily chat and preserves epistemic bound
 });
 
 test("temporal payload refreshes per turn without carrying weather or activity", () => {
-  const first = computeTemporalContextData(new Date(2026, 6, 29, 21, 7), "Asia/Shanghai");
-  const second = computeTemporalContextData(new Date(2026, 6, 29, 21, 8), "Asia/Shanghai");
+  const first = computeTemporalContextData(new Date("2026-07-29T21:07:00+08:00"), "Asia/Shanghai");
+  const second = computeTemporalContextData(new Date("2026-07-29T21:08:00+08:00"), "Asia/Shanghai");
   assert.deepEqual(first, {
     date: "2026-07-29",
     weekday: "周三",
@@ -408,4 +408,14 @@ test("relationship and short-term mood only modulate allowlisted presentation", 
   assert.match(hint, /禁止据此新增、删除或改写任何 persona\/system 事实/);
   assert.match(hint, /禁止推导隐藏好感度、恋爱关系或新的长期记忆/);
   assert.equal(buildRelationshipMoodHint(null, "unknown"), "");
+});
+
+test('explicit timezone controls the actual date and clock across midnight',()=>{
+  const result=computeTemporalContextData(new Date('2026-10-28T16:30:00Z'),'Asia/Shanghai');
+  assert.deepEqual(result,{date:'2026-10-29',weekday:'周四',time:'00:30',timeZone:'Asia/Shanghai'});
+});
+
+test('rendered live time keeps the explicit zone date instead of the host date',()=>{
+  const prompt=computeLiveContext(new Date('2026-10-28T16:30:00Z'),{},'other',{timeZone:'Asia/Shanghai'});
+  assert.match(prompt,/2026年10月29日 周四 00:30（Asia\/Shanghai）/);
 });
