@@ -46,3 +46,4 @@
 - 本机 `npm run test:gate`：预检 JS 38 项、主 JS 611 项；Rust 260 passed / 2 既有 ignored；Python、资源合同及 Rust 编译检查通过（Python 保留1项既有 skip）。
 - 发布前复核并增加三组回归：合法长消息组不漏搜且完整检查隐私/不联网要求；多日期或混合时态保守标为未知；科学/工作成长/综合兴趣可进入活动评估并显示。
 - 追踪：[QQ 语音与电话 #86](https://github.com/aaronfang/kxyy-desktop-pet/issues/86)、[自然交流与时间记忆 #87](https://github.com/aaronfang/kxyy-desktop-pet/issues/87)、[搜索资料卡 #88](https://github.com/aaronfang/kxyy-desktop-pet/issues/88)。
+- 首轮 Windows CI 暴露电话命令测试中的固定 Unix 路径预期；已改为平台路径比较，保持独立 profile 和 NapCat 工作目录的完整断言。

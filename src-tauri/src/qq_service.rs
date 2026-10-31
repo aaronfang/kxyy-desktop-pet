@@ -772,8 +772,10 @@ mod tests {
                 .collect();
             assert!(args.contains(&"--no-sandbox".to_string()));
             assert!(args.contains(&format!(
-                "--user-data-dir=/fixture/KxyyRTCQQ/runtime/{}-profile",
-                if host { "host" } else { "account" }
+                "--user-data-dir={}",
+                root.join("runtime")
+                    .join(if host { "host-profile" } else { "account-profile" })
+                    .display()
             )));
             assert_eq!(args.contains(&"12345678".to_string()), !host);
             let env: std::collections::HashMap<_, _> = command
@@ -802,7 +804,7 @@ mod tests {
             if !host {
                 assert_eq!(
                     env["NAPCAT_WORKDIR"].as_deref(),
-                    Some("/fixture/KxyyRTCQQ/napcat")
+                    Some(root.join("napcat").to_string_lossy().as_ref())
                 );
             }
         }
