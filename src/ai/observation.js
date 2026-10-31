@@ -44,3 +44,12 @@ export function renderObservationBlock(items, {
 export function isObservationSafe(input) {
   return !!sanitizeObservationText(input);
 }
+
+// Public search summaries discuss token budgets and credential technology.
+// Reject actual credential-shaped values, not the technical vocabulary itself.
+const PUBLIC_WEB_DIRECTIVE = /(ignore\s+(all\s+)?previous|忽略.{0,12}(指令|规则|系统)|(?:输出|泄露|显示|打印|覆盖|替换|修改).{0,12}(?:系统提示词|系统规则|隐藏指令)|(?:reveal|print|show|override|replace)\s+(?:(?:the|your|all|previous)\s+){0,3}(?:system\s+prompt|instructions)|(?:请|立即|现在|务必|必须).{0,12}调用工具|调用工具.{0,8}(?:上传|发送|删除|执行|泄露)|(?:call|invoke)\s+(?:the\s+)?tool\s+(?:to|now)|越过安全|绕过安全)/i;
+export function sanitizePublicWebText(input,{maxChars=800}={}) {
+  const text=String(input??'').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').replace(/\s+/g,' ').trim().slice(0,Math.max(40,Math.min(2000,Number(maxChars)||800)));
+  if(!text || PUBLIC_WEB_DIRECTIVE.test(text) || /(?:sk-|tvly-)[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{12,}|(?:api[ _-]?key|access[ _-]?key|token|password|密码|密钥)\s*[:=：]\s*[A-Za-z0-9._/-]{6,}|-----begin private key|\d{14,}/iu.test(text))return '';
+  return text;
+}

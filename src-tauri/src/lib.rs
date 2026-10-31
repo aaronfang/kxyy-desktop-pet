@@ -1,4 +1,5 @@
 mod api;
+mod web_research;
 mod fresh_topics;
 mod local_text;
 mod memory;
