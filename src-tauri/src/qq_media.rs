@@ -308,3 +308,83 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+/// Decode only media obtained from the verified owner's QQ message. Callers
+/// supply fixed QQ data roots, never an event/model-selected allowlist.
+pub fn read_image(path: &Path, roots: &[PathBuf]) -> Result<String, &'static str> {
+    use std::io::Read;
+    let path = path.canonicalize().map_err(|_| "image-unavailable")?;
+    if !roots
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .any(|r| path.starts_with(r))
+    {
+        return Err("image-location");
+    }
+    let mut file = std::fs::File::open(path).map_err(|_| "image-unavailable")?;
+    let meta = file.metadata().map_err(|_| "image-unavailable")?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 8 * 1024 * 1024 {
+        return Err("image-size");
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "image-unavailable")?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("image-size");
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "image-format")?;
+    if !matches!(
+        reader.format(),
+        Some(
+            image::ImageFormat::Png
+                | image::ImageFormat::Jpeg
+                | image::ImageFormat::Gif
+                | image::ImageFormat::WebP
+        )
+    ) {
+        return Err("image-format");
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    // GIF/WebP animations deliberately use only their first image, not a claim
+    // to have watched an animation. Re-encoding strips metadata and other bytes.
+    let decoded = reader
+        .decode()
+        .map_err(|_| "image-decode")?
+        .thumbnail(1024, 1024);
+    let mut out = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|_| "image-encode")?;
+    if out.get_ref().len() > 2 * 1024 * 1024 {
+        return Err("image-size");
+    }
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    ))
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    #[test]
+    fn qq_image_reader_decodes_owned_png_and_rejects_escape_or_non_image() {
+        let root=std::env::temp_dir().join(format!("qq-image-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let image=base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        let path=root.join("image.png");std::fs::write(&path,image).unwrap();
+        let result=read_image(&path,&[root.clone()]).expect("valid owned picture should be decoded");
+        assert!(result.starts_with("data:image/png;base64,"));
+        assert!(read_image(&path,&[root.join("elsewhere")]).is_err());
+        std::fs::write(&path,b"this is not an image").unwrap();assert!(read_image(&path,&[root.clone()]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -904,6 +904,8 @@ pub struct MemoryMessage {
     pub image_caption: String,
     #[serde(default)]
     pub do_not_remember: bool,
+    #[serde(default)]
+    pub message_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -967,6 +969,7 @@ pub struct MemoryRecallItem {
     pub kind: String,
     pub text: String,
     pub occurred_at: Option<i64>,
+    pub temporal: Option<Value>,
     pub confidence: f64,
     pub score: f64,
     pub uncertain: bool,
@@ -2282,7 +2285,7 @@ fn replay_episode(
         .get("entities")
         .cloned()
         .unwrap_or_else(|| Value::Array(vec![]));
-    tx.execute("INSERT INTO memory_episodes(id,user_id,session_id,summary,emotion,importance,topics_json,entities_json,occurred_at,created_at,updated_at,pinned,user_edited) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET summary=excluded.summary,emotion=excluded.emotion,importance=excluded.importance,topics_json=excluded.topics_json,entities_json=excluded.entities_json,updated_at=excluded.updated_at,pinned=excluded.pinned,user_edited=excluded.user_edited", params![id,user_id,session_id,truncate_chars(summary,1000),p.get("emotion").and_then(Value::as_str).unwrap_or(""),clamp01(p.get("importance").and_then(Value::as_f64).unwrap_or(trust)),serde_json::to_string(&topics).unwrap_or("[]".into()),serde_json::to_string(&entities).unwrap_or("[]".into()),observed_at,p.get("pinned").and_then(Value::as_bool).unwrap_or(false) as i64,p.get("userEdited").and_then(Value::as_bool).unwrap_or(false) as i64])?;
+    tx.execute("INSERT INTO memory_episodes(id,user_id,session_id,summary,emotion,importance,topics_json,entities_json,occurred_at,created_at,updated_at,pinned,user_edited) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?12,?9,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET summary=excluded.summary,emotion=excluded.emotion,importance=excluded.importance,topics_json=excluded.topics_json,entities_json=excluded.entities_json,updated_at=excluded.updated_at,pinned=excluded.pinned,user_edited=excluded.user_edited", params![id,user_id,session_id,truncate_chars(summary,1000),p.get("emotion").and_then(Value::as_str).unwrap_or(""),clamp01(p.get("importance").and_then(Value::as_f64).unwrap_or(trust)),serde_json::to_string(&topics).unwrap_or("[]".into()),serde_json::to_string(&entities).unwrap_or("[]".into()),observed_at,p.get("pinned").and_then(Value::as_bool).unwrap_or(false) as i64,p.get("userEdited").and_then(Value::as_bool).unwrap_or(false) as i64,p.get("occurredAt").and_then(Value::as_i64).unwrap_or(observed_at)])?;
     Ok(())
 }
 
@@ -3248,6 +3251,7 @@ fn enqueue_session(
         .map(|mut m| {
             m.content = truncate_chars(&m.content, 5800);
             m.image_caption = truncate_chars(&m.image_caption, 200);
+            m.message_at = m.message_at.filter(|at| *at > 0 && *at <= now_ts()+60);
             m
         })
         .take(200)
@@ -3382,7 +3386,8 @@ pub(crate) fn recall_memory(
     let query = format!("{} {}", request.query, request.image_caption)
         .trim()
         .to_string();
-    let proactive_topic = request
+    let owner_initiative=request.reason.trim().eq_ignore_ascii_case("owner-initiative");
+    let proactive_topic = owner_initiative || request
         .reason
         .trim()
         .eq_ignore_ascii_case("proactive-topic");
@@ -3404,6 +3409,14 @@ pub(crate) fn recall_memory(
     };
     let mut candidates = load_recent_candidates(conn, &user_id).map_err(|e| e.to_string())?;
     let has_query = !query.is_empty();
+    if owner_initiative {
+        let mut stmt=conn.prepare("SELECT c.id,c.text,c.importance,c.pinned,c.due_at,c.updated_at FROM memory_commitments c
+            WHERE c.user_id=?1 AND c.status='expired' AND c.due_at BETWEEN ?2 AND ?3
+            AND NOT EXISTS(SELECT 1 FROM memory_events e WHERE e.user_id=c.user_id AND e.item_kind='commitment' AND e.item_id=c.id AND e.event_type='commitment.status_changed')
+            ORDER BY c.due_at DESC LIMIT 12").map_err(|e|e.to_string())?;
+        let rows=stmt.query_map(params![user_id,now_ts()-2*86400,now_ts()],|r|Ok(Candidate{id:r.get(0)?,text:r.get(1)?,kind:"commitment".into(),tags:"约定到期，完成情况未知".into(),status:"pending".into(),confidence:0.8,importance:r.get(2)?,pinned:r.get::<_,i64>(3)?!=0,occurred_at:r.get(4)?,updated_at:r.get(5)?,predicate:None,value:None})).map_err(|e|e.to_string())?;
+        candidates.extend(rows.filter_map(Result::ok));
+    }
     if has_query {
         for candidate in search_candidates(conn, &request.card_id, &user_id, &query)
             .map_err(|e| e.to_string())?
@@ -3445,6 +3458,7 @@ pub(crate) fn recall_memory(
             if is_sensitive(&c.text) {
                 return None;
             }
+            if owner_initiative && c.kind!="episode" && c.kind!="commitment" {return None;}
             let lexical = if has_query {
                 jaccard(&qgrams, &grams(&format!("{} {}", c.text, c.tags)))
             } else {
@@ -3484,16 +3498,38 @@ pub(crate) fn recall_memory(
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
+    // Prefer a compact semantic claim for ordinary questions, while retaining
+    // independent context when the user asks for a story/time/shared experience.
+    let episodic_query = ["上次", "那次", "经历", "故事", "一起", "什么时候", "为什么", "原因", "当时", "回忆"]
+        .iter().any(|word| query.contains(word));
+    let mut fact_sources = HashMap::<String,String>::new();
+    if !episodic_query && contextual_fallback.is_none() && has_query {
+        let mut stmt = conn.prepare("SELECT source_episode_id FROM memory_facts WHERE id=?1 AND user_id=?2")
+            .map_err(|e|e.to_string())?;
+        for (candidate, _) in &scored {
+            if candidate.kind == "fact" {
+                if let Ok(Some(source)) = stmt.query_row(params![candidate.id,user_id], |r|r.get::<_,Option<String>>(0)) {
+                    fact_sources.insert(candidate.id.clone(),source);
+                }
+            }
+        }
+        let sources: HashSet<_> = fact_sources.values().cloned().collect();
+        // Defer only unpinned linked episodes; suppression below depends on
+        // actual selection, so a fact that doesn't fit cannot hide its source.
+        scored.sort_by_key(|(c,_)| c.kind == "episode" && !c.pinned && sources.contains(&c.id));
+    }
+    let mut selected_sources = HashSet::new();
+
     let requested_limit = request
         .max_items
         .unwrap_or(MAX_RECALL_ITEMS)
         .clamp(1, MAX_RECALL_ITEMS);
-    let limit = if proactive_topic && !has_query {
+    let limit = if owner_initiative {requested_limit.min(6)} else if proactive_topic && !has_query {
         requested_limit.min(PROACTIVE_RECALL_MAX_ITEMS)
     } else {
         requested_limit
     };
-    let char_budget = if proactive_topic && !has_query {
+    let char_budget = if owner_initiative {900} else if proactive_topic && !has_query {
         PROACTIVE_RECALL_CHAR_BUDGET
     } else {
         RECALL_CHAR_BUDGET
@@ -3503,6 +3539,22 @@ pub(crate) fn recall_memory(
     let mut pinned_count = 0usize;
     let mut dynamic_count = 0usize;
     for (candidate, score) in scored {
+        let temporal=conn.query_row(
+            "SELECT payload_json FROM memory_events WHERE user_id=?1 AND item_kind=?2 AND item_id=?3 AND event_type NOT LIKE '%.pinned' AND event_type NOT LIKE '%.status_changed' ORDER BY created_at DESC,rowid DESC LIMIT 1",
+            params![user_id,candidate.kind,candidate.id],|row|row.get::<_,String>(0)
+        ).optional().map_err(|e|e.to_string())?.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).and_then(|v|v.get("temporal").cloned());
+        if owner_initiative {
+            let timely=if candidate.kind=="commitment"{candidate.occurred_at.is_some_and(|due|due<=now && now-due<=2*86400)}
+                else {temporal.as_ref().and_then(|t|t["messageAt"].as_i64()).is_some_and(|at|at<=now&&now-at<=3*86400)};
+            if !timely{continue;}
+        }
+        if let Some(target)=crate::memory_time::relative_day(&query,now) {
+            let is_event=candidate.kind=="episode"||temporal.as_ref().is_some_and(|t|t["tense"]!="stable");
+            if is_event && temporal.as_ref().and_then(|t|t["eventDate"].as_str()).is_some_and(|date|date!=target.to_string()) {continue;}
+        }
+        if candidate.kind == "episode" && !candidate.pinned && selected_sources.contains(&candidate.id) {
+            continue;
+        }
         if candidate.pinned && pinned_count >= 2 {
             continue;
         }
@@ -3525,11 +3577,15 @@ pub(crate) fn recall_memory(
             dynamic_count += 1;
         }
         chars += len;
+        if let Some(source) = fact_sources.get(&candidate.id) {
+            selected_sources.insert(source.clone());
+        }
         selected.push(MemoryRecallItem {
             id: candidate.id,
             kind: candidate.kind,
             text: candidate.text,
             occurred_at: candidate.occurred_at,
+            temporal,
             confidence: candidate.confidence,
             score,
             uncertain: candidate.status == "disputed" || candidate.confidence < 0.65,
@@ -4710,6 +4766,8 @@ struct Extraction {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct ExtractedEpisode {
+    /// None preserves older jobs; new extraction must classify independent context.
+    distinct_context: Option<bool>,
     summary: String,
     emotion: String,
     importance: f64,
@@ -4718,7 +4776,7 @@ struct ExtractedEpisode {
     source_message_ids: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct ExtractedFact {
     text: String,
@@ -4936,8 +4994,9 @@ fn process_job(app: &AppHandle, job: &PendingJob) -> Result<Extraction, String> 
                 format!(" [图片:{}]", m.image_caption)
             };
             format!(
-                "[id={}] {role}: {}{image}",
+                "[id={} 原消息北京时间={}] {role}: {}{image}",
                 m.id,
+                m.message_at.and_then(crate::memory_time::day).map(|d|d.to_string()).unwrap_or_else(||"未知".into()),
                 truncate_chars(&m.content, 1800)
             )
         })
@@ -4946,11 +5005,13 @@ fn process_job(app: &AppHandle, job: &PendingJob) -> Result<Extraction, String> 
     let system = r#"你是桌宠的长期记忆整理器。只提取关于当前用户、双方共同经历和角色明确承诺的内容。
 事实只能来自用户消息中明确说出的内容，不能从角色消息、网络资料或角色推测中推导用户事实。
 不要保存新闻、热搜、天气、价格、版本发布、限免等时效信息，也不要提取角色人设规则、普通寒暄、API Key、密码、token、支付信息、证件号或精确住址。
+相对日期必须按原消息日期理解，不是整理日期。已发生事件、当前状态、未来计划分开；没有完成证据不要把计划写成已经发生，日期未知不猜。一次吃饭、行程、心情不是长期偏好。
 短期状态用 temporary；长期偏好用 stable；用户明确要求长期记住的稳定身份事实才用 permanent。
 correction/preferenceChange 只在用户明确纠正或说明发生变化时使用。
 sourceMessageIds 必须逐字使用输入中真实存在的 id。所有字段允许为空，不要硬凑。
+episode.distinctContext 必须为布尔值：只有含独立事件、情绪变化、共同活动或事实之外的有价值背景时为 true；普通寒暄、事实偏好复述、角色应答或保存回执为 false 且 summary 留空。事实可单独保留，不要求配套经历。
 严格只输出 JSON：
-{"episode":{"summary":"","emotion":"","importance":0.5,"topics":[],"entities":[],"sourceMessageIds":[]},"facts":[{"text":"","predicate":"","value":"","durability":"temporary|stable|permanent","evidence":"assertion|confirmation|correction|preferenceChange","confidence":0.7,"importance":0.5,"validFrom":null,"sourceMessageIds":[]}],"commitments":[{"text":"","dueAt":null,"importance":0.7}]}"#;
+{"episode":{"summary":"","distinctContext":false,"emotion":"","importance":0.5,"topics":[],"entities":[],"sourceMessageIds":[]},"facts":[{"text":"","predicate":"","value":"","durability":"temporary|stable|permanent","evidence":"assertion|confirmation|correction|preferenceChange","confidence":0.7,"importance":0.5,"validFrom":null,"sourceMessageIds":[]}],"commitments":[{"text":"","dueAt":null,"importance":0.7}]}"#;
     let provider = crate::api::ApiMemoryCompletionProvider::new(app.clone());
     let raw = crate::memory_core::MemoryCompletionProvider::complete_memory_batch(
         &provider,
@@ -5003,7 +5064,7 @@ fn apply_extraction(
     let tx = conn.transaction()?;
     let mut episode_id = None;
     let summary = truncate_chars(&extraction.episode.summary, 1000);
-    if !summary.is_empty() && !is_sensitive(&summary) {
+    if extraction.episode.distinct_context != Some(false) && !summary.is_empty() && !is_sensitive(&summary) {
         let ids: HashSet<_> = extraction.episode.source_message_ids.iter().collect();
         let source_message_ids: Vec<String> = messages
             .iter()
@@ -5042,14 +5103,16 @@ fn apply_extraction(
             .collect();
         let topics_json = serde_json::to_string(&topics).unwrap_or_else(|_| "[]".into());
         let entities_json = serde_json::to_string(&entities).unwrap_or_else(|_| "[]".into());
+        let temporal=crate::memory_time::evidence(&messages,&source_message_ids,false);
+        let event_at=crate::memory_time::event_epoch(&temporal).unwrap_or(now);
         tx.execute(
             "INSERT INTO memory_episodes(id,user_id,session_id,summary,emotion,importance,
              topics_json,entities_json,source_excerpt,source_expires_at,occurred_at,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,?11)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
             params![id, job.user_id, job.session_id, summary, truncate_chars(&extraction.episode.emotion, 60),
                 clamp01(extraction.episode.importance), topics_json, entities_json,
                 if excerpt.is_empty() { None } else { Some(truncate_chars(&excerpt, 800)) },
-                now + SOURCE_RETENTION_SECS, now],
+                now + SOURCE_RETENTION_SECS, event_at, now],
         )?;
         let episode_payload = serde_json::json!({
             "summary": summary.clone(),
@@ -5058,6 +5121,8 @@ fn apply_extraction(
             "topics": topics.clone(),
             "entities": entities.clone(),
             "sourceMessageIds": source_message_ids.clone(),
+            "temporal": temporal,
+            "occurredAt": event_at,
         })
         .to_string();
         let event_id = append_event(
@@ -5129,6 +5194,14 @@ fn apply_extraction(
         if source_message_ids.is_empty() {
             continue;
         }
+        let mut normalized=fact.clone();
+        let source_text=messages.iter().filter(|m|source_message_ids.contains(&m.id)).map(|m|m.content.as_str()).collect::<Vec<_>>().join(" ");
+        let event_evidence=crate::memory_time::evidence(&messages,&source_message_ids,false);
+        if event_evidence["tense"]!="unknown" && !["喜欢","偏好","习惯","长期","一直","身份","叫我"].iter().any(|s|source_text.contains(s)) {
+            normalized.durability="temporary".into();
+            normalized.valid_from=crate::memory_time::event_epoch(&event_evidence);
+        }
+        let fact=&normalized;
         let text = truncate_chars(&fact.text, 600);
         let (predicate, value) = fact_keys(fact, &text);
         let same_before: Option<String> = tx
@@ -5184,6 +5257,7 @@ fn apply_extraction(
             "importance": clamp01(fact.importance),
             "sourceEpisodeId": episode_id.clone(),
             "sourceMessageIds": source_message_ids.clone(),
+            "temporal": crate::memory_time::evidence(&messages,&source_message_ids,fact.durability!="temporary"),
         })
         .to_string();
         let event_id = append_event(
@@ -5458,7 +5532,7 @@ fn insert_fact(
         "temporary" | "permanent" => fact.durability.as_str(),
         _ => "stable",
     };
-    let valid_to = (durability == "temporary").then_some(now + 7 * 86_400);
+    let valid_to = (durability == "temporary").then_some(fact.valid_from.unwrap_or(now) + 7 * 86_400);
     let status = if conflict && !change {
         "disputed"
     } else {
@@ -5753,8 +5827,8 @@ mod tests {
             card_id: "card".into(), nickname: "元宝".into(), session_id: "qq:test".into(),
             batch_start: 0, batch_end: 2,
             messages: vec![
-                MemoryMessage { id: "user-1".into(), role: "user".into(), content: "我喜欢乌龙茶".into(), image_caption: String::new(), do_not_remember: false },
-                MemoryMessage { id: "assistant-1".into(), role: "assistant".into(), content: "下回聊聊茶吧".into(), image_caption: String::new(), do_not_remember: false },
+                MemoryMessage { id: "user-1".into(), role: "user".into(), content: "我喜欢乌龙茶".into(), image_caption: String::new(), do_not_remember: false, message_at: None },
+                MemoryMessage { id: "assistant-1".into(), role: "assistant".into(), content: "下回聊聊茶吧".into(), image_caption: String::new(), do_not_remember: false, message_at: None },
             ],
         }).unwrap();
         assert!(queued.accepted);
@@ -5770,6 +5844,95 @@ mod tests {
         assert_eq!(items[0].text, "用户喜欢乌龙茶");
         assert!(recall_memory(&mut conn, &MemoryRecallRequest { nickname: "ππ".into(), ..request }).unwrap().items.is_empty());
         assert!(take_due_job(&mut conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn dated_episode_recall_keeps_source_day_instead_of_worker_day() {
+        let mut conn=test_db();
+        let at=chrono::DateTime::parse_from_rfc3339("2026-10-28T19:30:00+08:00").unwrap().timestamp();
+        enqueue_qq_exchange(&mut conn,MemoryEnqueueRequest{card_id:"card".into(),nickname:"元宝".into(),session_id:"dated".into(),batch_start:0,batch_end:1,messages:vec![
+            MemoryMessage{id:"user-1".into(),role:"user".into(),content:"昨天吃了汉堡，和朋友庆祝项目完成".into(),image_caption:String::new(),do_not_remember:false,message_at:Some(at)}
+        ]}).unwrap();
+        let job=take_due_job(&mut conn).unwrap().unwrap();
+        let extraction=serde_json::from_value(serde_json::json!({"episode":{"summary":"和朋友吃汉堡庆祝项目完成","importance":0.8,"distinctContext":true,"sourceMessageIds":["user-1"]}})).unwrap();
+        apply_extraction(&mut conn,&job,extraction).unwrap();
+        let result=recall_memory(&mut conn,&MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:"和朋友吃汉堡庆祝项目完成".into(),reason:String::new(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        let item=result.items.iter().find(|i|i.kind=="episode").unwrap();
+        let temporal=item.temporal.as_ref().expect("recall must carry source time");
+        assert_eq!(temporal["eventDate"],"2026-10-27");
+        assert_eq!(temporal["messageAt"],at);
+        assert_eq!(temporal["tense"],"past");
+        assert_eq!(crate::memory_time::day(item.occurred_at.unwrap()).unwrap().to_string(),"2026-10-27");
+        let id=item.id.clone();
+        let other_day=recall_memory(&mut conn,&MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:"2026-10-28 和朋友吃汉堡庆祝项目完成".into(),reason:String::new(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        assert!(!other_day.items.iter().any(|i|i.id==id),"known events from a different day must not answer a date-specific recall");
+        rebuild_from_events(&mut conn,&MemoryRebuildEventsRequest{card_id:"card".into(),nickname:Some("元宝".into())}).unwrap();
+        let request=MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:"和朋友吃汉堡庆祝项目完成".into(),reason:String::new(),image_caption:String::new(),max_items:Some(6)};
+        let after=recall_memory(&mut conn,&request).unwrap();
+        let item=after.items.iter().find(|i|i.id==id).unwrap();
+        assert_eq!(crate::memory_time::day(item.occurred_at.unwrap()).unwrap().to_string(),"2026-10-27","event replay must retain event day independently of creation");
+        update_memory(&mut conn,&MemoryUpdateRequest{kind:"episode".into(),id:id.clone(),text:Some("汉堡聚会，具体日期已无法确认".into()),pinned:None,status:None}).unwrap();
+        let after=recall_memory(&mut conn,&MemoryRecallRequest{query:"汉堡聚会，具体日期已无法确认".into(),..request}).unwrap();
+        assert!(after.items.iter().find(|i|i.id==id).unwrap().temporal.is_none(),"editing content must not retain stale inferred dates");
+    }
+
+    #[test]
+    fn one_meal_is_not_promoted_to_a_stable_present_state() {
+        let mut conn=test_db();let at=now_ts()-86400;
+        enqueue_qq_exchange(&mut conn,MemoryEnqueueRequest{card_id:"card".into(),nickname:"元宝".into(),session_id:"meal-fact".into(),batch_start:0,batch_end:1,messages:vec![MemoryMessage{id:"user-1".into(),role:"user".into(),content:"今晚吃了汉堡".into(),image_caption:String::new(),do_not_remember:false,message_at:Some(at)}]}).unwrap();
+        let job=take_due_job(&mut conn).unwrap().unwrap();
+        apply_extraction(&mut conn,&job,Extraction{facts:vec![fact("晚饭吃了汉堡","晚饭","汉堡","assertion")],..Extraction::default()}).unwrap();
+        let response=recall_memory(&mut conn,&MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:"晚饭吃了汉堡".into(),reason:String::new(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        assert_eq!(response.items[0].temporal.as_ref().unwrap()["tense"],"past");
+    }
+
+    #[test]
+    fn consolidation_does_not_keep_fact_only_episode_but_recalls_distinct_context() {
+        let mut conn = test_db();
+        enqueue_qq_exchange(&mut conn, MemoryEnqueueRequest {
+            card_id: "card".into(), nickname: "元宝".into(), session_id: "qq:admission".into(),
+            batch_start: 0, batch_end: 2, messages: vec![
+                MemoryMessage { id: "user-1".into(), role: "user".into(), content: "我喜欢乌龙茶".into(), image_caption: String::new(), do_not_remember: false, message_at: None },
+                MemoryMessage { id: "reply".into(), role: "assistant".into(), content: "知道了".into(), image_caption: String::new(), do_not_remember: false, message_at: None },
+            ],
+        }).unwrap();
+        let job = take_due_job(&mut conn).unwrap().unwrap();
+        let extraction: Extraction = serde_json::from_value(serde_json::json!({
+            "episode":{"summary":"用户表达乌龙茶偏好，角色回应", "distinctContext":false,"sourceMessageIds":["user-1"]},
+            "facts":[{"text":"用户喜欢乌龙茶","predicate":"饮品偏好","value":"乌龙茶","sourceMessageIds":["user-1"]}]
+        })).unwrap();
+        apply_extraction(&mut conn, &job, extraction).unwrap();
+        let result = recall_memory(&mut conn, &MemoryRecallRequest {card_id:"card".into(),nickname:"元宝".into(),query:"乌龙茶".into(),reason:String::new(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        assert_eq!(result.items.len(),1, "a bare fact acknowledgment should not generate an episode");
+        assert_eq!(result.items[0].kind,"fact");
+    }
+
+    #[test]
+    fn qq_search_exchange_never_becomes_long_term_evidence() {
+        for query in ["请联网搜索乌龙茶价格", "帮我在网上搜下最近有什么好看的电影", "上网搜搜最近上映的电影", "查下最近上映的电影"] {
+            let mut conn=test_db();
+            let result=enqueue_qq_exchange(&mut conn,MemoryEnqueueRequest{card_id:"card".into(),nickname:"元宝".into(),session_id:"qq:web".into(),batch_start:0,batch_end:2,messages:vec![
+                MemoryMessage{id:"u".into(),role:"user".into(),content:query.into(),image_caption:String::new(),do_not_remember:false, message_at: None },
+                MemoryMessage{id:"a".into(),role:"assistant".into(),content:"网页显示资料……".into(),image_caption:String::new(),do_not_remember:false, message_at: None },
+            ]}).unwrap();
+            assert!(!result.accepted,"search must not enter Memory: {query}");
+            assert!(take_due_job(&mut conn).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn recall_prefers_source_fact_but_keeps_episode_for_experience_questions() {
+        let mut conn = test_db();
+        let uid = get_or_create_user(&conn,"card","元宝").unwrap();
+        conn.execute("INSERT INTO memory_episodes(id,user_id,summary,importance,occurred_at,created_at,updated_at) VALUES('tea-event',?1,'雨天一起聊乌龙茶，元宝讲了第一次旅行时买茶的故事',0.8,?2,?2,?2)",params![uid,now_ts()]).unwrap();
+        let tx=conn.unchecked_transaction().unwrap();
+        insert_fact(&tx,"card",&uid,Some("tea-event"),&fact("元宝喜欢乌龙茶","饮品偏好","乌龙茶","assertion"),now_ts()).unwrap();tx.commit().unwrap();
+        let request=MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:"我喜欢哪种乌龙茶".into(),reason:String::new(),image_caption:String::new(),max_items:Some(6)};
+        let result=recall_memory(&mut conn,&request).unwrap();
+        assert_eq!(result.items.iter().filter(|i|i.kind=="fact").count(),1);
+        assert!(!result.items.iter().any(|i|i.id=="tea-event"),"factual recall must not spend two slots on one source");
+        let result=recall_memory(&mut conn,&MemoryRecallRequest{query:"上次聊乌龙茶的故事是什么".into(),..request}).unwrap();
+        assert!(result.items.iter().any(|i|i.id=="tea-event"),"episodic questions still need independent background");
     }
 
     fn fact(text: &str, predicate: &str, value: &str, evidence: &str) -> ExtractedFact {
@@ -6016,14 +6179,14 @@ mod tests {
                     role: "user".into(),
                     content: "最近有什么游戏消息？".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 },
                 MemoryMessage {
                     id: "assistant-1".into(),
                     role: "assistant".into(),
                     content: "Steam 喜加一有《呼吸边缘》免费领。".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 },
             ])
             .unwrap(),
@@ -7363,7 +7526,7 @@ mod tests {
                 role: "user".into(),
                 content: "一条短消息".into(),
                 image_caption: String::new(),
-                do_not_remember: false,
+                do_not_remember: false, message_at: None,
             })
             .collect();
         let chunks = chunk_memory_messages(messages);
@@ -7413,7 +7576,7 @@ mod tests {
                 role: "user".into(),
                 content: "产品经理面试已经完成了".into(),
                 image_caption: String::new(),
-                do_not_remember: false,
+                do_not_remember: false, message_at: None,
             }],
             now_ts(),
         )
@@ -7444,21 +7607,21 @@ mod tests {
                     role: "user".into(),
                     content: "我下周参加产品经理面试".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 },
                 MemoryMessage {
                     id: "m-private".into(),
                     role: "user".into(),
                     content: "这段只是临时吐槽".into(),
                     image_caption: String::new(),
-                    do_not_remember: true,
+                    do_not_remember: true, message_at: None,
                 },
                 MemoryMessage {
                     id: "m-secret".into(),
                     role: "user".into(),
                     content: "我的 API Key 是 sk-secret".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 },
             ],
         };
@@ -7501,14 +7664,14 @@ mod tests {
                         role: "user".into(),
                         content: "我下周有面试".into(),
                         image_caption: String::new(),
-                        do_not_remember: false,
+                        do_not_remember: false, message_at: None,
                     },
                     MemoryMessage {
                         id: "final-assistant".into(),
                         role: "assistant".into(),
                         content: "我会记住，下次可以问问进展".into(),
                         image_caption: String::new(),
-                        do_not_remember: false,
+                        do_not_remember: false, message_at: None,
                     },
                 ],
             },
@@ -7759,6 +7922,21 @@ mod tests {
             .any(|item| item.id == "recent-chat-topic"));
         assert!(proactive.items.len() <= 3);
         assert!(proactive.total_chars <= 300);
+
+        let payload=serde_json::json!({"temporal":{"messageAt":now_ts(),"tense":"current"}}).to_string();
+        append_event(&conn,&MemoryEventInput{user_id:&user,card_id:"card",item_kind:"episode",item_id:"recent-chat-topic",event_type:"episode.created",source_type:"test",source_id:None,modality:"text",observed_at:now_ts(),trust:0.9,consent:"allowed",idempotency_key:"initiative-temporal",payload_json:&payload}).unwrap();
+        let owner=recall_memory(&mut conn,&MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:String::new(),reason:"owner-initiative".into(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        assert!(owner.items.iter().any(|i|i.id=="recent-chat-topic"));
+        assert!(owner.items.iter().all(|i|i.kind!="fact"),"pinned facts must not starve actual follow-up candidates");
+        let tx=conn.unchecked_transaction().unwrap();
+        let due=insert_commitment(&tx,"card",&user,None,"今天预约的面试进展",Some(now_ts()-60),0.9,now_ts()).unwrap().unwrap();tx.commit().unwrap();
+        maintenance(&conn).unwrap();
+        let owner=recall_memory(&mut conn,&MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:String::new(),reason:"owner-initiative".into(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        assert!(owner.items.iter().any(|i|i.id==due),"automatic expiry must not erase a timely progress check");
+        conn.execute("UPDATE memory_commitments SET status='cancelled' WHERE id=?1",[&due]).unwrap();
+        let owner=recall_memory(&mut conn,&MemoryRecallRequest{card_id:"card".into(),nickname:"元宝".into(),query:String::new(),reason:"owner-initiative".into(),image_caption:String::new(),max_items:Some(6)}).unwrap();
+        assert!(owner.items.iter().all(|i|i.id!=due));
+
     }
 
     #[test]
@@ -7814,7 +7992,7 @@ mod tests {
                     role: "user".into(),
                     content: "周末准备去露营".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 }],
             },
         )
@@ -7907,7 +8085,7 @@ mod tests {
                     role: "user".into(),
                     content: "下周参加面试".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 }],
             },
         )
@@ -7972,7 +8150,7 @@ mod tests {
                     role: "user".into(),
                     content: "明天参加面试".into(),
                     image_caption: String::new(),
-                    do_not_remember: false,
+                    do_not_remember: false, message_at: None,
                 }],
             },
         )
@@ -8059,10 +8237,13 @@ pub(crate) fn qq_test_connection() -> Connection {
 pub(crate) fn qq_private_text(text: &str) -> bool {
     is_sensitive(text) || ["别记","不要记","不用记","别保存","不要保存","不用保存","别把","只在本次","只在这次","仅本次","只在这轮","仅在本次","临时口令"].iter().any(|word|text.contains(word))
 }
+pub(crate) fn qq_external_query(text:&str) -> bool {
+    ["查一下","查一查","查查","查下","查找","检索","搜集","找一些","找些","找几条","重新搜","搜索","搜一下","搜一搜","搜下","搜搜","找一下","找一找","找找","联网","网上查","网上搜","网上找","上网查","上网搜","上网找","网页"].iter().any(|w|text.contains(w))
+}
 pub(crate) fn enqueue_qq_exchange(conn: &mut Connection, request: MemoryEnqueueRequest) -> Result<MemoryEnqueueResponse,String> {
     let excluded=request.messages.iter().any(|m| {
         let text=m.content.trim();
-        m.do_not_remember || qq_private_text(text) || text.starts_with("请记住") || text.starts_with("请你记住")
+        m.do_not_remember || qq_private_text(text) || (m.role == "user" && qq_external_query(text)) || text.starts_with("请记住") || text.starts_with("请你记住")
             || text.starts_with("请帮我记住") || text.starts_with("帮我记住") || text.starts_with("记住：")
     });
     if excluded {return Ok(MemoryEnqueueResponse {accepted:false,duplicate:false,job_id:String::new()});}

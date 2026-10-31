@@ -19,7 +19,16 @@ pub struct Config {
     pub voice_input: bool,
     #[serde(default)]
     pub phone_enabled: bool,
+    #[serde(default="proactive_off")] pub proactive_mode:String,
+    #[serde(default="proactive_auto")] pub proactive_channel:String,
+    #[serde(default="quiet_start")] pub quiet_start:u8,
+    #[serde(default="quiet_end")] pub quiet_end:u8,
+    #[serde(default)] pub daily_contact_goal:bool,
 }
+fn proactive_auto()->String{"auto".into()}
+fn proactive_off()->String{"off".into()}
+fn quiet_start()->u8{23}
+fn quiet_end()->u8{9}
 fn text_reply_mode() -> String {
     "text".into()
 }
@@ -36,6 +45,8 @@ impl Default for Config {
             reply_mode: text_reply_mode(),
             voice_input: false,
             phone_enabled: false,
+            proactive_mode:proactive_off(),proactive_channel:proactive_auto(),quiet_start:quiet_start(),quiet_end:quiet_end(),
+            daily_contact_goal:false,
         }
     }
 }
@@ -55,6 +66,8 @@ impl Config {
         current
     }
     fn validate(&self) -> Result<(), String> {
+        if !["auto","qq","desktop"].contains(&self.proactive_channel.as_str()){return Err("主动通道无效".into());}
+        if !["off","natural","active"].contains(&self.proactive_mode.as_str()) || self.quiet_start>23 || self.quiet_end>23 {return Err("主动聊天设置无效".into());}
         if !["text", "voice"].contains(&self.reply_mode.as_str())
             || self.ws_url.len() > 200
             || self.owner_id.len() > 12
@@ -116,6 +129,11 @@ fn id_text(value: &Value) -> Option<String> {
     }
     Some(text)
 }
+fn builtin_face_name(id: &str) -> Option<&'static str> {
+    static NAMES: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| serde_json::from_str(include_str!("../../shared/qq-faces.json")).expect("bundled QQ face metadata"))
+        .get("faces")?.get(id)?.as_str()
+}
 fn owner_text(config: &Config, event: &Value, now: i64) -> Option<(String, String)> {
     if event.get("post_type")?.as_str()? != "message"
         || event.get("message_type")?.as_str()? != "private"
@@ -145,10 +163,17 @@ fn owner_text(config: &Config, event: &Value, now: i64) -> Option<(String, Strin
         }
         let mut text = String::new();
         for part in parts {
-            if part.get("type")?.as_str()? != "text" {
-                return None;
+            match part.get("type")?.as_str()? {
+                "text" => text.push_str(part.get("data")?.get("text")?.as_str()?),
+                "face" => {
+                    let id=id_text(part.get("data")?.get("id")?)?.parse::<u16>().ok()?.to_string();
+                    let meaning=builtin_face_name(&id).unwrap_or("未知内置表情");
+                    text.push_str(&format!("[QQ表情：{meaning} #{id}]"));
+                },
+                "image" if part.get("data")?.is_object() => text.push_str("[图片]"),
+                "video" => text.push_str("[暂不支持的视频附件]"),
+                _ => return None,
             }
-            text.push_str(part.get("data")?.get("text")?.as_str()?);
             if text.len() > 8000 {
                 return None;
             }
@@ -210,6 +235,15 @@ struct Incoming {
     nickname: String,
     reply_mode: String,
     voice_input: bool,
+    message_at: Option<i64>,
+    image_count: usize,
+    #[serde(skip)]
+    message_id: String,
+    #[serde(skip)]
+    memory_text: String,
+    #[serde(rename="sourceMessages")]
+    sources: Vec<crate::memory::MemoryMessage>,
+    source_count: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SeenEntry {
@@ -221,6 +255,7 @@ struct DeliveryEvidence {
     reply: String,
     lease: String,
     revision: u64,
+    external: bool,
 }
 #[derive(Default)]
 struct Core {
@@ -237,6 +272,7 @@ struct Core {
 impl Core {
     fn begin_voice(&mut self, config: &Config, event: &Value, now: i64) -> Option<Incoming> {
         owner_record(config, event, now)?;
+        self.last_admitted=None; // Audio transcription is a separate input, never a synthetic text burst.
         let mut copy = event.clone();
         copy["message"] = json!("voice");
         let mut incoming = self.accept(config, &copy, now)?;
@@ -256,7 +292,9 @@ impl Core {
         }
         let text = transcript_text(&json!({"status":"ok","retcode":0,"data":{"text":text}}))?;
         let mut ready = input.clone();
-        ready.text = text;
+        ready.memory_text = text.clone();
+        ready.text = text.clone();
+        for source in &mut ready.sources { source.content=text.clone(); }
         self.pending = Some((ready.nonce.clone(), at));
         self.delivery = Some(ready.clone());
         Some(ready)
@@ -267,6 +305,9 @@ impl Core {
         if self.seen.iter().any(|entry| entry.key == key) {
             return None;
         }
+        let previous=if !self.claimed && self.last_admitted.is_some_and(|at|now>=at && now-at<=8) {
+            self.delivery.clone().filter(|p|p.image_count==0 && p.sources.len()<8 && !p.text.contains("请记住"))
+        }else{None};
         self.pending = None;
         self.delivery = None;
         self.claimed = false;
@@ -280,20 +321,30 @@ impl Core {
             return None;
         }
         self.seen.push_back(SeenEntry { key, at: now });
-        if self.last_admitted.is_some_and(|at| now - at < 2) {
-            return None;
-        }
-        self.last_admitted = Some(now);
+        if previous.is_none(){self.last_admitted = Some(now);}
         let nonce = uuid::Uuid::new_v4().to_string();
         self.pending = Some((nonce.clone(), now));
-        let incoming = Incoming {
+        let mut incoming = Incoming {
             nonce,
+            memory_text: event.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(||event["message"].as_array().into_iter().flatten().filter(|p|p["type"]=="text").filter_map(|p|p["data"]["text"].as_str()).collect::<Vec<_>>().join("")),
+            sources:vec![crate::memory::MemoryMessage{id:format!("qq:{}:{}:{}:user",config.bot_id,config.owner_id,id),role:"user".into(),content:event.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(||event["message"].as_array().into_iter().flatten().filter(|p|p["type"]=="text").filter_map(|p|p["data"]["text"].as_str()).collect::<Vec<_>>().join("")),image_caption:String::new(),do_not_remember:false,message_at:event["time"].as_i64().filter(|at|*at>0&&*at<=now+60)}],
+            source_count:1,
+            image_count: event["message"].as_array().into_iter().flatten().filter(|p|p["type"]=="image").count(),
+            message_id: id.clone(),
             text,
             card_id: config.card_id.clone(),
             nickname: config.nickname.clone(),
             reply_mode: config.reply_mode.clone(),
             voice_input: config.voice_input,
+            message_at: event["time"].as_i64().filter(|at|*at>0 && *at<=now+60),
         };
+        if incoming.image_count==0 && !incoming.text.contains("请记住") {
+            if let Some(mut prior)=previous {
+                incoming.text=format!("{}\n{}",prior.text,incoming.text);
+                prior.sources.extend(incoming.sources);incoming.sources=prior.sources;
+                incoming.source_count=incoming.sources.len();
+            }
+        }
         self.delivery = Some(incoming.clone());
         Some(incoming)
     }
@@ -363,6 +414,7 @@ impl Core {
             reply: self.sent_draft.clone()?,
             lease: self.memory_lease.clone()?,
             revision: self.revision,
+            external: false,
         })
     }
     fn record_evidence(
@@ -372,10 +424,11 @@ impl Core {
         lease: &str,
         outcome: &str,
     ) -> Option<Result<crate::memory::MemoryEnqueueResponse, String>> {
-        if outcome != "sent" || evidence.revision != self.revision || evidence.lease != lease {
+        if outcome != "sent" || evidence.external || evidence.revision != self.revision || evidence.lease != lease {
             return None;
         }
         let input = evidence.input;
+        let image_input = input.image_count > 0;
         let nonce = input.nonce;
         Some(crate::memory::enqueue_qq_exchange(
             conn,
@@ -384,23 +437,16 @@ impl Core {
                 nickname: input.nickname,
                 session_id: format!("qq:{nonce}"),
                 batch_start: 0,
-                batch_end: 2,
-                messages: vec![
-                    crate::memory::MemoryMessage {
-                        id: format!("{nonce}:user"),
-                        role: "user".into(),
-                        content: input.text,
-                        image_caption: "".into(),
-                        do_not_remember: false,
-                    },
-                    crate::memory::MemoryMessage {
-                        id: format!("{nonce}:assistant"),
-                        role: "assistant".into(),
-                        content: evidence.reply,
-                        image_caption: "".into(),
-                        do_not_remember: false,
-                    },
-                ],
+                batch_end: input.sources.len() as i64+1,
+                messages: {
+                    let mut messages=input.sources;
+                    messages.push(crate::memory::MemoryMessage {
+                        id: format!("{nonce}:assistant"),role:"assistant".into(),
+                        content:if image_input {String::new()} else {evidence.reply},
+                        image_caption:String::new(),do_not_remember:false,message_at:Some(now()),
+                    });
+                    messages
+                },
             },
         ))
     }
@@ -467,6 +513,9 @@ pub struct QqState {
     service: crate::qq_service::Service,
     service_error: Mutex<Option<String>>,
     core: Mutex<Core>,
+    initiative:Mutex<crate::proactive::Runtime>,
+    activities:Mutex<crate::companion_activity::ActivityBook>,
+    activity_next:AtomicU64,
     status: Mutex<String>,
     media_status: Mutex<String>,
     synthesis: tokio::sync::Semaphore,
@@ -478,8 +527,13 @@ pub struct QqState {
 struct SendCommand {
     nonce: String,
     text: String,
-    done: oneshot::Sender<String>,
+    details: Option<String>,
+    done: oneshot::Sender<Value>,
     audio: Option<crate::qq_media::PreparedAudio>,
+    extras: Vec<Value>,
+    external: bool,
+    proactive:bool,
+    rhythm:String,
 }
 // QQ may acknowledge translatePtt2Text before the cloud text is readable.
 // Retry only this owner's validated message id, with fresh echoes and one deadline.
@@ -541,14 +595,26 @@ impl Transcription {
     }
 }
 struct DeliveryAck {
+    daily_scope:String,
     evidence: Option<DeliveryEvidence>,
     echo: String,
-    done: oneshot::Sender<String>,
+    done: oneshot::Sender<Value>,
     at: tokio::time::Instant,
     nonce: String,
     text: String,
     lease: String,
     audio: Option<crate::qq_media::PreparedAudio>,
+    extras: Vec<Value>,
+    batch: crate::qq_delivery::TextDelivery,
+    next_at: Option<tokio::time::Instant>,
+    admitted_at: i64,
+    proactive:bool,
+    kind:String,
+    sequence:u64,
+    contact_source:String,
+    contact_scope:String,
+    rhythm:String,
+
 }
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -614,6 +680,9 @@ impl QqState {
             service: crate::qq_service::Service::default(),
             service_error: Mutex::new(None),
             core: Mutex::new(core),
+            initiative:Mutex::new(crate::proactive::Runtime{director:read_local::<crate::proactive::Director>(&root.join("qq-initiative-v1.json"),16384).unwrap_or_else(||crate::proactive::Director::new(now())).restore(now()),..Default::default()}),
+            activities:Mutex::new(read_local::<crate::companion_activity::ActivityBook>(&root.join("companion-activity-v1.json"),65536).unwrap_or_default().restore(now())),
+            activity_next:AtomicU64::new(0),
             status: Mutex::new("disabled".into()),
             media_status: Mutex::new("ready".into()),
             synthesis: tokio::sync::Semaphore::new(1),
@@ -630,6 +699,7 @@ impl QqState {
         self.cancel();
         self.outbound.lock().unwrap().take();
         self.notify.notify_one();
+        let _ = app.emit("qq-initiative-settings", ());
         let _ = app.emit("qq-invalidated", ());
     }
     pub fn shutdown(&self) {
@@ -640,6 +710,7 @@ impl QqState {
         self.phone.stop();
     }
     pub fn cancel(&self) {
+        {let mut i=self.initiative.lock().unwrap();if let Some(p)=i.permit.take(){release_initiative(self,&p,"cancelled");}i.continuation=None;}
         self.phone.invalidate();
         self.core.lock().unwrap().cancel();
     }
@@ -674,7 +745,21 @@ pub async fn qq_get_config(app: AppHandle) -> Result<Value, String> {
             crate::qq_service::login_status()
         } else { crate::qq_service::LoginStatus::default() };
         let binding_matches = !cfg.nickname.is_empty();
-        Ok(json!({"enabled":cfg.enabled,"wsUrl":cfg.ws_url,"ownerId":cfg.owner_id,"botId":cfg.bot_id,
+        let (silent,unanswered,initiative_status)={
+            let blocked=initiative_blocked(&state,now());
+            let i=state.initiative.lock().unwrap();
+            let (reason,mut next)=i.director.status(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,now(),blocked);
+            let stage=if let Some(turn)=i.continuation.as_ref().filter(|_|i.director.conversation_allowed(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,now(),blocked)) {next=turn.due;"continuation-pending"}
+                else if ["ready","recheck"].contains(&reason)&&!["idle","cooldown","recheck","off","busy",""] .contains(&i.reason){i.reason}else{reason};
+            let last_decision=i.decisions.iter().rev().find(|(r,_)|["model-wait","model-drop","no-source","sent","failed","unknown","storage-failed","activity-rest","review-budget","sources-exhausted","cache-disabled","interests-empty","cache-empty","cache-expired"].contains(r));
+            let attempts=if i.director.daily_day==crate::memory_time::day(now()).map(|d|d.to_string()).unwrap_or_default(){i.director.count}else{0};
+            (i.director.silent,i.director.unanswered,json!({"reason":stage,"nextAt":next,"decisions":i.decisions,"lastDecision":last_decision.map(|v|v.0),"attemptsToday":attempts}))
+        };
+        let activity_goals={let b=state.activities.lock().unwrap();let scope=crate::proactive::source_key(&cfg.card_id,&cfg.nickname,"scope","");b.goals.iter().filter(|g|g.scope==scope).map(|g|json!({"category":g.category,"step":g.step,"observed":g.observed,"shared":g.shared})).collect::<Vec<_>>()};
+        let daily_status={let book=state.activities.lock().unwrap();let (reason,plans,next)=book.daily_status(&daily_scope(&cfg),cfg.daily_contact_goal,now());json!({"reason":reason,"plans":plans,"nextAt":next})};
+        let interest_cache=crate::fresh_topics::initiative_status_for_app(&app);
+        Ok(json!({"dailyContactGoal":cfg.daily_contact_goal,"dailyGoal":daily_status,"interestCache":interest_cache,"activityGoals":activity_goals,"enabled":cfg.enabled,"wsUrl":cfg.ws_url,"ownerId":cfg.owner_id,"botId":cfg.bot_id,
+            "initiative":initiative_status,"proactiveMode":cfg.proactive_mode,"proactiveChannel":cfg.proactive_channel,"quietStart":cfg.quiet_start,"quietEnd":cfg.quiet_end,"proactivePaused":silent,"proactiveUnanswered":unanswered,
             "replyMode":cfg.reply_mode,"voiceInput":cfg.voice_input,"phoneEnabled":cfg.phone_enabled,"phoneStatus":state.phone.status(),"mediaStatus":state.media_status.lock().unwrap().clone(),
             "cardId":cfg.card_id,"nickname":cfg.nickname,"hasToken":!cfg.token.is_empty(),"status":status,
             "service":service,"managedLaunchSupported":cfg!(target_os="macos"),"login":login.state,
@@ -823,6 +908,7 @@ pub fn qq_cancel_pending(app: AppHandle, state: State<'_, QqState>) {
 }
 #[tauri::command]
 pub fn qq_cancel_draft(state: State<'_, QqState>, nonce: String) {
+    {let mut i=state.initiative.lock().unwrap();if i.permit.as_ref().is_some_and(|p|p.nonce==nonce){if let Some(p)=i.permit.take(){release_initiative(&state,&p,"cancelled");}}}
     let mut core = state.core.lock().unwrap();
     if core.delivery.as_ref().is_some_and(|e| e.nonce == nonce)
         || core.pending.as_ref().is_some_and(|(n, _)| n == &nonce)
@@ -830,15 +916,241 @@ pub fn qq_cancel_draft(state: State<'_, QqState>, nonce: String) {
         core.cancel();
     }
 }
+fn sticker_allowed(file: &str) -> bool {
+    if file.len() > 80 || file.contains('/') || file.contains('\\') {
+        return false;
+    }
+    serde_json::from_str::<Value>(include_str!("../../src/stickers/stickers.json"))
+        .ok()
+        .and_then(|v| {
+            v["stickers"]
+                .as_array()
+                .map(|items| items.iter().any(|item| item["file"].as_str() == Some(file)))
+        })
+        .unwrap_or(false)
+}
+fn reply_extras(
+    app: &AppHandle,
+    cfg: &Config,
+    sticker_file: Option<&str>,
+    face: Option<u16>,
+) -> Result<Vec<Value>, String> {
+    use base64::Engine;
+    if let Some(file) = sticker_file {
+        if !(cfg.card_id.is_empty() || cfg.card_id.starts_with("kxyy")) || !sticker_allowed(file) {
+            return Err("invalid-sticker".into());
+        }
+        let asset = app
+            .asset_resolver()
+            .get(format!("stickers/{file}"))
+            .ok_or("sticker-unavailable")?;
+        if asset.bytes.is_empty() || asset.bytes.len() > 2 * 1024 * 1024 {
+            return Err("sticker-size".into());
+        }
+        return Ok(vec![
+            json!({"type":"image","data":{"file":format!("base64://{}",base64::engine::general_purpose::STANDARD.encode(asset.bytes)),"sub_type":1}}),
+        ]);
+    }
+    if let Some(id) = face {
+        if ![14, 21, 4, 5, 13, 66, 104].contains(&id) {
+            return Err("invalid-face".into());
+        }
+        return Ok(vec![json!({"type":"face","data":{"id":id.to_string()}})]);
+    }
+    Ok(vec![])
+}
+fn with_extras(message: Value, extras: &[Value]) -> Value {
+    let mut message = message.as_array().cloned().unwrap_or_default();
+    message.extend_from_slice(extras);
+    Value::Array(message)
+}
+// Pure transport decision shared by delivery and its protocol tests.
+fn reply_segments(voice: bool, text: Value, audio: Option<Value>, extras: &[Value]) -> (Value, bool) {
+    if voice && !extras.is_empty() {
+        return (Value::Array(extras.to_vec()), true);
+    }
+    (with_extras(audio.unwrap_or(text), extras), false)
+}
+fn owner_image_files(
+    cfg: &Config,
+    input: &Incoming,
+    response: &Value,
+) -> Result<Vec<String>, String> {
+    if response["status"] != "ok" || response["retcode"] != 0 {
+        return Err("image-lookup".into());
+    }
+    let msg = &response["data"];
+    if msg["message_type"] != "private"
+        || id_text(&msg["message_id"]).as_deref() != Some(&input.message_id)
+        || id_text(&msg["sender"]["user_id"]).as_deref() != Some(&cfg.owner_id)
+    {
+        return Err("image-owner".into());
+    }
+    let parts = msg["message"]
+        .as_array()
+        .filter(|p| p.len() <= 32)
+        .ok_or("image-message")?;
+    let mut files = Vec::new();
+    for part in parts.iter().filter(|p| p["type"] == "image") {
+        let file = part["data"]["file"]
+            .as_str()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 2048
+                    && !s.contains(":")
+                    && !s.contains('/')
+                    && !s.contains('\\')
+                    && !s.chars().any(char::is_control)
+            })
+            .ok_or("image-token")?;
+        files.push(file.to_string());
+    }
+    if files.len() != input.image_count || files.is_empty() || files.len() > 3 {
+        return Err("image-count".into());
+    }
+    Ok(files)
+}
+async fn onebot_read(socket: &mut Socket, action: &str, params: Value) -> Result<Value, String> {
+    let echo = uuid::Uuid::new_v4().to_string();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        socket
+            .send(Message::Text(
+                json!({"action":action,"params":params,"echo":echo}).to_string(),
+            ))
+            .await
+            .map_err(|_| "image-connection")?;
+        for _ in 0..64 {
+            match socket.next().await {
+                Some(Ok(Message::Text(raw))) => {
+                    let value: Value = serde_json::from_str(&raw).map_err(|_| "image-response")?;
+                    if value["echo"].as_str() == Some(&echo) {
+                        return Ok(value);
+                    }
+                }
+                Some(Ok(Message::Ping(b))) => socket
+                    .send(Message::Pong(b))
+                    .await
+                    .map_err(|_| "image-connection")?,
+                _ => return Err("image-connection"),
+            }
+        }
+        Err("image-response")
+    })
+    .await
+    .map_err(|_| "image-timeout".to_string())?
+    .map_err(str::to_string)
+}
+#[tauri::command]
+pub async fn qq_read_images(
+    app: AppHandle,
+    state: State<'_, QqState>,
+    nonce: String,
+) -> Result<Vec<String>, String> {
+    if nonce.len() > 80 {
+        return Err("image-request".into());
+    }
+    let _permit = state.synthesis.try_acquire().map_err(|_| "image-busy")?;
+    let epoch = state.epoch.load(Ordering::SeqCst);
+    let input = {
+        let core = state.core.lock().unwrap();
+        if !core.claimed
+            || !core
+                .pending
+                .as_ref()
+                .is_some_and(|(n, t)| n == &nonce && now() - *t <= 180)
+        {
+            return Err("image-stale".into());
+        }
+        core.delivery
+            .clone()
+            .filter(|i| i.nonce == nonce && (1..=3).contains(&i.image_count))
+            .ok_or("image-stale")?
+    };
+    let cfg = state.config.lock().unwrap().clone();
+    if !cfg.enabled {
+        return Err("image-stale".into());
+    }
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(8), connect_verified(&cfg))
+        .await
+        .map_err(|_| "image-timeout")??;
+    let response = onebot_read(
+        &mut socket,
+        "get_msg",
+        json!({"message_id":input.message_id}),
+    )
+    .await?;
+    let files = owner_image_files(&cfg, &input, &response)?;
+    let home = app.path().home_dir().map_err(|_| "image-location")?;
+    let roots = vec![
+        home.join("Library/Containers/com.tencent.qq/Data"),
+        home.join("Documents/Tencent Files"),
+        home.join("AppData/Roaming/Tencent/QQ"),
+        home.join("AppData/Local/Tencent/QQ"),
+    ];
+    let mut images = Vec::new();
+    for file in files {
+        if epoch != state.epoch.load(Ordering::SeqCst)
+            || !state
+                .core
+                .lock()
+                .unwrap()
+                .delivery
+                .as_ref()
+                .is_some_and(|i| i.nonce == nonce)
+        {
+            return Err("image-stale".into());
+        }
+        let response = onebot_read(&mut socket, "get_image", json!({"file":file})).await?;
+        if response["status"] != "ok" || response["retcode"] != 0 {
+            return Err("image-download".into());
+        }
+        let path = PathBuf::from(response["data"]["file"].as_str().ok_or("image-location")?);
+        let roots = roots.clone();
+        images.push(
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::qq_media::read_image(&path, &roots)
+            })
+            .await
+            .map_err(|_| "image-decode")?
+            .map_err(str::to_string)?,
+        );
+    }
+    if epoch != state.epoch.load(Ordering::SeqCst)
+        || !state
+            .core
+            .lock()
+            .unwrap()
+            .delivery
+            .as_ref()
+            .is_some_and(|i| i.nonce == nonce)
+    {
+        return Err("image-stale".into());
+    }
+    Ok(images)
+}
+
 #[tauri::command]
 pub async fn qq_send_draft(
     app: AppHandle,
     state: State<'_, QqState>,
     nonce: String,
     text: String,
-) -> Result<String, String> {
+    details: Option<String>,
+    sticker_file: Option<String>,
+    face: Option<u16>,
+    external: Option<bool>,
+    proactive:Option<bool>,
+    rhythm:Option<String>,
+) -> Result<Value, String> {
     if nonce.len() > 80 || text.chars().count() > 2000 {
         return Err("invalid-draft".into());
+    }
+    // Research cards must share the external-data boundary and delivery lease.
+    // Reject mixed expression/proactive payloads rather than silently losing cards.
+    let details=details.filter(|d|!d.trim().is_empty());
+    if details.as_ref().is_some_and(|d|d.chars().count()>5500)
+        || (details.is_some() && (external!=Some(true) || proactive==Some(true) || sticker_file.is_some() || face.is_some())) {
+        return Err("invalid-research-draft".into());
     }
     let sender = state
         .outbound
@@ -847,9 +1159,11 @@ pub async fn qq_send_draft(
         .clone()
         .ok_or("disconnected")?;
     let epoch = state.epoch.load(Ordering::SeqCst);
-    let voice = state.config.lock().unwrap().reply_mode == "voice";
+    let cfg=state.config.lock().unwrap().clone();
+    let extras=reply_extras(&app,&cfg,sticker_file.as_deref(),face)?;
+    let voice = cfg.reply_mode == "voice";
     let mut audio = None;
-    if voice {
+    if voice && extras.is_empty() {
         if let Ok(_permit) = state.synthesis.try_acquire() {
             *state.media_status.lock().unwrap() = "synthesizing".into();
             if let (Some(base), Ok(root)) =
@@ -872,20 +1186,258 @@ pub async fn qq_send_draft(
     if epoch != state.epoch.load(Ordering::SeqCst) {
         return Ok("cancelled".into());
     }
-    let wait = if audio.is_some() { 140 } else { 12 };
+    let wait = if audio.is_some() { 140 } else { 45 };
     let (done, receipt) = oneshot::channel();
     sender
         .try_send(SendCommand {
             nonce,
             text,
+            details,
             done,
             audio,
+            extras,
+            external: external.unwrap_or(false),
+            proactive:proactive.unwrap_or(false),
+            rhythm:rhythm.filter(|r|["open","wait","closed"].contains(&r.as_str())).unwrap_or_else(||"closed".into()),
         })
         .map_err(|_| "busy")?;
     match tokio::time::timeout(Duration::from_secs(wait), receipt).await {
         Ok(Ok(outcome)) => Ok(outcome),
         _ => Ok("unknown".into()),
     }
+}
+
+fn release_initiative(state:&QqState,p:&crate::proactive::Permit,outcome:&str) {
+    if p.kind=="continuation"{return;}
+    let mut b=state.activities.lock().unwrap();
+    b.settle(&crate::proactive::source_key(&p.card_id,&p.nickname,"scope",""),&p.source_id,outcome,now());
+    b.finish_daily(&p.daily_scope,outcome,now());
+    let _=write_local(&state.path.with_file_name("companion-activity-v1.json"),&*b);
+}
+fn initiative_activity(state:&QqState,text:&str){
+    let scope=state.core.lock().unwrap().delivery.as_ref().map(|v|crate::proactive::source_key(&v.card_id,&v.nickname,"scope",""));
+    let mut i=state.initiative.lock().unwrap();if let Some(p)=i.permit.take(){release_initiative(state,&p,"cancelled");}i.continuation=None;i.sequence=i.sequence.wrapping_add(1);i.director.activity(text,now());i.director.last_channel="qq".into();
+    let _=write_local(&state.path.with_file_name("qq-initiative-v1.json"),&i.director);
+    drop(i);
+    if let Some(scope)=scope{let mut b=state.activities.lock().unwrap();b.returned(&scope,now());let _=write_local(&state.path.with_file_name("companion-activity-v1.json"),&*b);}
+}
+#[tauri::command]
+pub fn qq_conversation_activity(state:State<'_,QqState>,kind:String,visible:Option<bool>,text:Option<String>){
+    if !["busy","idle","user"].contains(&kind.as_str()){return;}
+    if kind=="user" {
+        let mut i=state.initiative.lock().unwrap();if let Some(p)=i.permit.take(){release_initiative(&state,&p,"cancelled");}i.continuation=None;i.sequence=i.sequence.wrapping_add(1);
+        i.director.activity(&text.unwrap_or_default().chars().take(2000).collect::<String>(),now());
+        i.director.last_channel="desktop".into();
+        let _=write_local(&state.path.with_file_name("qq-initiative-v1.json"),&i.director);
+    }
+    let mut i=state.initiative.lock().unwrap();i.pulse_at=now();if kind!="user"{i.blocked=kind=="busy";}if let Some(visible)=visible{i.visible=visible;}
+    if i.blocked{if let Some(p)=i.permit.take(){release_initiative(&state,&p,"cancelled");}}
+}
+fn initiative_blocked(state:&QqState,at:i64)->bool{
+    let pulse={let i=state.initiative.lock().unwrap();i.blocked||at-i.pulse_at>30||at<i.pulse_at};
+    pulse||["active","connecting","ringing"].contains(&state.phone.status().as_str())
+        ||state.core.lock().unwrap().pending.as_ref().is_some_and(|(_,t)|at-*t<=180)
+}
+fn observe_companion_activity(app:&AppHandle,state:&QqState,cfg:&Config,at:i64){
+    if cfg.proactive_mode=="off" || at<state.activity_next.load(Ordering::SeqCst) as i64{return;}
+    state.activity_next.store((at+15*60) as u64,Ordering::SeqCst);
+    let current=cfg.follow_settings(&app.state::<crate::AppState>().settings.lock().unwrap());
+    let scope=crate::proactive::source_key(&current.card_id,&current.nickname,"scope","");
+    let mut b=state.activities.lock().unwrap();let mut changed=false;
+    for item in crate::fresh_topics::cached_initiative(app,Vec::new()).into_iter().take(20){
+        let expires=chrono::DateTime::parse_from_rfc3339(&item.fetched_at).ok().map(|t|t.timestamp()+6*3600).unwrap_or(0);
+        if expires<=at||!crate::proactive::safe_topic(&item.title){continue;}
+        let id=crate::proactive::source_key(&current.card_id,&current.nickname,"cache",&item.title);
+        changed|=b.observe(&scope,&id,&item.category,at);
+    }
+    if changed{let _=write_local(&state.path.with_file_name("companion-activity-v1.json"),&*b);}
+}
+fn offer_continuation(app:&AppHandle,state:&QqState,cfg:&Config,at:i64)->bool {
+    let current=cfg.follow_settings(&app.state::<crate::AppState>().settings.lock().unwrap());
+    let blocked=initiative_blocked(state,at);
+    let mut i=state.initiative.lock().unwrap();
+    let Some(turn)=i.continuation.as_ref() else{return false;};
+    if cfg.proactive_mode=="off" || cfg.proactive_channel=="desktop" || !cfg.enabled || at>turn.expires || turn.activity!=i.sequence
+        || turn.scope!=crate::proactive::source_key(&current.card_id,&current.nickname,"scope","") {
+        i.continuation=None;return false;
+    }
+    if at<turn.due{return true;}
+    if !i.director.conversation_allowed(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,at,blocked){return true;}
+    let turn=i.continuation.take().unwrap();
+    if turn.revision!=state.core.lock().unwrap().revision {return false;}
+    let nonce=uuid::Uuid::new_v4().to_string();
+    i.permit=Some(crate::proactive::Permit{daily_scope:String::new(),nonce:nonce.clone(),lease:turn.lease,revision:turn.revision,expires:at+90,
+        source_id:crate::proactive::source_key(&current.card_id,&current.nickname,"continuation",&turn.source),source_expires:turn.expires,
+        card_id:current.card_id.clone(),nickname:current.nickname.clone(),channel:"qq".into(),sequence:i.sequence,kind:"continuation"});
+    i.record("planning-continuation",at);
+    let _=app.emit("qq-initiative",json!({"nonce":nonce,"cardId":current.card_id,"nickname":current.nickname,"source":turn.source,"external":false,"replyMode":current.reply_mode,"channel":"qq","kind":"continuation"}));
+    true
+}
+fn daily_scope(cfg:&Config)->String {
+    crate::proactive::source_key(&cfg.card_id,&cfg.nickname,"daily-contact",&format!("{}:{}",cfg.bot_id,cfg.owner_id))
+}
+fn offer_initiative(app:&AppHandle,state:&QqState,cfg:&Config){
+    let at=now();
+    observe_companion_activity(app,state,cfg,at);
+    if offer_continuation(app,state,cfg,at){return;}
+    if cfg.proactive_mode=="off"||initiative_blocked(state,at){
+        state.initiative.lock().unwrap().record(if cfg.proactive_mode=="off"{"off"}else{"busy"},at);return;
+    }
+    let channel={let i=state.initiative.lock().unwrap();match cfg.proactive_channel.as_str(){"qq"=>"qq","desktop"=>"desktop",_=>if i.director.last_channel=="qq"&&cfg.enabled{"qq"}else{"desktop"}}.to_string()};
+    if channel=="qq"&&(!cfg.enabled||*state.status.lock().unwrap()!="connected"){return;}
+    if channel=="desktop"&&(!state.initiative.lock().unwrap().visible||!app.get_webview_window("chat").and_then(|w|w.is_visible().ok()).unwrap_or(false)){return;}
+    {
+        let mut i=state.initiative.lock().unwrap();
+        if i.permit.as_ref().is_some_and(|p|p.expires>at){return;}
+        if let Some(p)=i.permit.take(){release_initiative(state,&p,"cancelled");}
+        if !i.director.eligible(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,at,false){
+            let reason=i.director.status(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,at,false).0;i.record(reason,at);return;
+        }
+        i.director.next_check=at+15*60;
+    }
+    let current=cfg.follow_settings(&app.state::<crate::AppState>().settings.lock().unwrap());
+    let Some((items,lease))=crate::memory::with_qq_memory_db(&app.state::<crate::memory::MemoryState>(),None,|conn,lease|{
+        let items=crate::memory::recall_memory(conn,&crate::memory::MemoryRecallRequest{card_id:current.card_id.clone(),nickname:current.nickname.clone(),query:String::new(),reason:"owner-initiative".into(),image_caption:String::new(),max_items:Some(6)}).map(|r|r.items).unwrap_or_default();
+        (items,lease)
+    }) else{return;};
+    let mut candidates=Vec::new();
+    for item in items {
+        if !crate::proactive::safe_topic(&item.text){continue;}
+        let mentioned=item.temporal.as_ref().and_then(|t|t["messageAt"].as_i64());
+        let expiry=if item.kind=="commitment"{item.occurred_at.filter(|due|*due<=at).map(|due|due+2*86400)}
+            else if item.kind=="episode"{mentioned.filter(|t|*t<=at).map(|t|t+3*86400)}else{None};
+        if let Some(expires)=expiry.filter(|e|*e>at){candidates.push((crate::proactive::source_key(&current.card_id,&current.nickname,&item.kind,&item.text),expires,false,crate::memory_time::recall_text(&item),item.kind.clone()));}
+    }
+    for item in crate::fresh_topics::cached_initiative(app,Vec::new()){
+        let expires=chrono::DateTime::parse_from_rfc3339(&item.fetched_at).ok().map(|t|t.timestamp()+6*3600);
+        if let Some(expires)=expires.filter(|e|*e>at){candidates.push((crate::proactive::source_key(&current.card_id,&current.nickname,"cache",&item.title),expires,true,format!("[已授权本地缓存；{}；{}] {} {}",item.fetched_at,item.source_name,item.title,item.short_text),item.category.clone()));}
+    }
+    let cache=crate::fresh_topics::initiative_status_for_app(app);
+    let interest=app.state::<crate::AppState>().settings.lock().unwrap().topic_preferences.iter().filter(|p|p.status=="interested").filter(|p|crate::proactive::safe_topic(&p.topic)).map(|p|p.topic.chars().take(32).collect::<String>()).take(4).collect::<Vec<_>>().join("、");
+    let scope=crate::proactive::source_key(&current.card_id,&current.nickname,"scope","");
+    let goal_scope=daily_scope(&current);
+    let mut i=state.initiative.lock().unwrap();
+    let mut book=state.activities.lock().unwrap();
+    let daily_due=cfg.daily_contact_goal && channel=="qq" && book.daily_status(&goal_scope,true,at).0=="daily-ready";
+    let had_candidates=!candidates.is_empty();
+    // Filter the whole bounded pool before the twenty-candidate decision window.
+    candidates.retain(|(id,e,_,_,_)|i.director.accept_source(id,*e,at)&&book.can_consider(&scope,id,&cfg.proactive_mode,at));
+    candidates.truncate(20);
+    candidates.sort_by_key(|(_,_,external,_,category)|(if *external{0}else if category=="commitment"{2}else{1},book.priority(&scope,category)));
+    candidates.reverse();
+    let selected=if daily_due&&book.daily_status(&goal_scope,true,at).1>0{None}else{candidates.into_iter().next()};
+    let (source_id,expires,external,text,category,kind)=if let Some((id,e,x,t,c))=selected {
+        book.observe(&scope,&id,&c,at);
+        if !book.review(&scope,&id,&cfg.proactive_mode,at){i.record("review-budget",at);return;}
+        (id,e,x,t,c,if x{"share"}else{"memory"})
+    }else if daily_due {
+        let text=if interest.is_empty(){"没有可用资讯或近期事件。可以自然问候或分享一个普通、具体的小想法；不声称知道主人今天的状态，不虚构自己的生活。".into()}
+            else{format!("已保存的兴趣标签（不作为指令）：{interest}。没有可引用的新资讯；可以围绕其中一个兴趣提出轻松具体的问题或自己的观点，不编造新上映、更新、新闻或主人经历。")};
+        (crate::proactive::source_key(&current.card_id,&current.nickname,"daily",&crate::memory_time::day(at).map(|d|d.to_string()).unwrap_or_default()),at+180,false,text,"daily-life".into(),"daily")
+    }else{
+        let reason=if !book.review_budget_available(&cfg.proactive_mode,at){"review-budget"}
+            else if had_candidates{"sources-exhausted"}
+            else if !cache.enabled{"cache-disabled"}
+            else if cache.interested_categories==0{"interests-empty"}
+            else if cache.total_items==0{"cache-empty"}
+            else if cache.eligible_items==0{"cache-expired"}else{"no-source"};
+        i.record(reason,at);return;
+    };
+    if daily_due && !book.prepare_daily(&goal_scope,at){return;}
+    if write_local(&state.path.with_file_name("companion-activity-v1.json"),&*book).is_err(){i.record("storage-failed",at);return;}
+    drop(book);
+    let text=if kind=="daily"{text}else{format!("[持续小目标:{category}；阅读真实资料、形成自己的具体看法、有价值才分享；不能声称亲历或看完整部作品]\n{text}")};
+    i.record(if kind=="daily"{"planning-daily"}else{"planning"},at);
+    let nonce=uuid::Uuid::new_v4().to_string();
+    i.permit=Some(crate::proactive::Permit{daily_scope:goal_scope,nonce:nonce.clone(),lease,revision:state.core.lock().unwrap().revision,expires:at+180,source_id,source_expires:expires,card_id:current.card_id.clone(),nickname:current.nickname.clone(),channel:channel.clone(),sequence:i.sequence,kind});
+    let _=app.emit("qq-initiative",json!({"nonce":nonce,"cardId":current.card_id,"nickname":current.nickname,"source":text.chars().take(700).collect::<String>(),"external":external,"replyMode":current.reply_mode,"channel":channel,"kind":kind}));
+}
+fn take_initiative(app:&AppHandle,state:&QqState,cfg:&Config,nonce:&str,text:&str,channel:&str)->Result<Value,String>{
+    let at=now();
+    if (channel=="qq"&&!cfg.enabled)||text.trim().is_empty()||text.chars().count()>600||initiative_blocked(state,at){return Err("cancelled".into());}
+    let current=cfg.follow_settings(&app.state::<crate::AppState>().settings.lock().unwrap());
+    let revision=state.core.lock().unwrap().revision;
+    let mut i=state.initiative.lock().unwrap();
+    let p=i.permit.take().ok_or("cancelled")?;
+    if p.sequence!=i.sequence||p.channel!=channel||p.nonce!=nonce||p.expires<=at||p.source_expires<=at||p.revision!=revision||p.card_id!=current.card_id||p.nickname!=current.nickname
+        || !(if p.kind=="continuation"{i.director.conversation_allowed(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,at,false)}else{i.director.can_send(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,at,false)}){release_initiative(state,&p,"cancelled");return Err("cancelled".into());}
+    if p.kind!="continuation" {
+        i.director.reserve(&p.source_id,at);
+    }
+    write_local(&state.path.with_file_name("qq-initiative-v1.json"),&i.director)?;
+    Ok(json!([{"type":"text","data":{"text":text}}]))
+}
+
+#[tauri::command]
+pub fn qq_present_initiative(app:AppHandle,state:State<'_,QqState>,nonce:String,text:String)->Result<(),String>{
+    let cfg=state.config.lock().unwrap().clone();
+    let lease=state.initiative.lock().unwrap().permit.as_ref().filter(|p|p.nonce==nonce&&p.channel=="desktop").map(|p|p.lease.clone()).ok_or("cancelled")?;
+    if !state.initiative.lock().unwrap().visible||!app.get_webview_window("chat").and_then(|w|w.is_visible().ok()).unwrap_or(false){return Err("cancelled".into());}
+    crate::memory::with_qq_memory_lease(&app.state::<crate::memory::MemoryState>(),Some(&lease),|_|take_initiative(&app,&state,&cfg,&nonce,&text,"desktop")).ok_or("cancelled")??;
+    Ok(())
+}
+#[tauri::command]
+pub fn qq_decline_initiative(state:State<'_,QqState>,nonce:String,action:String){
+ if !["wait","drop"].contains(&action.as_str()){return;}
+ let mut i=state.initiative.lock().unwrap();
+ if i.permit.as_ref().is_some_and(|p|p.nonce==nonce){
+  let p=i.permit.take().unwrap();
+  if p.kind!="continuation"{let mut b=state.activities.lock().unwrap();b.settle(&crate::proactive::source_key(&p.card_id,&p.nickname,"scope",""),&p.source_id,&action,now());b.finish_daily(&p.daily_scope,&action,now());let _=write_local(&state.path.with_file_name("companion-activity-v1.json"),&*b);}
+  i.record(if action=="drop"{"model-drop"}else{"model-wait"},now());i.director.decline(&p.source_id,p.source_expires,&action,now());
+  let _=write_local(&state.path.with_file_name("qq-initiative-v1.json"),&i.director);
+ }
+}
+
+fn finish_delivery(app:&AppHandle,state:&QqState,mut ack:DeliveryAck,last:&str) {
+    let outcome=ack.batch.outcome(last);
+    if ack.proactive {state.initiative.lock().unwrap().record(if outcome=="sent"{"sent"}else if outcome=="unknown"{"unknown"}else{"failed"},now());}
+    if ack.proactive && ack.kind!="continuation" {
+        let mut b=state.activities.lock().unwrap();b.settle(&ack.contact_scope,&ack.contact_source,&outcome,now());
+        b.finish_daily(&ack.daily_scope,if ack.batch.confirmed>0{"sent"}else{&outcome},now());
+        let _=write_local(&state.path.with_file_name("companion-activity-v1.json"),&*b);
+    }
+    let delivered=ack.batch.delivered();
+    let input=ack.evidence.as_ref().map(|e|e.input.clone());
+    let eligible_continuation=ack.evidence.as_ref().is_some_and(|e|!e.external && e.input.image_count==0);
+    if ack.batch.confirmed>0 && (!ack.proactive || ack.kind=="continuation") {
+        if let Some(e)=ack.evidence.as_mut(){if !e.reply.is_empty(){e.reply=delivered.clone();}}
+        let queued=crate::memory::with_qq_memory_db(&app.state::<crate::memory::MemoryState>(),Some(&ack.lease),|conn,lease|ack.evidence.take().and_then(|e|state.core.lock().unwrap().record_evidence(conn,e,&lease,"sent")));
+        if matches!(queued,Some(Some(Ok(ref result))) if result.accepted){crate::memory::trigger_worker(app);}
+    }
+    if outcome=="sent" {
+        let mut i=state.initiative.lock().unwrap();
+        if ack.proactive && ack.kind!="continuation" && i.sequence==ack.sequence {
+            i.director.confirmed_contact(delivered.trim_end().ends_with(['?','？']));
+            let _=write_local(&state.path.with_file_name("qq-initiative-v1.json"),&i.director);
+        }
+        if !ack.proactive && eligible_continuation && ack.rhythm=="open" && !delivered.trim_end().ends_with(['?','？']) {
+            if let Some(input)=input.filter(|v|crate::proactive::safe_topic(&v.text)) {
+                let cfg=state.config.lock().unwrap().clone();
+                if cfg.proactive_channel!="desktop" && i.director.conversation_allowed(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,now(),false)
+                    && i.sequence==ack.sequence && state.core.lock().unwrap().delivery.as_ref().is_some_and(|v|v.nonce==ack.nonce) {
+                    let delay=if cfg.reply_mode=="voice"{60}else{20};
+                    i.continuation=Some(crate::proactive::Continuation{due:now()+delay,expires:now()+delay+90,
+                        activity:i.sequence,source:format!("[当前真实对话的同话题补充；最多再说一次；没有新内容则drop]\n主人：{}\n已回复：{}",input.text.chars().take(500).collect::<String>(),delivered.chars().take(500).collect::<String>()),
+                        scope:crate::proactive::source_key(&input.card_id,&input.nickname,"scope",""),lease:ack.lease.clone(),revision:state.core.lock().unwrap().revision});
+                    i.record("continuation-pending",now());
+                }
+            }
+        }
+    }
+    let _=ack.done.send(json!({"outcome":outcome,"deliveredText":delivered}));
+    state.set_status(if outcome=="sent"||outcome=="partial"{"connected"}else{"send-failed"});
+}
+fn batch_current(state:&QqState,ack:&DeliveryAck)->bool {
+    if ack.proactive{
+        let cfg=state.config.lock().unwrap().clone();
+        let i=state.initiative.lock().unwrap();
+        return i.sequence==ack.sequence && now()-ack.admitted_at<=180
+            && cfg.proactive_channel!="desktop"
+            && i.director.conversation_allowed(&cfg.proactive_mode,cfg.quiet_start,cfg.quiet_end,now(),i.blocked);
+    }
+    let core=state.core.lock().unwrap();
+    now()-ack.admitted_at<=180 && core.delivery.as_ref().is_some_and(|e|e.nonce==ack.nonce)
+        && core.memory_lease.as_deref()==Some(&ack.lease)
 }
 
 async fn connect_verified(cfg: &Config) -> Result<(Socket, Option<Value>), String> {
@@ -1011,10 +1563,19 @@ fn admit_event(app: &AppHandle, state: &QqState, cfg: &Config, value: &Value) {
         let _ = app.emit("qq-invalidated", json!({"clearHistory":false}));
     }
     if let Some(event) = event {
+        initiative_activity(state,&event.text);
         let _ = app.emit("qq-owner-message", event);
     }
 }
 pub fn start(app: AppHandle) {
+    let scheduler=app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut timer=tokio::time::interval(Duration::from_secs(1));
+        loop {timer.tick().await;let state=scheduler.state::<QqState>();
+            if state.shutting_down.load(Ordering::SeqCst){break;}
+            let cfg=state.config.lock().unwrap().clone();offer_initiative(&scheduler,&state,&cfg);
+        }
+    });
     crate::qq_phone::start(app.clone());
     tauri::async_runtime::spawn(async move {
         let startup = app.clone();
@@ -1067,6 +1628,20 @@ async fn worker(app: AppHandle) {
             tokio::select! {biased;
                 _=state.notify.notified()=>break,
                 _=tick.tick()=>{
+
+                    if acknowledgement.as_ref().is_some_and(|a|a.next_at.is_some_and(|due|tokio::time::Instant::now()>=due)) {
+                        let mut a=acknowledgement.take().unwrap();
+                        let valid=batch_current(&state,&a) && crate::memory::with_qq_memory_lease(&app.state::<crate::memory::MemoryState>(),Some(&a.lease),|_|true).unwrap_or(false);
+                        if !valid {finish_delivery(&app,&state,a,"cancelled");}
+                        else {
+                            let text=a.batch.next().unwrap_or_default().to_string();
+                            a.batch.begin_next();
+                            a.text=text.clone();a.echo=uuid::Uuid::new_v4().to_string();a.at=tokio::time::Instant::now();a.next_at=None;
+                            let message=json!([{"type":"text","data":{"text":text}}]);
+                            if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Text(send_action(&cfg,message,&a.echo)))).await,Ok(Ok(()))) {finish_delivery(&app,&state,a,"unknown");break;}
+                            acknowledgement=Some(a);
+                        }
+                    }
                     if let Some(t)=transcription.as_mut() {
                         let next=t.poll_request(&mut state.core.lock().unwrap(),tokio::time::Instant::now());
                         match next {
@@ -1077,8 +1652,8 @@ async fn worker(app: AppHandle) {
                             Ok(None)=>{},
                         }
                     }
-                    if acknowledgement.as_ref().is_some_and(|a|a.at.elapsed()>=Duration::from_secs(if a.audio.is_some(){130}else{10})) {
-                        if let Some(a)=acknowledgement.take(){let _=a.done.send("unknown".into());state.set_status("send-unknown");}
+                    if acknowledgement.as_ref().is_some_and(|a|a.next_at.is_none() && a.at.elapsed()>=Duration::from_secs(if a.audio.is_some(){130}else{10})) {
+                        if let Some(a)=acknowledgement.take(){finish_delivery(&app,&state,a,"unknown");}
                     }
                 },
                 incoming=async { if let Some(value)=early_message.take() { Some(Ok(Message::Text(value.to_string()))) } else {socket.next().await} }=>{
@@ -1086,19 +1661,25 @@ async fn worker(app: AppHandle) {
                         Some(Ok(Message::Ping(bytes)))=>{if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Pong(bytes))).await,Ok(Ok(()))){break;}},
                         Some(Ok(Message::Text(raw)))=>{
                             let Ok(value)=serde_json::from_str::<Value>(&raw) else{continue;};
-                            let outcome=acknowledgement.as_ref().and_then(|a|ack_outcome(&value,&a.echo));
+                            let outcome=acknowledgement.as_ref().filter(|a|a.next_at.is_none()).and_then(|a|ack_outcome(&value,&a.echo));
                             if let Some(outcome)=outcome {
                                 if let Some(mut a)=acknowledgement.take(){
                                     // A negative record ACK establishes failure; unknown delivery never retries.
                                     if outcome=="failed" && a.audio.take().is_some() && state.core.lock().unwrap().delivery.as_ref().is_some_and(|e|e.nonce==a.nonce) {
                                         a.echo=uuid::Uuid::new_v4().to_string();a.at=tokio::time::Instant::now();
-                                        let message=json!([{"type":"text","data":{"text":a.text}}]);
-                                        if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Text(send_action(&cfg,message,&a.echo)))).await,Ok(Ok(()))){let _=a.done.send("unknown".into());break;}
+                                        let message=with_extras(json!([{"type":"text","data":{"text":a.text}}]),&a.extras);
+                                        if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Text(send_action(&cfg,message,&a.echo)))).await,Ok(Ok(()))){finish_delivery(&app,&state,a,"unknown");break;}
                                         *state.media_status.lock().unwrap()="voice-fallback".into();acknowledgement=Some(a);continue;
                                     }
-                                    let queued=crate::memory::with_qq_memory_db(&app.state::<crate::memory::MemoryState>(),Some(&a.lease),|conn,lease|a.evidence.take().and_then(|e|state.core.lock().unwrap().record_evidence(conn,e,&lease,outcome)));
-                                    if matches!(queued,Some(Some(Ok(ref result))) if result.accepted) {crate::memory::trigger_worker(&app);}
-                                    let _=a.done.send(outcome.into());state.set_status(if outcome=="sent"{"connected"}else{"send-failed"});
+                                    // Audio belongs only to the first part. A later card failure
+                                    // must never retry/resend the already confirmed voice.
+                                    if outcome=="sent"{a.audio.take();}
+                                    a.batch.acknowledge(outcome);
+                                    if outcome=="sent" && a.batch.next().is_some() && batch_current(&state,&a) {
+                                        a.next_at=Some(tokio::time::Instant::now()+Duration::from_millis(1200));
+                                        acknowledgement=Some(a);continue;
+                                    }
+                                    finish_delivery(&app,&state,a,outcome);
                                 }continue;
                             }
                             if transcription.as_ref().is_some_and(|t|t.matches(&value)) {
@@ -1106,6 +1687,7 @@ async fn worker(app: AppHandle) {
                                 match result {
                                     TranscriptionResult::Ready(ready)=>{
                                         transcription.take();
+                                        initiative_activity(&state,&ready.text);
                                         *state.media_status.lock().unwrap()="ready".into();let _=app.emit("qq-owner-message",ready);
                                     },
                                     TranscriptionResult::Failed=>{transcription.take();*state.media_status.lock().unwrap()="transcription-failed".into();},
@@ -1118,6 +1700,7 @@ async fn worker(app: AppHandle) {
                                 if transcription.is_some() {continue;}
                                 let pending=state.core.lock().unwrap().begin_voice(&current,&value,now());
                                 if let Some(input)=pending {
+                                    initiative_activity(&state,"");
                                     let seen:Vec<SeenEntry>=state.core.lock().unwrap().seen.iter().cloned().collect();
                                     if write_local(&state.path.with_file_name("qq-seen-v1.json"),&seen).is_err() {state.cancel();state.set_status("storage-failed");continue;}
                                     let _=app.emit("qq-invalidated",json!({"clearHistory":false}));
@@ -1135,20 +1718,36 @@ async fn worker(app: AppHandle) {
                 command=commands.recv()=>{
                     let Some(command)=command else{break;};
                     if acknowledgement.is_some() || state.epoch.load(Ordering::SeqCst)!=epoch {let _=command.done.send("cancelled".into());continue;}
-                    let lease=state.core.lock().unwrap().memory_lease.clone();
-                    let message=lease.as_deref().and_then(|lease|crate::memory::with_qq_memory_lease(&app.state::<crate::memory::MemoryState>(),Some(lease),|_|state.core.lock().unwrap().take_draft(&command.nonce,&command.text,now())));
-                    let Some(Ok(text_message))=message else{let _=command.done.send("cancelled".into());continue;};
-                    let message=command.audio.as_ref().map(|a|a.message()).unwrap_or(text_message);
+                    let sequence=state.initiative.lock().unwrap().sequence;
+                    let goal_scope=state.initiative.lock().unwrap().permit.as_ref().filter(|p|p.nonce==command.nonce).map(|p|p.daily_scope.clone()).unwrap_or_default();
+                    let contact_source=state.initiative.lock().unwrap().permit.as_ref().filter(|p|p.nonce==command.nonce).map(|p|p.source_id.clone()).unwrap_or_default();
+                    let current=cfg.follow_settings(&app.state::<crate::AppState>().settings.lock().unwrap());
+                    let contact_scope=crate::proactive::source_key(&current.card_id,&current.nickname,"scope","");
+                    let kind=if command.proactive{state.initiative.lock().unwrap().permit.as_ref().filter(|p|p.nonce==command.nonce).map(|p|p.kind).unwrap_or("invalid")}else{"reply"};
+                    let lease=if command.proactive {state.initiative.lock().unwrap().permit.as_ref().filter(|p|p.nonce==command.nonce).map(|p|p.lease.clone())}else{state.core.lock().unwrap().memory_lease.clone()};
+                    let message=if command.proactive {
+                        lease.as_deref().and_then(|lease|crate::memory::with_qq_memory_lease(&app.state::<crate::memory::MemoryState>(),Some(lease),|_|take_initiative(&app,&state,&cfg,&command.nonce,&command.text,"qq")))
+                    } else {lease.as_deref().and_then(|lease|crate::memory::with_qq_memory_lease(&app.state::<crate::memory::MemoryState>(),Some(lease),|_|state.core.lock().unwrap().take_draft(&command.nonce,&command.text,now())))};
+                    let Some(Ok(_text_message))=message else{let _=command.done.send("cancelled".into());continue;};
+                    let batch=if let Some(details)=command.details.as_deref(){crate::qq_delivery::TextDelivery::with_details(&command.text,details)}else{crate::qq_delivery::TextDelivery::new(&command.text,cfg.reply_mode=="text" && command.extras.is_empty())};
+                    let first=batch.next().unwrap_or_default().to_string();
+                    let text_message=json!([{"type":"text","data":{"text":first}}]);
+                    let (message,expression_only)=reply_segments(cfg.reply_mode=="voice",text_message,command.audio.as_ref().map(|a|a.message()),&command.extras);
                     let echo=uuid::Uuid::new_v4().to_string();
+                    let mut evidence=if command.proactive && kind!="continuation"{None}else{state.core.lock().unwrap().delivery_evidence()};
+                    if kind=="continuation"{if let Some(e)=evidence.as_mut(){e.input.nonce=command.nonce.clone();e.reply=command.text.clone();}}
+                    if let Some(evidence)=evidence.as_mut(){evidence.external=command.external;}
+                    if expression_only {if let Some(evidence)=evidence.as_mut(){evidence.reply.clear();}}
+                    let ack=DeliveryAck{daily_scope:goal_scope,evidence,echo,done:command.done,at:tokio::time::Instant::now(),nonce:command.nonce,text:first,lease:lease.unwrap_or_default(),audio:command.audio,extras:command.extras,batch,next_at:None,admitted_at:now(),proactive:command.proactive,kind:kind.into(),sequence,contact_source,contact_scope,rhythm:if expression_only{"closed".into()}else{command.rhythm}};
                     // Once admitted to the socket, cancellation cannot establish non-delivery.
-                    if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Text(send_action(&cfg,message,&echo)))).await,Ok(Ok(()))){let _=command.done.send("unknown".into());break;}
-                    let evidence=state.core.lock().unwrap().delivery_evidence();
-                    acknowledgement=Some(DeliveryAck{evidence,echo,done:command.done,at:tokio::time::Instant::now(),nonce:command.nonce,text:command.text,lease:lease.unwrap_or_default(),audio:command.audio});
+                    // Settle even an initial send error through the same uncertain-delivery path.
+                    if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Text(send_action(&cfg,message,&ack.echo)))).await,Ok(Ok(()))){finish_delivery(&app,&state,ack,"unknown");break;}
+                    acknowledgement=Some(ack);
                 }
             }
         }
         if let Some(a) = acknowledgement.take() {
-            let _ = a.done.send("unknown".into());
+            finish_delivery(&app,&state,a,"unknown");
         }
         state.outbound.lock().unwrap().take();
         state.cancel();
@@ -1175,6 +1774,124 @@ mod tests {
     fn event() -> Value {
         json!({"post_type":"message","message_type":"private","sub_type":"friend","self_id":87654321u64,"user_id":12345678u64,"message_id":42,"time":1000,"message":[{"type":"text","data":{"text":"你好元元"}}]})
     }
+    #[test]
+    fn rapid_unclaimed_messages_are_merged_with_original_memory_dates() {
+        let mut core=Core::default();let cfg=config();
+        let mut a=event();a["message"]=json!("今天好累");
+        let first=core.accept(&cfg,&a,1001).unwrap();
+        let mut b=event();b["message_id"]=json!(43);b["time"]=json!(1001);b["message"]=json!("开了四个会");
+        let last=core.accept(&cfg,&b,1002).expect("rapid input must not be discarded");
+        assert_eq!(last.text,"今天好累\n开了四个会");
+        assert!(!core.claim(&first.nonce,1002));assert!(core.claim(&last.nonce,1002));
+        core.memory_lease=Some("lease".into());core.take_draft(&last.nonce,"辛苦啦",1002).unwrap();
+        let mut db=crate::memory::qq_test_connection();
+        assert!(core.record_exchange(&mut db,&last.nonce,"辛苦啦","lease","sent").unwrap().unwrap().accepted);
+        let raw:String=db.query_row("SELECT payload_json FROM memory_jobs",[],|r|r.get(0)).unwrap();
+        let messages:Vec<Value>=serde_json::from_str(&raw).unwrap();
+        assert_eq!(messages.len(),3);assert_eq!(messages[0]["messageAt"],1000);assert_eq!(messages[1]["messageAt"],1001);
+        assert_eq!(messages[0]["content"],"今天好累");assert_eq!(messages[1]["content"],"开了四个会");
+    }
+    #[test]
+    fn image_conversation_persists_only_user_caption_not_visual_claims() {
+        let mut core=Core::default();let mut value=event();
+        value["message"]=json!([{"type":"text","data":{"text":"我喜欢乌龙茶"}},{"type":"image","data":{"file":"opaque"}}]);
+        let input=core.accept(&config(),&value,1001).unwrap();
+        assert!(core.claim(&input.nonce,1001));core.memory_lease=Some("test-lease".into());
+        core.take_draft(&input.nonce,"看起来你住在某城市",1001).unwrap();
+        let mut db=crate::memory::qq_test_connection();
+        assert!(core.record_exchange(&mut db,&input.nonce,"看起来你住在某城市","test-lease","sent").unwrap().unwrap().accepted);
+        let raw:String=db.query_row("SELECT payload_json FROM memory_jobs",[],|r|r.get(0)).unwrap();
+        let messages:Vec<Value>=serde_json::from_str(&raw).unwrap();
+        assert_eq!(messages[0]["content"],"我喜欢乌龙茶");
+        assert!(!raw.contains("某城市"));assert!(!raw.contains("opaque"));assert!(!raw.contains("[图片]"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_image_lookup_ignores_unsolicited_echo_and_uses_original_message_token() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg=config();cfg.ws_url=format!("ws://{}",listener.local_addr().unwrap());
+        let peer=tokio::spawn(async move {
+            let (stream,_)=listener.accept().await.unwrap();
+            let mut ws=tokio_tungstenite::accept_async(stream).await.unwrap();
+            for action in ["get_login_info","get_msg","get_image"] {
+                let req:Value=serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(req["action"],action);
+                let data=match action {
+                    "get_login_info"=>json!({"user_id":87654321}),
+                    "get_msg"=>{assert_eq!(req["params"]["message_id"],"42");json!({"message_id":42,"message_type":"private","sender":{"user_id":12345678},"message":[{"type":"image","data":{"file":"verified-token"}}]})},
+                    _=>{assert_eq!(req["params"]["file"],"verified-token");json!({"file":"fixture.png"})},
+                };
+                ws.send(Message::Text(json!({"echo":"stale","status":"ok","retcode":0,"data":{"file":"must-ignore"}}).to_string())).await.unwrap();
+                ws.send(Message::Text(json!({"echo":req["echo"],"status":"ok","retcode":0,"data":data}).to_string())).await.unwrap();
+            }
+        });
+        let (mut ws,_)=connect_verified(&cfg).await.unwrap();
+        let mut value=event();value["message"]=json!([{"type":"image","data":{"file":"untrusted-event-token"}}]);
+        let input=Core::default().accept(&cfg,&value,1001).unwrap();
+        let response=onebot_read(&mut ws,"get_msg",json!({"message_id":input.message_id})).await.unwrap();
+        let files=owner_image_files(&cfg,&input,&response).unwrap();
+        let image=onebot_read(&mut ws,"get_image",json!({"file":files[0]})).await.unwrap();
+        assert_eq!(image["data"]["file"],"fixture.png");peer.await.unwrap();
+    }
+
+    #[test]
+    fn voice_reply_sends_an_expression_alone_and_text_mode_may_attach_it() {
+        let text=json!([{"type":"text","data":{"text":"未实际说出的模型台词"}}]);
+        let audio=json!([{"type":"record","data":{"file":"base64://fixture"}}]);
+        let extras=vec![json!({"type":"face","data":{"id":"14"}})];
+        let (message,expression_only)=reply_segments(true,text.clone(),Some(audio.clone()),&extras);
+        assert_eq!(message,json!(extras),"voice mode must not mix record with an expression");
+        assert!(expression_only,"unsent model dialogue must be excluded from Memory");
+        assert_eq!(reply_segments(true,text.clone(),None,&extras),(json!(extras),true));
+        assert_eq!(reply_segments(true,text.clone(),Some(audio.clone()),&[]),(audio,false));
+        let (message,expression_only)=reply_segments(false,text,None,&extras);
+        assert!(!expression_only);assert_eq!(message[0]["type"],"text");assert_eq!(message[1]["type"],"face");
+    }
+
+    #[test]
+    fn builtin_qq_faces_have_names_instead_of_unknown_visual_claims() {
+        for (id,name) in [(0,"惊讶"),(2,"色"),(1,"撇嘴"),(8,"睡"),(76,"赞"),(178,"斜眼笑")] {
+            let mut value=event();value["message"]=json!([{"type":"face","data":{"id":id.to_string()}}]);
+            let incoming=Core::default().accept(&config(),&value,1001).unwrap();
+            assert!(incoming.text.contains(&format!("[QQ表情：{name} #{id}]")),"face {id} should reach the model with its actual name");
+            assert_eq!(incoming.image_count,0,"built-in faces should not require visual downloads");
+            assert!(incoming.memory_text.is_empty(),"face labels must not become user factual evidence");
+        }
+    }
+
+    #[test]
+    fn sticker_selection_is_restricted_to_the_shipped_manifest() {
+        assert!(sticker_allowed("maimeng_01.gif"));
+        for file in ["../../settings.json","file:///etc/passwd","https://example.com/x.gif","unknown.gif","stickers/maimeng_01.gif"] {
+            assert!(!sticker_allowed(file));
+        }
+    }
+
+    #[test]
+    fn image_lookup_requires_original_owner_and_opaque_file_ids() {
+        let cfg=config();let mut value=event();
+        value["message"]=json!([{"type":"image","data":{"file":"event-supplied-must-not-use"}}]);
+        let input=Core::default().accept(&cfg,&value,1001).unwrap();
+        let response=json!({"status":"ok","retcode":0,"data":{"message_id":42,"message_type":"private","time":1000,"sender":{"user_id":cfg.owner_id},"message":[{"type":"image","data":{"file":"trusted-message-token","url":"http://127.0.0.1/secret"}}]}});
+        assert_eq!(owner_image_files(&cfg,&input,&response).unwrap(),vec!["trusted-message-token"]);
+        let mut wrong=response.clone();wrong["data"]["sender"]["user_id"]=json!("99999999");assert!(owner_image_files(&cfg,&input,&wrong).is_err());
+        wrong=response.clone();wrong["data"]["message_id"]=json!(43);assert!(owner_image_files(&cfg,&input,&wrong).is_err());
+        wrong=response.clone();wrong["data"]["message"][0]["data"]["file"]=json!("file:///etc/passwd");assert!(owner_image_files(&cfg,&input,&wrong).is_err());
+    }
+
+    #[test]
+    fn owner_mixed_text_face_and_images_reaches_the_conversation() {
+        let mut value=event();
+        value["message"]=json!([{"type":"text","data":{"text":"看看这个"}},{"type":"face","data":{"id":"14"}},{"type":"image","data":{"file":"opaque-napcat-file"}}]);
+        let mut core=Core::default();
+        let incoming=core.accept(&config(),&value,1001).expect("mixed message must not be silently discarded");
+        assert!(incoming.text.contains("看看这个"));
+        assert!(incoming.text.contains("微笑"));
+        assert_eq!(serde_json::to_value(incoming).unwrap()["imageCount"],1);
+        value["user_id"]=json!("99999999");
+        assert!(Core::default().accept(&config(),&value,1001).is_none());
+    }
+
     #[test]
     fn incoming_capabilities_follow_saved_config_not_owner_supplied_fields() {
         let mut cfg = config();
@@ -1307,6 +2024,8 @@ mod tests {
         let ready = core.finish_voice(&pending, "我喜欢乌龙茶", 1002).unwrap();
         assert_eq!(ready.nickname, "主人");
         assert_eq!(ready.text, "我喜欢乌龙茶");
+        assert_eq!(ready.sources[0].id, pending.sources[0].id, "transcription must retain the scoped original QQ source identity");
+        assert_eq!(ready.sources[0].content, "我喜欢乌龙茶");
         assert!(core.claim(&ready.nonce, 1002));
         core.memory_lease = Some("test-lease".into());
         core.take_draft(&ready.nonce, "我记着了", 1002).unwrap();
@@ -1410,6 +2129,17 @@ mod tests {
         assert!(core.claim(&incoming.nonce, 1001));
         core.memory_lease = Some("test-lease".into());
         (core, incoming, crate::memory::qq_test_connection())
+    }
+    #[test]
+    fn semantic_search_delivery_never_enters_memory_without_literal_search_words() {
+        for text in ["明天上海天气怎么样", "最近有什么好看的电影", "这家博物馆周末还开放吗"] {
+            let (mut core,input,mut conn)=claimed(text);
+            core.take_draft(&input.nonce,"来源资料的回答",1002).unwrap();
+            let mut evidence=core.delivery_evidence().unwrap();
+            evidence.external=true;
+            assert!(core.record_evidence(&mut conn,evidence,"test-lease","sent").is_none(),
+                "semantic searches must be excluded even when source retrieval fails");
+        }
     }
     fn recalled(
         conn: &mut rusqlite::Connection,
@@ -1825,7 +2555,7 @@ mod tests {
             ("message_type", json!("group")),
             ("sub_type", json!("group")),
             ("time", json!(1)),
-            ("message", json!([{ "type":"image","data":{"file":"x"}}])),
+            ("message", json!([{ "type":"image","data":null}])),
             ("message", json!("[CQ:image,file=x]")),
             ("message", json!("x".repeat(2001))),
         ] {
@@ -1836,7 +2566,7 @@ mod tests {
         let mut mixed = event();
         mixed["message"] =
             json!([{"type":"text","data":{"text":"hi"}},{"type":"image","data":{"file":"x"}}]);
-        assert!(owner_text(&config(), &mixed, 1001).is_none());
+        assert!(owner_text(&config(), &mixed, 1001).is_some());
     }
     #[test]
     fn new_owner_message_invalidates_draft_and_reconnect_deduplicates() {
@@ -1862,13 +2592,13 @@ mod tests {
         assert!(core.accept(&cfg, &second, 1005).is_none());
     }
     #[test]
-    fn throttle_and_deadline_fail_closed_with_bounded_dedupe() {
+    fn rapid_input_and_deadline_preserve_bounded_dedupe() {
         let mut core = Core::default();
         let cfg = config();
         let first = core.accept(&cfg, &event(), 1001).unwrap();
         let mut second = event();
         second["message_id"] = json!(43);
-        assert!(core.accept(&cfg, &second, 1001).is_none());
+        assert!(core.accept(&cfg, &second, 1001).is_some());
         assert!(core.take_draft(&first.nonce, "stale", 1002).is_err());
         for i in 1..600 {
             let mut e = event();

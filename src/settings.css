@@ -1009,3 +1009,5 @@ code {
   opacity: 0.6;
   cursor: default;
 }
+.qq-debug-panel { margin: 12px 0; padding: 12px; border: 1px solid var(--border, #ddd); border-radius: 8px; }
+#qqDecisionHistory { white-space: pre-line; }

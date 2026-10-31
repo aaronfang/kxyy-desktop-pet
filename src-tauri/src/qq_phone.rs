@@ -23,6 +23,7 @@ struct Relay {
     call_id: Option<String>,
     initial_calls: HashSet<String>,
     users: BTreeMap<u32, String>,
+    user_times:BTreeMap<u32,i64>,
     segments: BTreeMap<Key, Segment>,
     queue: VecDeque<Frame>,
     pending: HashMap<String, (Key, usize, tokio::time::Instant)>,
@@ -34,6 +35,7 @@ struct Relay {
     highest_segment: u32,
     provider_pcm: bool,
     session_started: bool,
+    turn_finished: bool,
 }
 impl Relay {
     fn from_snapshot(value: &Value) -> Result<Self, &'static str> {
@@ -144,7 +146,9 @@ impl Relay {
                 self.segments.clear();
                 self.paused = false;
             }
+            "tts_end" => self.turn_finished = true,
             "asr" if v["interim"] == false => {
+                self.turn_finished = false;
                 let g = id(&v["generation"])?;
                 let text = bounded_text(&v["text"], 512)?;
                 if g <= self.latest_generation && !self.users.is_empty() {
@@ -153,9 +157,11 @@ impl Relay {
                 self.latest_generation = g;
                 self.highest_segment = 0;
                 self.users.insert(g, text);
+                self.user_times.insert(g,chrono::Utc::now().timestamp());
                 while self.users.len() > 4 {
                     let first = *self.users.keys().next().unwrap();
                     self.users.remove(&first);
+                    self.user_times.remove(&first);
                 }
             }
             "audio_segment_start" => {
@@ -345,7 +351,7 @@ impl Relay {
             .0;
         let s = self.segments.remove(&key)?;
         Some((
-            json!({"type":"playback_segment","generation":key.0,"segmentId":key.1,"state":"completed"}),
+            json!({"type":"playback_segment","generation":key.0,"segmentId":key.1,"state":"completed","messageAt":self.user_times.get(&key.0)}),
             self.users.get(&key.0)?.clone(),
             s.text,
         ))
@@ -724,10 +730,9 @@ mod tests {
             .unwrap();
         // A later duplicate receipt may release only the once-complete segment.
         let (receipt, user, spoken) = r.receipt(&ack(&b)).expect("completed playback");
-        assert_eq!(
-            receipt,
-            json!({"type":"playback_segment","generation":7,"segmentId":1,"state":"completed"})
-        );
+        assert!(receipt["messageAt"].as_i64().is_some());
+        let mut wire_receipt=receipt;wire_receipt.as_object_mut().unwrap().remove("messageAt");
+        assert_eq!(wire_receipt,json!({"type":"playback_segment","generation":7,"segmentId":1,"state":"completed"}));
         assert_eq!(user, "我喜欢乌龙茶");
         assert_eq!(spoken, "好的，元宝");
         assert!(r.receipt(&ack(&b)).is_none());
@@ -988,7 +993,7 @@ async fn start_backend(
     name: &str,
     relay: &mut Relay,
 ) -> Result<(), &'static str> {
-    send(socket,json!({"type":"start","systemRole":role,"botName":name,"downlinkAudio":["managed-v1"],"ttsStream":["provider-pcm-v1"],"memoryContext":["turn-final-v1"]})).await?;
+    send(socket,json!({"type":"start","systemRole":role,"botName":name,"downlinkAudio":["managed-v1"],"ttsStream":["provider-pcm-v1"],"memoryContext":["turn-final-v1"],"temporalContext":["turn-local-v1"]})).await?;
     let session = next_json(socket).await?;
     if session["type"] != "session" || session["state"] != "started" {
         return Err("phone-backend-capability");
@@ -1170,6 +1175,7 @@ async fn call_session(
         relay,
     )
     .await;
+    context.flush();
     let _ = send(&mut backend, json!({"type":"stop"})).await;
     let _ = tokio::time::timeout(Duration::from_millis(500), backend.close(None)).await;
     result
@@ -1179,6 +1185,7 @@ trait CallContext {
     fn connected(&self);
     fn recall(&self, query: &str) -> Result<Vec<Value>, &'static str>;
     fn remember(&self, evidence: (Value, String, String));
+    fn flush(&self) {}
 }
 struct AppCallContext<'a> {
     app: &'a AppHandle,
@@ -1205,8 +1212,15 @@ impl CallContext for AppCallContext<'_> {
         let memory = self.app.state::<crate::memory::MemoryState>();
         crate::memory::with_qq_memory_db(&memory,Some(self.lease),|conn,_| {
             crate::memory::recall_memory(conn,&crate::memory::MemoryRecallRequest {card_id:self.cfg.card_id.clone(),nickname:self.cfg.nickname.clone(),query:query.into(),reason:"turn".into(),image_caption:String::new(),max_items:Some(6)})
-                .map(|r|r.items.into_iter().map(|i|json!({"kind":i.kind,"text":i.text,"pinned":i.pinned,"uncertain":i.uncertain})).collect::<Vec<_>>()).unwrap_or_default()
+                .map(|r|r.items.into_iter().map(|i|json!({"kind":i.kind,"text":crate::memory_time::recall_text(&i),"pinned":i.pinned,"uncertain":i.uncertain})).collect::<Vec<_>>()).unwrap_or_default()
         }).ok_or("phone-memory-invalidated")
+    }
+    fn flush(&self) {
+        let memory=self.app.state::<crate::memory::MemoryState>();
+        let _=crate::memory::with_qq_memory_db(&memory,Some(self.lease),|conn,_| {
+            let _=flush_spoken(conn,&self.session);
+        });
+        crate::memory::trigger_worker(self.app);
     }
     fn remember(&self, evidence: (Value, String, String)) {
         let memory = self.app.state::<crate::memory::MemoryState>();
@@ -1274,9 +1288,11 @@ async fn relay_session<C: CallContext>(
                 Some(Ok(Message::Binary(data)))=>relay.pcm(&data)?,
                 Some(Ok(Message::Text(raw))) if raw.len()<=128*1024=>{
                     let v:Value=serde_json::from_str(&raw).map_err(|_|"phone-protocol")?;
+                    if v["type"] == "asr" && v["interim"] == false { context.flush(); }
                     relay.backend(&v)?;
                     match v["type"].as_str().unwrap_or("") {
                         "speech_confirmed"|"assistant_discarded"|"error"=>{
+                            context.flush();
                             send(daemon,request("audio.clear",json!({"callId":relay.call_id}))).await?;
                             send(backend,json!({"type":"playback_reset"})).await?;
                         },
@@ -1284,7 +1300,7 @@ async fn relay_session<C: CallContext>(
                             let generation=id(&v["generation"])?;
                             let query=relay.users.get(&generation).ok_or("phone-memory-generation")?;
                             let items=context.recall(query)?;
-                            send(backend,json!({"type":"memory_context","generation":generation,"items":items})).await?;
+                            send(backend,json!({"type":"memory_context","generation":generation,"items":items,"temporalContext":crate::memory_time::current_context()})).await?;
                         },"session" if v["state"]=="ended"=>return Ok(()),_=>{}
                     }
                 },_=>return Err("phone-backend-disconnected"),
@@ -1293,8 +1309,20 @@ async fn relay_session<C: CallContext>(
         while let Some(completed) = relay.completed() {
             complete(context, backend, completed).await?;
         }
+        if relay.turn_finished && relay.segments.is_empty() && relay.pending.is_empty() && relay.queue.is_empty() {
+            context.flush();
+            relay.turn_finished=false;
+        }
     }
 }
+fn flush_spoken(conn: &rusqlite::Connection, session: &str) -> rusqlite::Result<usize> {
+    let prefix = format!("qq-phone:{session}:");
+    conn.execute(
+        "UPDATE memory_jobs SET next_attempt_at=?1 WHERE status='pending' AND substr(session_id,1,?2)=?3",
+        rusqlite::params![chrono::Utc::now().timestamp(), prefix.len(), prefix],
+    )
+}
+
 fn enqueue_spoken(
     conn: &mut rusqlite::Connection,
     cfg: &crate::qq::Config,
@@ -1304,36 +1332,92 @@ fn enqueue_spoken(
     spoken: String,
     wake_worker: impl FnOnce(),
 ) -> Result<crate::memory::MemoryEnqueueResponse, String> {
-    let identity = format!(
-        "{session}:{}:{}",
-        receipt["generation"], receipt["segmentId"]
-    );
-    let result = crate::memory::enqueue_qq_exchange(
-        conn,
-        crate::memory::MemoryEnqueueRequest {
-            card_id: cfg.card_id.clone(),
-            nickname: cfg.nickname.clone(),
-            session_id: format!("qq-phone:{identity}"),
-            batch_start: 0,
-            batch_end: 2,
-            messages: vec![
-                crate::memory::MemoryMessage {
-                    id: format!("{identity}:user"),
-                    role: "user".into(),
-                    content: user,
-                    image_caption: String::new(),
-                    do_not_remember: false,
-                },
-                crate::memory::MemoryMessage {
-                    id: format!("{identity}:assistant"),
-                    role: "assistant".into(),
-                    content: spoken,
-                    image_caption: String::new(),
-                    do_not_remember: false,
-                },
-            ],
-        },
-    )?;
+    use rusqlite::OptionalExtension;
+    let generation = id(&receipt["generation"]).map_err(str::to_string)?;
+    let segment = id(&receipt["segmentId"]).map_err(str::to_string)?;
+    let identity = format!("{session}:{generation}");
+    let session_id = format!("qq-phone:{identity}");
+    if crate::memory::qq_private_text(&user)
+        || crate::memory::qq_private_text(&spoken)
+        || ["请记住", "请你记住", "请帮我记住", "帮我记住", "记住："]
+            .iter()
+            .any(|w| user.trim().starts_with(w))
+    {
+        return Ok(crate::memory::MemoryEnqueueResponse {
+            accepted: false,
+            duplicate: false,
+            job_id: String::new(),
+        });
+    }
+    let existing:Option<(String,String,Option<String>)>=conn.query_row(
+        "SELECT j.id,j.status,j.payload_json FROM memory_jobs j JOIN memory_users u ON u.id=j.user_id WHERE j.session_id=?1 AND u.card_id=?2 AND u.normalized_name=?3",
+        rusqlite::params![session_id,cfg.card_id,cfg.nickname.trim().to_lowercase().chars().take(80).collect::<String>()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|"phone-memory-storage")?;
+    let assistant = crate::memory::MemoryMessage {
+        id: format!("{identity}:assistant:{segment}"),
+        role: "assistant".into(),
+        content: spoken,
+        image_caption: String::new(),
+        do_not_remember: false, message_at: Some(chrono::Utc::now().timestamp()),
+    };
+    let result = if let Some((job_id, status, payload)) = existing {
+        let mut messages: Vec<crate::memory::MemoryMessage> =
+            serde_json::from_str(payload.as_deref().unwrap_or("[]"))
+                .map_err(|_| "phone-memory-storage")?;
+        if status != "pending" || messages.iter().any(|m| m.id == assistant.id) {
+            return Ok(crate::memory::MemoryEnqueueResponse {
+                accepted: true,
+                duplicate: true,
+                job_id,
+            });
+        }
+        if messages.len() >= 65
+            || messages
+                .iter()
+                .map(|m| m.content.chars().count())
+                .sum::<usize>()
+                + assistant.content.chars().count()
+                > 5800
+        {
+            return Err("phone-memory-capacity".into());
+        }
+        messages.push(assistant);
+        let payload = serde_json::to_string(&messages).map_err(|_| "phone-memory-storage")?;
+        conn.execute("UPDATE memory_jobs SET payload_json=?1,next_attempt_at=?2,updated_at=?3 WHERE id=?4 AND status='pending'",rusqlite::params![payload,chrono::Utc::now().timestamp()+300,chrono::Utc::now().timestamp(),job_id]).map_err(|_|"phone-memory-storage")?;
+        crate::memory::MemoryEnqueueResponse {
+            accepted: true,
+            duplicate: false,
+            job_id,
+        }
+    } else {
+        let result = crate::memory::enqueue_qq_exchange(
+            conn,
+            crate::memory::MemoryEnqueueRequest {
+                card_id: cfg.card_id.clone(),
+                nickname: cfg.nickname.clone(),
+                session_id,
+                batch_start: 0,
+                batch_end: 65,
+                messages: vec![
+                    crate::memory::MemoryMessage {
+                        id: format!("{identity}:user"),
+                        role: "user".into(),
+                        content: user,
+                        image_caption: String::new(),
+                        do_not_remember: false, message_at: receipt["messageAt"].as_i64().filter(|at|*at>0&&*at<=chrono::Utc::now().timestamp()+60),
+                    },
+                    assistant,
+                ],
+            },
+        )?;
+        if result.accepted && !result.duplicate {
+            conn.execute(
+                "UPDATE memory_jobs SET next_attempt_at=?1 WHERE id=?2",
+                rusqlite::params![chrono::Utc::now().timestamp() + 300, result.job_id],
+            )
+            .map_err(|_| "phone-memory-storage")?;
+        }
+        result
+    };
     if result.accepted && !result.duplicate {
         wake_worker();
     }
@@ -1349,7 +1433,8 @@ async fn complete<C: CallContext>(
     }
     // Bridge output completion is not proof the remote person heard it.
     context.remember(evidence.clone());
-    send(backend, evidence.0).await
+    let mut receipt=evidence.0;receipt.as_object_mut().map(|o|o.remove("messageAt"));
+    send(backend, receipt).await
 }
 
 #[cfg(test)]
@@ -1678,6 +1763,29 @@ mod transport_tests {
         );
         assert!(context.saved.lock().unwrap().is_empty());
     }
+    #[test]
+    fn played_phone_segments_share_one_durable_turn_and_one_user_source() {
+        let mut db=crate::memory::qq_test_connection();
+        let cfg=crate::qq::Config{nickname:"元宝".into(),..Default::default()};
+        for (segment,text) in [(1,"好的，元宝"),(2,"下次聊聊茶")] {
+            enqueue_spoken(&mut db,&cfg,"call",&json!({"generation":7,"segmentId":segment}),"我喜欢乌龙茶".into(),text.into(),||{}).unwrap();
+        }
+        let count:i64=db.query_row("SELECT count(*) FROM memory_jobs",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,1,"one user turn must not become one job per spoken fragment");
+        let raw:String=db.query_row("SELECT payload_json FROM memory_jobs",[],|r|r.get(0)).unwrap();
+        let messages:Vec<Value>=serde_json::from_str(&raw).unwrap();
+        assert_eq!(messages.iter().filter(|m|m["role"]=="user").count(),1);
+        assert_eq!(messages.iter().filter(|m|m["role"]=="assistant").count(),2);
+        let due:i64=db.query_row("SELECT next_attempt_at FROM memory_jobs",[],|r|r.get(0)).unwrap();
+        assert!(due>chrono::Utc::now().timestamp()+200,"partial response stays staged until turn completion");
+        assert_eq!(flush_spoken(&db,"other-call").unwrap(),0);
+        assert_eq!(flush_spoken(&db,"call").unwrap(),1);
+        let due:i64=db.query_row("SELECT next_attempt_at FROM memory_jobs",[],|r|r.get(0)).unwrap();
+        assert!(due<=chrono::Utc::now().timestamp(),"completed turn is available to the worker immediately");
+        let duplicate=enqueue_spoken(&mut db,&cfg,"call",&json!({"generation":7,"segmentId":2}),"我喜欢乌龙茶".into(),"下次聊聊茶".into(),||{}).unwrap();
+        assert!(duplicate.duplicate);
+    }
+
     #[test]
     fn completed_phone_exchange_wakes_idle_consolidation_but_duplicates_and_private_turns_do_not() {
         let mut db = crate::memory::qq_test_connection();

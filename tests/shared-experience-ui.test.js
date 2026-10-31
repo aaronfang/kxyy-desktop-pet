@@ -183,6 +183,7 @@ test("restoring composer focus after a reply does not cancel companion speech", 
   const context = {
     inputEl,
     sendBtn: {}, attachBtn: {}, stickersBtn: {},
+    pulseConversationActivity() {},
     sharedExperience: { active: true, proactivePromise: Promise.resolve() },
     cancelSharedExperienceProactive: (reason) => cancellations.push(reason),
     Date,

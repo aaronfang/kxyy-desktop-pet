@@ -1,3 +1,4 @@
+import { memoryTimeText } from "./ai/memory-time.js";
 // M4 Global Workspace 的安全、可回退候选层。
 //
 // 这不是模型内部 J-Space，也不产生事实。候选只在内存中短暂存在，经过
@@ -138,7 +139,7 @@ export function workspaceCandidatesFromMemory(items, query = {}) {
   return items.map((item, index) => ({
     id: `memory:${item?.kind || "item"}:${item?.id || index}`,
     kind: item?.kind === "commitment" ? "commitment" : "memory",
-    content: item?.text,
+    content: memoryTimeText(item),
     sourceIds: [item?.id],
     activation: item?.pinned ? 0.9 : 0.65,
     relevance: Number(item?.relevance ?? item?.score ?? 0.65),
@@ -314,7 +315,7 @@ export function buildWorkspace({
   });
   const conflicts = detectWorkspaceConflicts(memoryItems.map((item) => ({
     ...item,
-    content: item?.text,
+    content: memoryTimeText(item),
     sourceIds: [item?.id],
   })));
   const safety = workspaceCandidatesFromSafety({ conflicts, scope });

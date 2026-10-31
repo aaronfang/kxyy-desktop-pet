@@ -30,7 +30,7 @@ test("realtime memory formatting keeps the bounded internal hint shape", () => {
   ]);
   assert.match(prompt, /通话开始时可用的内部记忆线索/);
   assert.match(prompt, /\[待兑现约定\].*下次提醒我带伞/);
-  assert.match(prompt, /\[事实\]\[置顶\] 置顶偏好/);
+  assert.match(prompt, /\[事实\]\[置顶\] \[事实；发生时间未知\] 置顶偏好/);
   assert.equal((prompt.match(/^- \[/gm) || []).length, 3);
   assert.doesNotMatch(prompt, /不应超过条数/);
 });

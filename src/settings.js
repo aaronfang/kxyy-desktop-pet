@@ -302,14 +302,13 @@ function syncLocalVoicePresetMeta() {
 
 /** 网页观察只允许编译进 App 的固定 provider，不接受自定义端点。 */
 function currentWebGroundingProvider() {
-  return (el("webGroundingProvider")?.value || "none").toLowerCase() === "tavily"
-    ? "tavily"
-    : "none";
+  const value = (el("webGroundingProvider")?.value || "none").toLowerCase();
+  return ["tavily", "deepseek"].includes(value) ? value : "none";
 }
 
 function syncWebGroundingFields() {
   const fields = el("webGroundingFieldsTavily");
-  if (fields) fields.hidden = currentWebGroundingProvider() !== "tavily";
+  if (fields) fields.hidden = false;
 }
 
 const FRESH_TOPIC_CATEGORY_LABELS = new Map([
@@ -571,7 +570,7 @@ function fill(s) {
   el("freshTopicParticipation").value = ["relevant", "occasional", "active"].includes(s.freshTopicParticipation)
     ? s.freshTopicParticipation
     : "relevant";
-  el("webGroundingProvider").value = s.webGroundingProvider === "tavily" ? "tavily" : "none";
+  el("webGroundingProvider").value = ["tavily", "deepseek"].includes(s.webGroundingProvider) ? s.webGroundingProvider : "none";
   el("tavilyApiKey").value = s.tavilyApiKey || "";
   syncWebGroundingFields();
   el("textModel").value = s.textModel ? normalizeDeepseekTextModel(s.textModel) : "";
@@ -1050,10 +1049,10 @@ async function save() {
   statusEl.textContent = "";
   try {
     const payload = collect();
-    if (payload.webGroundingEnabled && payload.webGroundingProvider === "tavily" && !payload.tavilyApiKey) {
-      throw new Error("请填写 Tavily API Key");
-    }
     await invoke("set_ai_settings", { settings: payload });
+    if (qqMediaDirty && !await controlQqService(false, true)) {
+      throw new Error("普通设置已保存；QQ 配置未保存，请在 QQ 页重试。");
+    }
     statusEl.style.color = "#16a34a";
     statusEl.textContent = "已保存";
   } catch (e) {
@@ -2595,10 +2594,37 @@ async function refreshQqConfig(fill=false) {
   if(epoch!==qqRefreshEpoch) return;
   el("qqEnabled").checked=cfg.enabled===true;
   if(fill || !qqMediaDirty) {
+    el("qqProactiveChannel").value=["qq","desktop"].includes(cfg.proactiveChannel)?cfg.proactiveChannel:"auto";
+    el("qqDailyContactGoal").checked=cfg.dailyContactGoal===true;
+    el("qqProactiveMode").value=["natural","active"].includes(cfg.proactiveMode)?cfg.proactiveMode:"off";
+    el("qqQuietStart").value=cfg.quietStart??23;el("qqQuietEnd").value=cfg.quietEnd??9;
     el("qqReplyMode").value=cfg.replyMode==="voice"?"voice":"text";
     el("qqVoiceInput").checked=cfg.voiceInput===true;
     el("qqPhoneEnabled").checked=cfg.phoneEnabled===true;
   }
+  const initiativeLabels={"activity-rest":"今日活动思考额度已用完，暂时休息","storage-failed":"主动状态保存失败，暂不发送",away:"主人暂时忙碌，稍后再聊","continuation-pending":"本轮还有可补充内容，稍后判断是否续话","planning-continuation":"正在判断同话题补充",off:"主动交流已关闭",paused:"已暂停；说“可以主动找我”恢复",unanswered:"连续提问未回应，等待主人再次说话",busy:"当前对话或通话忙碌，稍后再判断",quiet:"当前为静默时段",idle:"等待合适的闲置时机",cooldown:"长时联系冷却中",budget:"今日长时联系额度已用完",recheck:"稍后重新选题",ready:"准备判断是否有值得分享的内容","no-source":"没有合适的新话题，保持安静",planning:"正在判断是否值得开口","model-wait":"角色决定稍后再聊","model-drop":"角色决定跳过这个话题",sent:"最近一次主动消息已发送",unknown:"最近一次发送结果未知，不会重发",failed:"最近一次主动发送失败"};
+  Object.assign(initiativeLabels,{"review-budget":"今日选题评估额度已用完", "sources-exhausted":"现有来源已用过、暂缓或不适合，等待新资料", "cache-disabled":"没有近期记忆候选，兴趣缓存未开启", "interests-empty":"没有近期记忆候选，也尚未设置感兴趣分类", "cache-empty":"兴趣缓存暂无资料，等待自动采集", "cache-expired":"兴趣资料已过期，等待后台补充", "planning-daily":"正在准备今天的一次轻量联系"});
+  const reason=cfg.initiative?.reason;
+  const next=Number(cfg.initiative?.nextAt);
+  const modeLabels={off:'安静',natural:'自然',active:'更主动'};
+  const channelLabels={auto:'自动选择一个渠道',qq:'QQ 私聊',desktop:'桌宠聊天窗口'};
+  const attempts=Math.min(5,Math.max(0,Number(cfg.initiative?.attemptsToday)||0));
+  el("qqDebugSummary").textContent=`已保存模式：${modeLabels[cfg.proactiveMode]||'安静'} · 通道：${channelLabels[cfg.proactiveChannel]||channelLabels.auto} · 今日长时联系预留 ${attempts}/${cfg.proactiveMode==='active'?5:cfg.proactiveMode==='natural'?3:0}（含失败或未知尝试）`;
+  el("qqProactiveStatus").textContent=qqMediaDirty?"QQ 配置有未保存修改；点击底部保存或保存 QQ 配置后生效。":(initiativeLabels[reason]||(cfg.proactiveMode&&cfg.proactiveMode!=="off"?"主动交流已开启；没有合适内容时保持安静":"主动交流已关闭"))+(next>Date.now()/1000?` · 最早 ${new Date(next*1000).toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})} 再判断（约 ${Math.ceil((next-Date.now()/1000)/60)} 分钟后）`:"");
+  if(!qqMediaDirty && cfg.initiative?.lastDecision!==reason && initiativeLabels[cfg.initiative?.lastDecision])el("qqProactiveStatus").textContent+=` · 最近：${initiativeLabels[cfg.initiative.lastDecision]}`;
+  const debugTime=value=>Number.isFinite(Number(value))&&Number(value)>0?new Date(Number(value)*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}):'';
+  el("qqDecisionHistory").textContent=(Array.isArray(cfg.initiative?.decisions)?cfg.initiative.decisions:[]).slice(-24).filter(row=>Array.isArray(row)&&initiativeLabels[row[0]]&&debugTime(row[1])).map(row=>`${debugTime(row[1])} ${initiativeLabels[row[0]]}`).join('\n')||'本次启动尚无决策记录。';
+  const cache=cfg.interestCache;
+  el("qqInterestCacheStatus").textContent=!cache?'兴趣缓存状态暂不可用；请刷新状态。':!cache.enabled?'兴趣缓存未开启：到“时下信息”启用并保存“允许时下信息观察”。':`兴趣缓存已开启 · 共 ${Math.min(200,Math.max(0,Number(cache.totalItems)||0))} 条 · 感兴趣分类 ${Math.min(32,Math.max(0,Number(cache.interestedCategories)||0))} 个 · 六小时内的新鲜兴趣资料 ${Math.min(200,Math.max(0,Number(cache.eligibleItems)||0))} 条${debugTime(cache.latestFetchedAt)?` · 最近采集 ${debugTime(cache.latestFetchedAt)}`:''}。`+(cache.interestedCategories===0?'请到“人设 → 话题偏好”标记“感兴趣”。':cache.eligibleItems===0?'没有可用的有效兴趣资料，后台会按有效期自动补充；也可到“时下信息”手动采集。':'选题还会检查重复来源、分享价值与联系额度。');
+  const refreshLabels={'refresh-disabled':'后台更新已关闭','refresh-no-preferences':'没有启用的来源分类','refreshing':'正在后台补充资料','refresh-due':'资料到期，后台即将补充','refresh-backoff':'部分来源失败，正在退避','refresh-fresh':'资料仍有效，等待下次自动刷新'};
+  const refresh=cache?.refresh;
+  el("qqCacheRefreshStatus").textContent=refreshLabels[refresh?.reason]?`${refreshLabels[refresh.reason]}${refresh.failingSources>0?` · 失败来源 ${Math.min(15,refresh.failingSources)} 个`:''}${debugTime(refresh.nextAt)?` · 最早检查 ${debugTime(refresh.nextAt)}`:''}。`:'后台更新状态暂不可用。';
+  const dailyLabels={'daily-off':'每日联系目标未开启','daily-wait-time':'当天尚未主动联系，北京时间 18 点起择机准备','daily-ready':'每日联系目标待准备；仍须满足当前闲置、静默和连接条件','daily-planning':'正在准备每日联系','daily-exhausted':'今日两次联系准备已用完，明天再准备','daily-unknown':'本次送达结果未知，今天不自动补发目标消息','daily-confirmed':'今天已有确认送达的主动联系，目标已完成'};
+  const daily=cfg.dailyGoal;
+  el("qqDailyGoalStatus").textContent=(dailyLabels[daily?.reason]||'每日联系目标状态暂不可用')+(daily?.reason!=='daily-off'?` · 今日目标准备 ${Math.min(2,Math.max(0,Number(daily?.plans)||0))}/2`:'' )+(daily?.reason==='daily-wait-time'&&debugTime(daily.nextAt)?` · 最早 ${debugTime(daily.nextAt)}`:'')+(cfg.dailyContactGoal&&cfg.proactiveChannel==='desktop'?' · 当前为桌宠专用通道，QQ 每日目标暂不执行':'');
+  const activityLabels={general:'综合',science:'科学','work-growth':'工作成长','film-tv':'电影影视',games:'游戏',technology:'科技数码',music:'音乐',books:'阅读','daily-life':'日常',food:'美食',travel:'旅行',sports:'运动',commitment:'约定跟进',episode:'话题进展'};
+  const steps={observe:'等待新资料',reflect:'待形成感想',rest:'休息，等待新进展'};
+  el("qqActivityStatus").textContent=(Array.isArray(cfg.activityGoals)?cfg.activityGoals:[]).slice(0,12).filter(g=>activityLabels[g.category]&&steps[g.step]).map(g=>`${activityLabels[g.category]}：已收集 ${Math.min(10000,Math.max(0,Number(g.observed)||0))} 条，分享 ${Math.min(10000,Math.max(0,Number(g.shared)||0))} 次，${steps[g.step]}`).join('；');
   el("qqPhoneStatus").textContent=({disabled:"",ready:"QQ 电话已就绪，只接听绑定主号的新来电。",connecting:"正在连接 QQ 电话桥…",ringing:"正在准备接听主人来电…",active:"QQ 电话通话中", "phone-setup-required":"电话需要安装原生桥、独立 Python 音频环境及 BlackHole 2ch / 16ch。", "phone-audio-route-unavailable":"无法准备独立虚拟音频线路，请关闭电话后重试；普通 QQ 消息仍可用。", "phone-external-qq":"请先退出外部 QQ，桌宠才能启动电话专用 QQ。", "phone-backend-unavailable":"请先配置并启动本地 / VoxCPM2 / CosyVoice 实时语音服务。", "phone-native-not-ready":"电话桥尚未确认账号、原生能力或双向音频，请检查登录和音频权限。", "phone-connection-failed":"电话桥未连接，请检查安装与系统权限后关闭再开启。", "phone-ended":"电话已结束，等待下一次来电。", "phone-session-failed":"本次电话已停止，可重新拨打。"})[cfg.phoneStatus]||"电话服务尚未就绪。";
   el("qqMediaStatus").textContent=({ready:"",synthesizing:"正在合成 QQ 语音…",transcribing:"正在识别主人语音…","voice-fallback":"语音合成未完成，本条改用文字。","transcription-failed":"语音识别失败，请重发或发送文字。"})[cfg.mediaStatus]||"";
   // Scope is read-only and always comes from saved desktop settings.
@@ -2621,12 +2647,12 @@ async function refreshQqConfig(fill=false) {
 function qqFormRequest() {
   return {request:{enabled:el("qqEnabled").checked,wsUrl:el("qqWsUrl").value.trim(),
     ownerId:el("qqOwnerId").value.trim(),botId:el("qqBotId").value.trim(),cardId:el("qqCardId").value.trim(),
-    replyMode:el("qqReplyMode").value||"text",voiceInput:el("qqVoiceInput").checked,phoneEnabled:el("qqPhoneEnabled").checked,nickname:el("qqNickname").value.trim(),token:el("qqToken").value},clearToken:el("qqClearToken").checked};
+    dailyContactGoal:el("qqDailyContactGoal").checked,proactiveMode:el("qqProactiveMode").value||"off",proactiveChannel:el("qqProactiveChannel").value||"auto",quietStart:Number(el("qqQuietStart").value),quietEnd:Number(el("qqQuietEnd").value),replyMode:el("qqReplyMode").value||"text",voiceInput:el("qqVoiceInput").checked,phoneEnabled:el("qqPhoneEnabled").checked,nickname:el("qqNickname").value.trim(),token:el("qqToken").value},clearToken:el("qqClearToken").checked};
 }
 async function controlQqService(stop=false, save=false) {
-  if(qqServiceBusy) return;
+  if(qqServiceBusy) return false;
   qqServiceBusy=true;qqServiceError="";qqRefreshEpoch++;
-  for(const id of ["qqEnabled","qqSave","qqRefresh","qqReplyMode","qqVoiceInput","qqPhoneEnabled"]) el(id).disabled=true;
+  for(const id of ["qqEnabled","qqSave","qqRefresh","qqReplyMode","qqVoiceInput","qqPhoneEnabled","qqDailyContactGoal","qqProactiveMode","qqQuietStart","qqQuietEnd","qqProactiveChannel"]) el(id).disabled=true;
   el("qqServiceStatus").textContent=stop?"正在关闭自动回复和 QQ 连接…":"正在保存并启动 QQ / NapCat，请稍候…";
   try {
     if(stop) await invoke("qq_stop_service");
@@ -2634,17 +2660,19 @@ async function controlQqService(stop=false, save=false) {
     // Clear submitted credentials without overwriting unrelated unsaved fields.
     if(!stop){qqMediaDirty=false;el("qqToken").value="";el("qqClearToken").checked=false;}
     await refreshQqConfig();
+    return true;
   } catch(error) {
     qqServiceError=qqServiceErrors[typeof error==="string"?error:""]||(save?"保存失败：请检查地址、不同的 QQ 号、绑定昵称与 token。":"QQ 服务操作失败，请检查配置与本机服务后重试。");
     await refreshQqConfig().catch(()=>{el("qqEnabled").checked=false;});
     el("qqServiceStatus").textContent=qqServiceError;
     if(save) el("qqStatus").textContent=qqServiceError;
+    return false;
   } finally {
     qqServiceBusy=false;
-    for(const id of ["qqEnabled","qqSave","qqRefresh","qqReplyMode","qqVoiceInput","qqPhoneEnabled"]) el(id).disabled=false;
+    for(const id of ["qqEnabled","qqSave","qqRefresh","qqReplyMode","qqVoiceInput","qqPhoneEnabled","qqDailyContactGoal","qqProactiveMode","qqQuietStart","qqQuietEnd","qqProactiveChannel"]) el(id).disabled=false;
   }
 }
-for(const id of ["qqReplyMode","qqVoiceInput","qqPhoneEnabled"]) el(id)?.addEventListener("change",()=>{qqMediaDirty=true;});
+for(const id of ["qqReplyMode","qqVoiceInput","qqPhoneEnabled","qqDailyContactGoal","qqProactiveMode","qqQuietStart","qqQuietEnd","qqProactiveChannel","qqWsUrl","qqOwnerId","qqBotId","qqToken","qqClearToken"]) el(id)?.addEventListener("change",()=>{qqMediaDirty=true;el("qqProactiveStatus").textContent="QQ 配置有未保存修改；点击底部保存或保存 QQ 配置后生效。";});
 el("qqEnabled")?.addEventListener("change",()=>controlQqService(!el("qqEnabled").checked));
 el("qqLogin")?.addEventListener("click",()=>invoke("qq_open_login").catch(()=>{el("qqServiceStatus").textContent="无法打开本机 NapCat 登录页；请确认开关已开启。";}));
 el("qqRefreshLogin")?.addEventListener("click",async()=>{
@@ -2656,6 +2684,8 @@ el("qqRefreshLogin")?.addEventListener("click",async()=>{
 el("qqRefresh")?.addEventListener("click",()=>refreshQqConfig().catch(()=>{el("qqStatus").textContent="读取连接状态失败";}));
 el("qqSave")?.addEventListener("click",()=>controlQqService(false,true));
 document.querySelector('.tab-btn[data-tab="qq"]')?.addEventListener("click",()=>refreshQqConfig().catch(()=>{}));
+el("qqOpenInterestCache")?.addEventListener("click",()=>{document.querySelector('.tab-btn[data-tab="fresh-topics"]')?.click();el("webGroundingEnabled")?.focus();});
+el("qqOpenTopicPreferences")?.addEventListener("click",()=>{document.querySelector('.tab-btn[data-tab="persona"]')?.click();el("topicPreferenceRows")?.scrollIntoView({block:'center'});});
 
 async function init() {
   try {

@@ -127,3 +127,66 @@ test('QQ phone audio-route failure gives an actionable message while ordinary QQ
   assert.match(el('qqPhoneStatus').textContent,/虚拟音频/);
   assert.match(el('qqPhoneStatus').textContent,/消息/);
 });
+
+test('QQ debug status shows saved mode, eligibility time, bounded decisions and cache readiness',async()=>{
+  const at=Math.floor(Date.now()/1000)+3600;
+  const {el,refresh}=mount(async()=>({enabled:true,proactiveMode:'natural',proactiveChannel:'qq',
+    initiative:{reason:'cooldown',nextAt:at,attemptsToday:1,decisions:[['model-drop',at-5],['injected-private-text',at-2]]},
+    interestCache:{enabled:true,totalItems:40,interestedCategories:2,eligibleItems:7,latestFetchedAt:at-4000}}));
+  await refresh();
+  assert.match(el('qqDebugSummary').textContent,/自然.*QQ.*1.*3/);
+  assert.match(el('qqProactiveStatus').textContent,/再判断/);
+  assert.match(el('qqInterestCacheStatus').textContent,/40.*2.*7/);
+  assert.match(el('qqDecisionHistory').textContent,/跳过/);
+  assert.doesNotMatch(el('qqDecisionHistory').textContent,/injected-private-text/);
+});
+
+test('QQ cache guidance distinguishes disabled, missing interests and stale cache',async()=>{
+  for(const [cache,expected] of [
+    [{enabled:false,totalItems:20},/未开启.*时下信息/],
+    [{enabled:true,totalItems:20,interestedCategories:0,eligibleItems:0},/人设.*感兴趣/],
+    [{enabled:true,totalItems:20,interestedCategories:1,eligibleItems:0},/没有.*有效.*后台.*自动补充.*手动采集/],
+  ]) {
+    const {el,refresh}=mount(async()=>({interestCache:cache}));await refresh();
+    assert.match(el('qqInterestCacheStatus').textContent,expected);
+  }
+});
+
+test('daily contact target is opt-in, saved with QQ config, and shows refresh backoff separately',async()=>{
+  let saved;
+  const {el,refresh}=mount(async(command,args)=>{
+    if(command==='qq_save_config')saved=args.request;
+    if(command==='qq_get_config')return {proactiveMode:'natural',dailyContactGoal:true,dailyGoal:{reason:'daily-wait-time',plans:0,nextAt:Math.floor(Date.now()/1000)+3600},interestCache:{enabled:true,totalItems:20,interestedCategories:1,eligibleItems:0,refresh:{reason:'refresh-backoff',failingSources:2,nextAt:Math.floor(Date.now()/1000)+900}}};
+  });
+  await refresh();assert.equal(el('qqDailyContactGoal').checked,true);
+  assert.match(el('qqDailyGoalStatus').textContent,/18|准备/);
+  assert.match(el('qqCacheRefreshStatus').textContent,/退避.*2/);
+  el('qqDailyContactGoal').checked=false;el('qqDailyContactGoal').events.change();await el('qqSave').events.click();
+  assert.equal(saved.dailyContactGoal,false);
+});
+
+test('global save applies pending QQ initiative settings and reports partial failure',async()=>{
+  const saveSource=source.slice(source.indexOf('async function save()'),source.indexOf('// ---- 头像上传'));
+  for(const fail of [false,true]) {
+    const nodes=new Map(),calls=[];
+    const el=id=>{if(!nodes.has(id))nodes.set(id,{value:'',checked:false,disabled:false,textContent:'',style:{},events:{},addEventListener(n,cb){this.events[n]=cb;}});return nodes.get(id);};
+    const context=vm.createContext({el,invoke:async(command,args)=>{
+      calls.push({command,args});
+      if(command==='qq_save_config'&&fail)throw 'local-storage';
+      if(command==='qq_get_config')return {enabled:true,proactiveMode:fail?'off':'natural'};
+    },document:{querySelector:el},saveBtn:el('save'),statusEl:el('status'),currentBackend:()=> 'local',saveCardVoice:()=>{},saveCardProfile:()=>{},collect:()=>({}),localVoicePresetById:()=>null,setTimeout:()=>0});
+    vm.runInContext(source.slice(source.indexOf('const qqStatusLabels='),source.indexOf('async function init()'))+saveSource,context);
+    el('qqProactiveMode').value='natural';el('qqProactiveMode').events.change();
+    await vm.runInContext('save()',context);
+    assert.equal(calls.find(c=>c.command==='qq_save_config')?.args.request.proactiveMode,'natural');
+    assert.match(el('status').textContent,fail?/QQ.*未保存/:/已保存/);
+    assert.doesNotMatch(el('status').textContent,/local-storage/);
+    if(fail)assert.equal(el('qqProactiveMode').value,'natural','failed draft must survive');
+  }
+});
+
+
+test('all selectable interest categories have readable activity status labels',async()=>{
+ const {el,refresh}=mount(async()=>({enabled:true,status:'connected',activityGoals:[{category:'science',step:'reflect',observed:1,shared:0},{category:'work-growth',step:'reflect',observed:2,shared:1},{category:'general',step:'observe',observed:0,shared:0}]}));
+ await refresh();assert.match(el('qqActivityStatus').textContent,/科学：已收集 1 条/);assert.match(el('qqActivityStatus').textContent,/工作成长：已收集 2 条/);assert.match(el('qqActivityStatus').textContent,/综合：/);
+});

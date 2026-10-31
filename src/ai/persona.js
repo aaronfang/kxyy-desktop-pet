@@ -1078,13 +1078,12 @@ function resolvedTimeZone(override) {
 }
 
 export function computeTemporalContextData(now = new Date(), timeZone = "") {
-  const weekdayIdx = now.getDay() === 0 ? 6 : now.getDay() - 1;
-  return {
-    date: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`,
-    weekday: WEEKDAY_CN[weekdayIdx],
-    time: `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`,
-    timeZone: resolvedTimeZone(timeZone),
-  };
+  const zone=resolvedTimeZone(timeZone);
+  let parts;
+  try { parts=new Intl.DateTimeFormat('en-CA',{timeZone:zone==='local'?undefined:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',weekday:'short',hourCycle:'h23'}).formatToParts(now); }
+  catch { return computeTemporalContextData(now,Intl.DateTimeFormat().resolvedOptions().timeZone); }
+  const value=type=>parts.find(p=>p.type===type)?.value;
+  return {date:`${value('year')}-${value('month')}-${value('day')}`,weekday:{Mon:'周一',Tue:'周二',Wed:'周三',Thu:'周四',Fri:'周五',Sat:'周六',Sun:'周日'}[value('weekday')],time:`${value('hour')}:${value('minute')}`,timeZone:zone};
 }
 
 function livestreamLoreLines(lore) {
@@ -1115,7 +1114,8 @@ export function computeLiveContext(now, lore, cardId, {
   const weekday = temporal.weekday;
   const timeStr = temporal.time;
   const isKxyy = isKxyyPersona(cardId);
-  const dateStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日`;
+  const [year, month, day] = temporal.date.split("-");
+  const dateStr = `${year}年${Number(month)}月${Number(day)}日`;
   const lines = [
     "# 当前时间与会话模式（每轮重新计算）",
     `- 现在：${dateStr} ${weekday} ${timeStr}（${temporal.timeZone}）`,

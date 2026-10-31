@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use quick_xml::events::Event;
@@ -3961,6 +3962,22 @@ pub struct FreshTopicStatusResponse {
     pub items: Vec<FreshTopic>,
 }
 
+/// Text-free cache readiness, using saved settings rather than the settings draft.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitiativeCacheStatus {
+    pub enabled: bool,
+    pub total_items: usize,
+    pub interested_categories: usize,
+    pub eligible_items: usize,
+    latest_fetched_at: Option<i64>,
+    refresh: RefreshStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct RefreshStatus { pub reason:&'static str, pub next_at:i64, pub failing_sources:usize }
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshTopicPrefetchResponse {
@@ -4011,6 +4028,8 @@ struct ProviderCacheStatus {
     last_success_at: Option<String>,
     #[serde(default)]
     latest_published_at: Option<String>,
+    #[serde(default)]
+    failures: u8,
 }
 
 pub struct FreshTopicService {
@@ -4020,6 +4039,7 @@ pub struct FreshTopicService {
     provider_attempts: Mutex<BTreeMap<String, String>>,
     provider_results: Mutex<BTreeMap<String, ProviderCacheStatus>>,
     prefetch_lock: Mutex<()>,
+    maintenance_started: AtomicBool,
 }
 
 impl FreshTopicService {
@@ -4053,6 +4073,7 @@ impl FreshTopicService {
             provider_attempts: Mutex::new(provider_attempts),
             provider_results: Mutex::new(provider_results),
             prefetch_lock: Mutex::new(()),
+            maintenance_started: AtomicBool::new(false),
         }
     }
 
@@ -4088,10 +4109,19 @@ impl FreshTopicService {
         candidates
     }
 
+    fn source_next_refresh(&self, source_id:&str, at:i64)->i64 {
+        let previous=self.provider_attempts.lock().unwrap().get(source_id).and_then(|v|chrono::DateTime::parse_from_rfc3339(v).ok()).map(|v|v.timestamp());
+        let Some(previous)=previous.filter(|p|*p<=at) else{return at;};
+        let failures=self.provider_results.lock().unwrap().get(source_id).map(|r|r.failures).unwrap_or(0);
+        let wait=if failures==0 {PROVIDER_REFRESH_HOURS*3600}else{(15*60_i64).saturating_mul(1_i64<<failures.saturating_sub(1).min(5)).min(6*3600)};
+        previous+wait
+    }
+
     fn source_refresh_due(&self, source_id: &str, now: &str, force: bool) -> bool {
         let Some(now) = chrono::DateTime::parse_from_rfc3339(now).ok() else {
             return true;
         };
+        if !force{return now.timestamp()>=self.source_next_refresh(source_id,now.timestamp());}
         self.provider_attempts
             .lock()
             .unwrap()
@@ -4254,6 +4284,7 @@ impl FreshTopicService {
                     .lock()
                     .unwrap()
                     .insert(source.id().into(), fetched_at.into());
+                let previous_failures=self.provider_results.lock().unwrap().get(source.id()).map(|r|r.failures).unwrap_or(0);
                 let previous_success = self
                     .provider_results
                     .lock()
@@ -4281,6 +4312,7 @@ impl FreshTopicService {
                             previous_success
                         },
                         latest_published_at,
+                        failures:if matches!(result.status.as_str(),"ok"|"partial"|"empty"){0}else{previous_failures.saturating_add(1).min(6)},
                     },
                 );
             }
@@ -4351,6 +4383,49 @@ impl FreshTopicService {
             })
             .collect();
         self.prefetch(&client, &sources, fetched_at, quotas, force)
+    }
+
+    /// Separate from ordinary three-item chat recall. Filter before selection;
+    /// round-robin categories so a busy source cannot monopolize initiative.
+    pub fn initiative_pool(&self, categories:&[String], at:i64)->Vec<FreshTopic> {
+        let mut groups:BTreeMap<String,Vec<FreshTopic>>=BTreeMap::new();
+        for item in self.items.lock().unwrap().iter().filter(|item|categories.contains(&item.category)
+            && crate::proactive::safe_topic(&item.title)
+            && chrono::DateTime::parse_from_rfc3339(&item.fetched_at).ok()
+                .is_some_and(|t|t.timestamp()<=at && at-t.timestamp()<6*3600)) {
+            groups.entry(item.category.clone()).or_default().push(item.clone());
+        }
+        for items in groups.values_mut(){items.sort_by(|a,b|b.fetched_at.cmp(&a.fetched_at).then(a.source_id.cmp(&b.source_id)));}
+        let mut result=Vec::new();
+        for offset in 0..CACHE_MAX_ITEMS {
+            let before=result.len();
+            for items in groups.values(){if let Some(item)=items.get(offset){result.push(item.clone());if result.len()==CACHE_MAX_ITEMS{return result;}}}
+            if before==result.len(){break;}
+        }
+        result
+    }
+
+    pub fn refresh_status(&self,enabled:bool,quotas:&BTreeMap<String,usize>,at:i64)->RefreshStatus {
+        if !enabled{return RefreshStatus{reason:"refresh-disabled",next_at:0,failing_sources:0};}
+        if quotas.is_empty(){return RefreshStatus{reason:"refresh-no-preferences",next_at:0,failing_sources:0};}
+        if self.prefetch_lock.try_lock().is_err(){return RefreshStatus{reason:"refreshing",next_at:0,failing_sources:0};}
+        let sources=default_sources().into_iter().filter(|s|s.categories().iter().any(|c|quotas.contains_key(*c))).collect::<Vec<_>>();
+        let next=sources.iter().map(|s|self.source_next_refresh(s.id(),at)).min().unwrap_or(at+6*3600);
+        let results=self.provider_results.lock().unwrap();
+        let failures=sources.iter().filter(|s|results.get(s.id()).is_some_and(|r|r.failures>0)).count();
+        RefreshStatus{reason:if next<=at{"refresh-due"}else if failures>0{"refresh-backoff"}else{"refresh-fresh"},next_at:next,failing_sources:failures}
+    }
+
+    pub fn initiative_status(&self, enabled:bool, categories:&[String], at:i64)->InitiativeCacheStatus {
+        let quotas=categories.iter().map(|c|(c.clone(),15)).collect();
+        let refresh=self.refresh_status(enabled,&quotas,at);
+        let items=self.items.lock().unwrap();
+        let eligible=items.iter().filter(|item| enabled && categories.contains(&item.category)
+            && crate::proactive::safe_topic(&item.title)
+            && chrono::DateTime::parse_from_rfc3339(&item.fetched_at).ok()
+                .is_some_and(|fetched|fetched.timestamp()<=at && at-fetched.timestamp()<6*3600)).count();
+        InitiativeCacheStatus {enabled,total_items:items.len(),interested_categories:categories.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            eligible_items:eligible,latest_fetched_at:items.iter().filter_map(|item|chrono::DateTime::parse_from_rfc3339(&item.fetched_at).ok().map(|t|t.timestamp())).filter(|t|*t<=at).max(),refresh}
     }
 
     pub fn status(
@@ -4471,7 +4546,21 @@ pub fn schedule_startup_prefetch(app: AppHandle) {
     // per app launch instead of treating a previous process run as a six-hour
     // cache hit. The normal provider cooldown still prevents duplicate starts
     // within the same launch (and manual refreshes remain rate-limited).
-    schedule_prefetch(app, "startup", 8);
+    schedule_prefetch(app.clone(), "startup", 8);
+    start_cache_maintenance(app);
+}
+
+pub fn start_cache_maintenance(app:AppHandle) {
+    if app.state::<FreshTopicService>().maintenance_started.swap(true,AtomicOrdering::SeqCst){return;}
+    // One bounded worker. Re-read saved authorization before each batch; no
+    // model, chat or Memory is used by these existing fixed providers.
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let (enabled,quotas)=app_collection_plan(&app,None);
+        let at=chrono::Utc::now().timestamp();
+        let status=app.state::<FreshTopicService>().refresh_status(enabled,&quotas,at);
+        if status.reason=="refresh-due" {let _=prefetch_for_app(&app,"background",false,None);}
+    });
 }
 
 pub fn schedule_prefetch(app: AppHandle, reason: &'static str, delay_seconds: u64) {
@@ -5344,6 +5433,7 @@ mod tests {
                 attempted_at: "2026-08-08T05:00:00Z".into(),
                 last_success_at: Some("2026-08-08T05:00:00Z".into()),
                 latest_published_at: Some("2026-08-08T04:59:00Z".into()),
+                failures:0,
             },
         );
         let quotas = BTreeMap::from([("technology".into(), 3), ("games".into(), 6)]);
@@ -5441,6 +5531,65 @@ mod tests {
         assert!(excluded.items.is_empty());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn initiative_diagnostics_count_only_authorized_fresh_interests_without_exporting_sources() {
+        let path=cache_path();
+        let service=FreshTopicService::open(path.clone());
+        let at=chrono::DateTime::parse_from_rfc3339("2026-08-08T05:00:00Z").unwrap().timestamp();
+        let fresh=topic("current", "新游戏", "games", "2026-08-08T04:00:00Z");
+        let mut stale=topic("stale", "旧游戏", "games", "2026-08-08T01:00:00Z");stale.fetched_at="2026-08-07T22:00:00Z".into();
+        let neutral=topic("neutral", "音乐", "music", "2026-08-08T04:00:00Z");
+        service.replace(vec![fresh,stale,neutral]).unwrap();
+        let summary=service.initiative_status(true,&["games".into()],at);
+        assert_eq!(summary.total_items,3);assert_eq!(summary.eligible_items,1);assert_eq!(summary.interested_categories,1);
+        assert_eq!(service.initiative_status(false,&["games".into()],at).eligible_items,0);
+        assert_eq!(service.initiative_status(true,&[],at).eligible_items,0);
+        assert_eq!(service.initiative_status(true,&["games".into()],at+6*3600).eligible_items,0);
+        let serialized=serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("新游戏"));assert!(!serialized.contains("example.com"));
+        let _=fs::remove_file(path);
+    }
+
+    #[test]
+    fn initiative_pool_survives_three_excluded_heads_and_rotates_categories_before_bounding() {
+        let path=cache_path();let service=FreshTopicService::open(path.clone());
+        let at=chrono::DateTime::parse_from_rfc3339("2026-08-08T05:00:00Z").unwrap().timestamp();
+        let mut items=(0..9).map(|n|topic(&format!("g{n}"),&format!("游戏{n}"),"games","2026-08-08T04:00:00Z")).collect::<Vec<_>>();
+        items.push(topic("music","歌曲资料","music","2026-08-08T04:00:00Z"));
+        let mut stale=topic("stale","过期资料","music","2026-08-07T01:00:00Z");stale.fetched_at="2026-08-07T01:00:00Z".into();items.push(stale);
+        service.replace(items).unwrap();
+        let all=service.initiative_pool(&["games".into(),"music".into()],at);
+        assert_eq!(all.len(),10);assert_ne!(all[0].category,all[1].category);
+        let excluded=all[..3].iter().map(|i|i.source_id.clone()).collect::<Vec<_>>();
+        let remaining=all.into_iter().filter(|i|!excluded.contains(&i.source_id)).collect::<Vec<_>>();
+        assert_eq!(remaining.len(),7);
+        assert_eq!(service.query(FreshTopicQuery{max_items:20,..Default::default()},"2026-08-08T05:00:00Z").items.len(),3,"ordinary chat keeps its existing cap");
+        assert!(service.initiative_pool(&[],at).is_empty());
+        assert!(service.initiative_pool(&["games".into()],at+6*3600).is_empty());
+        let _=fs::remove_file(path);
+    }
+
+    #[test]
+    fn maintenance_refresh_retries_failures_with_backoff_and_survives_reload() {
+        let path=cache_path();let service=FreshTopicService::open(path.clone());
+        let client=build_http_client().unwrap();let quotas=BTreeMap::from([("games".into(),15)]);
+        let failing=FixtureSource{id:"retry-source",status:"timeout",items:vec![]};
+        service.prefetch(&client,&[&failing],"2026-08-08T05:00:00Z",&quotas,false);
+        assert_eq!(service.source_next_refresh("retry-source",1786165200),1786166100);
+        assert!(!service.source_refresh_due("retry-source","2026-08-08T05:14:59Z",false));
+        assert!(service.source_refresh_due("retry-source","2026-08-08T05:15:00Z",false));
+        service.prefetch(&client,&[&failing],"2026-08-08T05:15:00Z",&quotas,false);
+        let reopened=FreshTopicService::open(path.clone());
+        assert!(!reopened.source_refresh_due("retry-source","2026-08-08T05:44:59Z",false));
+        assert!(reopened.source_refresh_due("retry-source","2026-08-08T05:45:00Z",false));
+        assert_eq!(reopened.refresh_status(false,&quotas,1786165200).reason,"refresh-disabled");
+        let working=FixtureSource{status:"ok",items:vec![topic("new","新游戏","games","2026-08-08T05:45:00Z")],..failing};
+        reopened.prefetch(&client,&[&working],"2026-08-08T05:45:00Z",&quotas,false);
+        assert!(!reopened.source_refresh_due("retry-source","2026-08-08T11:44:59Z",false));
+        assert!(reopened.source_refresh_due("retry-source","2026-08-08T11:45:00Z",false));
+        let _=fs::remove_file(path);
     }
 
     #[test]
@@ -5854,7 +6003,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_failures_are_cached_for_six_hours_across_restart() {
+    fn provider_failures_obey_initial_fifteen_minute_backoff_across_restart() {
         let path = cache_path();
         let calls = AtomicU64::new(0);
         let source = CountingSource { calls: &calls };
@@ -5866,11 +6015,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let reopened = FreshTopicService::open(path.clone());
-        let second = reopened.prefetch(&client, &[&source], "2026-08-08T10:59:59Z", &quotas, false);
+        let second = reopened.prefetch(&client, &[&source], "2026-08-08T05:14:59Z", &quotas, false);
         assert_eq!(second.providers[0].status, "cached");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        let third = reopened.prefetch(&client, &[&source], "2026-08-08T11:00:00Z", &quotas, false);
+        let third = reopened.prefetch(&client, &[&source], "2026-08-08T05:15:00Z", &quotas, false);
         assert_eq!(third.providers[0].status, "rate_limited");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         let _ = fs::remove_file(path);
@@ -5924,4 +6073,24 @@ mod tests {
         assert_eq!(response.items.len(), 1);
         let _ = fs::remove_file(path);
     }
+}
+
+/// Passive initiative may read only an already-authorized local cache.
+/// Unlike query_for_app, this never falls back to a network provider.
+pub(crate) fn initiative_status_for_app(app:&AppHandle)->InitiativeCacheStatus {
+    let settings=app.state::<super::AppState>().settings.lock().unwrap().clone();
+    let categories:Vec<String>=settings.topic_preferences.iter().filter(|p|p.status=="interested").filter_map(|p|preference_category(&p.topic).map(str::to_string)).collect();
+    let at=chrono::Utc::now().timestamp();
+    let service=app.state::<FreshTopicService>();
+    let mut status=service.initiative_status(settings.web_grounding_enabled,&categories,at);
+    status.refresh=service.refresh_status(settings.web_grounding_enabled,&preference_quotas(&settings.topic_preferences),at);
+    status
+}
+
+pub(crate) fn cached_initiative(app:&AppHandle,excluded:Vec<String>)->Vec<FreshTopic>{
+    let settings=app.state::<super::AppState>().settings.lock().unwrap().clone();
+    if !settings.web_grounding_enabled{return Vec::new();}
+    let categories:Vec<String>=settings.topic_preferences.iter().filter(|p|p.status=="interested").filter_map(|p|preference_category(&p.topic).map(str::to_string)).collect();
+    if categories.is_empty(){return Vec::new();}
+    app.state::<FreshTopicService>().initiative_pool(&categories,chrono::Utc::now().timestamp()).into_iter().filter(|item|!excluded.contains(&item.source_id)).collect()
 }

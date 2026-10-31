@@ -3,7 +3,11 @@ mod web_research;
 mod fresh_topics;
 mod local_text;
 mod memory;
+mod memory_time;
 mod qq;
+mod qq_delivery;
+mod proactive;
+mod companion_activity;
 mod qq_audio;
 mod qq_media;
 mod qq_phone;
@@ -233,7 +237,7 @@ struct Settings {
     web_grounding_enabled: bool,
     #[serde(default = "default_fresh_topic_participation")]
     fresh_topic_participation: String,
-    /// 网页观察 provider：`none` / `tavily`。
+    /// 网页观察 provider：`none` / `tavily` / `deepseek`。
     #[serde(default)]
     web_grounding_provider: String,
     /// Tavily Search API Key。持久化在本机，由 Rust 代理用于固定搜索端点。
@@ -2213,6 +2217,7 @@ fn set_ai_settings(app: AppHandle, settings: AiSettingsInput) {
             .as_str()
         {
             "tavily" => "tavily".into(),
+            "deepseek" => "deepseek".into(),
             _ => "none".into(),
         };
         s.tavily_api_key = settings.tavily_api_key.trim().to_string();
@@ -2798,6 +2803,10 @@ pub fn run() {
             qq::qq_save_config,
             qq::qq_cancel_pending,
             qq::qq_send_draft,
+            qq::qq_conversation_activity,
+            qq::qq_present_initiative,
+            qq::qq_decline_initiative,
+            qq::qq_read_images,
             qq::qq_cancel_draft,
             memory::memory_status,
             memory::memory_integrity_check,
